@@ -25,6 +25,11 @@ pub mod serum3_cpi;
 pub mod state;
 pub mod types;
 
+pub use state::queue_fifo::{
+    CompactOrderParams, OpenbookQueueAction, PerpQueueAction, QueueEventType, QueueFifo,
+    QueueFifoEvent, QueueFifoHeader, SignatureBlob,
+};
+
 #[cfg(feature = "enable-gpl")]
 pub mod instructions;
 

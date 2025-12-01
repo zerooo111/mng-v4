@@ -9161,6 +9161,31 @@
           }
         ]
       }
+    },
+    {
+      "name": "QueueFifo",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "header",
+            "type": {
+              "defined": "QueueFifoHeader"
+            }
+          },
+          {
+            "name": "entries",
+            "type": {
+              "array": [
+                {
+                  "defined": "QueueFifoEvent"
+                },
+                64
+              ]
+            }
+          }
+        ]
+      }
     }
   ],
   "types": [
@@ -11705,6 +11730,221 @@
       "type": {
         "kind": "alias",
         "value": "u16"
+      }
+    },
+    {
+      "name": "QueueFifoHeader",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "head",
+            "type": "u32"
+          },
+          {
+            "name": "count",
+            "type": "u32"
+          },
+          {
+            "name": "lastExecutedSeq",
+            "type": "u64"
+          },
+          {
+            "name": "maxLagSlots",
+            "type": "u32"
+          },
+          {
+            "name": "reserved",
+            "type": "u32"
+          }
+        ]
+      }
+    },
+    {
+      "name": "QueueFifoEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "seqNo",
+            "type": "u64"
+          },
+          {
+            "name": "user",
+            "type": "publicKey"
+          },
+          {
+            "name": "continuum",
+            "type": "publicKey"
+          },
+          {
+            "name": "eventType",
+            "type": "u8"
+          },
+          {
+            "name": "padding",
+            "type": {
+              "array": [
+                "u8",
+                7
+              ]
+            }
+          },
+          {
+            "name": "params",
+            "type": {
+              "defined": "CompactOrderParams"
+            }
+          },
+          {
+            "name": "userSignature",
+            "type": {
+              "defined": "SignatureBlob"
+            }
+          },
+          {
+            "name": "continuumSignature",
+            "type": {
+              "defined": "SignatureBlob"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "CompactOrderParams",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "marketIndex",
+            "type": "u16"
+          },
+          {
+            "name": "side",
+            "type": "u8"
+          },
+          {
+            "name": "orderType",
+            "type": "u8"
+          },
+          {
+            "name": "selfTradeBehavior",
+            "type": "u8"
+          },
+          {
+            "name": "reduceOnly",
+            "type": "u8"
+          },
+          {
+            "name": "limit",
+            "type": "u8"
+          },
+          {
+            "name": "tifOffset",
+            "type": "u16"
+          },
+          {
+            "name": "maxBaseLots",
+            "type": "i64"
+          },
+          {
+            "name": "maxQuoteLots",
+            "type": "i64"
+          },
+          {
+            "name": "priceLots",
+            "type": "i64"
+          },
+          {
+            "name": "clientOrderId",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "SignatureBlob",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "bytes",
+            "type": {
+              "array": [
+                "u8",
+                64
+              ]
+            }
+          },
+          {
+            "name": "isPresent",
+            "type": "u8"
+          },
+          {
+            "name": "padding",
+            "type": {
+              "array": [
+                "u8",
+                7
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "QueueEventType",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "PerpPlaceOrder"
+          },
+          {
+            "name": "PerpCancelOrder"
+          },
+          {
+            "name": "OpenbookV2PlaceOrder"
+          },
+          {
+            "name": "OpenbookV2CancelOrder"
+          },
+          {
+            "name": "OpenbookV2PlaceTakeOrder"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PerpQueueAction",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "PlaceOrder"
+          },
+          {
+            "name": "CancelOrder"
+          }
+        ]
+      }
+    },
+    {
+      "name": "OpenbookQueueAction",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "PlaceOrder"
+          },
+          {
+            "name": "CancelOrder"
+          },
+          {
+            "name": "PlaceTakeOrder"
+          }
+        ]
       }
     }
   ],
