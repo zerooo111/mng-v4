@@ -151,6 +151,20 @@ pub enum MangoError {
     InvalidSequenceNumber,
     #[msg("invalid health")]
     InvalidHealth,
+    #[msg("queue is full")]
+    QueueIsFull,
+    #[msg("sequence number must increase")]
+    SequenceNumberTooLow,
+    #[msg("missing user intent signature pre-instruction")]
+    MissingIntentSignature,
+    #[msg("invalid sequencer signature")]
+    InvalidContinuumSignature,
+    #[msg("continuum key missing or not allowed")]
+    ContinuumKeyMissing,
+    #[msg("unsupported queue event type")]
+    UnsupportedQueueEventType,
+    #[msg("invalid compact queue params")]
+    InvalidQueueParams,
 }
 
 impl MangoError {

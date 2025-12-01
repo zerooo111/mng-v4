@@ -25,7 +25,7 @@ pub mod serum3_cpi;
 pub mod state;
 pub mod types;
 
-pub use state::queue_fifo::{
+pub use state::{
     CompactOrderParams, OpenbookQueueAction, PerpQueueAction, QueueEventType, QueueFifo,
     QueueFifoEvent, QueueFifoHeader, SignatureBlob,
 };
@@ -135,6 +135,15 @@ pub mod mango_v4 {
     pub fn group_close(ctx: Context<GroupClose>) -> Result<()> {
         #[cfg(feature = "enable-gpl")]
         instructions::group_close(ctx)?;
+        Ok(())
+    }
+
+    pub fn enqueue_perp_event(
+        ctx: Context<EnqueuePerpEvent>,
+        args: EnqueuePerpEventArgs,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::enqueue_perp_event(ctx, args)?;
         Ok(())
     }
 

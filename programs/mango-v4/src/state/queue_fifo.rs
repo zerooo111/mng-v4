@@ -1,5 +1,7 @@
 use crate::error::Contextable;
+use crate::error::MangoError;
 use crate::error_msg;
+use crate::error_msg_typed;
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::hash::hashv;
 use bytemuck::bytes_of;
@@ -20,6 +22,30 @@ pub struct QueueFifo {
 
 const_assert_eq!(size_of::<QueueFifo>() % 8, 0);
 
+impl QueueFifo {
+    pub fn is_full(&self) -> bool {
+        self.header.count as usize >= FIFO_QUEUE_CAPACITY
+    }
+
+    pub fn tail_index(&self) -> Option<usize> {
+        if self.header.count == 0 {
+            None
+        } else {
+            Some(((self.header.head + self.header.count - 1) % FIFO_QUEUE_CAPACITY as u32) as usize)
+        }
+    }
+
+    pub fn tail_seq(&self) -> u64 {
+        self.tail_index()
+            .map(|index| self.entries[index].seq_no)
+            .unwrap_or(self.header.last_executed_seq)
+    }
+
+    pub fn next_index(&self) -> usize {
+        ((self.header.head + self.header.count) % FIFO_QUEUE_CAPACITY as u32) as usize
+    }
+}
+
 #[zero_copy]
 #[repr(C)]
 #[derive(Debug, Default)]
@@ -38,6 +64,7 @@ const_assert_eq!(size_of::<QueueFifoHeader>() % 8, 0);
 #[derive(Debug, Default)]
 pub struct QueueFifoEvent {
     pub seq_no: u64,
+    pub submitted_slot: u64,
     pub user: Pubkey,
     pub continuum: Pubkey,
     pub event_type: u8,
@@ -49,8 +76,12 @@ pub struct QueueFifoEvent {
 
 impl QueueFifoEvent {
     pub fn queue_event_type(&self) -> Result<QueueEventType> {
-        QueueEventType::try_from(self.event_type)
-            .context("queue_fifo: invalid queue event type for entry")
+        QueueEventType::try_from(self.event_type).map_err(|_| {
+            error_msg_typed!(
+                MangoError::UnsupportedQueueEventType,
+                "queue_fifo: invalid queue event type for entry"
+            )
+        })
     }
 
     fn signature_flags(&self) -> [u8; 2] {
@@ -94,32 +125,46 @@ const_assert_eq!(size_of::<QueueFifoEvent>() % 8, 0);
 #[repr(C)]
 #[derive(Debug, Default)]
 pub struct CompactOrderParams {
+    pub max_base_lots: i64,
+    pub max_quote_lots: i64,
+    pub price_lots: i64,
+    pub client_order_id: u64,
     pub market_index: u16,
+    pub tif_offset: u16,
     pub side: u8,
     pub order_type: u8,
     pub self_trade_behavior: u8,
     pub reduce_only: u8,
     pub limit: u8,
-    pub tif_offset: u16,
-    pub max_base_lots: i64,
-    pub max_quote_lots: i64,
-    pub price_lots: i64,
-    pub client_order_id: u64,
+    pub padding: [u8; 7],
 }
 
 impl CompactOrderParams {
     pub fn side(&self) -> Result<Side> {
-        Side::try_from(self.side).context("queue_fifo: invalid side in compact order params")
+        Side::try_from(self.side).map_err(|_| {
+            error_msg_typed!(
+                MangoError::InvalidQueueParams,
+                "queue_fifo: invalid side in compact order params"
+            )
+        })
     }
 
     pub fn place_order_type(&self) -> Result<PlaceOrderType> {
-        PlaceOrderType::try_from(self.order_type)
-            .context("queue_fifo: invalid order type in compact order params")
+        PlaceOrderType::try_from(self.order_type).map_err(|_| {
+            error_msg_typed!(
+                MangoError::InvalidQueueParams,
+                "queue_fifo: invalid order type in compact order params"
+            )
+        })
     }
 
     pub fn self_trade_behavior(&self) -> Result<SelfTradeBehavior> {
-        SelfTradeBehavior::try_from(self.self_trade_behavior)
-            .context("queue_fifo: invalid self trade behavior in compact order params")
+        SelfTradeBehavior::try_from(self.self_trade_behavior).map_err(|_| {
+            error_msg_typed!(
+                MangoError::InvalidQueueParams,
+                "queue_fifo: invalid self trade behavior in compact order params"
+            )
+        })
     }
 
     pub fn is_reduce_only(&self) -> bool {
@@ -131,11 +176,21 @@ const_assert_eq!(size_of::<CompactOrderParams>() % 8, 0);
 
 #[zero_copy]
 #[repr(C)]
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SignatureBlob {
     pub bytes: [u8; 64],
     pub is_present: u8,
     pub padding: [u8; 7],
+}
+
+impl Default for SignatureBlob {
+    fn default() -> Self {
+        Self {
+            bytes: [0u8; 64],
+            is_present: 0,
+            padding: [0u8; 7],
+        }
+    }
 }
 
 const_assert_eq!(size_of::<SignatureBlob>() % 8, 0);
@@ -212,5 +267,5 @@ impl TryFrom<QueueEventType> for OpenbookQueueAction {
     }
 }
 
-const_assert_eq!(size_of::<QueueFifoEvent>(), 272);
+const_assert_eq!(size_of::<QueueFifoEvent>(), 280);
 const_assert_eq!(size_of::<QueueFifoHeader>(), 24);
