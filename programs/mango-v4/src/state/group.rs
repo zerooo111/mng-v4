@@ -21,6 +21,9 @@ pub const PERP_SETTLE_TOKEN_INDEX: TokenIndex = 0;
 /// The token index used in AccountBuybackFeesWithMngo to exchange for MNGO
 pub const FEE_BUYBACK_QUOTE_TOKEN_INDEX: TokenIndex = 0;
 
+pub const GROUP_CONTINUUM_KEY_OFFSET: usize = 0;
+pub const GROUP_CONTINUUM_KEY_SIZE: usize = 32;
+
 #[account(zero_copy)]
 #[derive(Debug)]
 pub struct Group {
@@ -136,6 +139,20 @@ impl Group {
         self.is_testing() || self.version > 1
     }
 
+    pub fn continuum_key(&self) -> Option<Pubkey> {
+        let start = GROUP_CONTINUUM_KEY_OFFSET;
+        let end = GROUP_CONTINUUM_KEY_OFFSET + GROUP_CONTINUUM_KEY_SIZE;
+        let mut bytes = [0u8; GROUP_CONTINUUM_KEY_SIZE];
+        bytes.copy_from_slice(&self.reserved[start..end]);
+
+        let key = Pubkey::new_from_array(bytes);
+        if key == Pubkey::default() {
+            None
+        } else {
+            Some(key)
+        }
+    }
+
     pub fn serum3_supported(&self) -> bool {
         self.is_testing() || self.version > 0
     }
@@ -246,6 +263,7 @@ pub enum IxGate {
     GroupChangeInsuranceFund = 76,
     PerpForceCloseUnmatched = 77,
     PerpSettleUnmatched = 78,
+    PerpEnqueueEvent = 79,
     // NOTE: Adding new variants requires matching changes in ts and the ix_gate_set instruction.
 }
 
