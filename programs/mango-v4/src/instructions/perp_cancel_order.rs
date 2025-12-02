@@ -4,18 +4,50 @@ use crate::accounts_ix::*;
 use crate::error::*;
 use crate::state::*;
 
+#[derive(Clone)]
+pub struct PerpCancelOrderAccounts<'a, 'info> {
+    pub account: &'a AccountLoader<'info, MangoAccountFixed>,
+    pub perp_market: &'a AccountLoader<'info, PerpMarket>,
+    pub bids: &'a AccountLoader<'info, BookSide>,
+    pub asks: &'a AccountLoader<'info, BookSide>,
+    pub owner_key: Pubkey,
+}
+
 pub fn perp_cancel_order(ctx: Context<PerpCancelOrder>, order_id: u128) -> Result<()> {
-    let mut account = ctx.accounts.account.load_full_mut()?;
+    perp_cancel_order_logic(
+        PerpCancelOrderAccounts {
+            account: &ctx.accounts.account,
+            perp_market: &ctx.accounts.perp_market,
+            bids: &ctx.accounts.bids,
+            asks: &ctx.accounts.asks,
+            owner_key: ctx.accounts.owner.key(),
+        },
+        order_id,
+    )
+}
+
+pub fn perp_cancel_order_prevalidated(
+    accounts: PerpCancelOrderAccounts<'_, '_>,
+    order_id: u128,
+) -> Result<()> {
+    perp_cancel_order_logic(accounts, order_id)
+}
+
+fn perp_cancel_order_logic(
+    accounts: PerpCancelOrderAccounts<'_, '_>,
+    order_id: u128,
+) -> Result<()> {
+    let mut account = accounts.account.load_full_mut()?;
     // account constraint #1
     require!(
-        account.fixed.is_owner_or_delegate(ctx.accounts.owner.key()),
+        account.fixed.is_owner_or_delegate(accounts.owner_key),
         MangoError::SomeError
     );
 
-    let perp_market = ctx.accounts.perp_market.load_mut()?;
+    let perp_market = accounts.perp_market.load_mut()?;
     let mut book = Orderbook {
-        bids: ctx.accounts.bids.load_mut()?,
-        asks: ctx.accounts.asks.load_mut()?,
+        bids: accounts.bids.load_mut()?,
+        asks: accounts.asks.load_mut()?,
     };
 
     let (slot, _) = account
@@ -29,7 +61,7 @@ pub fn perp_cancel_order(ctx: Context<PerpCancelOrder>, order_id: u128) -> Resul
 
     book.cancel_order_by_slot(
         &mut account.borrow_mut(),
-        ctx.accounts.account.as_ref().key,
+        accounts.account.as_ref().key,
         slot,
         perp_market.perp_market_index,
     )?;
