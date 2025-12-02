@@ -147,6 +147,12 @@ pub mod mango_v4 {
         Ok(())
     }
 
+    pub fn crank_fifo_queue(ctx: Context<CrankFifoQueue>, max_events: u8) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::crank_fifo_queue(ctx, max_events)?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn token_register(
         ctx: Context<TokenRegister>,

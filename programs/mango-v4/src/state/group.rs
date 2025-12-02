@@ -264,6 +264,7 @@ pub enum IxGate {
     PerpForceCloseUnmatched = 77,
     PerpSettleUnmatched = 78,
     PerpEnqueueEvent = 79,
+    CrankFifoQueue = 80,
     // NOTE: Adding new variants requires matching changes in ts and the ix_gate_set instruction.
 }
 

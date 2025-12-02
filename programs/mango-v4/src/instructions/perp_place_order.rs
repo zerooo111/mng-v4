@@ -7,10 +7,53 @@ use crate::health::*;
 use crate::state::*;
 use crate::util::clock_now;
 
+#[derive(Clone)]
+pub struct PerpPlaceOrderAccounts<'a, 'info> {
+    pub group: &'a AccountLoader<'info, Group>,
+    pub account: &'a AccountLoader<'info, MangoAccountFixed>,
+    pub perp_market: &'a AccountLoader<'info, PerpMarket>,
+    pub bids: &'a AccountLoader<'info, BookSide>,
+    pub asks: &'a AccountLoader<'info, BookSide>,
+    pub event_queue: &'a AccountLoader<'info, EventQueue>,
+    pub oracle: &'a AccountInfo<'info>,
+    pub owner_key: Pubkey,
+    pub remaining_accounts: &'a [AccountInfo<'info>],
+}
+
 // TODO
 #[allow(clippy::too_many_arguments)]
 pub fn perp_place_order(
     ctx: Context<PerpPlaceOrder>,
+    order: Order,
+    limit: u8,
+) -> Result<Option<u128>> {
+    perp_place_order_logic(
+        PerpPlaceOrderAccounts {
+            group: &ctx.accounts.group,
+            account: &ctx.accounts.account,
+            perp_market: &ctx.accounts.perp_market,
+            bids: &ctx.accounts.bids,
+            asks: &ctx.accounts.asks,
+            event_queue: &ctx.accounts.event_queue,
+            oracle: ctx.accounts.oracle.as_ref(),
+            owner_key: ctx.accounts.owner.key(),
+            remaining_accounts: ctx.remaining_accounts,
+        },
+        order,
+        limit,
+    )
+}
+
+pub fn perp_place_order_prevalidated(
+    accounts: PerpPlaceOrderAccounts<'_, '_>,
+    order: Order,
+    limit: u8,
+) -> Result<Option<u128>> {
+    perp_place_order_logic(accounts, order, limit)
+}
+
+fn perp_place_order_logic(
+    accounts: PerpPlaceOrderAccounts<'_, '_>,
     mut order: Order,
     limit: u8,
 ) -> Result<Option<u128>> {
@@ -25,13 +68,13 @@ pub fn perp_place_order(
     // Doing this automatically here makes it impossible for attackers to add orders to the orderbook
     // before triggering the funding computation.
     {
-        let mut perp_market = ctx.accounts.perp_market.load_mut()?;
+        let mut perp_market = accounts.perp_market.load_mut()?;
         let book = Orderbook {
-            bids: ctx.accounts.bids.load_mut()?,
-            asks: ctx.accounts.asks.load_mut()?,
+            bids: accounts.bids.load_mut()?,
+            asks: accounts.asks.load_mut()?,
         };
 
-        let oracle_ref = &AccountInfoRef::borrow(ctx.accounts.oracle.as_ref())?;
+        let oracle_ref = &AccountInfoRef::borrow(accounts.oracle)?;
         let oracle_state = perp_market.oracle_state(
             &OracleAccountInfos::from_reader(oracle_ref),
             None, // staleness checked in health
@@ -41,17 +84,17 @@ pub fn perp_place_order(
         perp_market.update_funding_and_stable_price(&book, &oracle_state, now_ts)?;
     }
 
-    let mut account = ctx.accounts.account.load_full_mut()?;
+    let mut account = accounts.account.load_full_mut()?;
     // account constraint #1
     require!(
-        account.fixed.is_owner_or_delegate(ctx.accounts.owner.key()),
+        account.fixed.is_owner_or_delegate(accounts.owner_key),
         MangoError::SomeError
     );
 
-    let account_pk = ctx.accounts.account.key();
+    let account_pk = accounts.account.key();
 
     let (perp_market_index, settle_token_index) = {
-        let perp_market = ctx.accounts.perp_market.load()?;
+        let perp_market = accounts.perp_market.load()?;
         (
             perp_market.perp_market_index,
             perp_market.settle_token_index,
@@ -68,7 +111,7 @@ pub fn perp_place_order(
     //
     let pre_health_opt = if !account.fixed.is_in_health_region() {
         let retriever = new_fixed_order_account_retriever_with_optional_banks(
-            ctx.remaining_accounts,
+            accounts.remaining_accounts,
             &account.borrow(),
             (now_ts, now_slot),
         )?;
@@ -88,14 +131,14 @@ pub fn perp_place_order(
         None
     };
 
-    let mut perp_market = ctx.accounts.perp_market.load_mut()?;
+    let mut perp_market = accounts.perp_market.load_mut()?;
     let mut book = Orderbook {
-        bids: ctx.accounts.bids.load_mut()?,
-        asks: ctx.accounts.asks.load_mut()?,
+        bids: accounts.bids.load_mut()?,
+        asks: accounts.asks.load_mut()?,
     };
 
-    let mut event_queue = ctx.accounts.event_queue.load_mut()?;
-    let group = ctx.accounts.group.load()?;
+    let mut event_queue = accounts.event_queue.load_mut()?;
+    let group = accounts.group.load()?;
 
     let now_ts: u64 = Clock::get()?.unix_timestamp.try_into().unwrap();
     account
