@@ -23,6 +23,26 @@ available under GPL.
 
 See DEVELOPING.md and FAQ-DEV.md
 
+## Perp FIFO queue (continuum sequencing)
+
+Perp order placement/cancellation now supports a FIFO queue that is sequenced by a
+whitelisted continuum signer. The flow is:
+
+1. The user signs an `OrderIntent` payload (no sequence number).
+2. The continuum sequencer assigns a `seq_no`, signs a `QueuedOrderIntent`
+   (order intent hash + sequence + expiry), and submits the transaction with
+   both Ed25519 pre-instructions.
+3. The `perp_enqueue_operation` instruction verifies both signatures from the
+   `Ed25519Program` pre-instructions, appends the event to the on-chain FIFO
+   queue, and enforces monotonic sequence numbers.
+4. `perp_crank_queued_operations` executes queued events strictly in sequence
+   number order, skipping gaps only after the configured lag window.
+
+For local testing, use locally generated continuum signatures by including an
+`ed25519_instruction::new_ed25519_instruction` for the continuum keypair in the
+enqueue transaction. The signed payload layouts are documented in
+`docs/order-intents.md`.
+
 ### Dependencies
 
 - rust version 1.69.0

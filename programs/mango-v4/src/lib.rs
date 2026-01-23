@@ -157,14 +157,17 @@ pub mod mango_v4 {
         Ok(())
     }
 
-    pub fn crank_fifo_queue(ctx: Context<CrankFifoQueue>, max_events: u8) -> Result<()> {
+    pub fn crank_fifo_queue<'info>(
+        ctx: Context<'_, '_, '_, 'info, CrankFifoQueue<'info>>,
+        max_events: u8,
+    ) -> Result<()> {
         #[cfg(feature = "enable-gpl")]
         instructions::crank_fifo_queue(ctx, max_events)?;
         Ok(())
     }
 
-    pub fn perp_crank_queued_operations(
-        ctx: Context<PerpCrankQueuedOperations>,
+    pub fn perp_crank_queued_operations<'info>(
+        ctx: Context<'_, '_, '_, 'info, PerpCrankQueuedOperations<'info>>,
         max_operations: u8,
     ) -> Result<()> {
         #[cfg(feature = "enable-gpl")]
@@ -1055,8 +1058,8 @@ pub mod mango_v4 {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn perp_place_order(
-        ctx: Context<PerpPlaceOrder>,
+    pub fn perp_place_order<'info>(
+        ctx: Context<'_, '_, '_, 'info, PerpPlaceOrder<'info>>,
         side: Side,
 
         // The price in lots (quote lots per base lots)
@@ -1119,8 +1122,8 @@ pub mod mango_v4 {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn perp_place_order_v2(
-        ctx: Context<PerpPlaceOrder>,
+    pub fn perp_place_order_v2<'info>(
+        ctx: Context<'_, '_, '_, 'info, PerpPlaceOrder<'info>>,
         side: Side,
 
         // The price in lots (quote lots per base lots)
@@ -1184,8 +1187,8 @@ pub mod mango_v4 {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn perp_place_order_pegged(
-        ctx: Context<PerpPlaceOrder>,
+    pub fn perp_place_order_pegged<'info>(
+        ctx: Context<'_, '_, '_, 'info, PerpPlaceOrder<'info>>,
         side: Side,
 
         // The adjustment from the oracle price, in lots (quote lots per base lots).
@@ -1256,8 +1259,8 @@ pub mod mango_v4 {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn perp_place_order_pegged_v2(
-        ctx: Context<PerpPlaceOrder>,
+    pub fn perp_place_order_pegged_v2<'info>(
+        ctx: Context<'_, '_, '_, 'info, PerpPlaceOrder<'info>>,
         side: Side,
 
         // The adjustment from the oracle price, in lots (quote lots per base lots).
