@@ -610,6 +610,10 @@ async fn test_perp_queue_failures() -> Result<(), TransportError> {
         &owner.to_keypair(),
         &intent_hash,
     ));
+    invalid_signature_tx.add_instruction_direct(new_ed25519_instruction(
+        &continuum,
+        &intent_hash,
+    ));
     invalid_signature_tx.add_instruction_direct(build_enqueue_perp_event_ix(
         group,
         queue,
@@ -636,7 +640,7 @@ async fn test_perp_queue_failures() -> Result<(), TransportError> {
         },
     ));
     invalid_signature_tx
-        .send_expect_error(MangoError::InvalidContinuumSignature)
+        .send_expect_error(MangoError::MissingContinuumSignature)
         .await
         .unwrap();
 
