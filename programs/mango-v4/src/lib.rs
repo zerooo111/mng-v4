@@ -163,6 +163,15 @@ pub mod mango_v4 {
         Ok(())
     }
 
+    pub fn perp_crank_queued_operations(
+        ctx: Context<PerpCrankQueuedOperations>,
+        max_operations: u8,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::perp_crank_queued_operations(ctx, max_operations)?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn token_register(
         ctx: Context<TokenRegister>,

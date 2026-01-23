@@ -213,6 +213,7 @@ pub enum QueueEventType {
     OpenbookV2PlaceOrder = 2,
     OpenbookV2CancelOrder = 3,
     OpenbookV2PlaceTakeOrder = 4,
+    PerpModifyOrder = 5,
 }
 
 impl QueueEventType {
@@ -220,6 +221,7 @@ impl QueueEventType {
         match self {
             QueueEventType::PerpPlaceOrder => Some(PerpQueueAction::PlaceOrder),
             QueueEventType::PerpCancelOrder => Some(PerpQueueAction::CancelOrder),
+            QueueEventType::PerpModifyOrder => Some(PerpQueueAction::ModifyOrder),
             _ => None,
         }
     }
@@ -239,6 +241,7 @@ impl QueueEventType {
 pub enum PerpQueueAction {
     PlaceOrder = 0,
     CancelOrder = 1,
+    ModifyOrder = 2,
 }
 
 impl TryFrom<QueueEventType> for PerpQueueAction {
