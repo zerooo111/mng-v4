@@ -28,6 +28,7 @@ pub struct PerpCrankQueuedOperations<'info> {
         has_one = asks,
         has_one = event_queue,
         has_one = oracle,
+        has_one = queue,
     )]
     pub perp_market: AccountLoader<'info, PerpMarket>,
     #[account(mut)]

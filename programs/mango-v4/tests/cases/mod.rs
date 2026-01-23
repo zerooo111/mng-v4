@@ -33,6 +33,7 @@ mod test_liq_perps_positive_pnl;
 mod test_liq_tokens;
 mod test_margin_trade;
 mod test_perp;
+mod test_perp_queue;
 mod test_perp_settle;
 mod test_perp_settle_fees;
 mod test_position_lifetime;

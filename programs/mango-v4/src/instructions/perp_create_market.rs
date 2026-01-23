@@ -56,6 +56,8 @@ pub fn perp_create_market(
         bids: ctx.accounts.bids.key(),
         asks: ctx.accounts.asks.key(),
         event_queue: ctx.accounts.event_queue.key(),
+        queue: ctx.accounts.queue.key(),
+        queue_last_executed_seq: 0,
         oracle: ctx.accounts.oracle.key(),
         oracle_config: oracle_config.to_oracle_config(),
         stable_price_model: StablePriceModel::default(),
@@ -95,7 +97,7 @@ pub fn perp_create_market(
         fees_withdrawn: 0,
         platform_liquidation_fee: I80F48::from_num(platform_liquidation_fee),
         accrued_liquidation_fees: I80F48::ZERO,
-        reserved: [0; 1848],
+        reserved: [0; 1808],
     };
 
     let oracle_ref = &AccountInfoRef::borrow(ctx.accounts.oracle.as_ref())?;

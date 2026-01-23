@@ -3370,6 +3370,7 @@ pub struct PerpCreateMarketInstruction {
     pub bids: Pubkey,
     pub asks: Pubkey,
     pub event_queue: Pubkey,
+    pub queue: Pubkey,
     pub payer: TestKeypair,
     pub settle_token_index: TokenIndex,
     pub perp_market_index: PerpMarketIndex,
@@ -3409,6 +3410,9 @@ impl PerpCreateMarketInstruction {
                 .await,
             event_queue: solana
                 .create_account_for_type::<EventQueue>(&mango_v4::id())
+                .await,
+            queue: solana
+                .create_account_for_type::<QueueFifo>(&mango_v4::id())
                 .await,
             oracle: base.oracle,
             base_decimals: base.mint.decimals,
@@ -3477,6 +3481,7 @@ impl ClientInstruction for PerpCreateMarketInstruction {
             bids: self.bids,
             asks: self.asks,
             event_queue: self.event_queue,
+            queue: self.queue,
             payer: self.payer.pubkey(),
             system_program: System::id(),
         };

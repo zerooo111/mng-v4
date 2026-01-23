@@ -58,6 +58,9 @@ pub struct EnqueuePerpEvent<'info> {
     #[account(mut)]
     pub queue: AccountLoader<'info, QueueFifo>,
 
+    #[account(has_one = group, has_one = queue)]
+    pub perp_market: AccountLoader<'info, PerpMarket>,
+
     /// CHECK: instruction sysvar is read to validate ed25519 signatures
     #[account(address = sysvar::instructions::ID)]
     pub instructions: UncheckedAccount<'info>,
