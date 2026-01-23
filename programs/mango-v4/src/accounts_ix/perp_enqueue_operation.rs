@@ -21,7 +21,7 @@ pub struct PerpEnqueueOperation<'info> {
     pub queue: AccountLoader<'info, QueueFifo>,
 
     #[account(mut, has_one = group)]
-    pub account: AccountLoader<'info, MangoAccount>,
+    pub account: AccountLoader<'info, MangoAccountFixed>,
 
     #[account(has_one = group, has_one = queue)]
     pub perp_market: AccountLoader<'info, PerpMarket>,

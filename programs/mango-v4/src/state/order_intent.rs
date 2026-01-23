@@ -37,7 +37,7 @@ impl From<CompactOrderParamsPayload> for CompactOrderParams {
     }
 }
 
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug, Default)]
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
 pub struct OrderIntent {
     pub version: u8,
     pub group: Pubkey,

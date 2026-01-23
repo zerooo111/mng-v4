@@ -8,7 +8,7 @@ use crate::state::*;
 use crate::util::clock_now;
 
 #[derive(Clone)]
-pub struct PerpPlaceOrderAccounts<'a, 'info> {
+pub struct PerpPlaceOrderAccounts<'a, 'b, 'info> {
     pub group: &'a AccountLoader<'info, Group>,
     pub account: &'a AccountLoader<'info, MangoAccountFixed>,
     pub perp_market: &'a AccountLoader<'info, PerpMarket>,
@@ -17,13 +17,13 @@ pub struct PerpPlaceOrderAccounts<'a, 'info> {
     pub event_queue: &'a AccountLoader<'info, EventQueue>,
     pub oracle: &'a AccountInfo<'info>,
     pub owner_key: Pubkey,
-    pub remaining_accounts: &'a [AccountInfo<'info>],
+    pub remaining_accounts: &'b [AccountInfo<'info>],
 }
 
 // TODO
 #[allow(clippy::too_many_arguments)]
-pub fn perp_place_order(
-    ctx: Context<PerpPlaceOrder>,
+pub fn perp_place_order<'info>(
+    ctx: Context<'_, '_, '_, 'info, PerpPlaceOrder<'info>>,
     order: Order,
     limit: u8,
 ) -> Result<Option<u128>> {
@@ -45,7 +45,7 @@ pub fn perp_place_order(
 }
 
 pub fn perp_place_order_prevalidated(
-    accounts: PerpPlaceOrderAccounts<'_, '_>,
+    accounts: PerpPlaceOrderAccounts<'_, '_, '_>,
     order: Order,
     limit: u8,
 ) -> Result<Option<u128>> {
@@ -53,7 +53,7 @@ pub fn perp_place_order_prevalidated(
 }
 
 fn perp_place_order_logic(
-    accounts: PerpPlaceOrderAccounts<'_, '_>,
+    accounts: PerpPlaceOrderAccounts<'_, '_, '_>,
     mut order: Order,
     limit: u8,
 ) -> Result<Option<u128>> {

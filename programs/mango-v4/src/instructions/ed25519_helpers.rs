@@ -4,6 +4,7 @@ use anchor_lang::solana_program::{
 };
 use bytemuck::{Pod, Zeroable};
 
+use crate::error::{Contextable, MangoError};
 use crate::error_msg;
 
 const SIGNATURE_OFFSETS_SERIALIZED_SIZE: usize = 14;
