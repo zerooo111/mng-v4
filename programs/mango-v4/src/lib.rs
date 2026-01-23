@@ -26,8 +26,9 @@ pub mod state;
 pub mod types;
 
 pub use state::{
-    CompactOrderParams, OpenbookQueueAction, PerpQueueAction, QueueEventType, QueueFifo,
-    QueueFifoEvent, QueueFifoHeader, SignatureBlob,
+    CompactOrderParams, CompactOrderParamsPayload, OpenbookQueueAction, OrderIntent,
+    PerpQueueAction, QueueEventType, QueueFifo, QueueFifoEvent, QueueFifoHeader, QueuedOrderIntent,
+    SignatureBlob,
 };
 
 #[cfg(feature = "enable-gpl")]
@@ -144,6 +145,15 @@ pub mod mango_v4 {
     ) -> Result<()> {
         #[cfg(feature = "enable-gpl")]
         instructions::enqueue_perp_event(ctx, args)?;
+        Ok(())
+    }
+
+    pub fn perp_enqueue_operation(
+        ctx: Context<PerpEnqueueOperation>,
+        args: PerpEnqueueOperationArgs,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::perp_enqueue_operation(ctx, args)?;
         Ok(())
     }
 
