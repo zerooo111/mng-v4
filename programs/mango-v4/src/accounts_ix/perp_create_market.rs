@@ -33,6 +33,8 @@ pub struct PerpCreateMarket<'info> {
     pub asks: AccountLoader<'info, BookSide>,
     #[account(zero)]
     pub event_queue: AccountLoader<'info, EventQueue>,
+    #[account(zero)]
+    pub queue: AccountLoader<'info, QueueFifo>,
 
     #[account(mut)]
     pub payer: Signer<'info>,

@@ -15,6 +15,13 @@ pub fn enqueue_perp_event(
         MangoError::UnsupportedQueueEventType
     );
 
+    let perp_market = ctx.accounts.perp_market.load()?;
+    require_eq!(
+        perp_market.perp_market_index,
+        args.params.market_index,
+        MangoError::InvalidQueueParams
+    );
+
     let group = ctx.accounts.group.load()?;
     let continuum = group
         .continuum_key()

@@ -80,6 +80,8 @@ export class PerpMarket {
       bids: PublicKey;
       asks: PublicKey;
       eventQueue: PublicKey;
+      queue: PublicKey;
+      queueLastExecutedSeq: BN;
       oracle: PublicKey;
       oracleConfig: OracleConfigDto;
       stablePriceModel: StablePriceModel;
@@ -130,6 +132,8 @@ export class PerpMarket {
       obj.bids,
       obj.asks,
       obj.eventQueue,
+      obj.queue,
+      obj.queueLastExecutedSeq,
       obj.oracle,
       obj.oracleConfig,
       obj.stablePriceModel,
@@ -181,6 +185,8 @@ export class PerpMarket {
     public bids: PublicKey,
     public asks: PublicKey,
     public eventQueue: PublicKey,
+    public queue: PublicKey,
+    public queueLastExecutedSeq: BN,
     public oracle: PublicKey,
     oracleConfig: OracleConfigDto,
     public stablePriceModel: StablePriceModel,

@@ -2745,12 +2745,16 @@ export class MangoClient {
     const bids = new Keypair();
     const asks = new Keypair();
     const eventQueue = new Keypair();
+    const queue = new Keypair();
 
     const bookSideSize = (this.program as any)._coder.accounts.size(
       (this.program.account.bookSide as any)._idlAccount,
     );
     const eventQueueSize = (this.program as any)._coder.accounts.size(
       (this.program.account.eventQueue as any)._idlAccount,
+    );
+    const queueSize = (this.program as any)._coder.accounts.size(
+      (this.program.account.queueFifo as any)._idlAccount,
     );
 
     const ix = await this.program.methods
@@ -2791,6 +2795,7 @@ export class MangoClient {
         bids: bids.publicKey,
         asks: asks.publicKey,
         eventQueue: eventQueue.publicKey,
+        queue: queue.publicKey,
         payer: (this.program.provider as AnchorProvider).wallet.publicKey,
       })
       .instruction();
@@ -2827,12 +2832,23 @@ export class MangoClient {
         fromPubkey: (this.program.provider as AnchorProvider).wallet.publicKey,
         newAccountPubkey: eventQueue.publicKey,
       }),
+      // fifo queue
+      SystemProgram.createAccount({
+        programId: this.program.programId,
+        space: queueSize,
+        lamports:
+          await this.program.provider.connection.getMinimumBalanceForRentExemption(
+            queueSize,
+          ),
+        fromPubkey: (this.program.provider as AnchorProvider).wallet.publicKey,
+        newAccountPubkey: queue.publicKey,
+      }),
     ];
     return await this.sendAndConfirmTransactionForGroup(
       group,
       [...preInstructions, ix],
       {
-        additionalSigners: [bids, asks, eventQueue],
+        additionalSigners: [bids, asks, eventQueue, queue],
       },
     );
   }

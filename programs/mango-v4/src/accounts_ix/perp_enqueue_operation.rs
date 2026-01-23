@@ -23,7 +23,7 @@ pub struct PerpEnqueueOperation<'info> {
     #[account(mut, has_one = group)]
     pub account: AccountLoader<'info, MangoAccount>,
 
-    #[account(has_one = group)]
+    #[account(has_one = group, has_one = queue)]
     pub perp_market: AccountLoader<'info, PerpMarket>,
 
     /// CHECK: instruction sysvar is read to validate ed25519 signatures

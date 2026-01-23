@@ -62,6 +62,10 @@ pub struct PerpMarket {
     pub asks: Pubkey,
     /// Address of the EventQueue account
     pub event_queue: Pubkey,
+    /// Address of the queue account
+    pub queue: Pubkey,
+    /// Last executed sequence number in the queue
+    pub queue_last_executed_seq: u64,
 
     /// Oracle account address
     pub oracle: Pubkey,
@@ -199,7 +203,7 @@ pub struct PerpMarket {
     pub accrued_liquidation_fees: I80F48,
 
     #[derivative(Debug = "ignore")]
-    pub reserved: [u8; 1848],
+    pub reserved: [u8; 1808],
 }
 
 const_assert_eq!(
@@ -213,6 +217,8 @@ const_assert_eq!(
         + 32
         + 32
         + 32
+        + 32
+        + 8
         + 96
         + 288
         + 8
@@ -237,7 +243,7 @@ const_assert_eq!(
         + 3 * 16
         + 8
         + 2 * 16
-        + 1848
+        + 1808
 );
 const_assert_eq!(size_of::<PerpMarket>(), 2808);
 const_assert_eq!(size_of::<PerpMarket>() % 8, 0);
@@ -492,6 +498,8 @@ impl PerpMarket {
             bids: Pubkey::new_unique(),
             asks: Pubkey::new_unique(),
             event_queue: Pubkey::new_unique(),
+            queue: Pubkey::new_unique(),
+            queue_last_executed_seq: 0,
             oracle: Pubkey::new_unique(),
             oracle_config: OracleConfig {
                 conf_filter: I80F48::ZERO,
@@ -535,7 +543,7 @@ impl PerpMarket {
             fees_withdrawn: 0,
             platform_liquidation_fee: I80F48::ZERO,
             accrued_liquidation_fees: I80F48::ZERO,
-            reserved: [0; 1848],
+            reserved: [0; 1808],
         }
     }
 }

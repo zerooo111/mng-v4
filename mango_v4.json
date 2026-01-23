@@ -4102,6 +4102,11 @@
           "isSigner": false
         },
         {
+          "name": "queue",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
           "name": "payer",
           "isMut": true,
           "isSigner": true
@@ -8699,6 +8704,20 @@
               "Address of the EventQueue account"
             ],
             "type": "publicKey"
+          },
+          {
+            "name": "queue",
+            "docs": [
+              "Address of the queue account"
+            ],
+            "type": "publicKey"
+          },
+          {
+            "name": "queueLastExecutedSeq",
+            "docs": [
+              "Last executed sequence number in the queue"
+            ],
+            "type": "u64"
           },
           {
             "name": "oracle",

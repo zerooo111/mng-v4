@@ -4102,6 +4102,11 @@ export type MangoV4 = {
           "isSigner": false
         },
         {
+          "name": "queue",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
           "name": "payer",
           "isMut": true,
           "isSigner": true
@@ -8699,6 +8704,20 @@ export type MangoV4 = {
               "Address of the EventQueue account"
             ],
             "type": "publicKey"
+          },
+          {
+            "name": "queue",
+            "docs": [
+              "Address of the queue account"
+            ],
+            "type": "publicKey"
+          },
+          {
+            "name": "queueLastExecutedSeq",
+            "docs": [
+              "Last executed sequence number in the queue"
+            ],
+            "type": "u64"
           },
           {
             "name": "oracle",
@@ -18835,6 +18854,11 @@ export const IDL: MangoV4 = {
           "isSigner": false
         },
         {
+          "name": "queue",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
           "name": "payer",
           "isMut": true,
           "isSigner": true
@@ -23432,6 +23456,20 @@ export const IDL: MangoV4 = {
               "Address of the EventQueue account"
             ],
             "type": "publicKey"
+          },
+          {
+            "name": "queue",
+            "docs": [
+              "Address of the queue account"
+            ],
+            "type": "publicKey"
+          },
+          {
+            "name": "queueLastExecutedSeq",
+            "docs": [
+              "Last executed sequence number in the queue"
+            ],
+            "type": "u64"
           },
           {
             "name": "oracle",

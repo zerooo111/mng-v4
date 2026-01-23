@@ -57,6 +57,11 @@ pub fn perp_crank_queued_operations(
 
     if result.is_err() {
         queue.header = saved_header;
+    } else {
+        let last_executed_seq = queue.header.last_executed_seq;
+        drop(queue);
+        let mut perp_market = ctx.accounts.perp_market.load_mut()?;
+        perp_market.queue_last_executed_seq = last_executed_seq;
     }
 
     result
