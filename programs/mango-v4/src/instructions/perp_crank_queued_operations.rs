@@ -4,13 +4,14 @@ use crate::accounts_ix::*;
 use crate::error::*;
 use crate::instructions::{
     perp_cancel_order_by_client_order_id_prevalidated, perp_place_order_prevalidated,
+    PerpCancelOrderByClientOrderIdAccounts, PerpPlaceOrderAccounts,
 };
 use crate::state::*;
 
 const MAX_QUEUED_OPS_PER_CALL: u8 = 8;
 
-pub fn perp_crank_queued_operations(
-    ctx: Context<PerpCrankQueuedOperations>,
+pub fn perp_crank_queued_operations<'info>(
+    ctx: Context<'_, '_, '_, 'info, PerpCrankQueuedOperations<'info>>,
     max_operations: u8,
 ) -> Result<()> {
     let mut queue = ctx.accounts.queue.load_mut()?;
@@ -67,7 +68,10 @@ pub fn perp_crank_queued_operations(
     result
 }
 
-fn dispatch_event(ctx: &Context<PerpCrankQueuedOperations>, event: &QueueFifoEvent) -> Result<()> {
+fn dispatch_event<'info>(
+    ctx: &Context<'_, '_, '_, 'info, PerpCrankQueuedOperations<'info>>,
+    event: &QueueFifoEvent,
+) -> Result<()> {
     match event.queue_event_type()? {
         QueueEventType::PerpPlaceOrder => execute_place(ctx, event),
         QueueEventType::PerpCancelOrder => execute_cancel(ctx, event),
@@ -76,7 +80,10 @@ fn dispatch_event(ctx: &Context<PerpCrankQueuedOperations>, event: &QueueFifoEve
     }
 }
 
-fn execute_place(ctx: &Context<PerpCrankQueuedOperations>, event: &QueueFifoEvent) -> Result<()> {
+fn execute_place<'info>(
+    ctx: &Context<'_, '_, '_, 'info, PerpCrankQueuedOperations<'info>>,
+    event: &QueueFifoEvent,
+) -> Result<()> {
     let (order, limit) = order_from_params(&event.params)?;
     perp_place_order_prevalidated(
         PerpPlaceOrderAccounts {
@@ -96,7 +103,10 @@ fn execute_place(ctx: &Context<PerpCrankQueuedOperations>, event: &QueueFifoEven
     Ok(())
 }
 
-fn execute_cancel(ctx: &Context<PerpCrankQueuedOperations>, event: &QueueFifoEvent) -> Result<()> {
+fn execute_cancel<'info>(
+    ctx: &Context<'_, '_, '_, 'info, PerpCrankQueuedOperations<'info>>,
+    event: &QueueFifoEvent,
+) -> Result<()> {
     perp_cancel_order_by_client_order_id_prevalidated(
         PerpCancelOrderByClientOrderIdAccounts {
             account: &ctx.accounts.account,
@@ -109,20 +119,20 @@ fn execute_cancel(ctx: &Context<PerpCrankQueuedOperations>, event: &QueueFifoEve
     )
 }
 
-fn execute_modify(ctx: &Context<PerpCrankQueuedOperations>, event: &QueueFifoEvent) -> Result<()> {
+fn execute_modify<'info>(
+    ctx: &Context<'_, '_, '_, 'info, PerpCrankQueuedOperations<'info>>,
+    event: &QueueFifoEvent,
+) -> Result<()> {
     execute_cancel(ctx, event)?;
     execute_place(ctx, event)
 }
 
-fn validate_event_targets(
-    ctx: &Context<PerpCrankQueuedOperations>,
+fn validate_event_targets<'info>(
+    ctx: &Context<'_, '_, '_, 'info, PerpCrankQueuedOperations<'info>>,
     event: &QueueFifoEvent,
 ) -> Result<()> {
     let account = ctx.accounts.account.load()?;
-    require!(
-        account.fixed.is_owner_or_delegate(event.user),
-        MangoError::SomeError
-    );
+    require!(account.is_owner_or_delegate(event.user), MangoError::SomeError);
 
     let perp_market = ctx.accounts.perp_market.load()?;
     require_eq!(
@@ -135,7 +145,7 @@ fn validate_event_targets(
 }
 
 fn advance_head(header: &mut QueueFifoHeader) {
-    header.head = (header.head + 1) % crate::state::queue_fifo::FIFO_QUEUE_CAPACITY as u32;
+    header.head = (header.head + 1) % FIFO_QUEUE_CAPACITY as u32;
     header.count = header.count.saturating_sub(1);
 }
 

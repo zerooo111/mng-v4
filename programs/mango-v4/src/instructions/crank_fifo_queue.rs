@@ -4,10 +4,14 @@ use crate::accounts_ix::*;
 use crate::error::*;
 use crate::instructions::{
     perp_cancel_order_by_client_order_id_prevalidated, perp_place_order_prevalidated,
+    PerpCancelOrderByClientOrderIdAccounts, PerpPlaceOrderAccounts,
 };
 use crate::state::*;
 
-pub fn crank_fifo_queue(ctx: Context<CrankFifoQueue>, max_events: u8) -> Result<()> {
+pub fn crank_fifo_queue<'info>(
+    ctx: Context<'_, '_, '_, 'info, CrankFifoQueue<'info>>,
+    max_events: u8,
+) -> Result<()> {
     let mut queue = ctx.accounts.queue.load_mut()?;
     let saved_header = queue.header;
 
@@ -33,8 +37,8 @@ pub fn crank_fifo_queue(ctx: Context<CrankFifoQueue>, max_events: u8) -> Result<
                     }
                 } else {
                     // Skip stale events
-                    queue.header.head = (queue.header.head + 1)
-                        % crate::state::queue_fifo::FIFO_QUEUE_CAPACITY as u32;
+                    queue.header.head =
+                        (queue.header.head + 1) % FIFO_QUEUE_CAPACITY as u32;
                     queue.header.count = queue.header.count.saturating_sub(1);
                     continue;
                 }
@@ -76,8 +80,7 @@ pub fn crank_fifo_queue(ctx: Context<CrankFifoQueue>, max_events: u8) -> Result<
                 _ => return err!(MangoError::UnsupportedQueueEventType),
             }
 
-            queue.header.head =
-                (queue.header.head + 1) % crate::state::queue_fifo::FIFO_QUEUE_CAPACITY as u32;
+            queue.header.head = (queue.header.head + 1) % FIFO_QUEUE_CAPACITY as u32;
             queue.header.count = queue.header.count.saturating_sub(1);
             last_executed = event.seq_no;
             queue.header.last_executed_seq = last_executed;
@@ -101,10 +104,7 @@ pub fn crank_fifo_queue(ctx: Context<CrankFifoQueue>, max_events: u8) -> Result<
 
 fn validate_event_targets(ctx: &Context<CrankFifoQueue>, event: &QueueFifoEvent) -> Result<()> {
     let account = ctx.accounts.account.load()?;
-    require!(
-        account.fixed.is_owner_or_delegate(event.user),
-        MangoError::SomeError
-    );
+    require!(account.is_owner_or_delegate(event.user), MangoError::SomeError);
 
     let perp_market = ctx.accounts.perp_market.load()?;
     require_eq!(

@@ -47,9 +47,8 @@ pub fn perp_enqueue_operation(
         .ok_or(MangoError::ContinuumKeyMissing)?;
 
     let order_intent_hash = order_intent.intent_hash()?;
-    require_eq!(
-        order_intent_hash,
-        queued_order_intent.order_intent_hash,
+    require!(
+        order_intent_hash == queued_order_intent.order_intent_hash,
         MangoError::OrderIntentHashMismatch
     );
 

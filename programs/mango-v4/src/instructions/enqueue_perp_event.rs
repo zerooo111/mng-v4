@@ -2,8 +2,6 @@ use crate::accounts_ix::*;
 use crate::error::*;
 use crate::state::*;
 use anchor_lang::prelude::*;
-use ed25519_dalek::{PublicKey as DalekPublicKey, Signature as DalekSignature, Verifier};
-
 use super::ed25519_helpers::find_ed25519_signature;
 
 pub fn enqueue_perp_event(
@@ -81,7 +79,17 @@ pub fn enqueue_perp_event(
 
     event.user_signature.bytes = intent_signature;
 
-    verify_continuum_signature(&event)?;
+    let Some(continuum_signature) =
+        find_ed25519_signature(&ctx.accounts.instructions, &event.continuum, &event.payload_hash())?
+    else {
+        msg!(
+            "enqueue_perp_event: rejected seq_no={} reason=missing_continuum_signature",
+            args.seq_no
+        );
+        return err!(MangoError::MissingContinuumSignature);
+    };
+
+    event.continuum_signature.bytes = continuum_signature;
 
     let index = queue.next_index();
     queue.entries[index] = event;
@@ -95,14 +103,4 @@ pub fn enqueue_perp_event(
     );
 
     Ok(())
-}
-
-fn verify_continuum_signature(event: &QueueFifoEvent) -> Result<()> {
-    let public_key = DalekPublicKey::from_bytes(event.continuum.as_ref())
-        .map_err(|_| error!(MangoError::InvalidContinuumSignature))?;
-    let signature = DalekSignature::from_bytes(&event.continuum_signature.bytes)
-        .map_err(|_| error!(MangoError::InvalidContinuumSignature))?;
-    public_key
-        .verify(&event.payload_hash(), &signature)
-        .map_err(|_| error!(MangoError::InvalidContinuumSignature))
 }
