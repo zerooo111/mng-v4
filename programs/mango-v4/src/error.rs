@@ -157,6 +157,8 @@ pub enum MangoError {
     SequenceNumberTooLow,
     #[msg("missing user intent signature pre-instruction")]
     MissingIntentSignature,
+    #[msg("missing sequencer intent signature pre-instruction")]
+    MissingContinuumSignature,
     #[msg("invalid sequencer signature")]
     InvalidContinuumSignature,
     #[msg("continuum key missing or not allowed")]
@@ -165,6 +167,18 @@ pub enum MangoError {
     UnsupportedQueueEventType,
     #[msg("invalid compact queue params")]
     InvalidQueueParams,
+    #[msg("order intent group does not match instruction")]
+    IntentGroupMismatch,
+    #[msg("order intent account does not match instruction")]
+    IntentAccountMismatch,
+    #[msg("order intent market does not match instruction")]
+    IntentMarketMismatch,
+    #[msg("order intent hash does not match queued intent")]
+    OrderIntentHashMismatch,
+    #[msg("order intent expired")]
+    OrderIntentExpired,
+    #[msg("queued order intent expired")]
+    QueuedOrderIntentExpired,
 }
 
 impl MangoError {
