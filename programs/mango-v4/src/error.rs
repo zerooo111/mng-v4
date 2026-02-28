@@ -155,6 +155,26 @@ pub enum MangoError {
     NoFreeOpenbookV2OpenOrdersIndex,
     #[msg("openbook v2 open orders exist already")]
     OpenbookV2OpenOrdersExistAlready,
+    #[msg("ctm ed25519 signature pre-instruction missing or invalid")]
+    CtmSignatureMissing,
+    #[msg("execution queue is full")]
+    ExecutionQueueFull,
+    #[msg("execution queue ingress is paused")]
+    ExecutionQueueIngressPaused,
+    #[msg("execution queue execution is paused")]
+    ExecutionQueueExecutePaused,
+    #[msg("execution queue payload exceeds max size")]
+    ExecutionQueuePayloadTooLarge,
+    #[msg("execution queue payload hash mismatch")]
+    ExecutionQueuePayloadHashMismatch,
+    #[msg("execution queue accounts hash mismatch")]
+    ExecutionQueueAccountsHashMismatch,
+    #[msg("execution queue envelope expired")]
+    ExecutionQueueEnvelopeExpired,
+    #[msg("execution queue duplicate sequence")]
+    ExecutionQueueDuplicateSequence,
+    #[msg("execution queue invalid item kind")]
+    ExecutionQueueInvalidItemKind,
 }
 
 impl MangoError {
