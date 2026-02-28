@@ -28,6 +28,9 @@ pub mod types;
 #[cfg(feature = "enable-gpl")]
 pub mod instructions;
 
+#[cfg(feature = "enable-gpl")]
+use instructions::{CtmEnvelope, ExecutionQueueConfigParams};
+
 #[cfg(all(not(feature = "no-entrypoint"), not(feature = "enable-gpl")))]
 
 compile_error!("compiling the program entrypoint without 'enable-gpl' makes no sense, enable it or use the 'cpi' or 'client' features");
@@ -537,6 +540,63 @@ pub mod mango_v4 {
     pub fn sequence_check(ctx: Context<SequenceCheck>, expected_sequence_number: u8) -> Result<()> {
         #[cfg(feature = "enable-gpl")]
         instructions::sequence_check(ctx, expected_sequence_number)?;
+        Ok(())
+    }
+
+    pub fn execution_queue_init(
+        ctx: Context<ExecutionQueueInit>,
+        ctm_signer: Pubkey,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_init(ctx, ctm_signer)?;
+        Ok(())
+    }
+
+    pub fn execution_queue_configure(
+        ctx: Context<ExecutionQueueAdmin>,
+        params: ExecutionQueueConfigParams,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_configure(ctx, params)?;
+        Ok(())
+    }
+
+    pub fn execution_queue_set_ctm_pending(
+        ctx: Context<ExecutionQueueAdmin>,
+        pending_ctm_signer: Pubkey,
+        activate_at_slot: u64,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_set_ctm_pending(ctx, pending_ctm_signer, activate_at_slot)?;
+        Ok(())
+    }
+
+    pub fn execution_queue_enqueue_ctm(
+        ctx: Context<ExecutionQueueEnqueueCtm>,
+        envelope: CtmEnvelope,
+        payload: Vec<u8>,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_enqueue_ctm(ctx, envelope, payload)?;
+        Ok(())
+    }
+
+    pub fn execution_queue_enqueue_liquidity(
+        ctx: Context<ExecutionQueueEnqueueLiquidity>,
+        kind: u8,
+        payload: Vec<u8>,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_enqueue_liquidity(ctx, kind, payload)?;
+        Ok(())
+    }
+
+    pub fn execution_queue_execute(
+        ctx: Context<ExecutionQueueExecute>,
+        max_items: u16,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_execute(ctx, max_items)?;
         Ok(())
     }
 
