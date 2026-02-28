@@ -175,6 +175,22 @@ pub enum MangoError {
     ExecutionQueueDuplicateSequence,
     #[msg("execution queue invalid item kind")]
     ExecutionQueueInvalidItemKind,
+    #[msg("execution queue payload decode failed")]
+    ExecutionQueuePayloadDecodeFailed,
+    #[msg("execution queue payload version unsupported")]
+    ExecutionQueuePayloadVersionUnsupported,
+    #[msg("execution queue payload variant invalid")]
+    ExecutionQueuePayloadVariantInvalid,
+    #[msg("execution queue payload kind mismatch")]
+    ExecutionQueuePayloadKindMismatch,
+    #[msg("execution queue execute accounts hash mismatch")]
+    ExecutionQueueExecuteAccountsHashMismatch,
+    #[msg("execution queue dispatch invocation failed")]
+    ExecutionQueueDispatchFailed,
+    #[msg("execution queue dispatch account layout invalid")]
+    ExecutionQueueDispatchAccountLayoutInvalid,
+    #[msg("execution queue owner must be queue authority")]
+    ExecutionQueueOwnerMustBeQueueAuthority,
 }
 
 impl MangoError {

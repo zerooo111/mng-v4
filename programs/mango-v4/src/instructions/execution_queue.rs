@@ -5,7 +5,9 @@ use anchor_lang::prelude::*;
 use anchor_lang::solana_program::ed25519_program;
 use anchor_lang::solana_program::hash::hashv;
 use anchor_lang::solana_program::instruction::{AccountMeta, Instruction};
+use anchor_lang::solana_program::program::{invoke, invoke_signed};
 use anchor_lang::solana_program::sysvar::instructions as tx_instructions;
+use anchor_lang::InstructionData;
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
 pub struct ExecutionQueueConfigParams {
@@ -46,6 +48,98 @@ const ED25519_SIGNATURE_OFFSETS_LEN: usize = 14;
 const ED25519_SIGNATURE_LEN: usize = 64;
 const ED25519_PUBKEY_LEN: usize = 32;
 const ED25519_CURRENT_INSTRUCTION_INDEX: u16 = u16::MAX;
+const QUEUE_PAYLOAD_VERSION_V1: u8 = 1;
+const QUEUE_PAYLOAD_HEADER_LEN: usize = 4;
+const EXECUTION_QUEUE_MAX_RETRIES: u8 = 5;
+
+#[repr(u8)]
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueuePayloadVariant {
+    PerpPlaceOrderV2 = 0,
+    PerpCancelOrder = 1,
+    PerpCancelOrderByClientOrderId = 2,
+    PerpCancelAllOrders = 3,
+    PerpCancelAllOrdersBySide = 4,
+    LiquidityDeposit = 5,
+    LiquidityWithdraw = 6,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
+pub struct PerpPlaceOrderV2Payload {
+    pub side: Side,
+    pub price_lots: i64,
+    pub max_base_lots: i64,
+    pub max_quote_lots: i64,
+    pub client_order_id: u64,
+    pub order_type: PlaceOrderType,
+    pub self_trade_behavior: SelfTradeBehavior,
+    pub reduce_only: bool,
+    pub expiry_timestamp: u64,
+    pub limit: u8,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
+pub struct PerpCancelOrderPayload {
+    pub order_id: u128,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
+pub struct PerpCancelOrderByClientOrderIdPayload {
+    pub client_order_id: u64,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
+pub struct PerpCancelAllOrdersPayload {
+    pub limit: u8,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
+pub struct PerpCancelAllOrdersBySidePayload {
+    pub side_option: Option<Side>,
+    pub limit: u8,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
+pub struct LiquidityDepositPayload {
+    pub amount: u64,
+    pub reduce_only: bool,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
+pub struct LiquidityWithdrawPayload {
+    pub amount: u64,
+    pub allow_borrow: bool,
+}
+
+#[derive(Clone, Debug)]
+enum QueuePayloadBody {
+    PerpPlaceOrderV2(PerpPlaceOrderV2Payload),
+    PerpCancelOrder(PerpCancelOrderPayload),
+    PerpCancelOrderByClientOrderId(PerpCancelOrderByClientOrderIdPayload),
+    PerpCancelAllOrders(PerpCancelAllOrdersPayload),
+    PerpCancelAllOrdersBySide(PerpCancelAllOrdersBySidePayload),
+    LiquidityDeposit(LiquidityDepositPayload),
+    LiquidityWithdraw(LiquidityWithdrawPayload),
+}
+
+#[derive(Clone, Debug)]
+struct DecodedQueuePayload {
+    variant: QueuePayloadVariant,
+    flags: u16,
+    body: QueuePayloadBody,
+}
+
+#[derive(Clone, Debug)]
+struct ExecutableCandidate {
+    idx: usize,
+    sequence: u64,
+    kind: u8,
+    payload: Vec<u8>,
+    payload_hash: [u8; 32],
+    accounts_hash: [u8; 32],
+    retries: u8,
+    is_ctm_lane: bool,
+}
 
 #[derive(Clone, Copy, Debug)]
 struct Ed25519SignatureOffsets {
@@ -91,6 +185,203 @@ fn canonical_envelope_message(group: Pubkey, envelope: &CtmEnvelope) -> [u8; 32]
         &envelope.expires_at_slot.to_le_bytes(),
     ])
     .to_bytes()
+}
+
+fn queue_payload_variant_from_u8(value: u8) -> Result<QueuePayloadVariant> {
+    match value {
+        0 => Ok(QueuePayloadVariant::PerpPlaceOrderV2),
+        1 => Ok(QueuePayloadVariant::PerpCancelOrder),
+        2 => Ok(QueuePayloadVariant::PerpCancelOrderByClientOrderId),
+        3 => Ok(QueuePayloadVariant::PerpCancelAllOrders),
+        4 => Ok(QueuePayloadVariant::PerpCancelAllOrdersBySide),
+        5 => Ok(QueuePayloadVariant::LiquidityDeposit),
+        6 => Ok(QueuePayloadVariant::LiquidityWithdraw),
+        _ => err!(MangoError::ExecutionQueuePayloadVariantInvalid),
+    }
+}
+
+fn queue_item_kind_for_payload_variant(variant: QueuePayloadVariant) -> u8 {
+    match variant {
+        QueuePayloadVariant::PerpPlaceOrderV2
+        | QueuePayloadVariant::PerpCancelOrder
+        | QueuePayloadVariant::PerpCancelOrderByClientOrderId
+        | QueuePayloadVariant::PerpCancelAllOrders
+        | QueuePayloadVariant::PerpCancelAllOrdersBySide => QueueItemKind::CtmWrapped as u8,
+        QueuePayloadVariant::LiquidityDeposit => QueueItemKind::LiquidityDeposit as u8,
+        QueuePayloadVariant::LiquidityWithdraw => QueueItemKind::LiquidityWithdraw as u8,
+    }
+}
+
+fn variant_uses_queue_owner_signer(variant: QueuePayloadVariant) -> bool {
+    matches!(
+        variant,
+        QueuePayloadVariant::PerpPlaceOrderV2
+            | QueuePayloadVariant::PerpCancelOrder
+            | QueuePayloadVariant::PerpCancelOrderByClientOrderId
+            | QueuePayloadVariant::PerpCancelAllOrders
+            | QueuePayloadVariant::PerpCancelAllOrdersBySide
+    )
+}
+
+fn decode_payload_body(variant: QueuePayloadVariant, body: &[u8]) -> Result<QueuePayloadBody> {
+    let decoded = match variant {
+        QueuePayloadVariant::PerpPlaceOrderV2 => QueuePayloadBody::PerpPlaceOrderV2(
+            PerpPlaceOrderV2Payload::try_from_slice(body)
+                .map_err(|_| error!(MangoError::ExecutionQueuePayloadDecodeFailed))?,
+        ),
+        QueuePayloadVariant::PerpCancelOrder => QueuePayloadBody::PerpCancelOrder(
+            PerpCancelOrderPayload::try_from_slice(body)
+                .map_err(|_| error!(MangoError::ExecutionQueuePayloadDecodeFailed))?,
+        ),
+        QueuePayloadVariant::PerpCancelOrderByClientOrderId => {
+            QueuePayloadBody::PerpCancelOrderByClientOrderId(
+                PerpCancelOrderByClientOrderIdPayload::try_from_slice(body)
+                    .map_err(|_| error!(MangoError::ExecutionQueuePayloadDecodeFailed))?,
+            )
+        }
+        QueuePayloadVariant::PerpCancelAllOrders => QueuePayloadBody::PerpCancelAllOrders(
+            PerpCancelAllOrdersPayload::try_from_slice(body)
+                .map_err(|_| error!(MangoError::ExecutionQueuePayloadDecodeFailed))?,
+        ),
+        QueuePayloadVariant::PerpCancelAllOrdersBySide => {
+            QueuePayloadBody::PerpCancelAllOrdersBySide(
+                PerpCancelAllOrdersBySidePayload::try_from_slice(body)
+                    .map_err(|_| error!(MangoError::ExecutionQueuePayloadDecodeFailed))?,
+            )
+        }
+        QueuePayloadVariant::LiquidityDeposit => QueuePayloadBody::LiquidityDeposit(
+            LiquidityDepositPayload::try_from_slice(body)
+                .map_err(|_| error!(MangoError::ExecutionQueuePayloadDecodeFailed))?,
+        ),
+        QueuePayloadVariant::LiquidityWithdraw => QueuePayloadBody::LiquidityWithdraw(
+            LiquidityWithdrawPayload::try_from_slice(body)
+                .map_err(|_| error!(MangoError::ExecutionQueuePayloadDecodeFailed))?,
+        ),
+    };
+    Ok(decoded)
+}
+
+fn decode_queue_payload(payload: &[u8]) -> Result<DecodedQueuePayload> {
+    require!(
+        payload.len() >= QUEUE_PAYLOAD_HEADER_LEN,
+        MangoError::ExecutionQueuePayloadDecodeFailed
+    );
+
+    let version = payload[0];
+    require!(
+        version == QUEUE_PAYLOAD_VERSION_V1,
+        MangoError::ExecutionQueuePayloadVersionUnsupported
+    );
+
+    let variant = queue_payload_variant_from_u8(payload[1])?;
+    let flags = u16::from_le_bytes([payload[2], payload[3]]);
+    require!(flags == 0, MangoError::ExecutionQueuePayloadDecodeFailed);
+
+    let body = decode_payload_body(variant, &payload[QUEUE_PAYLOAD_HEADER_LEN..])?;
+    Ok(DecodedQueuePayload {
+        variant,
+        flags,
+        body,
+    })
+}
+
+fn account_metas_from_infos(account_infos: &[AccountInfo]) -> Vec<AccountMeta> {
+    account_infos
+        .iter()
+        .map(|ai| AccountMeta {
+            pubkey: *ai.key,
+            is_signer: ai.is_signer,
+            is_writable: ai.is_writable,
+        })
+        .collect()
+}
+
+fn build_dispatch_ix_data(payload: &DecodedQueuePayload) -> Vec<u8> {
+    match &payload.body {
+        QueuePayloadBody::PerpPlaceOrderV2(p) => crate::instruction::PerpPlaceOrderV2 {
+            side: p.side,
+            price_lots: p.price_lots,
+            max_base_lots: p.max_base_lots,
+            max_quote_lots: p.max_quote_lots,
+            client_order_id: p.client_order_id,
+            order_type: p.order_type,
+            self_trade_behavior: p.self_trade_behavior,
+            reduce_only: p.reduce_only,
+            expiry_timestamp: p.expiry_timestamp,
+            limit: p.limit,
+        }
+        .data(),
+        QueuePayloadBody::PerpCancelOrder(p) => crate::instruction::PerpCancelOrder {
+            order_id: p.order_id,
+        }
+        .data(),
+        QueuePayloadBody::PerpCancelOrderByClientOrderId(p) => {
+            crate::instruction::PerpCancelOrderByClientOrderId {
+                client_order_id: p.client_order_id,
+            }
+            .data()
+        }
+        QueuePayloadBody::PerpCancelAllOrders(p) => {
+            crate::instruction::PerpCancelAllOrders { limit: p.limit }.data()
+        }
+        QueuePayloadBody::PerpCancelAllOrdersBySide(p) => {
+            crate::instruction::PerpCancelAllOrdersBySide {
+                side_option: p.side_option,
+                limit: p.limit,
+            }
+            .data()
+        }
+        QueuePayloadBody::LiquidityDeposit(p) => crate::instruction::TokenDeposit {
+            amount: p.amount,
+            reduce_only: p.reduce_only,
+        }
+        .data(),
+        QueuePayloadBody::LiquidityWithdraw(p) => crate::instruction::TokenWithdraw {
+            amount: p.amount,
+            allow_borrow: p.allow_borrow,
+        }
+        .data(),
+    }
+}
+
+fn dispatch_queue_payload(
+    payload: &DecodedQueuePayload,
+    remaining_accounts: &[AccountInfo],
+    group_key: Pubkey,
+    execution_queue_key: Pubkey,
+    execution_queue_bump: u8,
+) -> Result<()> {
+    let mut metas = account_metas_from_infos(remaining_accounts);
+    if variant_uses_queue_owner_signer(payload.variant) {
+        require!(
+            metas.len() >= 3,
+            MangoError::ExecutionQueueDispatchAccountLayoutInvalid
+        );
+        require!(
+            metas[2].pubkey == execution_queue_key,
+            MangoError::ExecutionQueueOwnerMustBeQueueAuthority
+        );
+        metas[2].is_signer = true;
+    }
+
+    let dispatch_ix = Instruction {
+        program_id: crate::id(),
+        accounts: metas,
+        data: build_dispatch_ix_data(payload),
+    };
+
+    if variant_uses_queue_owner_signer(payload.variant) {
+        let seeds: &[&[u8]] = &[
+            b"ExecutionQueue".as_ref(),
+            group_key.as_ref(),
+            &[execution_queue_bump],
+        ];
+        invoke_signed(&dispatch_ix, remaining_accounts, &[seeds])
+            .map_err(|_| error!(MangoError::ExecutionQueueDispatchFailed))
+    } else {
+        invoke(&dispatch_ix, remaining_accounts)
+            .map_err(|_| error!(MangoError::ExecutionQueueDispatchFailed))
+    }
 }
 
 fn read_u16(data: &[u8], offset: usize) -> Option<u16> {
@@ -292,6 +583,26 @@ pub fn execution_queue_enqueue_ctm(
         payload_hash == envelope.payload_hash,
         MangoError::ExecutionQueuePayloadHashMismatch
     );
+    let decoded_payload = decode_queue_payload(&payload)?;
+    require!(
+        decoded_payload.flags == 0,
+        MangoError::ExecutionQueuePayloadDecodeFailed
+    );
+    require!(
+        queue_item_kind_for_payload_variant(decoded_payload.variant)
+            == QueueItemKind::CtmWrapped as u8,
+        MangoError::ExecutionQueuePayloadKindMismatch
+    );
+    if variant_uses_queue_owner_signer(decoded_payload.variant) {
+        require!(
+            ctx.remaining_accounts.len() >= 3,
+            MangoError::ExecutionQueueDispatchAccountLayoutInvalid
+        );
+        require!(
+            *ctx.remaining_accounts[2].key == ctx.accounts.execution_queue.key(),
+            MangoError::ExecutionQueueOwnerMustBeQueueAuthority
+        );
+    }
 
     let account_hash = hash_accounts(
         &ctx.remaining_accounts
@@ -373,6 +684,15 @@ pub fn execution_queue_enqueue_liquidity(
             || kind == QueueItemKind::LiquidityWithdraw as u8,
         MangoError::ExecutionQueueInvalidItemKind
     );
+    let decoded_payload = decode_queue_payload(&payload)?;
+    require!(
+        decoded_payload.flags == 0,
+        MangoError::ExecutionQueuePayloadDecodeFailed
+    );
+    require!(
+        queue_item_kind_for_payload_variant(decoded_payload.variant) == kind,
+        MangoError::ExecutionQueuePayloadKindMismatch
+    );
 
     let clock = Clock::get()?;
     let mut queue = ctx.accounts.execution_queue.load_mut()?;
@@ -383,6 +703,7 @@ pub fn execution_queue_enqueue_liquidity(
     require!(!queue_is_full(&queue), MangoError::ExecutionQueueFull);
 
     let payload_hash = hashv(&[&payload]).to_bytes();
+    let accounts_hash = hash_accounts(&account_metas_from_infos(ctx.remaining_accounts));
     let slot = find_free_slot(&queue).ok_or_else(|| error!(MangoError::ExecutionQueueFull))?;
     let min_execute_slot = clock.slot + queue.liquidity_delay_slots;
     {
@@ -395,7 +716,7 @@ pub fn execution_queue_enqueue_liquidity(
         item.status = QueueItemStatus::Pending as u8;
         item.payload_len = payload.len() as u16;
         item.payload_hash = payload_hash;
-        item.accounts_hash = [0; 32];
+        item.accounts_hash = accounts_hash;
         item.payload[..payload.len()].copy_from_slice(&payload);
     }
 
@@ -413,102 +734,221 @@ pub fn execution_queue_enqueue_liquidity(
 
 pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u16) -> Result<()> {
     let clock = Clock::get()?;
-    let mut queue = ctx.accounts.execution_queue.load_mut()?;
-    queue.maybe_activate_pending_ctm(clock.slot);
+    let group_key = ctx.accounts.group.key();
+    let execution_queue_key = ctx.accounts.execution_queue.key();
+    let execution_queue_bump: u8;
+    {
+        let mut queue = ctx.accounts.execution_queue.load_mut()?;
+        execution_queue_bump = queue.bump;
+        queue.maybe_activate_pending_ctm(clock.slot);
+        require!(
+            queue.paused_execute == 0,
+            MangoError::ExecutionQueueExecutePaused
+        );
+    }
 
-    require!(
-        queue.paused_execute == 0,
-        MangoError::ExecutionQueueExecutePaused
-    );
+    let provided_accounts_hash = hash_accounts(&account_metas_from_infos(ctx.remaining_accounts));
 
     for _ in 0..max_items {
-        let next_seq = queue.next_sequence_to_execute;
-        let ctm_index = queue.items.iter().position(|it| {
-            it.status == QueueItemStatus::Pending as u8
-                && it.kind == QueueItemKind::CtmWrapped as u8
-                && it.sequence == next_seq
-        });
+        let mut candidate: Option<ExecutableCandidate> = None;
+        let mut blocked_on_min_slot = false;
 
-        if let Some(idx) = ctm_index {
-            let (sequence, kind, status, min_execute_slot) = {
-                let item = &queue.items[idx];
-                (
-                    item.sequence,
-                    item.kind,
-                    QueueItemStatus::Executed as u8,
-                    item.min_execute_slot,
-                )
-            };
-            if clock.slot < min_execute_slot {
-                break;
-            }
-
-            {
-                let item = &mut queue.items[idx];
-                item.status = status;
-                *item = QueueItem::default();
-            }
-            queue.next_sequence_to_execute = queue.next_sequence_to_execute.saturating_add(1);
-            queue.gap_observed_slot = 0;
-            queue.count = queue.count.saturating_sub(1);
-            emit!(QueueItemProcessed {
-                group: ctx.accounts.group.key(),
-                sequence,
-                kind,
-                status,
+        {
+            let mut queue = ctx.accounts.execution_queue.load_mut()?;
+            let next_seq = queue.next_sequence_to_execute;
+            let ctm_index = queue.items.iter().position(|it| {
+                it.status == QueueItemStatus::Pending as u8
+                    && it.kind == QueueItemKind::CtmWrapped as u8
+                    && it.sequence == next_seq
             });
-            continue;
+
+            if let Some(idx) = ctm_index {
+                let item = &queue.items[idx];
+                if clock.slot < item.min_execute_slot {
+                    blocked_on_min_slot = true;
+                } else {
+                    let payload_len = item.payload_len as usize;
+                    candidate = Some(ExecutableCandidate {
+                        idx,
+                        sequence: item.sequence,
+                        kind: item.kind,
+                        payload: item.payload[..payload_len].to_vec(),
+                        payload_hash: item.payload_hash,
+                        accounts_hash: item.accounts_hash,
+                        retries: item.retries,
+                        is_ctm_lane: true,
+                    });
+                }
+            } else {
+                let can_skip_gap = queue.max_seen_sequence >= next_seq;
+                if can_skip_gap {
+                    if queue.gap_observed_slot == 0 {
+                        queue.gap_observed_slot = clock.slot;
+                    }
+                    if clock.slot >= queue.gap_observed_slot.saturating_add(queue.gap_wait_slots) {
+                        emit!(QueueItemProcessed {
+                            group: ctx.accounts.group.key(),
+                            sequence: next_seq,
+                            kind: QueueItemKind::CtmWrapped as u8,
+                            status: QueueItemStatus::Skipped as u8,
+                        });
+                        queue.next_sequence_to_execute =
+                            queue.next_sequence_to_execute.saturating_add(1);
+                        queue.gap_observed_slot = 0;
+                        continue;
+                    }
+                }
+
+                let liq_index = queue
+                    .items
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, it)| {
+                        it.status == QueueItemStatus::Pending as u8
+                            && (it.kind == QueueItemKind::LiquidityDeposit as u8
+                                || it.kind == QueueItemKind::LiquidityWithdraw as u8)
+                            && clock.slot >= it.min_execute_slot
+                    })
+                    .min_by_key(|(_, it)| it.ingress_slot)
+                    .map(|(i, _)| i);
+
+                if let Some(idx) = liq_index {
+                    let item = &queue.items[idx];
+                    let payload_len = item.payload_len as usize;
+                    candidate = Some(ExecutableCandidate {
+                        idx,
+                        sequence: item.sequence,
+                        kind: item.kind,
+                        payload: item.payload[..payload_len].to_vec(),
+                        payload_hash: item.payload_hash,
+                        accounts_hash: item.accounts_hash,
+                        retries: item.retries,
+                        is_ctm_lane: false,
+                    });
+                }
+            }
         }
 
-        let can_skip_gap = queue.max_seen_sequence >= next_seq;
-        if can_skip_gap {
-            if queue.gap_observed_slot == 0 {
-                queue.gap_observed_slot = clock.slot;
-            }
-            if clock.slot >= queue.gap_observed_slot.saturating_add(queue.gap_wait_slots) {
+        if blocked_on_min_slot {
+            break;
+        }
+
+        let Some(candidate) = candidate else {
+            break;
+        };
+
+        let computed_payload_hash = hashv(&[&candidate.payload]).to_bytes();
+        let decoded_payload = match decode_queue_payload(&candidate.payload) {
+            Ok(p) => p,
+            Err(_) => {
+                let mut queue = ctx.accounts.execution_queue.load_mut()?;
+                let item = &mut queue.items[candidate.idx];
+                if item.status == QueueItemStatus::Pending as u8 {
+                    *item = QueueItem::default();
+                    queue.count = queue.count.saturating_sub(1);
+                    if candidate.is_ctm_lane {
+                        queue.next_sequence_to_execute =
+                            queue.next_sequence_to_execute.saturating_add(1);
+                        queue.gap_observed_slot = 0;
+                    }
+                }
                 emit!(QueueItemProcessed {
                     group: ctx.accounts.group.key(),
-                    sequence: next_seq,
-                    kind: QueueItemKind::CtmWrapped as u8,
-                    status: QueueItemStatus::Skipped as u8,
+                    sequence: candidate.sequence,
+                    kind: candidate.kind,
+                    status: QueueItemStatus::Failed as u8,
                 });
-                queue.next_sequence_to_execute = queue.next_sequence_to_execute.saturating_add(1);
-                queue.gap_observed_slot = 0;
                 continue;
             }
-        }
+        };
 
-        let liq_index = queue
-            .items
-            .iter()
-            .enumerate()
-            .filter(|(_, it)| {
-                it.status == QueueItemStatus::Pending as u8
-                    && (it.kind == QueueItemKind::LiquidityDeposit as u8
-                        || it.kind == QueueItemKind::LiquidityWithdraw as u8)
-                    && clock.slot >= it.min_execute_slot
-            })
-            .min_by_key(|(_, it)| it.ingress_slot)
-            .map(|(i, _)| i);
-
-        if let Some(idx) = liq_index {
-            let kind = queue.items[idx].kind;
-            let status = QueueItemStatus::Executed as u8;
-            {
-                let item = &mut queue.items[idx];
-                item.status = status;
+        let payload_kind = queue_item_kind_for_payload_variant(decoded_payload.variant);
+        if computed_payload_hash != candidate.payload_hash || payload_kind != candidate.kind {
+            let mut queue = ctx.accounts.execution_queue.load_mut()?;
+            let item = &mut queue.items[candidate.idx];
+            if item.status == QueueItemStatus::Pending as u8 {
                 *item = QueueItem::default();
+                queue.count = queue.count.saturating_sub(1);
+                if candidate.is_ctm_lane {
+                    queue.next_sequence_to_execute =
+                        queue.next_sequence_to_execute.saturating_add(1);
+                    queue.gap_observed_slot = 0;
+                }
             }
-            queue.count = queue.count.saturating_sub(1);
             emit!(QueueItemProcessed {
                 group: ctx.accounts.group.key(),
-                sequence: 0,
-                kind,
-                status,
+                sequence: candidate.sequence,
+                kind: candidate.kind,
+                status: QueueItemStatus::Failed as u8,
             });
             continue;
         }
 
+        if candidate.accounts_hash != [0; 32] {
+            require!(
+                provided_accounts_hash == candidate.accounts_hash,
+                MangoError::ExecutionQueueExecuteAccountsHashMismatch
+            );
+        }
+
+        let dispatch_result = dispatch_queue_payload(
+            &decoded_payload,
+            ctx.remaining_accounts,
+            group_key,
+            execution_queue_key,
+            execution_queue_bump,
+        );
+        if dispatch_result.is_ok() {
+            let mut queue = ctx.accounts.execution_queue.load_mut()?;
+            let item = &mut queue.items[candidate.idx];
+            if item.status == QueueItemStatus::Pending as u8 {
+                *item = QueueItem::default();
+                queue.count = queue.count.saturating_sub(1);
+                if candidate.is_ctm_lane {
+                    queue.next_sequence_to_execute =
+                        queue.next_sequence_to_execute.saturating_add(1);
+                    queue.gap_observed_slot = 0;
+                }
+            }
+            emit!(QueueItemProcessed {
+                group: ctx.accounts.group.key(),
+                sequence: candidate.sequence,
+                kind: candidate.kind,
+                status: QueueItemStatus::Executed as u8,
+            });
+            continue;
+        }
+
+        let next_retry = candidate.retries.saturating_add(1);
+        if next_retry >= EXECUTION_QUEUE_MAX_RETRIES {
+            let mut queue = ctx.accounts.execution_queue.load_mut()?;
+            let item = &mut queue.items[candidate.idx];
+            if item.status == QueueItemStatus::Pending as u8 {
+                *item = QueueItem::default();
+                queue.count = queue.count.saturating_sub(1);
+                if candidate.is_ctm_lane {
+                    queue.next_sequence_to_execute =
+                        queue.next_sequence_to_execute.saturating_add(1);
+                    queue.gap_observed_slot = 0;
+                }
+            }
+            emit!(QueueItemProcessed {
+                group: ctx.accounts.group.key(),
+                sequence: candidate.sequence,
+                kind: candidate.kind,
+                status: QueueItemStatus::Failed as u8,
+            });
+            continue;
+        }
+
+        let mut queue = ctx.accounts.execution_queue.load_mut()?;
+        let item = &mut queue.items[candidate.idx];
+        if item.status == QueueItemStatus::Pending as u8 {
+            if item.first_failure_slot == 0 {
+                item.first_failure_slot = clock.slot;
+            }
+            item.retries = next_retry;
+        }
         break;
     }
 

@@ -87,6 +87,10 @@ Implication: if account order or signer/writable flags differ from CTM-signed me
 - Ingress requires valid CTM signature.
 - Execute is permissionless.
 - Execution authority semantics are carried by signed payload/account set.
+- Signerless crank path:
+  - payload account metas must place `owner` at index 2 as the `ExecutionQueue` PDA;
+  - users authorize this by setting their Mango account delegate to the queue PDA;
+  - execute dispatch upgrades owner meta to signer and uses `invoke_signed` with queue PDA seeds.
 
 ### Liquidity variants
 
@@ -113,6 +117,8 @@ Implication: if account order or signer/writable flags differ from CTM-signed me
 7. On transient failure (missing account state/oracle freshness etc.):
    - increment retry metadata;
    - keep pending with backoff policy.
+
+For CTM perp variants the dispatch uses queue PDA signer authorization as described above, enabling permissionless cranking without end-user signatures.
 
 ## Failure Policy
 
@@ -149,4 +155,3 @@ Required harness invariants:
    - per-variant decode/auth checks;
    - deterministic ordering with gap + liquidity delay interactions.
 6. Add TS harness package that reuses shared payload codec constants.
-
