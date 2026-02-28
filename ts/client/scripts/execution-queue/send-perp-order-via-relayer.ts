@@ -160,6 +160,7 @@ async function main(): Promise<void> {
 
   const intent = await buildExecutionQueueUserIntent({
     group: group.publicKey,
+    executionQueue,
     mangoAccount: mangoAccount.publicKey,
     userOwner: user.publicKey,
     payload,

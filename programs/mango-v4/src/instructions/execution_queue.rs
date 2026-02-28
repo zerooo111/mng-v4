@@ -7,6 +7,7 @@ use anchor_lang::solana_program::hash::hashv;
 use anchor_lang::solana_program::instruction::{AccountMeta, Instruction};
 use anchor_lang::solana_program::program::{invoke, invoke_signed};
 use anchor_lang::solana_program::sysvar::instructions as tx_instructions;
+use anchor_lang::Discriminator;
 use anchor_lang::InstructionData;
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
@@ -363,12 +364,13 @@ fn build_dispatch_ix_data(payload: &DecodedQueuePayload) -> Vec<u8> {
 
 fn dispatch_queue_payload(
     payload: &DecodedQueuePayload,
-    remaining_accounts: &[AccountInfo],
+    dispatch_accounts: &[AccountInfo],
+    invoke_accounts: &[AccountInfo],
     group_key: Pubkey,
     execution_queue_key: Pubkey,
     execution_queue_bump: u8,
 ) -> Result<()> {
-    let mut metas = account_metas_from_infos(remaining_accounts);
+    let mut metas = account_metas_from_infos(dispatch_accounts);
     if variant_uses_queue_owner_signer(payload.variant) {
         require!(
             metas.len() >= 3,
@@ -393,10 +395,10 @@ fn dispatch_queue_payload(
             group_key.as_ref(),
             &[execution_queue_bump],
         ];
-        invoke_signed(&dispatch_ix, remaining_accounts, &[seeds])
+        invoke_signed(&dispatch_ix, invoke_accounts, &[seeds])
             .map_err(|_| error!(MangoError::ExecutionQueueDispatchFailed))
     } else {
-        invoke(&dispatch_ix, remaining_accounts)
+        invoke(&dispatch_ix, invoke_accounts)
             .map_err(|_| error!(MangoError::ExecutionQueueDispatchFailed))
     }
 }
@@ -583,10 +585,16 @@ pub fn execution_queue_init(ctx: Context<ExecutionQueueInit>, ctm_signer: Pubkey
     );
     let buffer_ai = &ctx.remaining_accounts[ctx.remaining_accounts.len() - 1];
     let buffer_loader: AccountLoader<ExecutionQueueBuffer> =
-        AccountLoader::try_from(buffer_ai).map_err(|_| error!(MangoError::SomeError))?;
+        AccountLoader::try_from_unchecked(&crate::id(), buffer_ai)
+            .map_err(|_| error!(MangoError::SomeError))?;
     let mut buffer = buffer_loader.load_init()?;
     let capacity = EXECUTION_QUEUE_CAPACITY as u32;
     buffer.init(ctx.accounts.execution_queue.key(), capacity);
+    drop(buffer);
+    {
+        let mut data = buffer_ai.try_borrow_mut_data()?;
+        data[..8].copy_from_slice(&ExecutionQueueBuffer::discriminator());
+    }
 
     let mut queue = ctx.accounts.execution_queue.load_init()?;
     queue.init(
@@ -640,14 +648,21 @@ pub fn execution_queue_enqueue_ctm(
     );
 
     require!(
-        !ctx.remaining_accounts.is_empty(),
+        ctx.remaining_accounts.len() >= 2,
         MangoError::ExecutionQueueDispatchAccountLayoutInvalid
     );
-    let (dispatch_accounts, buffer_tail) =
+    let (without_buffer, buffer_tail) =
         ctx.remaining_accounts.split_at(ctx.remaining_accounts.len() - 1);
+    let (dispatch_accounts, program_tail) = without_buffer.split_at(without_buffer.len() - 1);
+    let dispatch_program_ai = &program_tail[0];
+    require!(
+        *dispatch_program_ai.key == crate::id(),
+        MangoError::ExecutionQueueDispatchAccountLayoutInvalid
+    );
     let buffer_ai = &buffer_tail[0];
     let buffer_loader: AccountLoader<ExecutionQueueBuffer> =
-        AccountLoader::try_from(buffer_ai).map_err(|_| error!(MangoError::SomeError))?;
+        AccountLoader::try_from_unchecked(&crate::id(), buffer_ai)
+            .map_err(|_| error!(MangoError::SomeError))?;
 
     let clock = Clock::get()?;
     let mut queue = ctx.accounts.execution_queue.load_mut()?;
@@ -782,14 +797,21 @@ pub fn execution_queue_enqueue_liquidity(
     payload: Vec<u8>,
 ) -> Result<()> {
     require!(
-        !ctx.remaining_accounts.is_empty(),
+        ctx.remaining_accounts.len() >= 2,
         MangoError::ExecutionQueueDispatchAccountLayoutInvalid
     );
-    let (dispatch_accounts, buffer_tail) =
+    let (without_buffer, buffer_tail) =
         ctx.remaining_accounts.split_at(ctx.remaining_accounts.len() - 1);
+    let (dispatch_accounts, program_tail) = without_buffer.split_at(without_buffer.len() - 1);
+    let dispatch_program_ai = &program_tail[0];
+    require!(
+        *dispatch_program_ai.key == crate::id(),
+        MangoError::ExecutionQueueDispatchAccountLayoutInvalid
+    );
     let buffer_ai = &buffer_tail[0];
     let buffer_loader: AccountLoader<ExecutionQueueBuffer> =
-        AccountLoader::try_from(buffer_ai).map_err(|_| error!(MangoError::SomeError))?;
+        AccountLoader::try_from_unchecked(&crate::id(), buffer_ai)
+            .map_err(|_| error!(MangoError::SomeError))?;
 
     require!(
         payload.len() <= EXECUTION_QUEUE_PAYLOAD_MAX,
@@ -859,14 +881,21 @@ pub fn execution_queue_enqueue_liquidity(
 
 pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u16) -> Result<()> {
     require!(
-        !ctx.remaining_accounts.is_empty(),
+        ctx.remaining_accounts.len() >= 2,
         MangoError::ExecutionQueueDispatchAccountLayoutInvalid
     );
-    let (dispatch_accounts, buffer_tail) =
+    let (without_buffer, buffer_tail) =
         ctx.remaining_accounts.split_at(ctx.remaining_accounts.len() - 1);
+    let (dispatch_accounts, program_tail) = without_buffer.split_at(without_buffer.len() - 1);
+    let dispatch_program_ai = &program_tail[0];
+    require!(
+        *dispatch_program_ai.key == crate::id(),
+        MangoError::ExecutionQueueDispatchAccountLayoutInvalid
+    );
     let buffer_ai = &buffer_tail[0];
     let buffer_loader: AccountLoader<ExecutionQueueBuffer> =
-        AccountLoader::try_from(buffer_ai).map_err(|_| error!(MangoError::SomeError))?;
+        AccountLoader::try_from_unchecked(&crate::id(), buffer_ai)
+            .map_err(|_| error!(MangoError::SomeError))?;
 
     let clock = Clock::get()?;
     let group_key = ctx.accounts.group.key();
@@ -1032,16 +1061,34 @@ pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u
             continue;
         }
 
-        if candidate.accounts_hash != [0; 32] {
-            require!(
-                provided_accounts_hash == candidate.accounts_hash,
-                MangoError::ExecutionQueueExecuteAccountsHashMismatch
-            );
+        if candidate.accounts_hash != [0; 32]
+            && provided_accounts_hash != candidate.accounts_hash
+        {
+            let mut queue = ctx.accounts.execution_queue.load_mut()?;
+            let mut buffer = buffer_loader.load_mut()?;
+            let item = &mut buffer.items[candidate.idx];
+            if item.status == QueueItemStatus::Pending as u8 {
+                *item = QueueItem::default();
+                queue.count = queue.count.saturating_sub(1);
+                if candidate.is_ctm_lane {
+                    queue.next_sequence_to_execute =
+                        queue.next_sequence_to_execute.saturating_add(1);
+                    queue.gap_observed_slot = 0;
+                }
+            }
+            emit!(QueueItemProcessed {
+                group: ctx.accounts.group.key(),
+                sequence: candidate.sequence,
+                kind: candidate.kind,
+                status: QueueItemStatus::Failed as u8,
+            });
+            continue;
         }
 
         let dispatch_result = dispatch_queue_payload(
             &decoded_payload,
             dispatch_accounts,
+            without_buffer,
             group_key,
             execution_queue_key,
             execution_queue_bump,

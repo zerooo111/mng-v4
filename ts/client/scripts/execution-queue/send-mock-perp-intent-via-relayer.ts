@@ -83,6 +83,7 @@ async function main(): Promise<void> {
 
   const intent = await buildExecutionQueueUserIntent({
     group,
+    executionQueue,
     mangoAccount,
     userOwner: user.publicKey,
     payload,
@@ -151,4 +152,3 @@ main().catch((err) => {
   console.error(err);
   process.exit(1);
 });
-

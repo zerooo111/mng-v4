@@ -64,10 +64,10 @@ function toAccountMetas(config: LaneConfig): AccountMeta[] {
 }
 
 function decodeQueueCount(data: Buffer): number {
-  if (data.length < 196) {
+  if (data.length < 192) {
     return 0;
   }
-  return data.readUInt32LE(192);
+  return data.readUInt32LE(188);
 }
 
 async function main(): Promise<void> {

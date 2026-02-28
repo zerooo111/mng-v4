@@ -151,6 +151,7 @@ export type BuildExecutionQueueExecuteParams = {
 
 export type BuildExecutionQueueUserIntentParams = {
   group: PublicKey;
+  executionQueue?: PublicKey;
   mangoAccount: PublicKey;
   userOwner: PublicKey;
   kind?: QueueItemKind;
@@ -452,6 +453,45 @@ export async function hashExecutionQueueAccounts(
   return await sha256(Buffer.from(bytes));
 }
 
+function mergeEffectiveRuntimeFlags(
+  remainingAccounts: AccountMeta[],
+  fixedAccounts: AccountMeta[],
+): AccountMeta[] {
+  const merged = new Map<string, { isSigner: boolean; isWritable: boolean }>();
+  for (const a of [...fixedAccounts, ...remainingAccounts]) {
+    const key = a.pubkey.toBase58();
+    const prev = merged.get(key);
+    if (!prev) {
+      merged.set(key, { isSigner: !!a.isSigner, isWritable: !!a.isWritable });
+      continue;
+    }
+    prev.isSigner = prev.isSigner || !!a.isSigner;
+    prev.isWritable = prev.isWritable || !!a.isWritable;
+  }
+  return remainingAccounts.map((a) => {
+    const key = a.pubkey.toBase58();
+    const effective = merged.get(key)!;
+    return {
+      pubkey: a.pubkey,
+      isSigner: effective.isSigner,
+      isWritable: effective.isWritable,
+    };
+  });
+}
+
+async function hashExecutionQueueAccountsForCtmEnqueue(
+  group: PublicKey,
+  executionQueue: PublicKey,
+  remainingAccounts: AccountMeta[],
+): Promise<Buffer> {
+  const effectiveRemaining = mergeEffectiveRuntimeFlags(remainingAccounts, [
+    { pubkey: group, isSigner: false, isWritable: true },
+    { pubkey: executionQueue, isSigner: false, isWritable: true },
+    { pubkey: SYSVAR_INSTRUCTIONS_PUBKEY, isSigner: false, isWritable: false },
+  ]);
+  return await hashExecutionQueueAccounts(effectiveRemaining);
+}
+
 export async function hashExecutionQueuePayload(
   payload: Uint8Array,
 ): Promise<Buffer> {
@@ -504,7 +544,13 @@ export async function buildExecutionQueueUserIntent(
   userIntentMessage: Buffer;
 }> {
   const payloadHash = await hashExecutionQueuePayload(params.payload);
-  const accountsHash = await hashExecutionQueueAccounts(params.remainingAccounts);
+  const accountsHash = params.executionQueue
+    ? await hashExecutionQueueAccountsForCtmEnqueue(
+        params.group,
+        params.executionQueue,
+        params.remainingAccounts,
+      )
+    : await hashExecutionQueueAccounts(params.remainingAccounts);
   const envelopeLike: CtmEnvelopeWire = {
     sequence: 0n,
     minExecuteSlot: 0n,
@@ -579,6 +625,11 @@ export async function buildExecutionQueueEnqueueCtmIx(
     },
     ...params.remainingAccounts,
     {
+      pubkey: params.programId,
+      isSigner: false,
+      isWritable: false,
+    },
+    {
       pubkey: params.executionQueueBuffer,
       isSigner: false,
       isWritable: true,
@@ -614,9 +665,14 @@ export async function buildExecutionQueueEnqueueLiquidityIx(
   return new TransactionInstruction({
     programId: params.programId,
     keys: [
-      { pubkey: params.group, isSigner: false, isWritable: false },
+      { pubkey: params.group, isSigner: false, isWritable: true },
       { pubkey: params.executionQueue, isSigner: false, isWritable: true },
       ...params.remainingAccounts,
+      {
+        pubkey: params.programId,
+        isSigner: false,
+        isWritable: false,
+      },
       {
         pubkey: params.executionQueueBuffer,
         isSigner: false,
@@ -637,9 +693,14 @@ export async function buildExecutionQueueExecuteIx(
   return new TransactionInstruction({
     programId: params.programId,
     keys: [
-      { pubkey: params.group, isSigner: false, isWritable: false },
+      { pubkey: params.group, isSigner: false, isWritable: true },
       { pubkey: params.executionQueue, isSigner: false, isWritable: true },
       ...params.remainingAccounts,
+      {
+        pubkey: params.programId,
+        isSigner: false,
+        isWritable: false,
+      },
       {
         pubkey: params.executionQueueBuffer,
         isSigner: false,
@@ -667,7 +728,11 @@ export async function buildExecutionQueueEnqueueCtmWithIntentIxs(
   }
 
   const payloadHash = await hashExecutionQueuePayload(params.payload);
-  const accountsHash = await hashExecutionQueueAccounts(params.remainingAccounts);
+  const accountsHash = await hashExecutionQueueAccountsForCtmEnqueue(
+    params.group,
+    params.executionQueue,
+    params.remainingAccounts,
+  );
   const envelope: CtmEnvelopeWire = {
     sequence: toBigInt(params.sequence),
     minExecuteSlot: toBigInt(params.minExecuteSlot),

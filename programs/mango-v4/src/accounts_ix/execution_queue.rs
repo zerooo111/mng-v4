@@ -64,6 +64,7 @@ pub struct ExecutionQueueEnqueueLiquidity<'info> {
 
 #[derive(Accounts)]
 pub struct ExecutionQueueExecute<'info> {
+    #[account(mut)]
     pub group: AccountLoader<'info, Group>,
     #[account(
         mut,
