@@ -84,6 +84,7 @@ describe('Execution Queue Helpers', () => {
     const programId = Keypair.generate().publicKey;
     const group = Keypair.generate().publicKey;
     const executionQueue = Keypair.generate().publicKey;
+    const executionQueueBuffer = Keypair.generate().publicKey;
     const mangoAccount = Keypair.generate().publicKey;
     const user = Keypair.generate();
     const ctm = Keypair.generate();
@@ -108,6 +109,7 @@ describe('Execution Queue Helpers', () => {
       programId,
       group,
       executionQueue,
+      executionQueueBuffer,
       remainingAccounts,
       payload,
       sequence: 42,
@@ -138,6 +140,7 @@ describe('Execution Queue Helpers', () => {
     const programId = Keypair.generate().publicKey;
     const group = Keypair.generate().publicKey;
     const executionQueue = Keypair.generate().publicKey;
+    const executionQueueBuffer = Keypair.generate().publicKey;
     const liquidityPayload = encodeLiquidityDepositQueuePayload({
       amount: 1,
       reduceOnly: false,
@@ -146,6 +149,7 @@ describe('Execution Queue Helpers', () => {
       programId,
       group,
       executionQueue,
+      executionQueueBuffer,
       kind: QueueItemKind.LiquidityDeposit,
       remainingAccounts: [],
       payload: liquidityPayload,
@@ -154,6 +158,7 @@ describe('Execution Queue Helpers', () => {
       programId,
       group,
       executionQueue,
+      executionQueueBuffer,
       maxItems: 3,
       remainingAccounts: [
         {
@@ -164,8 +169,8 @@ describe('Execution Queue Helpers', () => {
       ],
     });
 
-    expect(enqueueLiquidityIx.keys.length).eq(2);
-    expect(executeIx.keys.length).eq(3);
+    expect(enqueueLiquidityIx.keys.length).eq(3);
+    expect(executeIx.keys.length).eq(4);
     expect(executeIx.data.length).eq(10);
   });
 

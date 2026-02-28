@@ -40,6 +40,7 @@ const RELAYER_DEFAULT_MIN_EXECUTE_SLOT_OFFSET = BigInt(
 const RELAYER_DEFAULT_EXPIRES_AT_SLOT = BigInt(
   process.env.CTM_RELAYER_DEFAULT_EXPIRES_AT_SLOT ?? '0',
 );
+const EXECUTION_QUEUE_BUFFER_PK = process.env.EXECUTION_QUEUE_BUFFER_PK;
 const RELAYER_PRIORITIZATION_FEE = Number(
   process.env.CTM_RELAYER_PRIORITIZATION_FEE ?? '0',
 );
@@ -162,9 +163,13 @@ async function main(): Promise<void> {
   if (!RELAYER_CTM_KEYPAIR) {
     throw new Error('CTM_RELAYER_CTM_KEYPAIR is required');
   }
+  if (!EXECUTION_QUEUE_BUFFER_PK) {
+    throw new Error('EXECUTION_QUEUE_BUFFER_PK is required');
+  }
 
   const payer = readKeypair(RELAYER_PAYER_KEYPAIR);
   const ctm = readKeypair(RELAYER_CTM_KEYPAIR);
+  const executionQueueBuffer = new PublicKey(EXECUTION_QUEUE_BUFFER_PK);
   const connection = new Connection(CLUSTER_URL, AnchorProvider.defaultOptions());
   const provider = new AnchorProvider(
     connection,
@@ -227,6 +232,7 @@ async function main(): Promise<void> {
               programId,
               group,
               executionQueue,
+              executionQueueBuffer,
               remainingAccounts,
               payload,
               sequence,

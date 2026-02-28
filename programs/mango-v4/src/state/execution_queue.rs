@@ -1,6 +1,6 @@
 use anchor_lang::prelude::*;
 
-pub const EXECUTION_QUEUE_CAPACITY: usize = 128;
+pub const EXECUTION_QUEUE_CAPACITY: usize = 1000;
 pub const EXECUTION_QUEUE_PAYLOAD_MAX: usize = 256;
 
 #[repr(u8)]
@@ -65,6 +65,7 @@ pub struct ExecutionQueue {
     pub group: Pubkey,
     pub admin: Pubkey,
     pub ctm_signer: Pubkey,
+    pub buffer: Pubkey,
     pub pending_ctm_signer: Pubkey,
     pub pending_ctm_activate_slot: u64,
     pub bump: u8,
@@ -79,21 +80,38 @@ pub struct ExecutionQueue {
     pub gap_wait_slots: u64,
     pub liquidity_delay_slots: u64,
     pub reserved: [u8; 128],
+}
+
+#[account(zero_copy)]
+#[derive(Debug)]
+pub struct ExecutionQueueBuffer {
+    pub execution_queue: Pubkey,
+    pub capacity: u32,
+    pub _padding: [u8; 4],
     pub items: [QueueItem; EXECUTION_QUEUE_CAPACITY],
 }
 
 impl ExecutionQueue {
-    pub fn init(&mut self, group: Pubkey, admin: Pubkey, ctm_signer: Pubkey, bump: u8) {
+    pub fn init(
+        &mut self,
+        group: Pubkey,
+        admin: Pubkey,
+        ctm_signer: Pubkey,
+        buffer: Pubkey,
+        capacity: u32,
+        bump: u8,
+    ) {
         self.group = group;
         self.admin = admin;
         self.ctm_signer = ctm_signer;
+        self.buffer = buffer;
         self.pending_ctm_signer = Pubkey::default();
         self.pending_ctm_activate_slot = 0;
         self.bump = bump;
         self.paused_ingress = 0;
         self.paused_execute = 0;
         self._padding = [0; 5];
-        self.capacity = EXECUTION_QUEUE_CAPACITY as u32;
+        self.capacity = capacity;
         self.count = 0;
         self.next_sequence_to_execute = 0;
         self.max_seen_sequence = 0;
@@ -101,7 +119,6 @@ impl ExecutionQueue {
         self.gap_wait_slots = 50;
         self.liquidity_delay_slots = 25;
         self.reserved = [0; 128];
-        self.items = [QueueItem::default(); EXECUTION_QUEUE_CAPACITY];
     }
 
     pub fn maybe_activate_pending_ctm(&mut self, current_slot: u64) {
@@ -112,5 +129,14 @@ impl ExecutionQueue {
             self.pending_ctm_signer = Pubkey::default();
             self.pending_ctm_activate_slot = 0;
         }
+    }
+}
+
+impl ExecutionQueueBuffer {
+    pub fn init(&mut self, execution_queue: Pubkey, capacity: u32) {
+        self.execution_queue = execution_queue;
+        self.capacity = capacity;
+        self._padding = [0; 4];
+        self.items = [QueueItem::default(); EXECUTION_QUEUE_CAPACITY];
     }
 }

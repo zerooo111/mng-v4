@@ -124,6 +124,7 @@ export type BuildExecutionQueueEnqueueCtmParams = {
   programId: PublicKey;
   group: PublicKey;
   executionQueue: PublicKey;
+  executionQueueBuffer: PublicKey;
   remainingAccounts: AccountMeta[];
   envelope: CtmEnvelopeWire;
   payload: Uint8Array;
@@ -133,6 +134,7 @@ export type BuildExecutionQueueEnqueueLiquidityParams = {
   programId: PublicKey;
   group: PublicKey;
   executionQueue: PublicKey;
+  executionQueueBuffer: PublicKey;
   kind: QueueItemKind.LiquidityDeposit | QueueItemKind.LiquidityWithdraw;
   remainingAccounts: AccountMeta[];
   payload: Uint8Array;
@@ -142,6 +144,7 @@ export type BuildExecutionQueueExecuteParams = {
   programId: PublicKey;
   group: PublicKey;
   executionQueue: PublicKey;
+  executionQueueBuffer: PublicKey;
   remainingAccounts: AccountMeta[];
   maxItems: number;
 };
@@ -159,6 +162,7 @@ export type BuildExecutionQueueEnqueueCtmWithIntentParams = {
   programId: PublicKey;
   group: PublicKey;
   executionQueue: PublicKey;
+  executionQueueBuffer: PublicKey;
   remainingAccounts: AccountMeta[];
   payload: Uint8Array;
   sequence: BigNumberish;
@@ -574,6 +578,11 @@ export async function buildExecutionQueueEnqueueCtmIx(
       isWritable: false,
     },
     ...params.remainingAccounts,
+    {
+      pubkey: params.executionQueueBuffer,
+      isSigner: false,
+      isWritable: true,
+    },
   ];
 
   return new TransactionInstruction({
@@ -608,6 +617,11 @@ export async function buildExecutionQueueEnqueueLiquidityIx(
       { pubkey: params.group, isSigner: false, isWritable: false },
       { pubkey: params.executionQueue, isSigner: false, isWritable: true },
       ...params.remainingAccounts,
+      {
+        pubkey: params.executionQueueBuffer,
+        isSigner: false,
+        isWritable: true,
+      },
     ],
     data,
   });
@@ -626,6 +640,11 @@ export async function buildExecutionQueueExecuteIx(
       { pubkey: params.group, isSigner: false, isWritable: false },
       { pubkey: params.executionQueue, isSigner: false, isWritable: true },
       ...params.remainingAccounts,
+      {
+        pubkey: params.executionQueueBuffer,
+        isSigner: false,
+        isWritable: true,
+      },
     ],
     data,
   });
@@ -678,6 +697,7 @@ export async function buildExecutionQueueEnqueueCtmWithIntentIxs(
     programId: params.programId,
     group: params.group,
     executionQueue: params.executionQueue,
+    executionQueueBuffer: params.executionQueueBuffer,
     remainingAccounts: params.remainingAccounts,
     envelope,
     payload: params.payload,

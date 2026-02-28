@@ -152,9 +152,8 @@ struct Ed25519SignatureOffsets {
     message_instruction_index: u16,
 }
 
-fn find_free_slot(queue: &ExecutionQueue) -> Option<usize> {
-    queue
-        .items
+fn find_free_slot(queue: &ExecutionQueue, buffer: &ExecutionQueueBuffer) -> Option<usize> {
+    buffer.items[..queue.capacity as usize]
         .iter()
         .position(|x| x.status == QueueItemStatus::Empty as u8)
 }
@@ -578,11 +577,24 @@ fn verify_user_ed25519_preinstruction(
 }
 
 pub fn execution_queue_init(ctx: Context<ExecutionQueueInit>, ctm_signer: Pubkey) -> Result<()> {
+    require!(
+        !ctx.remaining_accounts.is_empty(),
+        MangoError::ExecutionQueueDispatchAccountLayoutInvalid
+    );
+    let buffer_ai = &ctx.remaining_accounts[ctx.remaining_accounts.len() - 1];
+    let buffer_loader: AccountLoader<ExecutionQueueBuffer> =
+        AccountLoader::try_from(buffer_ai).map_err(|_| error!(MangoError::SomeError))?;
+    let mut buffer = buffer_loader.load_init()?;
+    let capacity = EXECUTION_QUEUE_CAPACITY as u32;
+    buffer.init(ctx.accounts.execution_queue.key(), capacity);
+
     let mut queue = ctx.accounts.execution_queue.load_init()?;
     queue.init(
         ctx.accounts.group.key(),
         ctx.accounts.admin.key(),
         ctm_signer,
+        buffer_ai.key(),
+        capacity,
         *ctx.bumps
             .get("execution_queue")
             .ok_or_else(|| error!(MangoError::SomeError))?,
@@ -627,8 +639,27 @@ pub fn execution_queue_enqueue_ctm(
         MangoError::ExecutionQueuePayloadTooLarge
     );
 
+    require!(
+        !ctx.remaining_accounts.is_empty(),
+        MangoError::ExecutionQueueDispatchAccountLayoutInvalid
+    );
+    let (dispatch_accounts, buffer_tail) =
+        ctx.remaining_accounts.split_at(ctx.remaining_accounts.len() - 1);
+    let buffer_ai = &buffer_tail[0];
+    let buffer_loader: AccountLoader<ExecutionQueueBuffer> =
+        AccountLoader::try_from(buffer_ai).map_err(|_| error!(MangoError::SomeError))?;
+
     let clock = Clock::get()?;
     let mut queue = ctx.accounts.execution_queue.load_mut()?;
+    require!(
+        queue.buffer == *buffer_ai.key,
+        MangoError::ExecutionQueueDispatchAccountLayoutInvalid
+    );
+    let mut buffer = buffer_loader.load_mut()?;
+    require!(
+        buffer.execution_queue == ctx.accounts.execution_queue.key(),
+        MangoError::ExecutionQueueDispatchAccountLayoutInvalid
+    );
     queue.maybe_activate_pending_ctm(clock.slot);
 
     require!(
@@ -654,17 +685,17 @@ pub fn execution_queue_enqueue_ctm(
     );
     if variant_uses_queue_owner_signer(decoded_payload.variant) {
         require!(
-            ctx.remaining_accounts.len() >= 3,
+            dispatch_accounts.len() >= 3,
             MangoError::ExecutionQueueDispatchAccountLayoutInvalid
         );
         require!(
-            *ctx.remaining_accounts[2].key == ctx.accounts.execution_queue.key(),
+            *dispatch_accounts[2].key == ctx.accounts.execution_queue.key(),
             MangoError::ExecutionQueueOwnerMustBeQueueAuthority
         );
     }
 
     let account_hash = hash_accounts(
-        &ctx.remaining_accounts
+        &dispatch_accounts
             .iter()
             .map(|ai| AccountMeta {
                 pubkey: *ai.key,
@@ -687,8 +718,8 @@ pub fn execution_queue_enqueue_ctm(
         MangoError::InvalidSequenceNumber
     );
     require!(
-        !queue
-            .items
+        !buffer
+            .items[..queue.capacity as usize]
             .iter()
             .any(|it| it.status == QueueItemStatus::Pending as u8
                 && it.kind == QueueItemKind::CtmWrapped as u8
@@ -705,7 +736,7 @@ pub fn execution_queue_enqueue_ctm(
 
     if variant_uses_queue_owner_signer(decoded_payload.variant) {
         let (mango_account_key, user_owner) =
-            extract_user_owner_for_ctm_payload(ctx.accounts.group.key(), ctx.remaining_accounts)?;
+            extract_user_owner_for_ctm_payload(ctx.accounts.group.key(), dispatch_accounts)?;
         let user_intent_hash = canonical_user_intent_message(
             ctx.accounts.group.key(),
             mango_account_key,
@@ -719,8 +750,8 @@ pub fn execution_queue_enqueue_ctm(
         )?;
     }
 
-    let slot = find_free_slot(&queue).ok_or_else(|| error!(MangoError::ExecutionQueueFull))?;
-    let item = &mut queue.items[slot];
+    let slot = find_free_slot(&queue, &buffer).ok_or_else(|| error!(MangoError::ExecutionQueueFull))?;
+    let item = &mut buffer.items[slot];
     *item = QueueItem::default();
     item.sequence = envelope.sequence;
     item.min_execute_slot = envelope.min_execute_slot;
@@ -751,6 +782,16 @@ pub fn execution_queue_enqueue_liquidity(
     payload: Vec<u8>,
 ) -> Result<()> {
     require!(
+        !ctx.remaining_accounts.is_empty(),
+        MangoError::ExecutionQueueDispatchAccountLayoutInvalid
+    );
+    let (dispatch_accounts, buffer_tail) =
+        ctx.remaining_accounts.split_at(ctx.remaining_accounts.len() - 1);
+    let buffer_ai = &buffer_tail[0];
+    let buffer_loader: AccountLoader<ExecutionQueueBuffer> =
+        AccountLoader::try_from(buffer_ai).map_err(|_| error!(MangoError::SomeError))?;
+
+    require!(
         payload.len() <= EXECUTION_QUEUE_PAYLOAD_MAX,
         MangoError::ExecutionQueuePayloadTooLarge
     );
@@ -772,17 +813,26 @@ pub fn execution_queue_enqueue_liquidity(
     let clock = Clock::get()?;
     let mut queue = ctx.accounts.execution_queue.load_mut()?;
     require!(
+        queue.buffer == *buffer_ai.key,
+        MangoError::ExecutionQueueDispatchAccountLayoutInvalid
+    );
+    let mut buffer = buffer_loader.load_mut()?;
+    require!(
+        buffer.execution_queue == ctx.accounts.execution_queue.key(),
+        MangoError::ExecutionQueueDispatchAccountLayoutInvalid
+    );
+    require!(
         queue.paused_ingress == 0,
         MangoError::ExecutionQueueIngressPaused
     );
     require!(!queue_is_full(&queue), MangoError::ExecutionQueueFull);
 
     let payload_hash = hashv(&[&payload]).to_bytes();
-    let accounts_hash = hash_accounts(&account_metas_from_infos(ctx.remaining_accounts));
-    let slot = find_free_slot(&queue).ok_or_else(|| error!(MangoError::ExecutionQueueFull))?;
+    let accounts_hash = hash_accounts(&account_metas_from_infos(dispatch_accounts));
+    let slot = find_free_slot(&queue, &buffer).ok_or_else(|| error!(MangoError::ExecutionQueueFull))?;
     let min_execute_slot = clock.slot + queue.liquidity_delay_slots;
     {
-        let item = &mut queue.items[slot];
+        let item = &mut buffer.items[slot];
         *item = QueueItem::default();
         item.sequence = 0;
         item.min_execute_slot = min_execute_slot;
@@ -808,12 +858,31 @@ pub fn execution_queue_enqueue_liquidity(
 }
 
 pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u16) -> Result<()> {
+    require!(
+        !ctx.remaining_accounts.is_empty(),
+        MangoError::ExecutionQueueDispatchAccountLayoutInvalid
+    );
+    let (dispatch_accounts, buffer_tail) =
+        ctx.remaining_accounts.split_at(ctx.remaining_accounts.len() - 1);
+    let buffer_ai = &buffer_tail[0];
+    let buffer_loader: AccountLoader<ExecutionQueueBuffer> =
+        AccountLoader::try_from(buffer_ai).map_err(|_| error!(MangoError::SomeError))?;
+
     let clock = Clock::get()?;
     let group_key = ctx.accounts.group.key();
     let execution_queue_key = ctx.accounts.execution_queue.key();
     let execution_queue_bump: u8;
     {
         let mut queue = ctx.accounts.execution_queue.load_mut()?;
+        require!(
+            queue.buffer == *buffer_ai.key,
+            MangoError::ExecutionQueueDispatchAccountLayoutInvalid
+        );
+        let buffer = buffer_loader.load()?;
+        require!(
+            buffer.execution_queue == ctx.accounts.execution_queue.key(),
+            MangoError::ExecutionQueueDispatchAccountLayoutInvalid
+        );
         execution_queue_bump = queue.bump;
         queue.maybe_activate_pending_ctm(clock.slot);
         require!(
@@ -822,7 +891,7 @@ pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u
         );
     }
 
-    let provided_accounts_hash = hash_accounts(&account_metas_from_infos(ctx.remaining_accounts));
+    let provided_accounts_hash = hash_accounts(&account_metas_from_infos(dispatch_accounts));
 
     for _ in 0..max_items {
         let mut candidate: Option<ExecutableCandidate> = None;
@@ -830,15 +899,17 @@ pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u
 
         {
             let mut queue = ctx.accounts.execution_queue.load_mut()?;
+            let buffer = buffer_loader.load()?;
+            let cap = (queue.capacity as usize).min(EXECUTION_QUEUE_CAPACITY);
             let next_seq = queue.next_sequence_to_execute;
-            let ctm_index = queue.items.iter().position(|it| {
+            let ctm_index = buffer.items[..cap].iter().position(|it| {
                 it.status == QueueItemStatus::Pending as u8
                     && it.kind == QueueItemKind::CtmWrapped as u8
                     && it.sequence == next_seq
             });
 
             if let Some(idx) = ctm_index {
-                let item = &queue.items[idx];
+                let item = &buffer.items[idx];
                 if clock.slot < item.min_execute_slot {
                     blocked_on_min_slot = true;
                 } else {
@@ -874,8 +945,8 @@ pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u
                     }
                 }
 
-                let liq_index = queue
-                    .items
+                let liq_index = buffer
+                    .items[..cap]
                     .iter()
                     .enumerate()
                     .filter(|(_, it)| {
@@ -888,7 +959,7 @@ pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u
                     .map(|(i, _)| i);
 
                 if let Some(idx) = liq_index {
-                    let item = &queue.items[idx];
+                    let item = &buffer.items[idx];
                     let payload_len = item.payload_len as usize;
                     candidate = Some(ExecutableCandidate {
                         idx,
@@ -917,7 +988,8 @@ pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u
             Ok(p) => p,
             Err(_) => {
                 let mut queue = ctx.accounts.execution_queue.load_mut()?;
-                let item = &mut queue.items[candidate.idx];
+                let mut buffer = buffer_loader.load_mut()?;
+                let item = &mut buffer.items[candidate.idx];
                 if item.status == QueueItemStatus::Pending as u8 {
                     *item = QueueItem::default();
                     queue.count = queue.count.saturating_sub(1);
@@ -940,7 +1012,8 @@ pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u
         let payload_kind = queue_item_kind_for_payload_variant(decoded_payload.variant);
         if computed_payload_hash != candidate.payload_hash || payload_kind != candidate.kind {
             let mut queue = ctx.accounts.execution_queue.load_mut()?;
-            let item = &mut queue.items[candidate.idx];
+            let mut buffer = buffer_loader.load_mut()?;
+            let item = &mut buffer.items[candidate.idx];
             if item.status == QueueItemStatus::Pending as u8 {
                 *item = QueueItem::default();
                 queue.count = queue.count.saturating_sub(1);
@@ -968,14 +1041,15 @@ pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u
 
         let dispatch_result = dispatch_queue_payload(
             &decoded_payload,
-            ctx.remaining_accounts,
+            dispatch_accounts,
             group_key,
             execution_queue_key,
             execution_queue_bump,
         );
         if dispatch_result.is_ok() {
             let mut queue = ctx.accounts.execution_queue.load_mut()?;
-            let item = &mut queue.items[candidate.idx];
+            let mut buffer = buffer_loader.load_mut()?;
+            let item = &mut buffer.items[candidate.idx];
             if item.status == QueueItemStatus::Pending as u8 {
                 *item = QueueItem::default();
                 queue.count = queue.count.saturating_sub(1);
@@ -997,7 +1071,8 @@ pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u
         let next_retry = candidate.retries.saturating_add(1);
         if next_retry >= EXECUTION_QUEUE_MAX_RETRIES {
             let mut queue = ctx.accounts.execution_queue.load_mut()?;
-            let item = &mut queue.items[candidate.idx];
+            let mut buffer = buffer_loader.load_mut()?;
+            let item = &mut buffer.items[candidate.idx];
             if item.status == QueueItemStatus::Pending as u8 {
                 *item = QueueItem::default();
                 queue.count = queue.count.saturating_sub(1);
@@ -1017,7 +1092,8 @@ pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u
         }
 
         let mut queue = ctx.accounts.execution_queue.load_mut()?;
-        let item = &mut queue.items[candidate.idx];
+        let mut buffer = buffer_loader.load_mut()?;
+        let item = &mut buffer.items[candidate.idx];
         if item.status == QueueItemStatus::Pending as u8 {
             if item.first_failure_slot == 0 {
                 item.first_failure_slot = clock.slot;

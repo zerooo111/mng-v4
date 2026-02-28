@@ -19,6 +19,7 @@ const CRANKER_KEYPAIR =
   process.env.MB_PAYER_KEYPAIR;
 const GROUP_PK = process.env.EXECUTION_QUEUE_GROUP_PK;
 const EXECUTION_QUEUE_PK = process.env.EXECUTION_QUEUE_PK;
+const EXECUTION_QUEUE_BUFFER_PK = process.env.EXECUTION_QUEUE_BUFFER_PK;
 const CRANK_INTERVAL_MS = Number(
   process.env.EXECUTION_QUEUE_CRANK_INTERVAL_MS ?? '1500',
 );
@@ -63,18 +64,20 @@ function toAccountMetas(config: LaneConfig): AccountMeta[] {
 }
 
 function decodeQueueCount(data: Buffer): number {
-  if (data.length < 160) {
+  if (data.length < 196) {
     return 0;
   }
-  return data.readUInt32LE(156);
+  return data.readUInt32LE(192);
 }
 
 async function main(): Promise<void> {
   if (!CLUSTER_URL) {
     throw new Error('CLUSTER_URL_OVERRIDE or MB_CLUSTER_URL is required');
   }
-  if (!GROUP_PK || !EXECUTION_QUEUE_PK) {
-    throw new Error('EXECUTION_QUEUE_GROUP_PK and EXECUTION_QUEUE_PK are required');
+  if (!GROUP_PK || !EXECUTION_QUEUE_PK || !EXECUTION_QUEUE_BUFFER_PK) {
+    throw new Error(
+      'EXECUTION_QUEUE_GROUP_PK, EXECUTION_QUEUE_PK and EXECUTION_QUEUE_BUFFER_PK are required',
+    );
   }
   if (!CRANKER_KEYPAIR) {
     throw new Error('EXECUTION_QUEUE_CRANKER_KEYPAIR (or MB_PAYER_KEYPAIR) is required');
@@ -104,6 +107,7 @@ async function main(): Promise<void> {
   );
   const group: Group = await client.getGroup(new PublicKey(GROUP_PK));
   const executionQueue = new PublicKey(EXECUTION_QUEUE_PK);
+  const executionQueueBuffer = new PublicKey(EXECUTION_QUEUE_BUFFER_PK);
 
   console.log(
     `Execution queue cranker started, queue=${executionQueue.toBase58()}, lanes=${lanes.length}`,
@@ -124,6 +128,7 @@ async function main(): Promise<void> {
           const status = await client.executionQueueExecute(
             group,
             executionQueue,
+            executionQueueBuffer,
             toAccountMetas(lane),
             CRANK_MAX_ITEMS,
             { prioritizationFee: CRANK_PRIORITIZATION_FEE },

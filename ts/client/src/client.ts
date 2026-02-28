@@ -152,6 +152,7 @@ export type MangoClientOptions = {
 
 export type ExecutionQueueEnqueueCtmWithIntentParams = {
   executionQueue: PublicKey;
+  executionQueueBuffer: PublicKey;
   remainingAccounts: AccountMeta[];
   payload: Uint8Array;
   sequence: bigint | BN | number;
@@ -165,6 +166,7 @@ export type ExecutionQueueEnqueueCtmWithIntentParams = {
 
 export type ExecutionQueueBaseCtmParams = {
   executionQueue: PublicKey;
+  executionQueueBuffer: PublicKey;
   sequence: bigint | BN | number;
   minExecuteSlot: bigint | BN | number;
   expiresAtSlot?: bigint | BN | number;
@@ -6419,6 +6421,7 @@ export class MangoClient {
       programId: this.programId,
       group: group.publicKey,
       executionQueue: params.executionQueue,
+      executionQueueBuffer: params.executionQueueBuffer,
       remainingAccounts: params.remainingAccounts,
       payload: params.payload,
       sequence: params.sequence,
@@ -6440,6 +6443,7 @@ export class MangoClient {
   public async executionQueueEnqueueLiquidity(
     group: Group,
     executionQueue: PublicKey,
+    executionQueueBuffer: PublicKey,
     kind: QueueItemKind.LiquidityDeposit | QueueItemKind.LiquidityWithdraw,
     payload: Uint8Array,
     remainingAccounts: AccountMeta[],
@@ -6449,6 +6453,7 @@ export class MangoClient {
       programId: this.programId,
       group: group.publicKey,
       executionQueue,
+      executionQueueBuffer,
       kind,
       remainingAccounts,
       payload,
@@ -6463,6 +6468,7 @@ export class MangoClient {
   public async executionQueueExecute(
     group: Group,
     executionQueue: PublicKey,
+    executionQueueBuffer: PublicKey,
     remainingAccounts: AccountMeta[],
     maxItems: number,
     opts: SendTransactionOpts = {},
@@ -6471,6 +6477,7 @@ export class MangoClient {
       programId: this.programId,
       group: group.publicKey,
       executionQueue,
+      executionQueueBuffer,
       remainingAccounts,
       maxItems,
     });
@@ -6528,6 +6535,7 @@ export class MangoClient {
       group,
       {
         executionQueue: params.executionQueue,
+        executionQueueBuffer: params.executionQueueBuffer,
         remainingAccounts: this.executionQueueRemainingAccountsFromMangoIx(
           placeOrderIx,
           params.executionQueue,
@@ -6566,6 +6574,7 @@ export class MangoClient {
       group,
       {
         executionQueue: params.executionQueue,
+        executionQueueBuffer: params.executionQueueBuffer,
         remainingAccounts: this.executionQueueRemainingAccountsFromMangoIx(
           cancelOrderIx,
           params.executionQueue,
@@ -6604,6 +6613,7 @@ export class MangoClient {
       group,
       {
         executionQueue: params.executionQueue,
+        executionQueueBuffer: params.executionQueueBuffer,
         remainingAccounts: this.executionQueueRemainingAccountsFromMangoIx(
           cancelOrderIx,
           params.executionQueue,
@@ -6642,6 +6652,7 @@ export class MangoClient {
       group,
       {
         executionQueue: params.executionQueue,
+        executionQueueBuffer: params.executionQueueBuffer,
         remainingAccounts: this.executionQueueRemainingAccountsFromMangoIx(
           cancelAllIx,
           params.executionQueue,
@@ -6688,6 +6699,7 @@ export class MangoClient {
       group,
       {
         executionQueue: params.executionQueue,
+        executionQueueBuffer: params.executionQueueBuffer,
         remainingAccounts: this.executionQueueRemainingAccountsFromMangoIx(
           cancelAllBySideIx,
           params.executionQueue,
