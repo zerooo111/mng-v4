@@ -4,7 +4,7 @@ use crate::state::*;
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::ed25519_program;
 use anchor_lang::solana_program::hash::hashv;
-use anchor_lang::solana_program::instruction::AccountMeta;
+use anchor_lang::solana_program::instruction::{AccountMeta, Instruction};
 use anchor_lang::solana_program::sysvar::instructions as tx_instructions;
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
@@ -39,6 +39,23 @@ pub struct QueueItemProcessed {
     pub sequence: u64,
     pub kind: u8,
     pub status: u8,
+}
+
+const ED25519_INSTRUCTION_HEADER_LEN: usize = 2;
+const ED25519_SIGNATURE_OFFSETS_LEN: usize = 14;
+const ED25519_SIGNATURE_LEN: usize = 64;
+const ED25519_PUBKEY_LEN: usize = 32;
+const ED25519_CURRENT_INSTRUCTION_INDEX: u16 = u16::MAX;
+
+#[derive(Clone, Copy, Debug)]
+struct Ed25519SignatureOffsets {
+    signature_offset: u16,
+    signature_instruction_index: u16,
+    public_key_offset: u16,
+    public_key_instruction_index: u16,
+    message_data_offset: u16,
+    message_data_size: u16,
+    message_instruction_index: u16,
 }
 
 fn find_free_slot(queue: &ExecutionQueue) -> Option<usize> {
@@ -76,26 +93,135 @@ fn canonical_envelope_message(group: Pubkey, envelope: &CtmEnvelope) -> [u8; 32]
     .to_bytes()
 }
 
+fn read_u16(data: &[u8], offset: usize) -> Option<u16> {
+    let bytes = data.get(offset..offset + 2)?;
+    Some(u16::from_le_bytes(bytes.try_into().ok()?))
+}
+
+fn parse_ed25519_signature_offsets(
+    data: &[u8],
+    signature_index: usize,
+) -> Option<Ed25519SignatureOffsets> {
+    let start = ED25519_INSTRUCTION_HEADER_LEN + signature_index * ED25519_SIGNATURE_OFFSETS_LEN;
+    Some(Ed25519SignatureOffsets {
+        signature_offset: read_u16(data, start)?,
+        signature_instruction_index: read_u16(data, start + 2)?,
+        public_key_offset: read_u16(data, start + 4)?,
+        public_key_instruction_index: read_u16(data, start + 6)?,
+        message_data_offset: read_u16(data, start + 8)?,
+        message_data_size: read_u16(data, start + 10)?,
+        message_instruction_index: read_u16(data, start + 12)?,
+    })
+}
+
+fn extract_ix_data<'a>(
+    ix: &'a Instruction,
+    expected_ix_index: usize,
+    ix_index: u16,
+) -> Option<&'a [u8]> {
+    if ix_index == ED25519_CURRENT_INSTRUCTION_INDEX || ix_index as usize == expected_ix_index {
+        Some(ix.data.as_slice())
+    } else {
+        None
+    }
+}
+
+fn extract_bytes<'a>(
+    ix: &'a Instruction,
+    expected_ix_index: usize,
+    ix_index: u16,
+    offset: usize,
+    len: usize,
+) -> Option<&'a [u8]> {
+    let data = extract_ix_data(ix, expected_ix_index, ix_index)?;
+    data.get(offset..offset + len)
+}
+
+fn ed25519_ix_matches(
+    ix: &Instruction,
+    ix_index: usize,
+    ctm_signer: Pubkey,
+    msg_hash: [u8; 32],
+) -> bool {
+    if ix.program_id != ed25519_program::id() || ix.data.len() < ED25519_INSTRUCTION_HEADER_LEN {
+        return false;
+    }
+
+    let signature_count = ix.data[0] as usize;
+    if signature_count == 0 {
+        return false;
+    }
+
+    let min_len = ED25519_INSTRUCTION_HEADER_LEN + signature_count * ED25519_SIGNATURE_OFFSETS_LEN;
+    if ix.data.len() < min_len {
+        return false;
+    }
+
+    for signature_index in 0..signature_count {
+        let Some(offsets) = parse_ed25519_signature_offsets(&ix.data, signature_index) else {
+            continue;
+        };
+
+        // Require the referenced signature blob to exist in this ed25519 instruction.
+        if extract_bytes(
+            ix,
+            ix_index,
+            offsets.signature_instruction_index,
+            offsets.signature_offset as usize,
+            ED25519_SIGNATURE_LEN,
+        )
+        .is_none()
+        {
+            continue;
+        }
+
+        let Some(public_key_bytes) = extract_bytes(
+            ix,
+            ix_index,
+            offsets.public_key_instruction_index,
+            offsets.public_key_offset as usize,
+            ED25519_PUBKEY_LEN,
+        ) else {
+            continue;
+        };
+
+        if public_key_bytes != ctm_signer.as_ref() {
+            continue;
+        }
+
+        if offsets.message_data_size as usize != msg_hash.len() {
+            continue;
+        }
+
+        let Some(message_bytes) = extract_bytes(
+            ix,
+            ix_index,
+            offsets.message_instruction_index,
+            offsets.message_data_offset as usize,
+            offsets.message_data_size as usize,
+        ) else {
+            continue;
+        };
+
+        if message_bytes == msg_hash.as_ref() {
+            return true;
+        }
+    }
+
+    false
+}
+
 fn verify_ed25519_preinstruction(
     ixs: &AccountInfo,
     ctm_signer: Pubkey,
     msg_hash: [u8; 32],
 ) -> Result<()> {
-    let mut index = 0;
-    loop {
-        let ix = match tx_instructions::load_instruction_at_checked(index, ixs) {
-            Ok(ix) => ix,
-            Err(ProgramError::InvalidArgument) => break,
-            Err(e) => return Err(e.into()),
-        };
-
-        if ix.program_id == ed25519_program::id()
-            && ix.data.windows(32).any(|x| x == ctm_signer.as_ref())
-            && ix.data.windows(32).any(|x| x == msg_hash)
-        {
+    let current_index = tx_instructions::load_current_index_checked(ixs)? as usize;
+    for index in 0..current_index {
+        let ix = tx_instructions::load_instruction_at_checked(index, ixs)?;
+        if ed25519_ix_matches(&ix, index, ctm_signer, msg_hash) {
             return Ok(());
         }
-        index += 1;
     }
 
     err!(MangoError::CtmSignatureMissing)
@@ -142,6 +268,10 @@ pub fn execution_queue_enqueue_ctm(
     envelope: CtmEnvelope,
     payload: Vec<u8>,
 ) -> Result<()> {
+    require!(
+        envelope.kind == QueueItemKind::CtmWrapped as u8,
+        MangoError::ExecutionQueueInvalidItemKind
+    );
     require!(
         payload.len() <= EXECUTION_QUEUE_PAYLOAD_MAX,
         MangoError::ExecutionQueuePayloadTooLarge
@@ -420,5 +550,82 @@ mod tests {
         ]);
 
         assert_ne!(first, second);
+    }
+
+    fn write_u16_le(data: &mut [u8], offset: usize, value: u16) {
+        data[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn test_ed25519_ix(
+        signer: Pubkey,
+        message: [u8; 32],
+        public_key_instruction_index: u16,
+        message_instruction_index: u16,
+    ) -> Instruction {
+        let header_len = ED25519_INSTRUCTION_HEADER_LEN + ED25519_SIGNATURE_OFFSETS_LEN;
+        let signature_offset = header_len;
+        let public_key_offset = signature_offset + ED25519_SIGNATURE_LEN;
+        let message_offset = public_key_offset + ED25519_PUBKEY_LEN;
+
+        let mut data = vec![0u8; message_offset + message.len()];
+        data[0] = 1; // num signatures
+        data[1] = 0; // padding
+
+        write_u16_le(&mut data, 2, signature_offset as u16);
+        write_u16_le(&mut data, 4, ED25519_CURRENT_INSTRUCTION_INDEX);
+        write_u16_le(&mut data, 6, public_key_offset as u16);
+        write_u16_le(&mut data, 8, public_key_instruction_index);
+        write_u16_le(&mut data, 10, message_offset as u16);
+        write_u16_le(&mut data, 12, message.len() as u16);
+        write_u16_le(&mut data, 14, message_instruction_index);
+
+        data[signature_offset..signature_offset + ED25519_SIGNATURE_LEN]
+            .copy_from_slice(&[7u8; 64]);
+        data[public_key_offset..public_key_offset + ED25519_PUBKEY_LEN]
+            .copy_from_slice(signer.as_ref());
+        data[message_offset..message_offset + message.len()].copy_from_slice(&message);
+
+        Instruction {
+            program_id: ed25519_program::id(),
+            accounts: vec![],
+            data,
+        }
+    }
+
+    #[test]
+    fn ed25519_match_requires_structured_signature_for_expected_signer_and_message() {
+        let signer = Pubkey::new_unique();
+        let msg_hash = [11u8; 32];
+        let ix = test_ed25519_ix(
+            signer,
+            msg_hash,
+            ED25519_CURRENT_INSTRUCTION_INDEX,
+            ED25519_CURRENT_INSTRUCTION_INDEX,
+        );
+
+        assert!(ed25519_ix_matches(&ix, 0, signer, msg_hash));
+    }
+
+    #[test]
+    fn ed25519_match_rejects_non_self_referential_message_offsets() {
+        let signer = Pubkey::new_unique();
+        let msg_hash = [13u8; 32];
+        let ix = test_ed25519_ix(signer, msg_hash, ED25519_CURRENT_INSTRUCTION_INDEX, 7);
+
+        assert!(!ed25519_ix_matches(&ix, 0, signer, msg_hash));
+    }
+
+    #[test]
+    fn ed25519_match_rejects_wrong_message() {
+        let signer = Pubkey::new_unique();
+        let msg_hash = [17u8; 32];
+        let ix = test_ed25519_ix(
+            signer,
+            [19u8; 32],
+            ED25519_CURRENT_INSTRUCTION_INDEX,
+            ED25519_CURRENT_INSTRUCTION_INDEX,
+        );
+
+        assert!(!ed25519_ix_matches(&ix, 0, signer, msg_hash));
     }
 }
