@@ -191,6 +191,10 @@ pub enum MangoError {
     ExecutionQueueDispatchAccountLayoutInvalid,
     #[msg("execution queue owner must be queue authority")]
     ExecutionQueueOwnerMustBeQueueAuthority,
+    #[msg("execution queue user signature pre-instruction missing or invalid")]
+    ExecutionQueueUserSignatureMissing,
+    #[msg("execution queue invalid user account for intent verification")]
+    ExecutionQueueInvalidUserAccount,
 }
 
 impl MangoError {

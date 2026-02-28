@@ -85,12 +85,25 @@ Implication: if account order or signer/writable flags differ from CTM-signed me
 ### CTM-wrapped variants
 
 - Ingress requires valid CTM signature.
+- Ingress also requires valid user-intent signature for the affected Mango account owner.
 - Execute is permissionless.
 - Execution authority semantics are carried by signed payload/account set.
 - Signerless crank path:
   - payload account metas must place `owner` at index 2 as the `ExecutionQueue` PDA;
   - users authorize this by setting their Mango account delegate to the queue PDA;
   - execute dispatch upgrades owner meta to signer and uses `invoke_signed` with queue PDA seeds.
+
+User-intent message (signed by Mango account owner):
+
+- domain: `mango-v4-user-intent-v1`
+- group pubkey
+- mango account pubkey
+- user owner pubkey
+- kind
+- payload hash
+- accounts hash
+
+This intentionally excludes CTM-assigned sequencing/timing fields, so user intent can be signed before CTM assigns sequence/min slot.
 
 ### Liquidity variants
 

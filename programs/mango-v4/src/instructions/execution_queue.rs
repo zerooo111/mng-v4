@@ -187,6 +187,24 @@ fn canonical_envelope_message(group: Pubkey, envelope: &CtmEnvelope) -> [u8; 32]
     .to_bytes()
 }
 
+fn canonical_user_intent_message(
+    group: Pubkey,
+    mango_account: Pubkey,
+    user_owner: Pubkey,
+    envelope: &CtmEnvelope,
+) -> [u8; 32] {
+    hashv(&[
+        b"mango-v4-user-intent-v1",
+        group.as_ref(),
+        mango_account.as_ref(),
+        user_owner.as_ref(),
+        &[envelope.kind],
+        &envelope.payload_hash,
+        &envelope.accounts_hash,
+    ])
+    .to_bytes()
+}
+
 fn queue_payload_variant_from_u8(value: u8) -> Result<QueuePayloadVariant> {
     match value {
         0 => Ok(QueuePayloadVariant::PerpPlaceOrderV2),
@@ -384,6 +402,27 @@ fn dispatch_queue_payload(
     }
 }
 
+fn extract_user_owner_for_ctm_payload(
+    group_key: Pubkey,
+    remaining_accounts: &[AccountInfo],
+) -> Result<(Pubkey, Pubkey)> {
+    require!(
+        remaining_accounts.len() >= 2,
+        MangoError::ExecutionQueueDispatchAccountLayoutInvalid
+    );
+    let mango_account_ai = &remaining_accounts[1];
+    let loader: AccountLoader<MangoAccountFixed> = AccountLoader::try_from(mango_account_ai)
+        .map_err(|_| error!(MangoError::ExecutionQueueInvalidUserAccount))?;
+    let account = loader
+        .load()
+        .map_err(|_| error!(MangoError::ExecutionQueueInvalidUserAccount))?;
+    require!(
+        account.group == group_key,
+        MangoError::ExecutionQueueInvalidUserAccount
+    );
+    Ok((*mango_account_ai.key, account.owner))
+}
+
 fn read_u16(data: &[u8], offset: usize) -> Option<u16> {
     let bytes = data.get(offset..offset + 2)?;
     Some(u16::from_le_bytes(bytes.try_into().ok()?))
@@ -502,20 +541,40 @@ fn ed25519_ix_matches(
     false
 }
 
-fn verify_ed25519_preinstruction(
+fn has_ed25519_preinstruction(
     ixs: &AccountInfo,
     ctm_signer: Pubkey,
     msg_hash: [u8; 32],
-) -> Result<()> {
+) -> Result<bool> {
     let current_index = tx_instructions::load_current_index_checked(ixs)? as usize;
     for index in 0..current_index {
         let ix = tx_instructions::load_instruction_at_checked(index, ixs)?;
         if ed25519_ix_matches(&ix, index, ctm_signer, msg_hash) {
-            return Ok(());
+            return Ok(true);
         }
     }
 
-    err!(MangoError::CtmSignatureMissing)
+    Ok(false)
+}
+
+fn verify_ed25519_preinstruction(
+    ixs: &AccountInfo,
+    signer: Pubkey,
+    msg_hash: [u8; 32],
+) -> Result<()> {
+    let found = has_ed25519_preinstruction(ixs, signer, msg_hash)?;
+    require!(found, MangoError::CtmSignatureMissing);
+    Ok(())
+}
+
+fn verify_user_ed25519_preinstruction(
+    ixs: &AccountInfo,
+    signer: Pubkey,
+    msg_hash: [u8; 32],
+) -> Result<()> {
+    let found = has_ed25519_preinstruction(ixs, signer, msg_hash)?;
+    require!(found, MangoError::ExecutionQueueUserSignatureMissing);
+    Ok(())
 }
 
 pub fn execution_queue_init(ctx: Context<ExecutionQueueInit>, ctm_signer: Pubkey) -> Result<()> {
@@ -643,6 +702,22 @@ pub fn execution_queue_enqueue_ctm(
         queue.ctm_signer,
         msg_hash,
     )?;
+
+    if variant_uses_queue_owner_signer(decoded_payload.variant) {
+        let (mango_account_key, user_owner) =
+            extract_user_owner_for_ctm_payload(ctx.accounts.group.key(), ctx.remaining_accounts)?;
+        let user_intent_hash = canonical_user_intent_message(
+            ctx.accounts.group.key(),
+            mango_account_key,
+            user_owner,
+            &envelope,
+        );
+        verify_user_ed25519_preinstruction(
+            ctx.accounts.instructions.as_ref(),
+            user_owner,
+            user_intent_hash,
+        )?;
+    }
 
     let slot = find_free_slot(&queue).ok_or_else(|| error!(MangoError::ExecutionQueueFull))?;
     let item = &mut queue.items[slot];
@@ -974,6 +1049,29 @@ mod tests {
         let one = canonical_envelope_message(group, &env);
         let two = canonical_envelope_message(group, &env);
         assert_eq!(one, two);
+    }
+
+    #[test]
+    fn canonical_user_intent_message_is_stable_and_binds_owner() {
+        let group = Pubkey::new_unique();
+        let mango_account = Pubkey::new_unique();
+        let owner_a = Pubkey::new_unique();
+        let owner_b = Pubkey::new_unique();
+        let env = CtmEnvelope {
+            sequence: 42,
+            min_execute_slot: 99,
+            kind: QueueItemKind::CtmWrapped as u8,
+            payload_hash: [7; 32],
+            accounts_hash: [9; 32],
+            expires_at_slot: 120,
+        };
+
+        let one = canonical_user_intent_message(group, mango_account, owner_a, &env);
+        let two = canonical_user_intent_message(group, mango_account, owner_a, &env);
+        let different_owner = canonical_user_intent_message(group, mango_account, owner_b, &env);
+
+        assert_eq!(one, two);
+        assert_ne!(one, different_owner);
     }
 
     #[test]

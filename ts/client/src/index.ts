@@ -22,6 +22,7 @@ export {
 } from './clientIxParamBuilder';
 export * from './constants';
 export * from './error';
+export * from './executionQueue';
 export * from './mango_v4';
 export * from './numbers/I80F48';
 export * from './risk';
