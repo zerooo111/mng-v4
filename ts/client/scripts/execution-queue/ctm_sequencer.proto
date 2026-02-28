@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+package ctmsequencer;
+
+message AccountMeta {
+  string pubkey = 1;
+  bool is_signer = 2;
+  bool is_writable = 3;
+}
+
+message SubmitIntentRequest {
+  string group = 1;
+  string execution_queue = 2;
+  string market = 3;
+  bytes payload = 4;
+  repeated AccountMeta remaining_accounts = 5;
+  uint64 min_execute_slot = 6;
+  uint64 expires_at_slot = 7;
+  string user_owner = 8;
+  string mango_account = 9;
+  bytes user_signature = 10;
+}
+
+message SubmitIntentResponse {
+  uint64 sequence = 1;
+  string tx_signature = 2;
+  bytes user_intent_message = 3;
+  bytes ctm_envelope_message = 4;
+}
+
+service CtmSequencerRelayer {
+  rpc SubmitIntent(SubmitIntentRequest) returns (SubmitIntentResponse);
+}

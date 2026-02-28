@@ -1,4 +1,5 @@
 import BN from 'bn.js';
+import nacl from 'tweetnacl';
 import {
   AccountMeta,
   Ed25519Program,
@@ -133,6 +134,7 @@ export type BuildExecutionQueueEnqueueLiquidityParams = {
   group: PublicKey;
   executionQueue: PublicKey;
   kind: QueueItemKind.LiquidityDeposit | QueueItemKind.LiquidityWithdraw;
+  remainingAccounts: AccountMeta[];
   payload: Uint8Array;
 };
 
@@ -142,6 +144,15 @@ export type BuildExecutionQueueExecuteParams = {
   executionQueue: PublicKey;
   remainingAccounts: AccountMeta[];
   maxItems: number;
+};
+
+export type BuildExecutionQueueUserIntentParams = {
+  group: PublicKey;
+  mangoAccount: PublicKey;
+  userOwner: PublicKey;
+  kind?: QueueItemKind;
+  payload: Uint8Array;
+  remainingAccounts: AccountMeta[];
 };
 
 export type BuildExecutionQueueEnqueueCtmWithIntentParams = {
@@ -480,6 +491,43 @@ export async function buildUserIntentMessage(
   );
 }
 
+export async function buildExecutionQueueUserIntent(
+  params: BuildExecutionQueueUserIntentParams,
+): Promise<{
+  envelopeLike: CtmEnvelopeWire;
+  payloadHash: Buffer;
+  accountsHash: Buffer;
+  userIntentMessage: Buffer;
+}> {
+  const payloadHash = await hashExecutionQueuePayload(params.payload);
+  const accountsHash = await hashExecutionQueueAccounts(params.remainingAccounts);
+  const envelopeLike: CtmEnvelopeWire = {
+    sequence: 0n,
+    minExecuteSlot: 0n,
+    kind: params.kind ?? QueueItemKind.CtmWrapped,
+    payloadHash,
+    accountsHash,
+    expiresAtSlot: 0n,
+  };
+  const userIntentMessage = await buildUserIntentMessage(
+    params.group,
+    params.mangoAccount,
+    params.userOwner,
+    envelopeLike,
+  );
+  return { envelopeLike, payloadHash, accountsHash, userIntentMessage };
+}
+
+export function signExecutionQueueIntentMessage(
+  privateKey: Uint8Array,
+  message: Uint8Array,
+): Uint8Array {
+  if (privateKey.length !== 64) {
+    throw new Error('privateKey must be 64 bytes');
+  }
+  return nacl.sign.detached(message, privateKey);
+}
+
 export function buildIntentEd25519Instruction(
   message: Uint8Array,
   signer: IntentSigner,
@@ -559,6 +607,7 @@ export async function buildExecutionQueueEnqueueLiquidityIx(
     keys: [
       { pubkey: params.group, isSigner: false, isWritable: false },
       { pubkey: params.executionQueue, isSigner: false, isWritable: true },
+      ...params.remainingAccounts,
     ],
     data,
   });

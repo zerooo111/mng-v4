@@ -94,6 +94,18 @@ import {
 import { Id } from './ids';
 import { IDL, MangoV4 } from './mango_v4';
 import { I80F48 } from './numbers/I80F48';
+import {
+  IntentSigner,
+  buildExecutionQueueEnqueueCtmWithIntentIxs,
+  buildExecutionQueueEnqueueLiquidityIx,
+  buildExecutionQueueExecuteIx,
+  encodePerpCancelAllOrdersBySideQueuePayload,
+  encodePerpCancelAllOrdersQueuePayload,
+  encodePerpCancelOrderByClientOrderIdQueuePayload,
+  encodePerpCancelOrderQueuePayload,
+  encodePerpPlaceOrderV2QueuePayload,
+  QueueItemKind,
+} from './executionQueue';
 import { FlashLoanType, HealthCheckKind, OracleConfigParams } from './types';
 import {
   EmptyWallet,
@@ -137,6 +149,63 @@ export type MangoClientOptions = {
   multipleConnections?: Connection[];
   fallbackOracleConfig?: FallbackOracleConfig;
 };
+
+export type ExecutionQueueEnqueueCtmWithIntentParams = {
+  executionQueue: PublicKey;
+  remainingAccounts: AccountMeta[];
+  payload: Uint8Array;
+  sequence: bigint | BN | number;
+  minExecuteSlot: bigint | BN | number;
+  expiresAtSlot?: bigint | BN | number;
+  userOwner: PublicKey;
+  mangoAccount: PublicKey;
+  userSigner: IntentSigner;
+  ctmSigner: IntentSigner;
+};
+
+export type ExecutionQueueBaseCtmParams = {
+  executionQueue: PublicKey;
+  sequence: bigint | BN | number;
+  minExecuteSlot: bigint | BN | number;
+  expiresAtSlot?: bigint | BN | number;
+  userSigner: IntentSigner;
+  ctmSigner: IntentSigner;
+};
+
+export type ExecutionQueuePerpPlaceOrderV2WithIntentParams =
+  ExecutionQueueBaseCtmParams & {
+    side: PerpOrderSide;
+    price: number;
+    quantity: number;
+    maxQuoteQuantity?: number;
+    clientOrderId?: number;
+    orderType?: PerpOrderType;
+    selfTradeBehavior?: PerpSelfTradeBehavior;
+    reduceOnly?: boolean;
+    expiryTimestamp?: number;
+    limit?: number;
+  };
+
+export type ExecutionQueuePerpCancelOrderWithIntentParams =
+  ExecutionQueueBaseCtmParams & {
+    orderId: BN;
+  };
+
+export type ExecutionQueuePerpCancelOrderByClientIdWithIntentParams =
+  ExecutionQueueBaseCtmParams & {
+    clientOrderId: BN;
+  };
+
+export type ExecutionQueuePerpCancelAllOrdersWithIntentParams =
+  ExecutionQueueBaseCtmParams & {
+    limit: number;
+  };
+
+export type ExecutionQueuePerpCancelAllOrdersBySideWithIntentParams =
+  ExecutionQueueBaseCtmParams & {
+    sideOption: PerpOrderSide | null;
+    limit: number;
+  };
 
 export type TxCallbackOptions = {
   txid: string;
@@ -6316,6 +6385,323 @@ export class MangoClient {
     return await this.sendAndConfirmTransactionForGroup(
       group,
       transactionInstructions,
+    );
+  }
+
+  private executionQueueRemainingAccountsFromMangoIx(
+    mangoIx: TransactionInstruction,
+    executionQueue: PublicKey,
+  ): AccountMeta[] {
+    if (mangoIx.keys.length < 3) {
+      throw new Error(
+        'queue-dispatched mango instruction requires at least 3 account metas',
+      );
+    }
+    const remainingAccounts = mangoIx.keys.map((k) => ({
+      pubkey: k.pubkey,
+      isSigner: k.isSigner,
+      isWritable: k.isWritable,
+    }));
+    remainingAccounts[2] = {
+      pubkey: executionQueue,
+      isSigner: false,
+      isWritable: remainingAccounts[2].isWritable,
+    };
+    return remainingAccounts;
+  }
+
+  public async executionQueueEnqueueCtmWithIntent(
+    group: Group,
+    params: ExecutionQueueEnqueueCtmWithIntentParams,
+    opts: SendTransactionOpts = {},
+  ): Promise<MangoSignatureStatus> {
+    const built = await buildExecutionQueueEnqueueCtmWithIntentIxs({
+      programId: this.programId,
+      group: group.publicKey,
+      executionQueue: params.executionQueue,
+      remainingAccounts: params.remainingAccounts,
+      payload: params.payload,
+      sequence: params.sequence,
+      minExecuteSlot: params.minExecuteSlot,
+      expiresAtSlot: params.expiresAtSlot,
+      userOwner: params.userOwner,
+      mangoAccount: params.mangoAccount,
+      userSigner: params.userSigner,
+      ctmSigner: params.ctmSigner,
+    });
+
+    return await this.sendAndConfirmTransactionForGroup(
+      group,
+      built.instructions,
+      opts,
+    );
+  }
+
+  public async executionQueueEnqueueLiquidity(
+    group: Group,
+    executionQueue: PublicKey,
+    kind: QueueItemKind.LiquidityDeposit | QueueItemKind.LiquidityWithdraw,
+    payload: Uint8Array,
+    remainingAccounts: AccountMeta[],
+    opts: SendTransactionOpts = {},
+  ): Promise<MangoSignatureStatus> {
+    const enqueueLiquidityIx = await buildExecutionQueueEnqueueLiquidityIx({
+      programId: this.programId,
+      group: group.publicKey,
+      executionQueue,
+      kind,
+      remainingAccounts,
+      payload,
+    });
+    return await this.sendAndConfirmTransactionForGroup(
+      group,
+      [enqueueLiquidityIx],
+      opts,
+    );
+  }
+
+  public async executionQueueExecute(
+    group: Group,
+    executionQueue: PublicKey,
+    remainingAccounts: AccountMeta[],
+    maxItems: number,
+    opts: SendTransactionOpts = {},
+  ): Promise<MangoSignatureStatus> {
+    const executeIx = await buildExecutionQueueExecuteIx({
+      programId: this.programId,
+      group: group.publicKey,
+      executionQueue,
+      remainingAccounts,
+      maxItems,
+    });
+    return await this.sendAndConfirmTransactionForGroup(group, [executeIx], opts);
+  }
+
+  public async executionQueuePerpPlaceOrderV2WithIntent(
+    group: Group,
+    mangoAccount: MangoAccount,
+    perpMarketIndex: PerpMarketIndex,
+    params: ExecutionQueuePerpPlaceOrderV2WithIntentParams,
+    opts: SendTransactionOpts = {},
+  ): Promise<MangoSignatureStatus> {
+    const resolvedClientOrderId = params.clientOrderId ?? Date.now();
+    const resolvedOrderType = params.orderType ?? PerpOrderType.limit;
+    const resolvedSelfTradeBehavior =
+      params.selfTradeBehavior ?? PerpSelfTradeBehavior.decrementTake;
+    const resolvedReduceOnly = params.reduceOnly ?? false;
+    const resolvedExpiryTimestamp = params.expiryTimestamp ?? 0;
+    const resolvedLimit = params.limit ?? 10;
+
+    const perpMarket = group.getPerpMarketByMarketIndex(perpMarketIndex);
+    const placeOrderIx = await this.perpPlaceOrderV2Ix(
+      group,
+      mangoAccount,
+      perpMarketIndex,
+      params.side,
+      params.price,
+      params.quantity,
+      params.maxQuoteQuantity,
+      resolvedClientOrderId,
+      resolvedOrderType,
+      resolvedSelfTradeBehavior,
+      resolvedReduceOnly,
+      resolvedExpiryTimestamp,
+      resolvedLimit,
+    );
+
+    const payload = encodePerpPlaceOrderV2QueuePayload({
+      side: params.side,
+      priceLots: BigInt(perpMarket.uiPriceToLots(params.price).toString()),
+      maxBaseLots: BigInt(perpMarket.uiBaseToLots(params.quantity).toString()),
+      maxQuoteLots: params.maxQuoteQuantity
+        ? BigInt(perpMarket.uiQuoteToLots(params.maxQuoteQuantity).toString())
+        : BigInt(I64_MAX_BN.toString()),
+      clientOrderId: resolvedClientOrderId,
+      orderType: resolvedOrderType,
+      selfTradeBehavior: resolvedSelfTradeBehavior,
+      reduceOnly: resolvedReduceOnly,
+      expiryTimestamp: resolvedExpiryTimestamp,
+      limit: resolvedLimit,
+    });
+
+    return await this.executionQueueEnqueueCtmWithIntent(
+      group,
+      {
+        executionQueue: params.executionQueue,
+        remainingAccounts: this.executionQueueRemainingAccountsFromMangoIx(
+          placeOrderIx,
+          params.executionQueue,
+        ),
+        payload,
+        sequence: params.sequence,
+        minExecuteSlot: params.minExecuteSlot,
+        expiresAtSlot: params.expiresAtSlot,
+        userOwner: mangoAccount.owner,
+        mangoAccount: mangoAccount.publicKey,
+        userSigner: params.userSigner,
+        ctmSigner: params.ctmSigner,
+      },
+      opts,
+    );
+  }
+
+  public async executionQueuePerpCancelOrderWithIntent(
+    group: Group,
+    mangoAccount: MangoAccount,
+    perpMarketIndex: PerpMarketIndex,
+    params: ExecutionQueuePerpCancelOrderWithIntentParams,
+    opts: SendTransactionOpts = {},
+  ): Promise<MangoSignatureStatus> {
+    const cancelOrderIx = await this.perpCancelOrderIx(
+      group,
+      mangoAccount,
+      perpMarketIndex,
+      params.orderId,
+    );
+    const payload = encodePerpCancelOrderQueuePayload({
+      orderId: BigInt(params.orderId.toString()),
+    });
+
+    return await this.executionQueueEnqueueCtmWithIntent(
+      group,
+      {
+        executionQueue: params.executionQueue,
+        remainingAccounts: this.executionQueueRemainingAccountsFromMangoIx(
+          cancelOrderIx,
+          params.executionQueue,
+        ),
+        payload,
+        sequence: params.sequence,
+        minExecuteSlot: params.minExecuteSlot,
+        expiresAtSlot: params.expiresAtSlot,
+        userOwner: mangoAccount.owner,
+        mangoAccount: mangoAccount.publicKey,
+        userSigner: params.userSigner,
+        ctmSigner: params.ctmSigner,
+      },
+      opts,
+    );
+  }
+
+  public async executionQueuePerpCancelOrderByClientOrderIdWithIntent(
+    group: Group,
+    mangoAccount: MangoAccount,
+    perpMarketIndex: PerpMarketIndex,
+    params: ExecutionQueuePerpCancelOrderByClientIdWithIntentParams,
+    opts: SendTransactionOpts = {},
+  ): Promise<MangoSignatureStatus> {
+    const cancelOrderIx = await this.perpCancelOrderByClientOrderIdIx(
+      group,
+      mangoAccount,
+      perpMarketIndex,
+      params.clientOrderId,
+    );
+    const payload = encodePerpCancelOrderByClientOrderIdQueuePayload({
+      clientOrderId: BigInt(params.clientOrderId.toString()),
+    });
+
+    return await this.executionQueueEnqueueCtmWithIntent(
+      group,
+      {
+        executionQueue: params.executionQueue,
+        remainingAccounts: this.executionQueueRemainingAccountsFromMangoIx(
+          cancelOrderIx,
+          params.executionQueue,
+        ),
+        payload,
+        sequence: params.sequence,
+        minExecuteSlot: params.minExecuteSlot,
+        expiresAtSlot: params.expiresAtSlot,
+        userOwner: mangoAccount.owner,
+        mangoAccount: mangoAccount.publicKey,
+        userSigner: params.userSigner,
+        ctmSigner: params.ctmSigner,
+      },
+      opts,
+    );
+  }
+
+  public async executionQueuePerpCancelAllOrdersWithIntent(
+    group: Group,
+    mangoAccount: MangoAccount,
+    perpMarketIndex: PerpMarketIndex,
+    params: ExecutionQueuePerpCancelAllOrdersWithIntentParams,
+    opts: SendTransactionOpts = {},
+  ): Promise<MangoSignatureStatus> {
+    const cancelAllIx = await this.perpCancelAllOrdersIx(
+      group,
+      mangoAccount,
+      perpMarketIndex,
+      params.limit,
+    );
+    const payload = encodePerpCancelAllOrdersQueuePayload({
+      limit: params.limit,
+    });
+
+    return await this.executionQueueEnqueueCtmWithIntent(
+      group,
+      {
+        executionQueue: params.executionQueue,
+        remainingAccounts: this.executionQueueRemainingAccountsFromMangoIx(
+          cancelAllIx,
+          params.executionQueue,
+        ),
+        payload,
+        sequence: params.sequence,
+        minExecuteSlot: params.minExecuteSlot,
+        expiresAtSlot: params.expiresAtSlot,
+        userOwner: mangoAccount.owner,
+        mangoAccount: mangoAccount.publicKey,
+        userSigner: params.userSigner,
+        ctmSigner: params.ctmSigner,
+      },
+      opts,
+    );
+  }
+
+  public async executionQueuePerpCancelAllOrdersBySideWithIntent(
+    group: Group,
+    mangoAccount: MangoAccount,
+    perpMarketIndex: PerpMarketIndex,
+    params: ExecutionQueuePerpCancelAllOrdersBySideWithIntentParams,
+    opts: SendTransactionOpts = {},
+  ): Promise<MangoSignatureStatus> {
+    const perpMarket = group.getPerpMarketByMarketIndex(perpMarketIndex);
+    const cancelAllBySideIx = await this.program.methods
+      .perpCancelAllOrdersBySide(params.sideOption, params.limit)
+      .accounts({
+        group: group.publicKey,
+        account: mangoAccount.publicKey,
+        owner: (this.program.provider as AnchorProvider).wallet.publicKey,
+        perpMarket: perpMarket.publicKey,
+        bids: perpMarket.bids,
+        asks: perpMarket.asks,
+      })
+      .instruction();
+
+    const payload = encodePerpCancelAllOrdersBySideQueuePayload({
+      side: params.sideOption,
+      limit: params.limit,
+    });
+
+    return await this.executionQueueEnqueueCtmWithIntent(
+      group,
+      {
+        executionQueue: params.executionQueue,
+        remainingAccounts: this.executionQueueRemainingAccountsFromMangoIx(
+          cancelAllBySideIx,
+          params.executionQueue,
+        ),
+        payload,
+        sequence: params.sequence,
+        minExecuteSlot: params.minExecuteSlot,
+        expiresAtSlot: params.expiresAtSlot,
+        userOwner: mangoAccount.owner,
+        mangoAccount: mangoAccount.publicKey,
+        userSigner: params.userSigner,
+        ctmSigner: params.ctmSigner,
+      },
+      opts,
     );
   }
 

@@ -9,6 +9,7 @@ import {
   buildCtmEnvelopeMessage,
   buildExecutionQueueEnqueueCtmWithIntentIxs,
   buildExecutionQueueEnqueueLiquidityIx,
+  buildExecutionQueueUserIntent,
   buildExecutionQueueExecuteIx,
   buildUserIntentMessage,
   encodeLiquidityDepositQueuePayload,
@@ -17,7 +18,9 @@ import {
   encodePerpPlaceOrderV2QueuePayload,
   hashExecutionQueueAccounts,
   hashExecutionQueuePayload,
+  signExecutionQueueIntentMessage,
 } from './executionQueue';
+import nacl from 'tweetnacl';
 
 describe('Execution Queue Helpers', () => {
   it('encodes payload header and body fields correctly', () => {
@@ -144,6 +147,7 @@ describe('Execution Queue Helpers', () => {
       group,
       executionQueue,
       kind: QueueItemKind.LiquidityDeposit,
+      remainingAccounts: [],
       payload: liquidityPayload,
     });
     const executeIx = await buildExecutionQueueExecuteIx({
@@ -163,5 +167,36 @@ describe('Execution Queue Helpers', () => {
     expect(enqueueLiquidityIx.keys.length).eq(2);
     expect(executeIx.keys.length).eq(3);
     expect(executeIx.data.length).eq(10);
+  });
+
+  it('builds and signs a user intent payload for relayer submission', async () => {
+    const user = Keypair.generate();
+    const group = Keypair.generate().publicKey;
+    const mangoAccount = Keypair.generate().publicKey;
+    const payload = encodePerpCancelAllOrdersQueuePayload({ limit: 9 });
+    const remainingAccounts = [
+      { pubkey: Keypair.generate().publicKey, isWritable: false, isSigner: false },
+      { pubkey: mangoAccount, isWritable: true, isSigner: false },
+      { pubkey: Keypair.generate().publicKey, isWritable: false, isSigner: false },
+    ];
+    const built = await buildExecutionQueueUserIntent({
+      group,
+      mangoAccount,
+      userOwner: user.publicKey,
+      payload,
+      remainingAccounts,
+    });
+    const sig = signExecutionQueueIntentMessage(
+      user.secretKey,
+      built.userIntentMessage,
+    );
+    expect(sig.length).eq(64);
+    expect(
+      nacl.sign.detached.verify(
+        new Uint8Array(built.userIntentMessage),
+        new Uint8Array(sig),
+        user.publicKey.toBytes(),
+      ),
+    ).to.be.true;
   });
 });
