@@ -24,6 +24,8 @@
     "example1-user": "ts-node ts/client/src/scripts/example1-user.ts",
     "example1-admin": "ts-node ts/client/src/scripts/example1-admin.ts",
     "execution-queue-local-bootstrap": "ts-node ts/client/scripts/execution-queue/local-bootstrap.ts",
+    "execution-queue-local-perp-e2e-bootstrap": "ts-node ts/client/scripts/execution-queue/local-perp-e2e-bootstrap.ts",
+    "execution-queue-local-perp-e2e-run": "ts-node ts/client/scripts/execution-queue/local-perp-e2e-run.ts",
     "execution-queue-cranker": "ts-node ts/client/scripts/execution-queue/execution-queue-cranker.ts",
     "ctm-sequencer-relayer": "ts-node ts/client/scripts/execution-queue/ctm-sequencer-relayer.ts",
     "execution-queue-send-mock-perp-intent": "ts-node ts/client/scripts/execution-queue/send-mock-perp-intent-via-relayer.ts",

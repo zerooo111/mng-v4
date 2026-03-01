@@ -1064,25 +1064,9 @@ pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u
         if candidate.accounts_hash != [0; 32]
             && provided_accounts_hash != candidate.accounts_hash
         {
-            let mut queue = ctx.accounts.execution_queue.load_mut()?;
-            let mut buffer = buffer_loader.load_mut()?;
-            let item = &mut buffer.items[candidate.idx];
-            if item.status == QueueItemStatus::Pending as u8 {
-                *item = QueueItem::default();
-                queue.count = queue.count.saturating_sub(1);
-                if candidate.is_ctm_lane {
-                    queue.next_sequence_to_execute =
-                        queue.next_sequence_to_execute.saturating_add(1);
-                    queue.gap_observed_slot = 0;
-                }
-            }
-            emit!(QueueItemProcessed {
-                group: ctx.accounts.group.key(),
-                sequence: candidate.sequence,
-                kind: candidate.kind,
-                status: QueueItemStatus::Failed as u8,
-            });
-            continue;
+            // The caller provided a dispatch lane that doesn't match the head item's account hash.
+            // Leave the queue untouched so another execute call with the correct lane can process it.
+            break;
         }
 
         let dispatch_result = dispatch_queue_payload(
