@@ -1,5 +1,77 @@
 # Usage Guide
 
+## Quickstart (Single Clean Run)
+
+Run from repo root in one shell (starts relayer + cranker in background, then runs E2E):
+
+```bash
+export PATH="/tmp/solana-1.16.14/solana-release/bin:$HOME/.cargo/bin:/home/ec2-user/.local/share/solana/install/active_release/bin:$PATH"
+export CLUSTER_OVERRIDE=devnet
+export CLUSTER_URL_OVERRIDE=http://127.0.0.1:8899
+export CTM_RELAYER_PROGRAM_ID=9nNhSkcxYFujiydpuuhVttUYBqYJQmxCzjrBofBvmutF
+export MB_PAYER_KEYPAIR=/home/ec2-user/.config/solana/id.json
+export GROUP_NUM=9110
+
+# Build + deploy
+cargo build-sbf --manifest-path programs/mango-v4/Cargo.toml --features enable-gpl
+solana program deploy \
+  --url http://127.0.0.1:8899 \
+  target/deploy/mango_v4.so \
+  --program-id target/deploy/mango_v4-keypair.json
+
+# Bootstrap local state
+export EXECUTION_QUEUE_GROUP_NUM=$GROUP_NUM
+export PERP_MARKET_INDEX=0
+npm run -s execution-queue-local-perp-e2e-bootstrap
+
+CFG="/tmp/execution-queue-e2e-${GROUP_NUM}.json"
+LANES="/tmp/execution-queue-lanes-${GROUP_NUM}.json"
+BUFFER_PK="$(node -p "require('${CFG}').executionQueueBuffer")"
+GROUP_PK="$(node -p "require('${CFG}').group")"
+QUEUE_PK="$(node -p "require('${CFG}').executionQueue")"
+
+# Start relayer
+env \
+  CLUSTER_OVERRIDE=devnet \
+  CLUSTER_URL_OVERRIDE=http://127.0.0.1:8899 \
+  CTM_RELAYER_PROGRAM_ID=9nNhSkcxYFujiydpuuhVttUYBqYJQmxCzjrBofBvmutF \
+  CTM_RELAYER_BIND_ADDR=127.0.0.1:9090 \
+  CTM_RELAYER_PAYER_KEYPAIR=/home/ec2-user/.config/solana/id.json \
+  CTM_RELAYER_CTM_KEYPAIR=/home/ec2-user/.config/solana/id.json \
+  EXECUTION_QUEUE_BUFFER_PK="$BUFFER_PK" \
+  CTM_RELAYER_SEQUENCE_STATE_PATH="/tmp/ctm-sequences-${GROUP_NUM}.json" \
+  CTM_RELAYER_MIN_EXECUTE_SLOT_OFFSET=1 \
+  ./node_modules/.bin/ts-node ts/client/scripts/execution-queue/ctm-sequencer-relayer.ts \
+  >/tmp/ctm-relayer-${GROUP_NUM}.log 2>&1 &
+RELAYER_PID=$!
+
+# Start cranker
+env \
+  CLUSTER_OVERRIDE=devnet \
+  CLUSTER_URL_OVERRIDE=http://127.0.0.1:8899 \
+  EXECUTION_QUEUE_GROUP_PK="$GROUP_PK" \
+  EXECUTION_QUEUE_PK="$QUEUE_PK" \
+  EXECUTION_QUEUE_BUFFER_PK="$BUFFER_PK" \
+  EXECUTION_QUEUE_PROGRAM_ID=9nNhSkcxYFujiydpuuhVttUYBqYJQmxCzjrBofBvmutF \
+  EXECUTION_QUEUE_CRANKER_KEYPAIR=/home/ec2-user/.config/solana/id.json \
+  EXECUTION_QUEUE_CRANK_LANES_JSON_PATH="$LANES" \
+  EXECUTION_QUEUE_CRANK_MAX_ITEMS=8 \
+  EXECUTION_QUEUE_CRANK_INTERVAL_MS=1000 \
+  ./node_modules/.bin/ts-node ts/client/scripts/execution-queue/execution-queue-cranker.ts \
+  >/tmp/execution-queue-cranker-${GROUP_NUM}.log 2>&1 &
+CRANKER_PID=$!
+
+# Run E2E
+export CTM_RELAYER_ADDR=127.0.0.1:9090
+export E2E_OUTPUT_CONFIG_PATH="$CFG"
+export E2E_MAKER_MAX_QUOTE_QTY=1000
+export E2E_TAKER_MAX_QUOTE_QTY=1000
+npm run -s execution-queue-local-perp-e2e-run
+
+# Optional cleanup
+kill $RELAYER_PID $CRANKER_PID
+```
+
 ## What Changed
 
 This branch now includes an end-to-end execution-queue path for CTM-sequenced perp actions, plus local tooling to run and validate it.
