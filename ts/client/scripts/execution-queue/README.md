@@ -13,6 +13,8 @@ CLUSTER_URL_OVERRIDE=https://api.devnet.solana.com \
 CTM_RELAYER_PAYER_KEYPAIR=~/.config/solana/id.json \
 CTM_RELAYER_CTM_KEYPAIR=~/.config/solana/id.json \
 CTM_RELAYER_PROGRAM_ID=<optional-program-id-override> \
+CTM_RELAYER_EVENT_SINK_URL=http://127.0.0.1:9091/ingest/relay-intent \
+CTM_RELAYER_EVENT_SINK_AUTH_TOKEN=<optional-token> \
 yarn ctm-sequencer-relayer
 ```
 
@@ -27,6 +29,57 @@ Proto: `ts/client/scripts/execution-queue/ctm_sequencer.proto`
 - `min_execute_slot`, `expires_at_slot`
 - `user_owner`, `mango_account`
 - `user_signature` (ed25519 signature over canonical user-intent message)
+
+## Continuum State Harness (HTTP + SSE :9091)
+
+Reads relay-ingested intents and on-chain queue events, then exposes optimistic and confirmed state from a single API.
+
+### Start
+
+```bash
+CONTINUUM_HARNESS_BIND_ADDR=0.0.0.0:9091 \
+CONTINUUM_HARNESS_MODE=local \
+CONTINUUM_HARNESS_EVENT_LOG_PATH=/tmp/continuum-harness-events.jsonl \
+CONTINUUM_HARNESS_PROGRAM_ID=<optional-program-id-override> \
+CLUSTER_OVERRIDE=devnet \
+CLUSTER_URL_OVERRIDE=http://127.0.0.1:8899 \
+yarn continuum-state-harness
+```
+
+### Key Endpoints
+
+- `POST /ingest/relay-intent`
+- `GET /state/markets/:market?view=optimistic|confirmed`
+- `GET /state/users/:owner?view=optimistic|confirmed`
+- `GET /state/balances/:owner?view=optimistic|confirmed`
+- `GET /state/orders/:market?owner=<pubkey>&view=optimistic|confirmed`
+- `GET /state/trades/:market?view=optimistic|confirmed&limit=200`
+- `GET /state/candles/:market?view=optimistic|confirmed&resolution_sec=60&limit=200`
+- `GET /state/queue/:market`
+- `GET /state/full?market=<id>&view=optimistic|confirmed`
+- `GET /state/stream` (SSE)
+- `GET /healthz`, `GET /metrics`, `GET /diagnostics/divergence`
+
+### Verification (Phase 5)
+
+Chain consistency check (`confirmed` harness view vs on-chain Mango perp open orders):
+
+```bash
+VERIFY_GROUP_PK=<group-pubkey> \
+CLUSTER_OVERRIDE=devnet \
+CLUSTER_URL_OVERRIDE=http://127.0.0.1:8899 \
+CONTINUUM_HARNESS_BASE_URL=http://127.0.0.1:9091 \
+VERIFY_VIEW=confirmed \
+yarn continuum-state-harness-verify
+```
+
+Deterministic replay check (shuffle-replay harness JSONL log):
+
+```bash
+CONTINUUM_HARNESS_EVENT_LOG_PATH=/tmp/continuum-harness-events.jsonl \
+REPLAY_CHECK_ITERATIONS=25 \
+yarn continuum-state-harness-replay-check
+```
 
 ## Execution Queue Cranker
 

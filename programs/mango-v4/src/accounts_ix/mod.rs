@@ -78,6 +78,8 @@ pub use token_register::*;
 pub use token_register_trustless::*;
 pub use token_update_index_and_rate::*;
 pub use token_withdraw::*;
+pub use unsafe_account_create::*;
+pub use unsafe_deposit::*;
 
 mod account_buyback_fees_with_mngo;
 mod account_close;
@@ -159,3 +161,5 @@ mod token_register;
 mod token_register_trustless;
 mod token_update_index_and_rate;
 mod token_withdraw;
+mod unsafe_account_create;
+mod unsafe_deposit;

@@ -1,0 +1,399 @@
+import { expect } from 'chai';
+import { Keypair } from '@solana/web3.js';
+import {
+  ContinuumStateEngine,
+  QueueProcessStatus,
+  decodeQueuePayload,
+} from './continuumHarness';
+import {
+  QueuePlaceOrderType,
+  QueueSelfTradeBehavior,
+  QueueSide,
+  encodePerpCancelAllOrdersQueuePayload,
+  encodePerpPlaceOrderV2QueuePayload,
+} from './executionQueue';
+
+function key(): string {
+  return Keypair.generate().publicKey.toBase58();
+}
+
+describe('Continuum State Harness', () => {
+  it('decodes v1 place-order queue payload', () => {
+    const payload = encodePerpPlaceOrderV2QueuePayload({
+      side: QueueSide.Bid,
+      priceLots: 101,
+      maxBaseLots: 5,
+      maxQuoteLots: 200,
+      clientOrderId: 77,
+      orderType: QueuePlaceOrderType.Limit,
+      selfTradeBehavior: QueueSelfTradeBehavior.DecrementTake,
+      reduceOnly: false,
+      expiryTimestamp: 0,
+      limit: 10,
+    });
+
+    const decoded = decodeQueuePayload(payload);
+    expect(decoded.variant).eq(0);
+    if (decoded.variant !== 0) {
+      throw new Error('expected place-order variant');
+    }
+    expect(decoded.price_lots.toString()).eq('101');
+    expect(decoded.max_base_lots.toString()).eq('5');
+    expect(decoded.client_order_id.toString()).eq('77');
+    expect(decoded.limit).eq(10);
+  });
+
+  it('builds optimistic and confirmed views from relay + processed events', () => {
+    const engine = new ContinuumStateEngine();
+    const group = key();
+    const executionQueue = key();
+    const owner = key();
+    const mangoAccount = key();
+    const market = '0';
+
+    const placePayload = encodePerpPlaceOrderV2QueuePayload({
+      side: QueueSide.Bid,
+      priceLots: 100,
+      maxBaseLots: 2,
+      maxQuoteLots: 100,
+      clientOrderId: 1,
+      orderType: QueuePlaceOrderType.Limit,
+      selfTradeBehavior: QueueSelfTradeBehavior.DecrementTake,
+      reduceOnly: false,
+      expiryTimestamp: 0,
+      limit: 10,
+    });
+
+    engine.ingestRelayIntent({
+      event_type: 'relay_intent_accepted',
+      ts_ms: 1,
+      group,
+      execution_queue: executionQueue,
+      market,
+      sequence: '1',
+      kind: 0,
+      payload_b64: placePayload.toString('base64'),
+      remaining_accounts: [],
+      min_execute_slot: '10',
+      expires_at_slot: '0',
+      user_owner: owner,
+      mango_account: mangoAccount,
+      enqueue_tx_signature: 'tx-enqueue-1',
+    });
+
+    const confirmedBefore = engine.getMarketState(market, 'confirmed');
+    const optimisticBefore = engine.getMarketState(market, 'optimistic');
+
+    expect(confirmedBefore.open_orders.length).eq(0);
+    expect(optimisticBefore.open_orders.length).eq(1);
+
+    engine.ingestQueueProcessed({
+      event_type: 'queue_item_processed',
+      ts_ms: 2,
+      group,
+      sequence: '1',
+      kind: 0,
+      status: QueueProcessStatus.Executed,
+      slot: '20',
+      tx_signature: 'tx-exec-1',
+    });
+
+    const confirmedAfter = engine.getMarketState(market, 'confirmed');
+    expect(confirmedAfter.open_orders.length).eq(1);
+
+    const cancelAllPayload = encodePerpCancelAllOrdersQueuePayload({
+      limit: 20,
+    });
+
+    engine.ingestRelayIntent({
+      event_type: 'relay_intent_accepted',
+      ts_ms: 3,
+      group,
+      execution_queue: executionQueue,
+      market,
+      sequence: '2',
+      kind: 0,
+      payload_b64: cancelAllPayload.toString('base64'),
+      remaining_accounts: [],
+      min_execute_slot: '10',
+      expires_at_slot: '0',
+      user_owner: owner,
+      mango_account: mangoAccount,
+      enqueue_tx_signature: 'tx-enqueue-2',
+    });
+    engine.ingestQueueProcessed({
+      event_type: 'queue_item_processed',
+      ts_ms: 4,
+      group,
+      sequence: '2',
+      kind: 0,
+      status: QueueProcessStatus.Executed,
+      slot: '21',
+      tx_signature: 'tx-exec-2',
+    });
+
+    const confirmedFinal = engine.getMarketState(market, 'confirmed');
+    expect(confirmedFinal.open_orders.length).eq(0);
+  });
+
+  it('replays deterministically regardless of ingestion order', () => {
+    const group = key();
+    const executionQueue = key();
+    const owner = key();
+    const mangoAccount = key();
+    const market = '7';
+
+    const placePayload = encodePerpPlaceOrderV2QueuePayload({
+      side: QueueSide.Ask,
+      priceLots: 88,
+      maxBaseLots: 3,
+      maxQuoteLots: 100,
+      clientOrderId: 44,
+      orderType: QueuePlaceOrderType.Limit,
+      selfTradeBehavior: QueueSelfTradeBehavior.DecrementTake,
+      reduceOnly: false,
+      expiryTimestamp: 0,
+      limit: 10,
+    });
+    const cancelAllPayload = encodePerpCancelAllOrdersQueuePayload({ limit: 10 });
+
+    const ordered = new ContinuumStateEngine();
+    ordered.ingestRelayIntent({
+      event_type: 'relay_intent_accepted',
+      ts_ms: 1,
+      group,
+      execution_queue: executionQueue,
+      market,
+      sequence: '1',
+      kind: 0,
+      payload_b64: placePayload.toString('base64'),
+      remaining_accounts: [],
+      min_execute_slot: '1',
+      expires_at_slot: '0',
+      user_owner: owner,
+      mango_account: mangoAccount,
+      enqueue_tx_signature: 'a',
+    });
+    ordered.ingestRelayIntent({
+      event_type: 'relay_intent_accepted',
+      ts_ms: 2,
+      group,
+      execution_queue: executionQueue,
+      market,
+      sequence: '2',
+      kind: 0,
+      payload_b64: cancelAllPayload.toString('base64'),
+      remaining_accounts: [],
+      min_execute_slot: '1',
+      expires_at_slot: '0',
+      user_owner: owner,
+      mango_account: mangoAccount,
+      enqueue_tx_signature: 'b',
+    });
+    ordered.ingestQueueProcessed({
+      event_type: 'queue_item_processed',
+      ts_ms: 3,
+      group,
+      sequence: '1',
+      kind: 0,
+      status: QueueProcessStatus.Executed,
+      slot: '10',
+      tx_signature: 'c',
+    });
+    ordered.ingestQueueProcessed({
+      event_type: 'queue_item_processed',
+      ts_ms: 4,
+      group,
+      sequence: '2',
+      kind: 0,
+      status: QueueProcessStatus.Executed,
+      slot: '11',
+      tx_signature: 'd',
+    });
+
+    const outOfOrder = new ContinuumStateEngine();
+    outOfOrder.ingestRelayIntent({
+      event_type: 'relay_intent_accepted',
+      ts_ms: 2,
+      group,
+      execution_queue: executionQueue,
+      market,
+      sequence: '2',
+      kind: 0,
+      payload_b64: cancelAllPayload.toString('base64'),
+      remaining_accounts: [],
+      min_execute_slot: '1',
+      expires_at_slot: '0',
+      user_owner: owner,
+      mango_account: mangoAccount,
+      enqueue_tx_signature: 'b',
+    });
+    outOfOrder.ingestQueueProcessed({
+      event_type: 'queue_item_processed',
+      ts_ms: 4,
+      group,
+      sequence: '2',
+      kind: 0,
+      status: QueueProcessStatus.Executed,
+      slot: '11',
+      tx_signature: 'd',
+    });
+    outOfOrder.ingestRelayIntent({
+      event_type: 'relay_intent_accepted',
+      ts_ms: 1,
+      group,
+      execution_queue: executionQueue,
+      market,
+      sequence: '1',
+      kind: 0,
+      payload_b64: placePayload.toString('base64'),
+      remaining_accounts: [],
+      min_execute_slot: '1',
+      expires_at_slot: '0',
+      user_owner: owner,
+      mango_account: mangoAccount,
+      enqueue_tx_signature: 'a',
+    });
+    outOfOrder.ingestQueueProcessed({
+      event_type: 'queue_item_processed',
+      ts_ms: 3,
+      group,
+      sequence: '1',
+      kind: 0,
+      status: QueueProcessStatus.Executed,
+      slot: '10',
+      tx_signature: 'c',
+    });
+
+    expect(outOfOrder.getSnapshot('confirmed')).deep.eq(
+      ordered.getSnapshot('confirmed'),
+    );
+  });
+
+  it('tracks divergences for processed events without relay acceptance', () => {
+    const engine = new ContinuumStateEngine();
+    const group = key();
+
+    engine.ingestQueueProcessed({
+      event_type: 'queue_item_processed',
+      ts_ms: Date.now(),
+      group,
+      sequence: '99',
+      kind: 0,
+      status: QueueProcessStatus.Failed,
+      slot: '123',
+      tx_signature: 'unknown-processed',
+    });
+
+    const divergences = engine.listDivergences();
+    expect(divergences.length).eq(1);
+    expect(divergences[0].reason).eq('processed_without_relay_intent');
+
+    const queue = engine.getQueueState('unknown');
+    expect(queue.unmatched_processed_count).eq(1);
+  });
+
+  it('builds trade prints and candles from crossing executed orders', () => {
+    const engine = new ContinuumStateEngine();
+    const group = key();
+    const executionQueue = key();
+    const makerOwner = key();
+    const takerOwner = key();
+    const makerMango = key();
+    const takerMango = key();
+    const market = '0';
+
+    const makerBid = encodePerpPlaceOrderV2QueuePayload({
+      side: QueueSide.Bid,
+      priceLots: 100,
+      maxBaseLots: 2,
+      maxQuoteLots: 500,
+      clientOrderId: 1,
+      orderType: QueuePlaceOrderType.Limit,
+      selfTradeBehavior: QueueSelfTradeBehavior.DecrementTake,
+      reduceOnly: false,
+      expiryTimestamp: 0,
+      limit: 10,
+    });
+    const takerAsk = encodePerpPlaceOrderV2QueuePayload({
+      side: QueueSide.Ask,
+      priceLots: 99,
+      maxBaseLots: 1,
+      maxQuoteLots: 500,
+      clientOrderId: 2,
+      orderType: QueuePlaceOrderType.Limit,
+      selfTradeBehavior: QueueSelfTradeBehavior.DecrementTake,
+      reduceOnly: false,
+      expiryTimestamp: 0,
+      limit: 10,
+    });
+
+    engine.ingestRelayIntent({
+      event_type: 'relay_intent_accepted',
+      ts_ms: 1000,
+      group,
+      execution_queue: executionQueue,
+      market,
+      sequence: '1',
+      kind: 0,
+      payload_b64: makerBid.toString('base64'),
+      remaining_accounts: [],
+      min_execute_slot: '1',
+      expires_at_slot: '0',
+      user_owner: makerOwner,
+      mango_account: makerMango,
+      enqueue_tx_signature: 'mk',
+    });
+    engine.ingestRelayIntent({
+      event_type: 'relay_intent_accepted',
+      ts_ms: 2000,
+      group,
+      execution_queue: executionQueue,
+      market,
+      sequence: '2',
+      kind: 0,
+      payload_b64: takerAsk.toString('base64'),
+      remaining_accounts: [],
+      min_execute_slot: '1',
+      expires_at_slot: '0',
+      user_owner: takerOwner,
+      mango_account: takerMango,
+      enqueue_tx_signature: 'tk',
+    });
+    engine.ingestQueueProcessed({
+      event_type: 'queue_item_processed',
+      ts_ms: 3000,
+      group,
+      sequence: '1',
+      kind: 0,
+      status: QueueProcessStatus.Executed,
+      slot: '10',
+      tx_signature: 'mk-exec',
+    });
+    engine.ingestQueueProcessed({
+      event_type: 'queue_item_processed',
+      ts_ms: 4000,
+      group,
+      sequence: '2',
+      kind: 0,
+      status: QueueProcessStatus.Executed,
+      slot: '11',
+      tx_signature: 'tk-exec',
+    });
+
+    const trades = engine.getTrades(market, 'confirmed', 10);
+    expect(trades.length).eq(1);
+    expect(trades[0].price_lots).eq('100');
+    expect(trades[0].base_lots).eq('1');
+    expect(trades[0].taker_side).eq('ask');
+
+    const candles = engine.getCandles(market, 'confirmed', 60, 10);
+    expect(candles.length).eq(1);
+    expect(candles[0].open_price_lots).eq('100');
+    expect(candles[0].close_price_lots).eq('100');
+    expect(candles[0].base_volume_lots).eq('1');
+
+    const balances = engine.getBalances(makerOwner, 'confirmed');
+    expect(balances.totals.total_open_order_base_lots_bid).eq('1');
+  });
+});

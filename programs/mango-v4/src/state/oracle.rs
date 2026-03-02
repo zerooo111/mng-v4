@@ -8,9 +8,6 @@ use anchor_lang::{AnchorDeserialize, Discriminator};
 use derivative::Derivative;
 use fixed::types::I80F48;
 use static_assertions::const_assert_eq;
-use switchboard_on_demand::PullFeedAccountData;
-use switchboard_program::FastRoundResultAccountData;
-use switchboard_v2::AggregatorAccountData;
 
 use super::{load_raydium_pool_state, orca_mainnet_whirlpool, raydium_mainnet};
 
@@ -49,24 +46,6 @@ pub const fn power_of_ten(decimals: i8) -> I80F48 {
 pub const QUOTE_DECIMALS: i8 = 6;
 pub const SOL_DECIMALS: i8 = 9;
 pub const QUOTE_NATIVE_TO_UI: I80F48 = power_of_ten(-QUOTE_DECIMALS);
-
-pub mod switchboard_v1_devnet_oracle {
-    use solana_program::declare_id;
-    declare_id!("7azgmy1pFXHikv36q1zZASvFq5vFa39TT9NweVugKKTU");
-}
-pub mod switchboard_v2_mainnet_oracle {
-    use solana_program::declare_id;
-    declare_id!("DtmE9D2CSB4L5D6A15mraeEjrGMm6auWVzgaD8hK2tZM");
-}
-
-pub mod switchboard_on_demand_devnet_oracle {
-    use solana_program::declare_id;
-    declare_id!("SBondMDrcV3K4kxZR1HNVT7osZxAHVHgYXL5Ze1oMUv");
-}
-pub mod switchboard_on_demand_mainnet_oracle {
-    use solana_program::declare_id;
-    declare_id!("SBondMDrcV3K4kxZR1HNVT7osZxAHVHgYXL5Ze1oMUv");
-}
 
 pub mod pyth_mainnet_usdc_oracle {
     use solana_program::declare_id;
@@ -121,11 +100,8 @@ impl OracleConfigParams {
 pub enum OracleType {
     Pyth,
     Stub,
-    SwitchboardV1, // Obsolete
-    SwitchboardV2,
     OrcaCLMM,
     RaydiumCLMM,
-    SwitchboardOnDemand,
 }
 
 pub struct OracleState {
@@ -192,21 +168,7 @@ pub fn determine_oracle_type(acc_info: &impl KeyedAccountReader) -> Result<Oracl
     } else if data[0..8] == StubOracle::discriminator() {
         return Ok(OracleType::Stub);
     }
-    // https://github.com/switchboard-xyz/switchboard-v2/blob/main/libraries/rs/src/aggregator.rs#L114
-    // note: disc is not public, hence the copy pasta
-    else if data[0..8] == [217, 230, 65, 101, 201, 162, 27, 125] {
-        return Ok(OracleType::SwitchboardV2);
-    }
-    // note: this is the only known way of checking this
-    else if acc_info.owner() == &switchboard_v1_devnet_oracle::ID
-        || acc_info.owner() == &switchboard_v2_mainnet_oracle::ID
-    {
-        return Ok(OracleType::SwitchboardV1);
-    } else if acc_info.owner() == &switchboard_on_demand_devnet_oracle::ID
-        || acc_info.owner() == &switchboard_on_demand_mainnet_oracle::ID
-    {
-        return Ok(OracleType::SwitchboardOnDemand);
-    } else if acc_info.owner() == &orca_mainnet_whirlpool::ID {
+    else if acc_info.owner() == &orca_mainnet_whirlpool::ID {
         return Ok(OracleType::OrcaCLMM);
     } else if acc_info.owner() == &raydium_mainnet::ID {
         return Ok(OracleType::RaydiumCLMM);
@@ -369,85 +331,6 @@ fn oracle_state_unchecked_inner<T: KeyedAccountReader>(
             }
         }
         OracleType::Pyth => get_pyth_state(oracle_info, base_decimals)?,
-        OracleType::SwitchboardV2 => {
-            fn from_foreign_error(e: impl std::fmt::Display) -> Error {
-                error_msg!("{}", e)
-            }
-
-            let feed = bytemuck::from_bytes::<AggregatorAccountData>(&data[8..]);
-            let feed_result = feed.get_result().map_err(from_foreign_error)?;
-            let ui_price: f64 = feed_result.try_into().map_err(from_foreign_error)?;
-            let ui_deviation: f64 = feed
-                .latest_confirmed_round
-                .std_deviation
-                .try_into()
-                .map_err(from_foreign_error)?;
-
-            // The round_open_slot is an underestimate of the last update slot: Reporters will see
-            // the round opening and only then start executing the price tasks.
-            let last_update_slot = feed.latest_confirmed_round.round_open_slot;
-
-            let decimals = QUOTE_DECIMALS - (base_decimals as i8);
-            let decimal_adj = power_of_ten(decimals);
-            let price = I80F48::from_num(ui_price) * decimal_adj;
-            let deviation = I80F48::from_num(ui_deviation) * decimal_adj;
-            require_gte!(price, 0);
-            OracleState {
-                price,
-                last_update_slot,
-                deviation,
-                oracle_type: OracleType::SwitchboardV2,
-            }
-        }
-        OracleType::SwitchboardV1 => {
-            let result = FastRoundResultAccountData::deserialize(data).unwrap();
-            let ui_price = I80F48::from_num(result.result.result);
-
-            let ui_deviation =
-                I80F48::from_num(result.result.max_response - result.result.min_response);
-            let last_update_slot = result.result.round_open_slot;
-
-            let decimals = QUOTE_DECIMALS - (base_decimals as i8);
-            let decimal_adj = power_of_ten(decimals);
-            let price = ui_price * decimal_adj;
-            let deviation = ui_deviation * decimal_adj;
-            require_gte!(price, 0);
-            OracleState {
-                price,
-                last_update_slot,
-                deviation,
-                oracle_type: OracleType::SwitchboardV1,
-            }
-        }
-        OracleType::SwitchboardOnDemand => {
-            fn from_foreign_error(e: impl std::fmt::Display) -> Error {
-                error_msg!("{}", e)
-            }
-            let feed = bytemuck::from_bytes::<PullFeedAccountData>(&data[8..]);
-            let ui_price: f64 = feed
-                .value()
-                .ok_or_else(|| error_msg!("missing price"))?
-                .try_into()
-                .map_err(from_foreign_error)?;
-            let ui_deviation: f64 = feed
-                .std_dev()
-                .ok_or_else(|| error_msg!("missing deviation"))?
-                .try_into()
-                .map_err(from_foreign_error)?;
-            let last_update_slot = feed.result.min_slot;
-
-            let decimals = QUOTE_DECIMALS - (base_decimals as i8);
-            let decimal_adj = power_of_ten(decimals);
-            let price = I80F48::from_num(ui_price) * decimal_adj;
-            let deviation = I80F48::from_num(ui_deviation) * decimal_adj;
-            require_gte!(price, 0);
-            OracleState {
-                price,
-                last_update_slot,
-                deviation,
-                oracle_type: OracleType::SwitchboardOnDemand,
-            }
-        }
         OracleType::OrcaCLMM => {
             let whirlpool = load_orca_pool_state(oracle_info)?;
             let clmm_price = whirlpool.get_clmm_price();

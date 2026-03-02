@@ -14,6 +14,7 @@ import * as protoLoader from '@grpc/proto-loader';
 import nacl from 'tweetnacl';
 import { MANGO_V4_ID } from '../../src/constants';
 import {
+  buildIntentEd25519Instruction,
   buildExecutionQueueEnqueueCtmWithIntentIxs,
   IntentSigner,
 } from '../../src/executionQueue';
@@ -41,6 +42,9 @@ const RELAYER_DEFAULT_EXPIRES_AT_SLOT = BigInt(
   process.env.CTM_RELAYER_DEFAULT_EXPIRES_AT_SLOT ?? '0',
 );
 const EXECUTION_QUEUE_BUFFER_PK = process.env.EXECUTION_QUEUE_BUFFER_PK;
+const RELAYER_EVENT_SINK_URL = process.env.CTM_RELAYER_EVENT_SINK_URL || '';
+const RELAYER_EVENT_SINK_AUTH_TOKEN =
+  process.env.CTM_RELAYER_EVENT_SINK_AUTH_TOKEN || '';
 const RELAYER_PRIORITIZATION_FEE = Number(
   process.env.CTM_RELAYER_PRIORITIZATION_FEE ?? '0',
 );
@@ -153,6 +157,58 @@ function parseRemainingAccounts(
   }));
 }
 
+function toHexUtf8IntentMessage(intentMessage: Uint8Array): Buffer {
+  return Buffer.from(Buffer.from(intentMessage).toString('hex'), 'utf-8');
+}
+
+async function maybeEmitRelayIntentAccepted(event: {
+  ts_ms: number;
+  group: string;
+  execution_queue: string;
+  market: string;
+  sequence: string;
+  kind: number;
+  payload_b64: string;
+  remaining_accounts: SubmitIntentRequest['remaining_accounts'];
+  min_execute_slot: string;
+  expires_at_slot: string;
+  user_owner: string;
+  mango_account: string;
+  enqueue_tx_signature: string;
+}): Promise<void> {
+  if (!RELAYER_EVENT_SINK_URL) {
+    return;
+  }
+
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+  if (RELAYER_EVENT_SINK_AUTH_TOKEN.length) {
+    headers.Authorization = `Bearer ${RELAYER_EVENT_SINK_AUTH_TOKEN}`;
+  }
+
+  const body = JSON.stringify({
+    event_type: 'relay_intent_accepted',
+    ...event,
+  });
+
+  try {
+    const response = await fetch(RELAYER_EVENT_SINK_URL, {
+      method: 'POST',
+      headers,
+      body,
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      console.error(
+        `relay event sink failed: status=${response.status}, body=${text.slice(0, 256)}`,
+      );
+    }
+  } catch (err) {
+    console.error('relay event sink request failed:', err);
+  }
+}
+
 async function main(): Promise<void> {
   if (!CLUSTER_URL) {
     throw new Error('CLUSTER_URL_OVERRIDE or MB_CLUSTER_URL is required');
@@ -244,21 +300,55 @@ async function main(): Promise<void> {
               ctmSigner,
             });
 
-            const userSigOk = nacl.sign.detached.verify(
+            const userSigRawOk = nacl.sign.detached.verify(
               new Uint8Array(built.userIntentMessage),
               new Uint8Array(userSigner.signature),
               userOwner.toBytes(),
             );
-            if (!userSigOk) {
+            const userIntentMessageHexUtf8 = toHexUtf8IntentMessage(
+              built.userIntentMessage,
+            );
+            const userSigHexUtf8Ok = nacl.sign.detached.verify(
+              new Uint8Array(userIntentMessageHexUtf8),
+              new Uint8Array(userSigner.signature),
+              userOwner.toBytes(),
+            );
+
+            if (!userSigRawOk && !userSigHexUtf8Ok) {
               throw new Error('user intent signature verification failed');
             }
 
-            const status = await sendTransaction(provider, built.instructions, [], {
+            const userIntentPreInstruction = userSigRawOk
+              ? built.userIntentPreInstruction
+              : buildIntentEd25519Instruction(userIntentMessageHexUtf8, userSigner);
+            const instructions = [
+              userIntentPreInstruction,
+              built.ctmEnvelopePreInstruction,
+              built.enqueueInstruction,
+            ];
+
+            const status = await sendTransaction(provider, instructions, [], {
               prioritizationFee: RELAYER_PRIORITIZATION_FEE,
             });
             return { built, status };
           },
         );
+
+        await maybeEmitRelayIntentAccepted({
+          ts_ms: Date.now(),
+          group: group.toBase58(),
+          execution_queue: executionQueue.toBase58(),
+          market: req.market,
+          sequence: sequence.toString(),
+          kind: value.built.envelope.kind,
+          payload_b64: payload.toString('base64'),
+          remaining_accounts: req.remaining_accounts ?? [],
+          min_execute_slot: minExecuteSlot.toString(),
+          expires_at_slot: expiresAtSlot.toString(),
+          user_owner: userOwner.toBase58(),
+          mango_account: mangoAccount.toBase58(),
+          enqueue_tx_signature: value.status.signature,
+        });
 
         callback(null, {
           sequence: sequence.toString(),

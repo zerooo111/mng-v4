@@ -205,6 +205,19 @@ fn canonical_user_intent_message(
     .to_bytes()
 }
 
+fn canonical_user_intent_message_hex_utf8(msg_hash: [u8; 32]) -> [u8; 64] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = [0u8; 64];
+    let mut i = 0usize;
+    while i < 32 {
+        let b = msg_hash[i];
+        out[i * 2] = HEX[(b >> 4) as usize];
+        out[i * 2 + 1] = HEX[(b & 0x0f) as usize];
+        i += 1;
+    }
+    out
+}
+
 fn queue_payload_variant_from_u8(value: u8) -> Result<QueuePayloadVariant> {
     match value {
         0 => Ok(QueuePayloadVariant::PerpPlaceOrderV2),
@@ -472,7 +485,7 @@ fn ed25519_ix_matches(
     ix: &Instruction,
     ix_index: usize,
     ctm_signer: Pubkey,
-    msg_hash: [u8; 32],
+    message: &[u8],
 ) -> bool {
     if ix.program_id != ed25519_program::id() || ix.data.len() < ED25519_INSTRUCTION_HEADER_LEN {
         return false;
@@ -520,7 +533,7 @@ fn ed25519_ix_matches(
             continue;
         }
 
-        if offsets.message_data_size as usize != msg_hash.len() {
+        if offsets.message_data_size as usize != message.len() {
             continue;
         }
 
@@ -534,7 +547,7 @@ fn ed25519_ix_matches(
             continue;
         };
 
-        if message_bytes == msg_hash.as_ref() {
+        if message_bytes == message {
             return true;
         }
     }
@@ -545,12 +558,12 @@ fn ed25519_ix_matches(
 fn has_ed25519_preinstruction(
     ixs: &AccountInfo,
     ctm_signer: Pubkey,
-    msg_hash: [u8; 32],
+    message: &[u8],
 ) -> Result<bool> {
     let current_index = tx_instructions::load_current_index_checked(ixs)? as usize;
     for index in 0..current_index {
         let ix = tx_instructions::load_instruction_at_checked(index, ixs)?;
-        if ed25519_ix_matches(&ix, index, ctm_signer, msg_hash) {
+        if ed25519_ix_matches(&ix, index, ctm_signer, message) {
             return Ok(true);
         }
     }
@@ -561,9 +574,9 @@ fn has_ed25519_preinstruction(
 fn verify_ed25519_preinstruction(
     ixs: &AccountInfo,
     signer: Pubkey,
-    msg_hash: [u8; 32],
+    message: &[u8],
 ) -> Result<()> {
-    let found = has_ed25519_preinstruction(ixs, signer, msg_hash)?;
+    let found = has_ed25519_preinstruction(ixs, signer, message)?;
     require!(found, MangoError::CtmSignatureMissing);
     Ok(())
 }
@@ -573,8 +586,14 @@ fn verify_user_ed25519_preinstruction(
     signer: Pubkey,
     msg_hash: [u8; 32],
 ) -> Result<()> {
-    let found = has_ed25519_preinstruction(ixs, signer, msg_hash)?;
-    require!(found, MangoError::ExecutionQueueUserSignatureMissing);
+    if has_ed25519_preinstruction(ixs, signer, msg_hash.as_ref())? {
+        return Ok(());
+    }
+
+    // Frontend compatibility: some wallets sign utf8(hex(intent_hash)).
+    let msg_hex_utf8 = canonical_user_intent_message_hex_utf8(msg_hash);
+    let found_hex = has_ed25519_preinstruction(ixs, signer, msg_hex_utf8.as_ref())?;
+    require!(found_hex, MangoError::ExecutionQueueUserSignatureMissing);
     Ok(())
 }
 
@@ -746,7 +765,7 @@ pub fn execution_queue_enqueue_ctm(
     verify_ed25519_preinstruction(
         ctx.accounts.instructions.as_ref(),
         queue.ctm_signer,
-        msg_hash,
+        msg_hash.as_ref(),
     )?;
 
     if variant_uses_queue_owner_signer(decoded_payload.variant) {
@@ -1182,6 +1201,15 @@ mod tests {
     }
 
     #[test]
+    fn canonical_user_intent_hex_utf8_is_lowercase_hex() {
+        let msg_hash = [0xabu8; 32];
+        let hex = canonical_user_intent_message_hex_utf8(msg_hash);
+        assert_eq!(hex.len(), 64);
+        assert_eq!(&hex[..4], b"abab");
+        assert_eq!(&hex[60..], b"abab");
+    }
+
+    #[test]
     fn accounts_hash_changes_with_order() {
         let a = Pubkey::new_unique();
         let b = Pubkey::new_unique();
@@ -1248,7 +1276,7 @@ mod tests {
             ED25519_CURRENT_INSTRUCTION_INDEX,
         );
 
-        assert!(ed25519_ix_matches(&ix, 0, signer, msg_hash));
+        assert!(ed25519_ix_matches(&ix, 0, signer, msg_hash.as_ref()));
     }
 
     #[test]
@@ -1257,7 +1285,7 @@ mod tests {
         let msg_hash = [13u8; 32];
         let ix = test_ed25519_ix(signer, msg_hash, ED25519_CURRENT_INSTRUCTION_INDEX, 7);
 
-        assert!(!ed25519_ix_matches(&ix, 0, signer, msg_hash));
+        assert!(!ed25519_ix_matches(&ix, 0, signer, msg_hash.as_ref()));
     }
 
     #[test]
@@ -1271,6 +1299,6 @@ mod tests {
             ED25519_CURRENT_INSTRUCTION_INDEX,
         );
 
-        assert!(!ed25519_ix_matches(&ix, 0, signer, msg_hash));
+        assert!(!ed25519_ix_matches(&ix, 0, signer, msg_hash.as_ref()));
     }
 }

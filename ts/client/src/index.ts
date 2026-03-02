@@ -21,6 +21,8 @@ export {
   buildIxGate,
 } from './clientIxParamBuilder';
 export * from './constants';
+export * from './continuumHarness';
+export * from './continuumHarnessClient';
 export * from './error';
 export * from './executionQueue';
 export * from './mango_v4';

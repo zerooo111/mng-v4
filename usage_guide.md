@@ -38,12 +38,25 @@ env \
   CTM_RELAYER_BIND_ADDR=127.0.0.1:9090 \
   CTM_RELAYER_PAYER_KEYPAIR=/home/ec2-user/.config/solana/id.json \
   CTM_RELAYER_CTM_KEYPAIR=/home/ec2-user/.config/solana/id.json \
+  CTM_RELAYER_EVENT_SINK_URL=http://127.0.0.1:9091/ingest/relay-intent \
   EXECUTION_QUEUE_BUFFER_PK="$BUFFER_PK" \
   CTM_RELAYER_SEQUENCE_STATE_PATH="/tmp/ctm-sequences-${GROUP_NUM}.json" \
   CTM_RELAYER_MIN_EXECUTE_SLOT_OFFSET=1 \
   ./node_modules/.bin/ts-node ts/client/scripts/execution-queue/ctm-sequencer-relayer.ts \
   >/tmp/ctm-relayer-${GROUP_NUM}.log 2>&1 &
 RELAYER_PID=$!
+
+# Start continuum state harness
+env \
+  CLUSTER_OVERRIDE=devnet \
+  CLUSTER_URL_OVERRIDE=http://127.0.0.1:8899 \
+  CONTINUUM_HARNESS_BIND_ADDR=127.0.0.1:9091 \
+  CONTINUUM_HARNESS_MODE=local \
+  CONTINUUM_HARNESS_PROGRAM_ID=9nNhSkcxYFujiydpuuhVttUYBqYJQmxCzjrBofBvmutF \
+  CONTINUUM_HARNESS_EVENT_LOG_PATH="/tmp/continuum-harness-${GROUP_NUM}.jsonl" \
+  ./node_modules/.bin/ts-node ts/client/scripts/execution-queue/continuum-state-harness.ts \
+  >/tmp/continuum-harness-${GROUP_NUM}.log 2>&1 &
+HARNESS_PID=$!
 
 # Start cranker
 env \
@@ -69,7 +82,7 @@ export E2E_TAKER_MAX_QUOTE_QTY=1000
 npm run -s execution-queue-local-perp-e2e-run
 
 # Optional cleanup
-kill $RELAYER_PID $CRANKER_PID
+kill $RELAYER_PID $CRANKER_PID $HARNESS_PID
 ```
 
 ## What Changed
@@ -125,6 +138,40 @@ solana program deploy \
   --program-id target/deploy/mango_v4-keypair.json
 ```
 
+## SBF Build Notes (Important)
+
+This repo now uses a local patched OpenBook dependency for reliable SBF builds:
+
+- `openbook-v2` is sourced from:
+  - `third-party/openbook-v2-patched/programs/openbook-v2`
+- workspace dependency is pinned in:
+  - `Cargo.toml` (`[workspace.dependencies].openbook-v2`)
+
+Why this patch exists:
+
+- Upstream OpenBook + current toolchain produced SBF failures from:
+  - duplicate `Pod/Zeroable` impls on zero-copy structs,
+  - BPF stack-frame overflows in heavy external oracle account parsers.
+
+Local patch behavior:
+
+- keeps OpenBook support needed by Mango,
+- removes problematic duplicate derives in OpenBook orderbook structs,
+- disables Switchboard/Raydium oracle parsing in patched OpenBook oracle module.
+
+Mango-side build stability change:
+
+- direct `switchboard-*` dependencies were removed from `programs/mango-v4/Cargo.toml`,
+- Mango oracle parsing now targets Pyth/Stub/CLMM paths used in local flow.
+
+If future upstream versions are restored:
+
+1. revert `Cargo.toml` `openbook-v2` path override back to a git rev,
+2. reintroduce required external oracle deps only after `cargo build-sbf` is clean,
+3. run:
+   - `cargo check --manifest-path programs/mango-v4/Cargo.toml --features enable-gpl`
+   - `cargo build-sbf --manifest-path programs/mango-v4/Cargo.toml --features enable-gpl`
+
 ## Local Bootstrap (Group + Queue + Users + Market)
 
 Use a fresh group number for each clean test run.
@@ -154,10 +201,61 @@ env \
   CTM_RELAYER_BIND_ADDR=127.0.0.1:9090 \
   CTM_RELAYER_PAYER_KEYPAIR=/home/ec2-user/.config/solana/id.json \
   CTM_RELAYER_CTM_KEYPAIR=/home/ec2-user/.config/solana/id.json \
+  CTM_RELAYER_EVENT_SINK_URL=http://127.0.0.1:9091/ingest/relay-intent \
   EXECUTION_QUEUE_BUFFER_PK=<from bootstrap output> \
   CTM_RELAYER_SEQUENCE_STATE_PATH=/tmp/ctm-sequences-<GROUP_NUM>.json \
   CTM_RELAYER_MIN_EXECUTE_SLOT_OFFSET=1 \
   ./node_modules/.bin/ts-node ts/client/scripts/execution-queue/ctm-sequencer-relayer.ts
+```
+
+## Start Continuum State Harness (Optimistic + Confirmed API)
+
+```bash
+env \
+  CLUSTER_OVERRIDE=devnet \
+  CLUSTER_URL_OVERRIDE=http://127.0.0.1:8899 \
+  CONTINUUM_HARNESS_BIND_ADDR=127.0.0.1:9091 \
+  CONTINUUM_HARNESS_MODE=local \
+  CONTINUUM_HARNESS_PROGRAM_ID=9nNhSkcxYFujiydpuuhVttUYBqYJQmxCzjrBofBvmutF \
+  CONTINUUM_HARNESS_EVENT_LOG_PATH=/tmp/continuum-harness-<GROUP_NUM>.jsonl \
+  ./node_modules/.bin/ts-node ts/client/scripts/execution-queue/continuum-state-harness.ts
+```
+
+Quick checks:
+
+```bash
+curl -s http://127.0.0.1:9091/healthz | jq
+curl -s 'http://127.0.0.1:9091/state/markets/0?view=optimistic' | jq
+curl -s 'http://127.0.0.1:9091/state/balances/<owner-pubkey>?view=optimistic' | jq
+curl -s 'http://127.0.0.1:9091/state/trades/0?view=confirmed&limit=200' | jq
+curl -s 'http://127.0.0.1:9091/state/candles/0?view=confirmed&resolution_sec=60&limit=200' | jq
+curl -N http://127.0.0.1:9091/state/stream
+```
+
+Full endpoint and schema reference:
+- `api.md`
+
+## Harness Verification (Phase 5)
+
+Consistency check between harness `confirmed` view and live on-chain Mango perp open orders:
+
+```bash
+export VERIFY_GROUP_PK=<group-pubkey>
+export CLUSTER_OVERRIDE=devnet
+export CLUSTER_URL_OVERRIDE=http://127.0.0.1:8899
+export CONTINUUM_HARNESS_BASE_URL=http://127.0.0.1:9091
+export VERIFY_VIEW=confirmed
+
+npm run -s continuum-state-harness-verify
+```
+
+Deterministic replay check against captured harness event log:
+
+```bash
+export CONTINUUM_HARNESS_EVENT_LOG_PATH=/tmp/continuum-harness-<GROUP_NUM>.jsonl
+export REPLAY_CHECK_ITERATIONS=25
+
+npm run -s continuum-state-harness-replay-check
 ```
 
 ## Start Cranker
