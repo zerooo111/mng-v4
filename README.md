@@ -1,5 +1,22 @@
 _work in progress_
 
+## Local Workspace Quick Start
+
+If you are running the full local stack (validator + harness/relayer/bridge + frontend + nginx HTTPS),
+use the root workspace launcher:
+
+- Full instructions: `/home/ec2-user/stagin4/README.md`
+- Launcher script: `/home/ec2-user/stagin4/startup_all_local.sh`
+
+Common commands:
+
+```bash
+cd /home/ec2-user/stagin4
+DEPLOY_TIMEOUT_SECS=45 DEPLOY_RETRIES=0 ./startup_all_local.sh restart
+./startup_all_local.sh status
+./startup_all_local.sh stop
+```
+
 ## License
 
 See the LICENSE file.

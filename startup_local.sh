@@ -22,6 +22,8 @@ CTM_RELAYER_BIND_ADDR="${CTM_RELAYER_BIND_ADDR:-127.0.0.1:9090}"
 HARNESS_BIND_ADDR="${HARNESS_BIND_ADDR:-127.0.0.1:9091}"
 RESET_VALIDATOR="${RESET_VALIDATOR:-1}"
 BUILD_SBF="${BUILD_SBF:-0}"
+# Some services (notably the harness) can take >60s to become ready on cold starts.
+STARTUP_WAIT_TRIES="${STARTUP_WAIT_TRIES:-180}"
 
 BUFFER_LAYOUT_PATH="${RUN_DIR}/execution-queue-buffer-${GROUP_NUM}.json"
 MAKER_KEYPAIR_PATH="${RUN_DIR}/execution-queue-maker-${GROUP_NUM}.json"
@@ -81,7 +83,7 @@ stop_if_running() {
 }
 
 wait_for_rpc() {
-  local max_tries=60
+  local max_tries="${STARTUP_WAIT_TRIES}"
   for _ in $(seq 1 "${max_tries}"); do
     if curl -s "${SOLANA_URL}" \
       -H 'Content-Type: application/json' \
@@ -97,7 +99,7 @@ wait_for_rpc() {
 
 wait_for_http_ok() {
   local url="$1"
-  local max_tries=60
+  local max_tries="${STARTUP_WAIT_TRIES}"
   for _ in $(seq 1 "${max_tries}"); do
     if curl -fsS "${url}" >/dev/null 2>&1; then
       return 0
@@ -120,7 +122,7 @@ port_is_listening() {
 
 wait_for_port_listen() {
   local port="$1"
-  local max_tries=60
+  local max_tries="${STARTUP_WAIT_TRIES}"
   for _ in $(seq 1 "${max_tries}"); do
     if port_is_listening "${port}"; then
       return 0
@@ -133,7 +135,7 @@ wait_for_port_listen() {
 
 wait_for_harness_health() {
   local url="$1"
-  local max_tries=60
+  local max_tries="${STARTUP_WAIT_TRIES}"
   for _ in $(seq 1 "${max_tries}"); do
     if curl -s "${url}" | rg -q '"ok"[[:space:]]*:[[:space:]]*true'; then
       return 0
