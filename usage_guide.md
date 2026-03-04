@@ -107,12 +107,41 @@ Modified file:
   - `ts/client/scripts/execution-queue/local-perp-e2e-bootstrap.ts`
 - Added local full relayer-driven runner:
   - `ts/client/scripts/execution-queue/local-perp-e2e-run.ts`
+- Added random SOL/USDC quoting bot (relayer path):
+  - `ts/client/scripts/execution-queue/random-sol-usdc-quoter-bot.ts`
 - Added package scripts:
   - `execution-queue-local-perp-e2e-bootstrap`
   - `execution-queue-local-perp-e2e-run`
+  - `execution-queue-random-sol-usdc-quoter`
 
 Modified file:
 - `package.json`
+
+## Random Quoter Bot
+
+The quoter submits limit orders through the CTM relayer every 5s.
+
+- Reference price source: CoinGecko Simple Price API (`solana/usd`) primary, on-chain SOL/perp oracle fallback.
+- Price bands: bid in `[ref*(1-2%), ref]`, ask in `[ref, ref*(1+2%)]`.
+- Size: random `1-3` SOL per quote.
+- Flow per bot each tick:
+  - optional `cancel_all` enqueue
+  - `perp_place_order_v2` enqueue
+
+Example:
+
+```bash
+export QUOTER_CONFIG_PATH=/home/ec2-user/stagin4/mng-v4/.localnet/run/execution-queue-e2e-9120.json
+export CLUSTER_URL_OVERRIDE=http://127.0.0.1:8899
+export CTM_RELAYER_ADDR=127.0.0.1:9090
+export QUOTER_INTERVAL_MS=5000
+export QUOTER_PRICE_RANGE_BPS=200
+export QUOTER_SIZE_MIN_SOL=1
+export QUOTER_SIZE_MAX_SOL=3
+export QUOTER_COINGECKO_ASSET_ID=solana
+export QUOTER_COINGECKO_VS_CURRENCY=usd
+npm run -s execution-queue-random-sol-usdc-quoter
+```
 
 ## Prerequisites
 

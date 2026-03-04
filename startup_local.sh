@@ -36,7 +36,12 @@ RELAYER_PID_FILE="${PID_DIR}/relayer.pid"
 HARNESS_PID_FILE="${PID_DIR}/harness.pid"
 CRANKER_PID_FILE="${PID_DIR}/cranker.pid"
 
-export PATH="$HOME/.cargo/bin:/home/ec2-user/.local/share/solana/install/active_release/bin:$PATH"
+SOLANA_116_BIN_DIR="${SOLANA_116_BIN_DIR:-/home/ec2-user/.local/solana-1.16.7-release/bin}"
+if [[ -d "${SOLANA_116_BIN_DIR}" ]]; then
+  export PATH="$HOME/.cargo/bin:${SOLANA_116_BIN_DIR}:/home/ec2-user/.local/share/solana/install/active_release/bin:$PATH"
+else
+  export PATH="$HOME/.cargo/bin:/home/ec2-user/.local/share/solana/install/active_release/bin:$PATH"
+fi
 
 mkdir -p "${LEDGER_DIR}" "${LOG_DIR}" "${RUN_DIR}" "${PID_DIR}"
 cd "${ROOT_DIR}"

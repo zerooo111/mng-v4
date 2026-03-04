@@ -203,10 +203,7 @@ export type UserState = {
     base_position_lots: string;
     quote_position_native: string;
   }>;
-  margin_summary: {
-    status: 'placeholder';
-    source: 'queue-replay';
-  };
+  margin_summary: MarginSummary;
 };
 
 export type QueueState = {
@@ -265,12 +262,78 @@ export type UserBalances = {
     total_open_order_base_lots_ask: string;
     total_quote_reserved_lots: string;
   };
-  margin_summary: {
-    status: 'placeholder';
-    source: 'queue-replay';
-  };
+  margin_summary: MarginSummary;
   view: QueueView;
 };
+
+export type MarginSummaryPlaceholder = {
+  status: 'placeholder';
+  source: 'queue-replay';
+};
+
+export type MarginSummaryEmpty = {
+  status: 'empty';
+  source: 'onchain-mango-health';
+  account_count: 0;
+  totals: {
+    equity_native_quote: string;
+    pnl_native_quote: string;
+    assets_native_quote: string;
+    liabs_native_quote: string;
+    init_health_native_quote: string;
+    maint_health_native_quote: string;
+    margin_usage_fraction: number;
+  };
+  accounts: [];
+};
+
+export type MarginSummaryAccount = {
+  mango_account: string;
+  owner: string;
+  equity_native_quote: string;
+  pnl_native_quote: string;
+  assets_native_quote: string;
+  liabs_native_quote: string;
+  init_health_native_quote: string;
+  maint_health_native_quote: string;
+  init_health_ratio: string;
+  maint_health_ratio: string;
+  margin_usage_fraction: number;
+  perp_positions: Array<{
+    market_index: number;
+    base_position_lots: string;
+    quote_position_native: string;
+  }>;
+};
+
+export type MarginSummaryOk = {
+  status: 'ok';
+  source: 'onchain-mango-health';
+  account_count: number;
+  totals: {
+    equity_native_quote: string;
+    pnl_native_quote: string;
+    assets_native_quote: string;
+    liabs_native_quote: string;
+    init_health_native_quote: string;
+    maint_health_native_quote: string;
+    margin_usage_fraction: number;
+  };
+  // Compatibility fields for consumers that read top-level values.
+  equity_native_quote?: string;
+  pnl_native_quote?: string;
+  assets_native_quote?: string;
+  liabs_native_quote?: string;
+  init_health_native_quote?: string;
+  maint_health_native_quote?: string;
+  margin_usage_fraction?: number;
+  accounts: MarginSummaryAccount[];
+};
+
+export type MarginSummary =
+  | MarginSummaryPlaceholder
+  | MarginSummaryEmpty
+  | MarginSummaryOk;
 
 export type EngineSnapshot = {
   view: QueueView;

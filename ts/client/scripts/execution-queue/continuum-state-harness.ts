@@ -11,6 +11,7 @@ import {
   Keypair,
   Logs,
   PublicKey,
+  SystemProgram,
   TransactionInstruction,
 } from '@solana/web3.js';
 import { createHash } from 'crypto';
@@ -28,6 +29,8 @@ import {
   parseProgramDataLogLine,
 } from '../../src/continuumHarness';
 import { MangoClient } from '../../src/client';
+import { HealthType } from '../../src/accounts/mangoAccount';
+import { ZERO_I80F48 } from '../../src/numbers/I80F48';
 
 dotenv.config();
 
@@ -67,6 +70,26 @@ const HARNESS_GROUP_PK =
 const HARNESS_AIRDROP_DEPOSIT_UI_AMOUNT = Number(
   process.env.CONTINUUM_HARNESS_AIRDROP_DEPOSIT_UI_AMOUNT || '1000',
 );
+const HARNESS_AIRDROP_AUTO_CREATE_MANGO_ACCOUNT =
+  (process.env.CONTINUUM_HARNESS_AIRDROP_AUTO_CREATE_MANGO_ACCOUNT ||
+    (HARNESS_MODE === 'local' ? 'true' : 'false')) === 'true';
+const HARNESS_AIRDROP_AUTO_CREATE_ACCOUNT_NUM = Number(
+  process.env.CONTINUUM_HARNESS_AIRDROP_AUTO_CREATE_ACCOUNT_NUM || '0',
+);
+const HARNESS_AIRDROP_AUTO_CREATE_TOKEN_COUNT = Number(
+  process.env.CONTINUUM_HARNESS_AIRDROP_AUTO_CREATE_TOKEN_COUNT || '8',
+);
+const HARNESS_AIRDROP_AUTO_CREATE_SERUM3_COUNT = Number(
+  process.env.CONTINUUM_HARNESS_AIRDROP_AUTO_CREATE_SERUM3_COUNT || '4',
+);
+const HARNESS_AIRDROP_AUTO_CREATE_PERP_COUNT = Number(
+  process.env.CONTINUUM_HARNESS_AIRDROP_AUTO_CREATE_PERP_COUNT || '4',
+);
+const HARNESS_AIRDROP_AUTO_CREATE_PERP_OO_COUNT = Number(
+  process.env.CONTINUUM_HARNESS_AIRDROP_AUTO_CREATE_PERP_OO_COUNT || '32',
+);
+const HARNESS_AIRDROP_AUTO_CREATE_NAME =
+  process.env.CONTINUUM_HARNESS_AIRDROP_AUTO_CREATE_NAME || 'harness-auto';
 const HARNESS_SANITY_INTERVAL_MS = Number(
   process.env.CONTINUUM_HARNESS_SANITY_INTERVAL_MS || '5000',
 );
@@ -394,6 +417,20 @@ function u64ToLe(value: bigint): Buffer {
   return out;
 }
 
+function u32ToLe(value: number): Buffer {
+  if (!Number.isInteger(value) || value < 0 || value > 0xffffffff) {
+    throw new Error(`u32 out of range: ${value}`);
+  }
+  const out = Buffer.alloc(4);
+  out.writeUInt32LE(value, 0);
+  return out;
+}
+
+function anchorString(value: string): Buffer {
+  const encoded = Buffer.from(value, 'utf8');
+  return Buffer.concat([u32ToLe(encoded.length), encoded]);
+}
+
 function parseOwnerFromAirdropRequest(
   req: IncomingMessage,
   url: URL,
@@ -412,28 +449,52 @@ function parseOwnerFromAirdropRequest(
   return owner;
 }
 
-async function enrichBalancesWithOnchainCollateral(
+async function enrichOwnerStateWithOnchain(
   ownerRaw: string,
-  baseBalances: any,
+  baseState: any,
   airdrop: AirdropContext | null,
   view: QueueView,
 ): Promise<any> {
   if (!airdrop?.mangoClient || !airdrop.groupPk) {
-    return baseBalances;
+    return baseState;
   }
 
   let owner: PublicKey;
   try {
     owner = new PublicKey(ownerRaw);
   } catch {
-    return baseBalances;
+    return baseState;
   }
 
   try {
     const group = await airdrop.mangoClient.getGroup(airdrop.groupPk);
     const ownerAccounts = await airdrop.mangoClient.getMangoAccountsForOwner(group, owner);
     if (!ownerAccounts.length) {
-      return baseBalances;
+      return {
+        ...baseState,
+        margin_summary: {
+          status: 'empty',
+          source: 'onchain-mango-health',
+          account_count: 0,
+          totals: {
+            equity_native_quote: '0',
+            pnl_native_quote: '0',
+            assets_native_quote: '0',
+            liabs_native_quote: '0',
+            init_health_native_quote: '0',
+            maint_health_native_quote: '0',
+            margin_usage_fraction: 0,
+          },
+          equity_native_quote: '0',
+          pnl_native_quote: '0',
+          assets_native_quote: '0',
+          liabs_native_quote: '0',
+          init_health_native_quote: '0',
+          maint_health_native_quote: '0',
+          margin_usage_fraction: 0,
+          accounts: [],
+        },
+      };
     }
 
     const tokenTotals = new Map<
@@ -474,6 +535,55 @@ async function enrichBalancesWithOnchainCollateral(
     );
     const usdcMint = airdrop.usdcMint.toBase58();
     const usdcToken = tokens.find((t) => t.mint === usdcMint);
+    const aggregate = {
+      equity: ZERO_I80F48(),
+      pnl: ZERO_I80F48(),
+      assets: ZERO_I80F48(),
+      liabs: ZERO_I80F48(),
+      initHealth: ZERO_I80F48(),
+      maintHealth: ZERO_I80F48(),
+    };
+    const marginAccounts = ownerAccounts.map((account) => {
+      const equity = account.getEquity(group);
+      const pnl = account.getPnl(group);
+      const assets = account.getAssetsValue(group, HealthType.init);
+      const liabs = account.getLiabsValue(group);
+      const initHealth = account.getHealth(group, HealthType.init);
+      const maintHealth = account.getHealth(group, HealthType.maint);
+      const initHealthRatio = account.getHealthRatio(group, HealthType.init);
+      const maintHealthRatio = account.getHealthRatio(group, HealthType.maint);
+      aggregate.equity.iadd(equity);
+      aggregate.pnl.iadd(pnl);
+      aggregate.assets.iadd(assets);
+      aggregate.liabs.iadd(liabs);
+      aggregate.initHealth.iadd(initHealth);
+      aggregate.maintHealth.iadd(maintHealth);
+      const assetsNum = assets.toNumber();
+      const liabsNum = liabs.toNumber();
+      const marginUsage = assetsNum > 0 ? liabsNum / assetsNum : 0;
+      return {
+        mango_account: account.publicKey.toBase58(),
+        owner: account.owner.toBase58(),
+        equity_native_quote: equity.toString(),
+        pnl_native_quote: pnl.toString(),
+        assets_native_quote: assets.toString(),
+        liabs_native_quote: liabs.toString(),
+        init_health_native_quote: initHealth.toString(),
+        maint_health_native_quote: maintHealth.toString(),
+        init_health_ratio: initHealthRatio.toString(),
+        maint_health_ratio: maintHealthRatio.toString(),
+        margin_usage_fraction: Number.isFinite(marginUsage) ? marginUsage : 0,
+        perp_positions: account.perpActive().map((p) => ({
+          market_index: p.marketIndex,
+          base_position_lots: p.basePositionLots.toString(),
+          quote_position_native: p.quotePositionNative.toString(),
+        })),
+      };
+    });
+
+    const totalMarginUsage = aggregate.assets.toNumber() > 0
+      ? aggregate.liabs.div(aggregate.assets).toNumber()
+      : 0;
 
     const collateralPayload = {
       source:
@@ -486,18 +596,44 @@ async function enrichBalancesWithOnchainCollateral(
     };
 
     return {
-      ...baseBalances,
+      ...baseState,
       mango_accounts:
-        baseBalances.mango_accounts?.length
-          ? baseBalances.mango_accounts
+        baseState.mango_accounts?.length
+          ? baseState.mango_accounts
           : ownerAccounts.map((a) => a.publicKey.toBase58()),
+      margin_summary: {
+        status: 'ok',
+        source: 'onchain-mango-health',
+        account_count: marginAccounts.length,
+        totals: {
+          equity_native_quote: aggregate.equity.toString(),
+          pnl_native_quote: aggregate.pnl.toString(),
+          assets_native_quote: aggregate.assets.toString(),
+          liabs_native_quote: aggregate.liabs.toString(),
+          init_health_native_quote: aggregate.initHealth.toString(),
+          maint_health_native_quote: aggregate.maintHealth.toString(),
+          margin_usage_fraction: Number.isFinite(totalMarginUsage)
+            ? totalMarginUsage
+            : 0,
+        },
+        equity_native_quote: aggregate.equity.toString(),
+        pnl_native_quote: aggregate.pnl.toString(),
+        assets_native_quote: aggregate.assets.toString(),
+        liabs_native_quote: aggregate.liabs.toString(),
+        init_health_native_quote: aggregate.initHealth.toString(),
+        maint_health_native_quote: aggregate.maintHealth.toString(),
+        margin_usage_fraction: Number.isFinite(totalMarginUsage)
+          ? totalMarginUsage
+          : 0,
+        accounts: marginAccounts,
+      },
       ...(view === 'confirmed'
         ? { confirmed_collateral: collateralPayload }
         : { optimistic_collateral: collateralPayload }),
     };
   } catch (err) {
     console.warn(`failed to enrich ${view} balances for ${ownerRaw}: ${err}`);
-    return baseBalances;
+    return baseState;
   }
 }
 
@@ -689,6 +825,77 @@ async function processAirdropRequest(
   };
 }
 
+async function createUnsafeMangoAccountForOwner(
+  airdrop: AirdropContext,
+  group: any,
+  owner: PublicKey,
+  accountNum: number,
+): Promise<{
+  mangoAccountPk: PublicKey;
+  created: boolean;
+  txSignature: string | null;
+}> {
+  const [mangoAccountPk] = PublicKey.findProgramAddressSync(
+    [
+      Buffer.from('MangoAccount'),
+      group.publicKey.toBuffer(),
+      owner.toBuffer(),
+      u32ToLe(accountNum),
+    ],
+    airdrop.programId,
+  );
+
+  const existingAi = await airdrop.connection.getAccountInfo(
+    mangoAccountPk,
+    HARNESS_COMMITMENT,
+  );
+  if (existingAi) {
+    return { mangoAccountPk, created: false, txSignature: null };
+  }
+
+  const ixData = Buffer.concat([
+    anchorDiscriminator('unsafe_account_create'),
+    u32ToLe(accountNum),
+    Buffer.from([
+      HARNESS_AIRDROP_AUTO_CREATE_TOKEN_COUNT,
+      HARNESS_AIRDROP_AUTO_CREATE_SERUM3_COUNT,
+      HARNESS_AIRDROP_AUTO_CREATE_PERP_COUNT,
+      HARNESS_AIRDROP_AUTO_CREATE_PERP_OO_COUNT,
+    ]),
+    anchorString(HARNESS_AIRDROP_AUTO_CREATE_NAME),
+  ]);
+  const createIx = new TransactionInstruction({
+    programId: airdrop.programId,
+    keys: [
+      { pubkey: group.publicKey, isSigner: false, isWritable: false },
+      { pubkey: mangoAccountPk, isSigner: false, isWritable: true },
+      { pubkey: owner, isSigner: false, isWritable: false },
+      { pubkey: airdrop.faucet.publicKey, isSigner: true, isWritable: false },
+      { pubkey: airdrop.faucet.publicKey, isSigner: true, isWritable: true },
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+    ],
+    data: ixData,
+  });
+
+  try {
+    const status = await airdrop.mangoClient!.sendAndConfirmTransactionForGroup(
+      group,
+      [createIx],
+    );
+    return { mangoAccountPk, created: true, txSignature: status.signature };
+  } catch (err) {
+    // Handle races where another request creates the same account first.
+    const raceAi = await airdrop.connection.getAccountInfo(
+      mangoAccountPk,
+      HARNESS_COMMITMENT,
+    );
+    if (raceAi) {
+      return { mangoAccountPk, created: false, txSignature: null };
+    }
+    throw err;
+  }
+}
+
 async function processAirdropDepositRequest(
   req: IncomingMessage,
   url: URL,
@@ -703,6 +910,8 @@ async function processAirdropDepositRequest(
   raw_amount: string;
   unsafe_deposit_tx_signature: string;
   execution_path: 'unsafe_deposit' | 'token_deposit_into_existing_fallback';
+  auto_created_mango_account: boolean;
+  unsafe_account_create_tx_signature: string | null;
 }> {
   if (!airdrop) {
     throw new Error('airdrop endpoint is disabled');
@@ -722,6 +931,8 @@ async function processAirdropDepositRequest(
   const ownerRaw = parseOwnerFromAirdropRequest(req, url, payload);
   const owner = new PublicKey(ownerRaw);
   const group = await airdrop.mangoClient.getGroup(airdrop.groupPk);
+  let autoCreatedMangoAccount = false;
+  let unsafeAccountCreateTxSignature: string | null = null;
 
   let mangoAccount;
   const requestedMangoAccount = payload?.mango_account as string | undefined;
@@ -738,9 +949,32 @@ async function processAirdropDepositRequest(
   } else {
     const ownerAccounts = await airdrop.mangoClient.getMangoAccountsForOwner(group, owner);
     if (!ownerAccounts.length) {
-      throw new Error('no mango account found for owner in configured group');
+      if (!HARNESS_AIRDROP_AUTO_CREATE_MANGO_ACCOUNT) {
+        throw new Error('no mango account found for owner in configured group');
+      }
+      const requestedAccountNum = payload?.account_num;
+      const accountNum = requestedAccountNum === undefined
+        ? HARNESS_AIRDROP_AUTO_CREATE_ACCOUNT_NUM
+        : Number(requestedAccountNum);
+      if (
+        !Number.isInteger(accountNum) ||
+        accountNum < 0 ||
+        accountNum > 0xffffffff
+      ) {
+        throw new Error('account_num must be a valid u32');
+      }
+      const createResult = await createUnsafeMangoAccountForOwner(
+        airdrop,
+        group,
+        owner,
+        accountNum,
+      );
+      mangoAccount = await airdrop.mangoClient.getMangoAccount(createResult.mangoAccountPk);
+      autoCreatedMangoAccount = createResult.created;
+      unsafeAccountCreateTxSignature = createResult.txSignature;
+    } else {
+      mangoAccount = ownerAccounts[0];
     }
-    mangoAccount = ownerAccounts[0];
   }
 
   const rawAmount = toRawAmount(airdrop.depositUiAmount, airdrop.decimals);
@@ -812,6 +1046,8 @@ async function processAirdropDepositRequest(
     raw_amount: rawAmount.toString(),
     unsafe_deposit_tx_signature: unsafeDepositSignature,
     execution_path: executionPath,
+    auto_created_mango_account: autoCreatedMangoAccount,
+    unsafe_account_create_tx_signature: unsafeAccountCreateTxSignature,
   };
 }
 
@@ -955,9 +1191,16 @@ function buildHttpServer(airdrop: AirdropContext | null): http.Server {
       if (method === 'GET' && url.pathname.startsWith('/state/users/')) {
         const owner = decodeURIComponent(url.pathname.slice('/state/users/'.length));
         const view = parseView(url);
+        const baseUserState = engine.getUserState(owner, view);
+        const data = await enrichOwnerStateWithOnchain(
+          owner,
+          baseUserState,
+          airdrop,
+          view,
+        );
         writeJson(res, 200, {
           view,
-          data: engine.getUserState(owner, view),
+          data,
         });
         return;
       }
@@ -968,7 +1211,7 @@ function buildHttpServer(airdrop: AirdropContext | null): http.Server {
         );
         const view = parseView(url);
         const baseBalances = engine.getBalances(owner, view);
-        const data = await enrichBalancesWithOnchainCollateral(
+        const data = await enrichOwnerStateWithOnchain(
           owner,
           baseBalances,
           airdrop,
