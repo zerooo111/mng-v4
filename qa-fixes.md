@@ -420,3 +420,41 @@
 - Follow-up:
   - The stale relayer process that startup launched before the rebuild stayed on the old binary; after replacing it with the rebuilt Rust engine, the executor immediately began draining.
   - The execution-queue refactor and local Mango integration path are now in working shape again; the remaining work returns to throughput optimization rather than queue-account correctness.
+
+### 32) Fresh post-refactor throughput result: offchain submit path now clears 50 ops/s; queue drain is the new bottleneck
+- Run profile:
+  - fresh localnet group `9123`
+  - Rust relayer/executor active on:
+    - gRPC `127.0.0.1:9090`
+    - HTTP metrics `127.0.0.1:9093`
+  - 10 provisioned quote bots
+  - quoter settings:
+    - `QUOTER_INTERVAL_MS=100`
+    - `QUOTER_NONBLOCKING_SUBMIT=true`
+    - `QUOTER_MAX_INFLIGHT=500`
+    - `QUOTER_CANCEL_MODE=client-id`
+    - `QUOTER_CANCEL_EVERY_TICKS=1`
+    - `QUOTER_CANCEL_BEFORE_PLACE=true`
+    - `QUOTER_LOG_EACH_ORDER=false`
+- Client-side observed generation:
+  - quoter reported roughly `43-45 place intents/s`
+  - quoter reported roughly `88-90 combined intents/s`
+- Harness-validated acceptance over the main window:
+  - `1841` `relay_intent_accepted` events
+  - acceptance window duration: about `20.718s`
+  - accepted throughput: about `88.86 ops/s`
+- Relayer metrics during the run:
+  - `execution_engine_requests_total 1844`
+  - `execution_engine_requests_ok_total 1844`
+  - `execution_engine_requests_error_total 0`
+  - `execution_engine_submit_avg_ms 183.388`
+- Queue / execute observations:
+  - only `14` `queue_item_processed` events occurred in the same window
+  - queue inspection immediately after the run showed:
+    - `count=1000`
+    - `next=20`
+    - `max=1845`
+  - this means the execution queue filled completely while accepted submissions continued at high rate
+- Implication:
+  - Offchain submit throughput is no longer the primary blocker for the `50 place/cancel ops/s` target.
+  - The bottleneck has shifted to queue drain / onchain execution throughput.

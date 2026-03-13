@@ -673,7 +673,7 @@ async function main(): Promise<void> {
                 bot.group,
                 mangoAccount,
                 marketIndex,
-                bot.lastPlacedClientOrderId,
+                new BN(bot.lastPlacedClientOrderId),
               );
               const cancelRemaining = executionQueueRemainingAccountsFromMangoIx(
                 executionQueuePk,
