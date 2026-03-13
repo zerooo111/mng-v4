@@ -1,0 +1,26 @@
+[package]
+name = "service-mango-execution-engine"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+anyhow = "1.0"
+anchor-lang = { workspace = true }
+mango-v4 = { path = "../../programs/mango-v4", features = ["client", "enable-gpl"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["full"] }
+tonic = { version = "0.11", features = ["transport"] }
+prost = "0.12"
+warp = "0.3.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+solana-client = { workspace = true }
+solana-sdk = { workspace = true, default-features = false }
+solana-program = { workspace = true }
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+base64 = "0.22"
+
+[build-dependencies]
+tonic-build = { version = "0.11", features = ["prost"] }

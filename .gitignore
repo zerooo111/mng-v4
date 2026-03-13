@@ -20,5 +20,4 @@ err-txs
 
 .localnet
 .localnet.bak.*
-bin/
 third-party
