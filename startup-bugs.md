@@ -83,3 +83,34 @@
   - Gate the validator `--bpf-program` arguments on `PRELOAD_PROGRAM_IN_VALIDATOR`.
 - Restart rule:
   - If deploy mode is intended for debugging CPI/runtime behavior, verify both the deploy step and validator launch path honor the same preload flag.
+
+### 8) Ad-hoc local cranker runs can silently target the wrong program id
+- Symptom:
+  - Manual `execution-queue-cranker.ts` runs on local validator failed with:
+    - `Transaction simulation failed: Attempt to load a program that does not exist`
+  - The onchain `execution_queue_execute` path looked broken even after direct-dispatch fixes were deployed.
+- Root cause:
+  - The cranker defaults to `MANGO_V4_ID[CLUSTER]`.
+  - In local ad-hoc runs, if `EXECUTION_QUEUE_PROGRAM_ID` is not set explicitly, the cranker can target the wrong program id even while `CLUSTER_URL_OVERRIDE` points at `127.0.0.1:8899`.
+- Fix:
+  - Always set `EXECUTION_QUEUE_PROGRAM_ID` for local cranker runs.
+  - The checked-in startup path now passes the local program id; the repeated failure only came from manual shell invocations that omitted it.
+- Restart rule:
+  - When a local execute simulation fails with “program does not exist” and no Mango logs, check the program id in the client-side execute builder before changing onchain code.
+
+### 9) Detached `ts-node` cranker launch is not currently reliable enough to be the source of truth
+- Symptom:
+  - Foreground cranker runs worked and drained the queue.
+  - The same cranker launched detached from `startup_local.sh` appeared to start, but no long-lived process remained and no queue executes were sent.
+- Root cause:
+  - The local daemonized `ts-node` cranker launch path is flaky in this environment.
+  - This is separate from the onchain execute path; direct interactive runs proved execute works.
+- Fix:
+  - Treat the foreground cranker invocation as the known-good local execute runner for now.
+  - Document the clean path as:
+    1. deployed validator
+    2. Rust relayer
+    3. foreground TS cranker
+    4. E2E runner
+- Restart rule:
+  - If submit is healthy but the queue never drains, verify the cranker is truly alive with a direct foreground run before investigating the program.

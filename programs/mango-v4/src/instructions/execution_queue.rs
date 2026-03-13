@@ -468,6 +468,129 @@ fn dispatch_perp_place_order_v2<'info>(
     Ok(())
 }
 
+fn queue_owner_signer<'info>(dispatch_accounts: &[AccountInfo<'info>]) -> Result<Signer<'info>> {
+    require!(
+        dispatch_accounts.len() >= 3,
+        MangoError::ExecutionQueueDispatchAccountLayoutInvalid
+    );
+    let mut owner_ai = dispatch_accounts[2].clone();
+    owner_ai.is_signer = true;
+    Signer::try_from(&owner_ai)
+        .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))
+}
+
+fn dispatch_perp_cancel_all_orders<'info>(
+    payload: &PerpCancelAllOrdersPayload,
+    dispatch_accounts: &[AccountInfo<'info>],
+) -> Result<()> {
+    require!(
+        dispatch_accounts.len() >= 6,
+        MangoError::ExecutionQueueDispatchAccountLayoutInvalid
+    );
+
+    let mut accounts = PerpCancelAllOrders {
+        group: AccountLoader::try_from(&dispatch_accounts[0])
+            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
+        account: AccountLoader::try_from(&dispatch_accounts[1])
+            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
+        owner: queue_owner_signer(dispatch_accounts)?,
+        perp_market: AccountLoader::try_from(&dispatch_accounts[3])
+            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
+        bids: AccountLoader::try_from(&dispatch_accounts[4])
+            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
+        asks: AccountLoader::try_from(&dispatch_accounts[5])
+            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
+    };
+    let program_id = crate::id();
+    let ctx = Context::new(&program_id, &mut accounts, &dispatch_accounts[6..], BTreeMap::new());
+    crate::instructions::perp_cancel_all_orders(ctx, payload.limit)?;
+    Ok(())
+}
+
+fn dispatch_perp_cancel_all_orders_by_side<'info>(
+    payload: &PerpCancelAllOrdersBySidePayload,
+    dispatch_accounts: &[AccountInfo<'info>],
+) -> Result<()> {
+    require!(
+        dispatch_accounts.len() >= 6,
+        MangoError::ExecutionQueueDispatchAccountLayoutInvalid
+    );
+
+    let mut accounts = PerpCancelAllOrdersBySide {
+        group: AccountLoader::try_from(&dispatch_accounts[0])
+            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
+        account: AccountLoader::try_from(&dispatch_accounts[1])
+            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
+        owner: queue_owner_signer(dispatch_accounts)?,
+        perp_market: AccountLoader::try_from(&dispatch_accounts[3])
+            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
+        bids: AccountLoader::try_from(&dispatch_accounts[4])
+            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
+        asks: AccountLoader::try_from(&dispatch_accounts[5])
+            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
+    };
+    let program_id = crate::id();
+    let ctx = Context::new(&program_id, &mut accounts, &dispatch_accounts[6..], BTreeMap::new());
+    crate::instructions::perp_cancel_all_orders_by_side(ctx, payload.side_option, payload.limit)?;
+    Ok(())
+}
+
+fn dispatch_perp_cancel_order<'info>(
+    payload: &PerpCancelOrderPayload,
+    dispatch_accounts: &[AccountInfo<'info>],
+) -> Result<()> {
+    require!(
+        dispatch_accounts.len() >= 6,
+        MangoError::ExecutionQueueDispatchAccountLayoutInvalid
+    );
+
+    let mut accounts = PerpCancelOrder {
+        group: AccountLoader::try_from(&dispatch_accounts[0])
+            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
+        account: AccountLoader::try_from(&dispatch_accounts[1])
+            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
+        owner: queue_owner_signer(dispatch_accounts)?,
+        perp_market: AccountLoader::try_from(&dispatch_accounts[3])
+            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
+        bids: AccountLoader::try_from(&dispatch_accounts[4])
+            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
+        asks: AccountLoader::try_from(&dispatch_accounts[5])
+            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
+    };
+    let program_id = crate::id();
+    let ctx = Context::new(&program_id, &mut accounts, &dispatch_accounts[6..], BTreeMap::new());
+    crate::instructions::perp_cancel_order(ctx, payload.order_id)?;
+    Ok(())
+}
+
+fn dispatch_perp_cancel_order_by_client_order_id<'info>(
+    payload: &PerpCancelOrderByClientOrderIdPayload,
+    dispatch_accounts: &[AccountInfo<'info>],
+) -> Result<()> {
+    require!(
+        dispatch_accounts.len() >= 6,
+        MangoError::ExecutionQueueDispatchAccountLayoutInvalid
+    );
+
+    let mut accounts = PerpCancelOrderByClientOrderId {
+        group: AccountLoader::try_from(&dispatch_accounts[0])
+            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
+        account: AccountLoader::try_from(&dispatch_accounts[1])
+            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
+        owner: queue_owner_signer(dispatch_accounts)?,
+        perp_market: AccountLoader::try_from(&dispatch_accounts[3])
+            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
+        bids: AccountLoader::try_from(&dispatch_accounts[4])
+            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
+        asks: AccountLoader::try_from(&dispatch_accounts[5])
+            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
+    };
+    let program_id = crate::id();
+    let ctx = Context::new(&program_id, &mut accounts, &dispatch_accounts[6..], BTreeMap::new());
+    crate::instructions::perp_cancel_order_by_client_order_id(ctx, payload.client_order_id)?;
+    Ok(())
+}
+
 fn dispatch_queue_payload(
     payload: &DecodedQueuePayload,
     dispatch_accounts: &[AccountInfo],
@@ -476,8 +599,23 @@ fn dispatch_queue_payload(
     execution_queue_key: Pubkey,
     execution_queue_bump: u8,
 ) -> Result<()> {
-    if let QueuePayloadBody::PerpPlaceOrderV2(place) = &payload.body {
-        return dispatch_perp_place_order_v2(place, dispatch_accounts);
+    match &payload.body {
+        QueuePayloadBody::PerpPlaceOrderV2(place) => {
+            return dispatch_perp_place_order_v2(place, dispatch_accounts);
+        }
+        QueuePayloadBody::PerpCancelOrder(cancel) => {
+            return dispatch_perp_cancel_order(cancel, dispatch_accounts);
+        }
+        QueuePayloadBody::PerpCancelOrderByClientOrderId(cancel) => {
+            return dispatch_perp_cancel_order_by_client_order_id(cancel, dispatch_accounts);
+        }
+        QueuePayloadBody::PerpCancelAllOrders(cancel) => {
+            return dispatch_perp_cancel_all_orders(cancel, dispatch_accounts);
+        }
+        QueuePayloadBody::PerpCancelAllOrdersBySide(cancel) => {
+            return dispatch_perp_cancel_all_orders_by_side(cancel, dispatch_accounts);
+        }
+        _ => {}
     }
 
     require!(

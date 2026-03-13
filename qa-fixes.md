@@ -458,3 +458,36 @@
 - Implication:
   - Offchain submit throughput is no longer the primary blocker for the `50 place/cancel ops/s` target.
   - The bottleneck has shifted to queue drain / onchain execution throughput.
+
+### 33) Local deployed-mode place/cancel E2E is green again with direct queue dispatch and external cranker
+- Changes validated together:
+  - `execution_queue_execute` now directly dispatches queued perp operations for:
+    - `PerpPlaceOrderV2`
+    - `PerpCancelOrder`
+    - `PerpCancelOrderByClientOrderId`
+    - `PerpCancelAllOrders`
+    - `PerpCancelAllOrdersBySide`
+  - This removes the failing self-dispatch path from the local place/cancel queue flow.
+  - Local execute testing also confirmed that ad-hoc cranker runs must set `EXECUTION_QUEUE_PROGRAM_ID` or they can target the wrong program id on localnet.
+- Known-good local workflow:
+  - start stack:
+    - `PRELOAD_PROGRAM_IN_VALIDATOR=0 RESET_VALIDATOR=1 CTM_RELAYER_IMPL=rust EXECUTION_QUEUE_ENGINE_ENABLED=false ./startup_local.sh restart`
+  - run cranker in foreground with explicit local program id
+  - run:
+    - `CLUSTER_OVERRIDE=devnet CLUSTER_URL_OVERRIDE=http://127.0.0.1:8899 CTM_RELAYER_ADDR=127.0.0.1:9090 E2E_OUTPUT_CONFIG_PATH=.localnet/run/execution-queue-e2e-9120.json E2E_MAKER_MAX_QUOTE_QTY=1000 E2E_TAKER_MAX_QUOTE_QTY=1000 npm run -s execution-queue-local-perp-e2e-run`
+- Latest validated result on `2026-03-13`:
+  - E2E output returned:
+    - `status: ok`
+  - relayer submissions:
+    - maker place sequence `3`
+    - taker place sequence `4`
+    - cancel-all sequence `5`
+  - final positions:
+    - maker `20000` base lots
+    - taker `-20000` base lots
+  - queue inspector after drain:
+    - `count=0`
+    - `next=3`
+- Operational note:
+  - The embedded Rust executor remains disabled in the clean local path for now.
+  - The current reliable execute runner is the external TS cranker with the explicit local program id.

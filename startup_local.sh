@@ -383,7 +383,7 @@ start_cranker() {
   if [[ -z "${buffer_pk}" ]]; then
     buffer_pk="${queue_pk}"
   fi
-  setsid env \
+  nohup env \
     CLUSTER_OVERRIDE=devnet \
     CLUSTER_URL_OVERRIDE="${SOLANA_URL}" \
     EXECUTION_QUEUE_GROUP_PK="${group_pk}" \
@@ -401,6 +401,34 @@ start_cranker() {
 }
 
 run_e2e() {
+  local temp_cranker_pid=""
+  if [[ "${CTM_RELAYER_IMPL}" == "rust" && "${EXECUTION_QUEUE_ENGINE_ENABLED}" != "true" ]]; then
+    local group_pk queue_pk buffer_pk
+    group_pk="$(read_cfg_field group)"
+    queue_pk="$(read_cfg_field executionQueue)"
+    buffer_pk="$(read_cfg_field executionQueueBuffer || true)"
+    if [[ -z "${buffer_pk}" ]]; then
+      buffer_pk="${queue_pk}"
+    fi
+    env \
+      CLUSTER_OVERRIDE=devnet \
+      CLUSTER_URL_OVERRIDE="${SOLANA_URL}" \
+      EXECUTION_QUEUE_GROUP_PK="${group_pk}" \
+      EXECUTION_QUEUE_PK="${queue_pk}" \
+      EXECUTION_QUEUE_BUFFER_PK="${buffer_pk}" \
+      EXECUTION_QUEUE_PROGRAM_ID="${PROGRAM_ID}" \
+      EXECUTION_QUEUE_CRANKER_KEYPAIR="${MB_PAYER_KEYPAIR}" \
+      EXECUTION_QUEUE_CRANK_LANES_JSON_PATH="${LANE_CONFIG_PATH}" \
+      EXECUTION_QUEUE_CRANK_RELAY_EVENT_LOG_PATH="${CONTINUUM_EVENT_LOG_PATH}" \
+      EXECUTION_QUEUE_CRANK_MAX_ITEMS=8 \
+      EXECUTION_QUEUE_CRANK_INTERVAL_MS=1000 \
+      node -r ts-node/register/transpile-only ts/client/scripts/execution-queue/execution-queue-cranker.ts \
+      >"${LOG_DIR}/execution-queue-cranker.log" 2>&1 < /dev/null &
+    temp_cranker_pid="$!"
+    sleep 2
+  fi
+
+  local exit_code=0
   env \
     CLUSTER_OVERRIDE=devnet \
     CLUSTER_URL_OVERRIDE="${SOLANA_URL}" \
@@ -408,7 +436,14 @@ run_e2e() {
     E2E_OUTPUT_CONFIG_PATH="${E2E_OUTPUT_CONFIG_PATH}" \
     E2E_MAKER_MAX_QUOTE_QTY=1000 \
     E2E_TAKER_MAX_QUOTE_QTY=1000 \
-    npm run -s execution-queue-local-perp-e2e-run
+    npm run -s execution-queue-local-perp-e2e-run || exit_code=$?
+
+  if [[ -n "${temp_cranker_pid}" ]]; then
+    kill "${temp_cranker_pid}" 2>/dev/null || true
+    wait "${temp_cranker_pid}" 2>/dev/null || true
+  fi
+
+  return "${exit_code}"
 }
 
 start_all() {

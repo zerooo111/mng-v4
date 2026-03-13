@@ -1,5 +1,102 @@
 # Execution Queue Relayer + Cranker
 
+## Working Local E2E Pipeline
+
+This is the current known-good end-to-end path for local validator testing with:
+- deployed Mango program on local validator
+- Rust relayer for submit
+- external TS cranker for execute
+- one intent per place tx
+
+### 1. Start the local stack
+
+```bash
+PRELOAD_PROGRAM_IN_VALIDATOR=0 \
+RESET_VALIDATOR=1 \
+CTM_RELAYER_IMPL=rust \
+EXECUTION_QUEUE_ENGINE_ENABLED=false \
+./startup_local.sh restart
+```
+
+Expected healthy ports:
+- validator RPC: `http://127.0.0.1:8899`
+- relayer gRPC: `127.0.0.1:9090`
+- relayer HTTP health/metrics: `http://127.0.0.1:9093`
+- harness HTTP: `http://127.0.0.1:9091`
+
+### 2. Start the cranker in a separate terminal
+
+```bash
+cd /home/ec2-user/stagin4/mng-v4
+
+env \
+  CLUSTER_OVERRIDE=devnet \
+  CLUSTER_URL_OVERRIDE=http://127.0.0.1:8899 \
+  EXECUTION_QUEUE_GROUP_PK=9VYm4QaBhEPEiFfyGxXEDpN7ZTh2muajTDebKrDL4f5k \
+  EXECUTION_QUEUE_PK=HfaFVCt5FnLQfLETidHYopgQ2RqpW5JhR66yfQdtYrFP \
+  EXECUTION_QUEUE_BUFFER_PK=HfaFVCt5FnLQfLETidHYopgQ2RqpW5JhR66yfQdtYrFP \
+  EXECUTION_QUEUE_PROGRAM_ID=9nNhSkcxYFujiydpuuhVttUYBqYJQmxCzjrBofBvmutF \
+  EXECUTION_QUEUE_CRANKER_KEYPAIR=/home/ec2-user/.config/solana/id.json \
+  EXECUTION_QUEUE_CRANK_LANES_JSON_PATH=.localnet/run/execution-queue-lanes-9120.json \
+  EXECUTION_QUEUE_CRANK_RELAY_EVENT_LOG_PATH=.localnet/run/continuum-harness-9120.jsonl \
+  EXECUTION_QUEUE_CRANK_MAX_ITEMS=8 \
+  EXECUTION_QUEUE_CRANK_INTERVAL_MS=1000 \
+  node -r ts-node/register/transpile-only \
+  ts/client/scripts/execution-queue/execution-queue-cranker.ts
+```
+
+Important:
+- `EXECUTION_QUEUE_PROGRAM_ID` must be set on localnet. If omitted, the cranker falls back to `MANGO_V4_ID[CLUSTER]` and can target the wrong program id.
+- `EXECUTION_QUEUE_ENGINE_ENABLED=false` keeps execute traffic out of the Rust relayer while the external cranker is used.
+
+### 3. Run the E2E test
+
+```bash
+CLUSTER_OVERRIDE=devnet \
+CLUSTER_URL_OVERRIDE=http://127.0.0.1:8899 \
+CTM_RELAYER_ADDR=127.0.0.1:9090 \
+E2E_OUTPUT_CONFIG_PATH=.localnet/run/execution-queue-e2e-9120.json \
+E2E_MAKER_MAX_QUOTE_QTY=1000 \
+E2E_TAKER_MAX_QUOTE_QTY=1000 \
+npm run -s execution-queue-local-perp-e2e-run
+```
+
+Expected result:
+- JSON output with `"status": "ok"`
+- relayer submissions for maker place, taker place, and cancel
+- queue drains back to `count=0`
+
+Last validated result on `2026-03-13`:
+- `status: ok`
+- maker sequence `3`
+- taker sequence `4`
+- cancel sequence `5`
+- final positions:
+  - maker `20000` base lots
+  - taker `-20000` base lots
+
+### 4. Quick checks
+
+```bash
+./startup_local.sh status
+curl -s http://127.0.0.1:9093/metrics | rg 'execution_engine_(requests|execute)'
+npx ts-node --transpile-only ts/client/scripts/execution-queue/inspect-queue-head.ts \
+  .localnet/run/execution-queue-e2e-9120.json
+```
+
+Healthy expectations:
+- `status` shows validator / harness / relayer running
+- queue inspector reports `count=0`
+- relayer request counters advance
+
+### Current recommendation
+
+For local integration testing, prefer:
+- Rust relayer for submit
+- external TS cranker for execute
+
+The embedded Rust executor is still under separate debugging and should not be treated as the default clean-path execute runner yet.
+
 ## CTM Sequencer Relayer (gRPC :9090)
 
 Runs a gRPC server that accepts user-signed intents, assigns a **market-specific sequence number**, applies CTM envelope signing, and submits `execution_queue_enqueue_ctm`.
