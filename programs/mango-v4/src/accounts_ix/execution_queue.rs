@@ -4,7 +4,7 @@ use anchor_lang::prelude::*;
 use anchor_lang::solana_program::sysvar::instructions as tx_instructions;
 
 #[derive(Accounts)]
-pub struct ExecutionQueueInit<'info> {
+pub struct ExecutionQueueCreate<'info> {
     #[account(
         mut,
         constraint = group.load()?.admin == admin.key() @ MangoError::SomeError,
@@ -13,15 +13,52 @@ pub struct ExecutionQueueInit<'info> {
     #[account(
         init,
         payer = payer,
-        space = 8 + std::mem::size_of::<ExecutionQueue>(),
+        space = EXECUTION_QUEUE_CREATE_SPACE,
         seeds = [b"ExecutionQueue".as_ref(), group.key().as_ref()],
         bump,
     )]
-    pub execution_queue: AccountLoader<'info, ExecutionQueue>,
+    /// CHECK: zero-copy queue account is initialized after chunked expansion
+    pub execution_queue: UncheckedAccount<'info>,
     #[account(mut)]
     pub payer: Signer<'info>,
     pub admin: Signer<'info>,
     pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct ExecutionQueueResize<'info> {
+    #[account(
+        mut,
+        constraint = group.load()?.admin == admin.key() @ MangoError::SomeError,
+    )]
+    pub group: AccountLoader<'info, Group>,
+    #[account(
+        mut,
+        seeds = [b"ExecutionQueue".as_ref(), group.key().as_ref()],
+        bump,
+    )]
+    /// CHECK: chunked grow path before zero-copy init
+    pub execution_queue: UncheckedAccount<'info>,
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub admin: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct ExecutionQueueInit<'info> {
+    #[account(
+        mut,
+        constraint = group.load()?.admin == admin.key() @ MangoError::SomeError,
+    )]
+    pub group: AccountLoader<'info, Group>,
+    #[account(
+        zero,
+        seeds = [b"ExecutionQueue".as_ref(), group.key().as_ref()],
+        bump,
+    )]
+    pub execution_queue: AccountLoader<'info, ExecutionQueue>,
+    pub admin: Signer<'info>,
 }
 
 #[derive(Accounts)]

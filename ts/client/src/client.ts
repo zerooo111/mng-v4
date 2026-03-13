@@ -152,7 +152,7 @@ export type MangoClientOptions = {
 
 export type ExecutionQueueEnqueueCtmWithIntentParams = {
   executionQueue: PublicKey;
-  executionQueueBuffer: PublicKey;
+  executionQueueBuffer?: PublicKey;
   remainingAccounts: AccountMeta[];
   payload: Uint8Array;
   sequence: bigint | BN | number;
@@ -166,7 +166,7 @@ export type ExecutionQueueEnqueueCtmWithIntentParams = {
 
 export type ExecutionQueueBaseCtmParams = {
   executionQueue: PublicKey;
-  executionQueueBuffer: PublicKey;
+  executionQueueBuffer?: PublicKey;
   sequence: bigint | BN | number;
   minExecuteSlot: bigint | BN | number;
   expiresAtSlot?: bigint | BN | number;

@@ -21,12 +21,41 @@ import {
 import { MangoClient } from '../../src/client';
 import {
   buildExecutionQueueUserIntent,
+  encodePerpCancelOrderByClientOrderIdQueuePayload,
   encodePerpCancelAllOrdersQueuePayload,
   encodePerpPlaceOrderV2QueuePayload,
   signExecutionQueueIntentMessage,
 } from '../../src/executionQueue';
 
 dotenv.config();
+
+const WS_HANDSHAKE_405 = 'Unexpected server response: 405';
+
+function shouldIgnoreBackgroundWsHandshakeError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : `${err}`;
+  return msg.includes(WS_HANDSHAKE_405);
+}
+
+process.on('uncaughtException', (err) => {
+  if (shouldIgnoreBackgroundWsHandshakeError(err)) {
+    console.error(
+      `ignoring background websocket handshake error: ${err instanceof Error ? err.message : err}`,
+    );
+    return;
+  }
+  console.error(err);
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (err) => {
+  if (shouldIgnoreBackgroundWsHandshakeError(err)) {
+    console.error(
+      `ignoring background websocket rejection: ${err instanceof Error ? err.message : err}`,
+    );
+    return;
+  }
+  console.error('unhandled rejection in quoter:', err);
+});
 
 type BotSpec = {
   name: string;
@@ -35,13 +64,22 @@ type BotSpec = {
   side: PerpOrderSide;
 };
 
+type BotSpecWire = {
+  name: string;
+  keypairPath: string;
+  mangoAccount: string;
+  side: 'bid' | 'ask' | 'buy' | 'sell';
+};
+
 type BotRuntime = {
   name: string;
   keypair: Keypair;
   mangoAccountPk: PublicKey;
+  mangoAccount: Awaited<ReturnType<MangoClient['getMangoAccount']>>;
   side: PerpOrderSide;
   client: MangoClient;
   group: Awaited<ReturnType<MangoClient['getGroup']>>;
+  lastPlacedClientOrderId: number | null;
 };
 
 type E2EConfig = {
@@ -70,6 +108,8 @@ const CONFIG_PATH =
   process.env.E2E_OUTPUT_CONFIG_PATH ||
   '/tmp/execution-queue-e2e-9101.json';
 const CLUSTER_URL_OVERRIDE = process.env.CLUSTER_URL_OVERRIDE;
+const CLUSTER_WS_URL_OVERRIDE =
+  process.env.CLUSTER_WS_URL_OVERRIDE || process.env.MB_CLUSTER_WS_URL || '';
 const RELAYER_ADDR_OVERRIDE = process.env.CTM_RELAYER_ADDR;
 const COMMITMENT: Commitment =
   (process.env.QUOTER_COMMITMENT as Commitment) || 'confirmed';
@@ -82,6 +122,8 @@ const MIN_EXECUTE_SLOT_OFFSET = BigInt(
 );
 const CANCEL_BEFORE_PLACE =
   (process.env.QUOTER_CANCEL_BEFORE_PLACE || 'true') === 'true';
+const CANCEL_MODE = (process.env.QUOTER_CANCEL_MODE || 'all').toLowerCase();
+const CANCEL_EVERY_TICKS = Number(process.env.QUOTER_CANCEL_EVERY_TICKS || '1');
 const CANCEL_LIMIT = Number(process.env.QUOTER_CANCEL_LIMIT || '255');
 const ORDER_LIMIT = Number(process.env.QUOTER_ORDER_LIMIT || '20');
 const QUOTE_BUDGET_MULTIPLIER = Number(
@@ -96,10 +138,40 @@ const COINGECKO_VS_CURRENCY =
 const COINGECKO_TIMEOUT_MS = Number(
   process.env.QUOTER_COINGECKO_TIMEOUT_MS || '1500',
 );
+const COINGECKO_REFRESH_MS = Number(
+  process.env.QUOTER_COINGECKO_REFRESH_MS || '10000',
+);
+const BOTS_JSON_PATH = process.env.QUOTER_BOTS_JSON_PATH || '';
+const BOTS_JSON = process.env.QUOTER_BOTS_JSON || '';
+const PARALLEL_BOT_EXECUTION =
+  (process.env.QUOTER_PARALLEL_BOT_EXECUTION || 'true') === 'true';
+const LOG_TPS_EVERY_TICKS = Number(process.env.QUOTER_LOG_TPS_EVERY_TICKS || '5');
+const LOG_EACH_ORDER = (process.env.QUOTER_LOG_EACH_ORDER || 'true') === 'true';
+const NONBLOCKING_SUBMIT =
+  (process.env.QUOTER_NONBLOCKING_SUBMIT || 'false') === 'true';
+const MAX_INFLIGHT = Number(process.env.QUOTER_MAX_INFLIGHT || '200');
+const RELAYER_RPC_TIMEOUT_MS = Number(
+  process.env.QUOTER_RELAYER_RPC_TIMEOUT_MS || '5000',
+);
+const GROUP_RELOAD_EVERY_TICKS = Number(
+  process.env.QUOTER_GROUP_RELOAD_EVERY_TICKS || '0',
+);
+const ACCOUNT_RELOAD_EVERY_TICKS = Number(
+  process.env.QUOTER_ACCOUNT_RELOAD_EVERY_TICKS || '0',
+);
+const MIN_INTERVAL_MS = Number(process.env.QUOTER_MIN_INTERVAL_MS || '100');
 const BOT_SIDES = (process.env.QUOTER_BOT_SIDES || 'bid,ask')
   .split(',')
   .map((v) => v.trim().toLowerCase())
   .filter((v) => v.length > 0);
+const DEBUG_STARTUP = (process.env.QUOTER_DEBUG_STARTUP || 'false') === 'true';
+
+function startupDebug(msg: string): void {
+  if (!DEBUG_STARTUP) {
+    return;
+  }
+  console.error(`[quoter-startup] ${msg}`);
+}
 
 function readKeypair(rawPathOrJson: string): Keypair {
   const maybeFile = path.resolve(rawPathOrJson);
@@ -133,7 +205,8 @@ function executionQueueRemainingAccountsFromMangoIx(
   const remaining = keys.map((k) => ({
     pubkey: k.pubkey,
     isWritable: k.isWritable,
-    isSigner: k.isSigner,
+    // Queue-dispatched instructions must not require user signatures at enqueue time.
+    isSigner: false,
   }));
   remaining[2] = {
     pubkey: executionQueue,
@@ -163,6 +236,24 @@ function randomQuotePrice(
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function deriveWsEndpoint(httpUrl: string): string | null {
+  try {
+    const parsed = new URL(httpUrl);
+    const protocol = parsed.protocol === 'https:' ? 'wss:' : 'ws:';
+    let port = parsed.port;
+    if (
+      (parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost') &&
+      parsed.port === '8899'
+    ) {
+      port = '8900';
+    }
+    const host = port.length ? `${parsed.hostname}:${port}` : parsed.hostname;
+    return `${protocol}//${host}${parsed.pathname || ''}`;
+  } catch {
+    return null;
+  }
 }
 
 async function submitIntentViaRelayer(params: {
@@ -209,6 +300,9 @@ async function submitIntentViaRelayer(params: {
           mango_account: params.mangoAccount.toBase58(),
           user_signature: Buffer.from(userSignature),
         },
+        {
+          deadline: Date.now() + RELAYER_RPC_TIMEOUT_MS,
+        },
         (
           err: Error | null,
           res: { sequence: string; tx_signature: string },
@@ -225,6 +319,22 @@ async function submitIntentViaRelayer(params: {
 }
 
 function loadBotSpecs(config: E2EConfig): BotSpec[] {
+  if (BOTS_JSON_PATH.length || BOTS_JSON.length) {
+    const raw = BOTS_JSON_PATH.length
+      ? fs.readFileSync(path.resolve(BOTS_JSON_PATH), 'utf-8')
+      : BOTS_JSON;
+    const parsed = JSON.parse(raw) as BotSpecWire[];
+    if (!Array.isArray(parsed) || !parsed.length) {
+      throw new Error('QUOTER_BOTS_JSON_PATH/QUOTER_BOTS_JSON must contain a non-empty array');
+    }
+    return parsed.map((bot, i) => ({
+      name: bot.name || `bot-${i}`,
+      keypairPath: bot.keypairPath,
+      mangoAccount: bot.mangoAccount,
+      side: sideFromString(bot.side),
+    }));
+  }
+
   const specs: BotSpec[] = [];
   if (config.maker?.keypairPath && config.maker?.mangoAccount) {
     specs.push({
@@ -248,6 +358,16 @@ function loadBotSpecs(config: E2EConfig): BotSpec[] {
     );
   }
   return specs;
+}
+
+function isRelayerTransportError(errText: string): boolean {
+  const msg = errText.toLowerCase();
+  return (
+    msg.includes('unavailable') ||
+    msg.includes('channel has been shut down') ||
+    msg.includes('connection dropped') ||
+    msg.includes('no connection established')
+  );
 }
 
 function getOnchainReferencePriceUi(params: {
@@ -295,8 +415,12 @@ async function fetchCoinGeckoReferencePriceUi(): Promise<number> {
 }
 
 async function main(): Promise<void> {
-  if (INTERVAL_MS < 1000) {
-    throw new Error('QUOTER_INTERVAL_MS must be >= 1000');
+  startupDebug('main-enter');
+  if (!Number.isFinite(MIN_INTERVAL_MS) || MIN_INTERVAL_MS <= 0) {
+    throw new Error('QUOTER_MIN_INTERVAL_MS must be > 0');
+  }
+  if (INTERVAL_MS < MIN_INTERVAL_MS) {
+    throw new Error(`QUOTER_INTERVAL_MS must be >= ${MIN_INTERVAL_MS}`);
   }
   if (PRICE_RANGE_BPS <= 0 || PRICE_RANGE_BPS > 1000) {
     throw new Error('QUOTER_PRICE_RANGE_BPS must be in (0, 1000]');
@@ -304,10 +428,32 @@ async function main(): Promise<void> {
   if (SIZE_MIN_SOL <= 0 || SIZE_MAX_SOL < SIZE_MIN_SOL) {
     throw new Error('invalid QUOTER_SIZE_MIN_SOL / QUOTER_SIZE_MAX_SOL');
   }
+  if (!Number.isFinite(COINGECKO_REFRESH_MS) || COINGECKO_REFRESH_MS <= 0) {
+    throw new Error('QUOTER_COINGECKO_REFRESH_MS must be > 0');
+  }
+  if (!Number.isInteger(MAX_INFLIGHT) || MAX_INFLIGHT <= 0) {
+    throw new Error('QUOTER_MAX_INFLIGHT must be an integer > 0');
+  }
+  if (!Number.isInteger(CANCEL_EVERY_TICKS) || CANCEL_EVERY_TICKS <= 0) {
+    throw new Error('QUOTER_CANCEL_EVERY_TICKS must be an integer > 0');
+  }
+  if (CANCEL_MODE !== 'all' && CANCEL_MODE !== 'client-id') {
+    throw new Error('QUOTER_CANCEL_MODE must be all or client-id');
+  }
+  if (!Number.isInteger(GROUP_RELOAD_EVERY_TICKS) || GROUP_RELOAD_EVERY_TICKS < 0) {
+    throw new Error('QUOTER_GROUP_RELOAD_EVERY_TICKS must be an integer >= 0');
+  }
+  if (
+    !Number.isInteger(ACCOUNT_RELOAD_EVERY_TICKS) ||
+    ACCOUNT_RELOAD_EVERY_TICKS < 0
+  ) {
+    throw new Error('QUOTER_ACCOUNT_RELOAD_EVERY_TICKS must be an integer >= 0');
+  }
 
   const config = JSON.parse(
     fs.readFileSync(path.resolve(CONFIG_PATH), 'utf-8'),
   ) as E2EConfig;
+  startupDebug('config-loaded');
   const cluster = config.cluster;
   const clusterUrl = CLUSTER_URL_OVERRIDE || config.clusterUrl;
   const relayerAddr = RELAYER_ADDR_OVERRIDE || config.relayer?.bindAddr || '127.0.0.1:9090';
@@ -316,10 +462,18 @@ async function main(): Promise<void> {
   const marketIndex = config.perpMarketIndex as PerpMarketIndex;
   const solMintPk = config.solMint ? new PublicKey(config.solMint) : null;
 
-  const connection = new Connection(clusterUrl, COMMITMENT);
+  const wsEndpoint = CLUSTER_WS_URL_OVERRIDE || deriveWsEndpoint(clusterUrl) || undefined;
+  const connection = new Connection(clusterUrl, {
+    ...AnchorProvider.defaultOptions(),
+    commitment: COMMITMENT,
+    wsEndpoint,
+  });
+  startupDebug(`connection-created ws=${wsEndpoint || 'default'}`);
   const botSpecs = loadBotSpecs(config);
+  startupDebug(`bot-specs-loaded count=${botSpecs.length}`);
 
   const bots: BotRuntime[] = [];
+  let sharedGroup: Awaited<ReturnType<MangoClient['getGroup']>> | null = null;
   for (const spec of botSpecs) {
     const keypair = readKeypair(spec.keypairPath);
     const provider = new AnchorProvider(
@@ -330,14 +484,23 @@ async function main(): Promise<void> {
     const client = await MangoClient.connect(provider, cluster, new PublicKey(config.programId), {
       idsSource: 'get-program-accounts',
     });
-    const group = await client.getGroup(groupPk);
+    startupDebug(`client-connected bot=${spec.name}`);
+    if (!sharedGroup) {
+      sharedGroup = await client.getGroup(groupPk);
+      startupDebug('group-loaded');
+    }
+    const mangoAccountPk = new PublicKey(spec.mangoAccount);
+    const mangoAccount = await client.getMangoAccount(mangoAccountPk);
+    startupDebug(`mango-account-loaded bot=${spec.name}`);
     bots.push({
       name: spec.name,
       keypair,
-      mangoAccountPk: new PublicKey(spec.mangoAccount),
+      mangoAccountPk,
+      mangoAccount,
       side: spec.side,
       client,
-      group,
+      group: sharedGroup,
+      lastPlacedClientOrderId: null,
     });
   }
 
@@ -350,6 +513,7 @@ async function main(): Promise<void> {
     oneofs: true,
   });
   const proto = grpc.loadPackageDefinition(pkgDef) as any;
+  startupDebug('grpc-proto-loaded');
   const buildRelayerClient = () =>
     new proto.ctmsequencer.CtmSequencerRelayer(
       relayerAddr,
@@ -379,7 +543,14 @@ async function main(): Promise<void> {
         assetId: COINGECKO_ASSET_ID,
         vsCurrency: COINGECKO_VS_CURRENCY,
         apiBase: COINGECKO_API_BASE,
+        refreshMs: COINGECKO_REFRESH_MS,
       },
+      parallelBotExecution: PARALLEL_BOT_EXECUTION,
+      logEachOrder: LOG_EACH_ORDER,
+      nonblockingSubmit: NONBLOCKING_SUBMIT,
+      maxInFlight: MAX_INFLIGHT,
+      groupReloadEveryTicks: GROUP_RELOAD_EVERY_TICKS,
+      accountReloadEveryTicks: ACCOUNT_RELOAD_EVERY_TICKS,
       bots: bots.map((b) => ({
         name: b.name,
         owner: b.keypair.publicKey.toBase58(),
@@ -389,68 +560,179 @@ async function main(): Promise<void> {
     }),
   );
 
+  let totalPlaceIntents = 0;
+  let totalCancelIntents = 0;
+  let ticks = 0;
+  const startedAtMs = Date.now();
+  let cachedCoinGeckoPriceUi: number | null = null;
+  let cachedCoinGeckoTsMs = 0;
+  const inFlight = new Set<Promise<void>>();
+
+  const handleTickError = (err: unknown) => {
+    const errText = err instanceof Error ? err.message : `${err}`;
+    if (isRelayerTransportError(errText)) {
+      try {
+        relayerClient.close();
+      } catch {
+        // no-op
+      }
+      relayerClient = buildRelayerClient();
+    }
+    console.error(
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        msg: 'quote tick failed',
+        error: errText,
+      }),
+    );
+  };
+
   while (running) {
     const tickStart = Date.now();
     try {
-      await bots[0].group.reloadAll(bots[0].client);
-      let referencePrice: number;
-      let referenceSource: 'coingecko' | 'onchain-fallback' = 'coingecko';
-      try {
-        referencePrice = await fetchCoinGeckoReferencePriceUi();
-      } catch (e) {
-        referencePrice = getOnchainReferencePriceUi({
-          group: bots[0].group,
-          marketIndex,
-          solMint: solMintPk,
-        });
-        referenceSource = 'onchain-fallback';
-        console.warn(
-          JSON.stringify({
-            ts: new Date().toISOString(),
-            msg: 'coingecko price fetch failed; using onchain fallback',
-            error: e instanceof Error ? e.message : `${e}`,
+      const currentTick = ticks + 1;
+      if (
+        GROUP_RELOAD_EVERY_TICKS > 0 &&
+        currentTick % GROUP_RELOAD_EVERY_TICKS === 0
+      ) {
+        await bots[0].group.reloadAll(bots[0].client);
+      }
+      if (
+        ACCOUNT_RELOAD_EVERY_TICKS > 0 &&
+        currentTick % ACCOUNT_RELOAD_EVERY_TICKS === 0
+      ) {
+        await Promise.all(
+          bots.map(async (bot) => {
+            bot.mangoAccount = await bot.client.getMangoAccount(bot.mangoAccountPk);
           }),
         );
+      }
+      let referencePrice: number;
+      let referenceSource: 'coingecko' | 'onchain-fallback' = 'coingecko';
+      const nowMs = Date.now();
+      const shouldRefreshCoinGecko =
+        cachedCoinGeckoPriceUi === null ||
+        nowMs - cachedCoinGeckoTsMs >= COINGECKO_REFRESH_MS;
+      if (shouldRefreshCoinGecko) {
+        try {
+          const fetched = await fetchCoinGeckoReferencePriceUi();
+          cachedCoinGeckoPriceUi = fetched;
+          cachedCoinGeckoTsMs = nowMs;
+          referencePrice = fetched;
+        } catch (e) {
+          if (cachedCoinGeckoPriceUi !== null) {
+            referencePrice = cachedCoinGeckoPriceUi;
+            console.warn(
+              JSON.stringify({
+                ts: new Date().toISOString(),
+                msg: 'coingecko price fetch failed; using cached coingecko price',
+                error: e instanceof Error ? e.message : `${e}`,
+              }),
+            );
+          } else {
+            referencePrice = getOnchainReferencePriceUi({
+              group: bots[0].group,
+              marketIndex,
+              solMint: solMintPk,
+            });
+            referenceSource = 'onchain-fallback';
+            console.warn(
+              JSON.stringify({
+                ts: new Date().toISOString(),
+                msg: 'coingecko price fetch failed; using onchain fallback',
+                error: e instanceof Error ? e.message : `${e}`,
+              }),
+            );
+          }
+        }
+      } else {
+        if (cachedCoinGeckoPriceUi === null) {
+          referencePrice = getOnchainReferencePriceUi({
+            group: bots[0].group,
+            marketIndex,
+            solMint: solMintPk,
+          });
+          referenceSource = 'onchain-fallback';
+        } else {
+          referencePrice = cachedCoinGeckoPriceUi;
+        }
       }
       const minExecuteSlot =
         BigInt(await connection.getSlot(COMMITMENT)) + MIN_EXECUTE_SLOT_OFFSET;
 
-      for (const bot of bots) {
-        const mangoAccount = await bot.client.getMangoAccount(bot.mangoAccountPk);
+      const runBotTick = async (bot: BotRuntime) => {
+        const mangoAccount = bot.mangoAccount;
         const perpMarket = bot.group.getPerpMarketByMarketIndex(marketIndex);
 
-        if (CANCEL_BEFORE_PLACE) {
-          const cancelIx = await bot.client.perpCancelAllOrdersIx(
-            bot.group,
-            mangoAccount,
-            marketIndex,
-            CANCEL_LIMIT,
-          );
-          const cancelRemaining = executionQueueRemainingAccountsFromMangoIx(
-            executionQueuePk,
-            cancelIx.keys,
-          );
-          const cancelPayload = encodePerpCancelAllOrdersQueuePayload({
-            limit: CANCEL_LIMIT,
-          });
-          await submitIntentViaRelayer({
-            relayerClient,
-            group: bot.group.publicKey,
-            executionQueue: executionQueuePk,
-            market: marketIndex,
-            payload: cancelPayload,
-            remainingAccounts: cancelRemaining,
-            userOwner: bot.keypair.publicKey,
-            userSecretKey: bot.keypair.secretKey,
-            mangoAccount: mangoAccount.publicKey,
-            minExecuteSlot,
-          });
+        const shouldCancelThisTick =
+          CANCEL_BEFORE_PLACE && currentTick % CANCEL_EVERY_TICKS === 0;
+        if (shouldCancelThisTick) {
+          if (CANCEL_MODE === 'client-id') {
+            if (bot.lastPlacedClientOrderId !== null) {
+              const cancelIx = await bot.client.perpCancelOrderByClientOrderIdIx(
+                bot.group,
+                mangoAccount,
+                marketIndex,
+                bot.lastPlacedClientOrderId,
+              );
+              const cancelRemaining = executionQueueRemainingAccountsFromMangoIx(
+                executionQueuePk,
+                cancelIx.keys,
+              );
+              const cancelPayload = encodePerpCancelOrderByClientOrderIdQueuePayload({
+                clientOrderId: BigInt(bot.lastPlacedClientOrderId),
+              });
+              await submitIntentViaRelayer({
+                relayerClient,
+                group: bot.group.publicKey,
+                executionQueue: executionQueuePk,
+                market: marketIndex,
+                payload: cancelPayload,
+                remainingAccounts: cancelRemaining,
+                userOwner: bot.keypair.publicKey,
+                userSecretKey: bot.keypair.secretKey,
+                mangoAccount: mangoAccount.publicKey,
+                minExecuteSlot,
+              });
+              totalCancelIntents += 1;
+            }
+          } else {
+            const cancelIx = await bot.client.perpCancelAllOrdersIx(
+              bot.group,
+              mangoAccount,
+              marketIndex,
+              CANCEL_LIMIT,
+            );
+            const cancelRemaining = executionQueueRemainingAccountsFromMangoIx(
+              executionQueuePk,
+              cancelIx.keys,
+            );
+            const cancelPayload = encodePerpCancelAllOrdersQueuePayload({
+              limit: CANCEL_LIMIT,
+            });
+            await submitIntentViaRelayer({
+              relayerClient,
+              group: bot.group.publicKey,
+              executionQueue: executionQueuePk,
+              market: marketIndex,
+              payload: cancelPayload,
+              remainingAccounts: cancelRemaining,
+              userOwner: bot.keypair.publicKey,
+              userSecretKey: bot.keypair.secretKey,
+              mangoAccount: mangoAccount.publicKey,
+              minExecuteSlot,
+            });
+            totalCancelIntents += 1;
+          }
         }
 
         const sizeSol = randomSizeSol();
         const quotePrice = randomQuotePrice(referencePrice, bot.side);
         const maxQuoteQty = Number((quotePrice * sizeSol * QUOTE_BUDGET_MULTIPLIER).toFixed(6));
         const clientOrderId = Date.now() * 1000 + Math.floor(Math.random() * 1000);
+        // Record the intended client id before submit so pipelined ticks can issue
+        // a targeted cancel on the next cycle without waiting for the place RPC to return.
+        bot.lastPlacedClientOrderId = clientOrderId;
 
         const placeIx = await bot.client.perpPlaceOrderV2Ix(
           bot.group,
@@ -496,44 +778,96 @@ async function main(): Promise<void> {
           mangoAccount: mangoAccount.publicKey,
           minExecuteSlot,
         });
+        totalPlaceIntents += 1;
 
+        if (LOG_EACH_ORDER) {
+          console.log(
+            JSON.stringify({
+              ts: new Date().toISOString(),
+              bot: bot.name,
+              side: sideToString(bot.side),
+              referencePrice,
+              referenceSource,
+              quotePrice,
+              sizeSol,
+              maxQuoteQty,
+              sequence: resp.sequence,
+              txSignature: resp.tx_signature,
+            }),
+          );
+        }
+      };
+
+      if (NONBLOCKING_SUBMIT) {
+        if (PARALLEL_BOT_EXECUTION) {
+          for (const bot of bots) {
+            while (inFlight.size >= MAX_INFLIGHT) {
+              await Promise.race(inFlight);
+            }
+            const promise = runBotTick(bot).catch((err) => {
+              handleTickError(err);
+            });
+            inFlight.add(promise);
+            void promise.finally(() => {
+              inFlight.delete(promise);
+            });
+          }
+        } else {
+          while (inFlight.size >= MAX_INFLIGHT) {
+            await Promise.race(inFlight);
+          }
+          const sequence = (async () => {
+            for (const bot of bots) {
+              await runBotTick(bot);
+            }
+          })().catch((err) => {
+            handleTickError(err);
+          });
+          inFlight.add(sequence);
+          void sequence.finally(() => {
+            inFlight.delete(sequence);
+          });
+        }
+      } else if (PARALLEL_BOT_EXECUTION) {
+        await Promise.all(bots.map((bot) => runBotTick(bot)));
+      } else {
+        for (const bot of bots) {
+          await runBotTick(bot);
+        }
+      }
+
+      ticks += 1;
+      if (LOG_TPS_EVERY_TICKS > 0 && ticks % LOG_TPS_EVERY_TICKS === 0) {
+        const elapsedSec = Math.max(1, (Date.now() - startedAtMs) / 1000);
+        const avgPlaceTps = totalPlaceIntents / elapsedSec;
+        const avgIntentTps = (totalPlaceIntents + totalCancelIntents) / elapsedSec;
         console.log(
           JSON.stringify({
             ts: new Date().toISOString(),
-            bot: bot.name,
-            side: sideToString(bot.side),
-            referencePrice,
-            referenceSource,
-            quotePrice,
-            sizeSol,
-            maxQuoteQty,
-            sequence: resp.sequence,
-            txSignature: resp.tx_signature,
+            msg: 'quoter-stats',
+            ticks,
+            bots: bots.length,
+            totalPlaceIntents,
+            totalCancelIntents,
+            avgPlaceTps,
+            avgIntentTps,
+            cancelBeforePlace: CANCEL_BEFORE_PLACE,
+            cancelEveryTicks: CANCEL_EVERY_TICKS,
+            inFlight: inFlight.size,
           }),
         );
       }
     } catch (err) {
-      const errText = err instanceof Error ? err.message : `${err}`;
-      if (errText.includes('UNAVAILABLE')) {
-        try {
-          relayerClient.close();
-        } catch {
-          // no-op
-        }
-        relayerClient = buildRelayerClient();
-      }
-      console.error(
-        JSON.stringify({
-          ts: new Date().toISOString(),
-          msg: 'quote tick failed',
-          error: errText,
-        }),
-      );
+      handleTickError(err);
     }
 
     const elapsed = Date.now() - tickStart;
     const waitMs = Math.max(0, INTERVAL_MS - elapsed);
     await sleep(waitMs);
+  }
+
+  if (inFlight.size > 0) {
+    await Promise.allSettled(Array.from(inFlight));
   }
 }
 

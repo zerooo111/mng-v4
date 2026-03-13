@@ -18,6 +18,7 @@ import {
   encodePerpPlaceOrderV2QueuePayload,
   signExecutionQueueIntentMessage,
 } from '../../src/executionQueue';
+import { decodeExecutionQueueCount } from '../../src/executionQueueLayout';
 
 dotenv.config();
 
@@ -33,7 +34,7 @@ type E2EConfig = {
   programId: string;
   group: string;
   executionQueue: string;
-  executionQueueBuffer: string;
+  executionQueueBuffer?: string;
   usdcMint: string;
   perpMarketIndex: number;
   maker: {
@@ -95,13 +96,6 @@ function executionQueueRemainingAccountsFromMangoIx(
   return remaining;
 }
 
-function decodeQueueCount(data: Buffer): number {
-  if (data.length < 192) {
-    return 0;
-  }
-  return data.readUInt32LE(188);
-}
-
 async function waitForQueueToDrain(
   connection: Connection,
   executionQueue: PublicKey,
@@ -109,7 +103,7 @@ async function waitForQueueToDrain(
   const deadline = Date.now() + QUEUE_EMPTY_TIMEOUT_MS;
   while (Date.now() < deadline) {
     const ai = await connection.getAccountInfo(executionQueue, 'confirmed');
-    const count = ai?.data ? decodeQueueCount(ai.data) : 0;
+    const count = ai?.data ? decodeExecutionQueueCount(ai.data) : 0;
     if (count === 0) {
       return;
     }
@@ -182,7 +176,9 @@ async function main(): Promise<void> {
   const programId = new PublicKey(config.programId);
   const groupPk = new PublicKey(config.group);
   const executionQueuePk = new PublicKey(config.executionQueue);
-  const executionQueueBufferPk = new PublicKey(config.executionQueueBuffer);
+  const executionQueueBufferPk = new PublicKey(
+    config.executionQueueBuffer || config.executionQueue,
+  );
   const marketIndex = config.perpMarketIndex as PerpMarketIndex;
 
   const makerKp = readKeypair(config.maker.keypairPath);

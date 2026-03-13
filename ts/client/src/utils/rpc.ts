@@ -44,6 +44,7 @@ export interface LatestBlockhash {
 
 export type SendTransactionOpts = Partial<{
   preflightCommitment: Commitment;
+  skipPreflight: boolean;
   latestBlockhash: Readonly<LatestBlockhash>;
   prioritizationFee: number;
   estimateFee: boolean;
@@ -52,9 +53,19 @@ export type SendTransactionOpts = Partial<{
   postTxConfirmationCallback: (callbackOpts: TxCallbackOptions) => void;
   txConfirmationCommitment: Commitment;
   confirmInBackground: boolean;
+  skipConfirmation: boolean;
   alts: AddressLookupTableAccount[];
   multipleConnections: Connection[];
 }>;
+
+const DEFAULT_SIGNATURE_STATUS_POLL_INTERVAL_MS = 500;
+const signatureStatusPollIntervalMs = (() => {
+  const value = Number(process.env.MANGO_TX_STATUS_POLL_INTERVAL_MS ?? '');
+  if (Number.isFinite(value) && value > 0) {
+    return value;
+  }
+  return DEFAULT_SIGNATURE_STATUS_POLL_INTERVAL_MS;
+})();
 
 export async function sendTransaction(
   provider: AnchorProvider,
@@ -127,13 +138,15 @@ export async function sendTransaction(
     signature = await Promise.any(
       allConnections.map((c) => {
         return c.sendRawTransaction(vtx.serialize(), {
-          skipPreflight: true, // mergedOpts.skipPreflight,
+          skipPreflight: opts.skipPreflight ?? true,
+          maxRetries: 20,
         });
       }),
     );
   } else {
     signature = await connection.sendRawTransaction(vtx.serialize(), {
-      skipPreflight: true, // mergedOpts.skipPreflight,
+      skipPreflight: opts.skipPreflight ?? true,
+      maxRetries: 20,
     });
   }
 
@@ -147,6 +160,9 @@ export async function sendTransaction(
       console.warn(`postSendTxCallback error ${e}`);
     }
   }
+  if (opts.skipConfirmation) {
+    return { signature };
+  }
   if (!opts.confirmInBackground) {
     return await confirmTransaction(
       connection,
@@ -155,7 +171,13 @@ export async function sendTransaction(
       signature,
     );
   } else {
-    confirmTransaction(connection, opts, latestBlockhash, signature);
+    void confirmTransaction(connection, opts, latestBlockhash, signature).catch(
+      (err) => {
+        console.error(
+          `background transaction confirmation failed for ${signature}: ${tryStringify(err)}`,
+        );
+      },
+    );
     return { signature };
   }
 }
@@ -185,6 +207,7 @@ const confirmTransaction = async (
             connection: c,
             timeoutStrategy: {
               block: latestBlockhash,
+              getSignatureStatusesPoolIntervalMs: signatureStatusPollIntervalMs,
             },
             abortSignal: abortController.signal,
           }),
@@ -199,6 +222,7 @@ const confirmTransaction = async (
             connection: c,
             timeoutStrategy: {
               timeout: 90,
+              getSignatureStatusesPoolIntervalMs: signatureStatusPollIntervalMs,
             },
             abortSignal: abortController.signal,
           }),

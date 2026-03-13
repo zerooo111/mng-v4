@@ -8,6 +8,7 @@ import os from 'os';
 import path from 'path';
 import { MangoClient } from '../../src/client';
 import { MANGO_V4_ID } from '../../src/constants';
+import { EXECUTION_QUEUE_ACCOUNT_SPACE } from '../../src/executionQueueLayout';
 
 dotenv.config();
 
@@ -20,13 +21,9 @@ const PAYER_KEYPAIR =
 const PROGRAM_ID_OVERRIDE = process.env.CTM_RELAYER_PROGRAM_ID;
 const GROUP_NUM = Number(process.env.EXECUTION_QUEUE_GROUP_NUM || '7001');
 const MANGO_ACCOUNT_NUM = Number(process.env.EXECUTION_QUEUE_ACCOUNT_NUM || '0');
-const EXECUTION_QUEUE_BUFFER_KEYPAIR =
-  process.env.EXECUTION_QUEUE_BUFFER_KEYPAIR || '/tmp/execution-queue-buffer-keypair.json';
 const CTM_KEYPAIR = process.env.CTM_RELAYER_CTM_KEYPAIR;
 const CTM_PUBKEY = process.env.CTM_PUBKEY;
 const INSURANCE_MINT_OVERRIDE = process.env.INSURANCE_MINT;
-const EXECUTION_QUEUE_BUFFER_SPACE = 8 + 32 + 4 + 4 + 1000 * 368;
-
 function readKeypair(rawPathOrJson: string): Keypair {
   const maybeFile = path.resolve(rawPathOrJson);
   const raw = fs.existsSync(maybeFile)
@@ -40,6 +37,81 @@ function anchorDiscriminator(ixName: string): Buffer {
     .update(`global:${ixName}`)
     .digest()
     .subarray(0, 8);
+}
+
+function queueNeedsInit(data: Buffer): boolean {
+  return data.length < 8 || data.subarray(0, 8).every((byte) => byte === 0);
+}
+
+async function ensureExecutionQueue(params: {
+  connection: Connection;
+  sendAndConfirm: (instructions: TransactionInstruction[]) => Promise<unknown>;
+  programId: PublicKey;
+  group: PublicKey;
+  executionQueue: PublicKey;
+  admin: PublicKey;
+  ctmSigner: PublicKey;
+}): Promise<void> {
+  let queueInfo = await params.connection.getAccountInfo(params.executionQueue);
+  if (!queueInfo) {
+    await params.sendAndConfirm([
+      new TransactionInstruction({
+        programId: params.programId,
+        keys: [
+          { pubkey: params.group, isSigner: false, isWritable: true },
+          { pubkey: params.executionQueue, isSigner: false, isWritable: true },
+          { pubkey: params.admin, isSigner: true, isWritable: true },
+          { pubkey: params.admin, isSigner: true, isWritable: false },
+          { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+        ],
+        data: anchorDiscriminator('execution_queue_create'),
+      }),
+    ]);
+    queueInfo = await params.connection.getAccountInfo(params.executionQueue);
+  }
+
+  if (!queueInfo) {
+    throw new Error('execution queue account was not created');
+  }
+
+  while (queueInfo.data.length < EXECUTION_QUEUE_ACCOUNT_SPACE) {
+    await params.sendAndConfirm([
+      new TransactionInstruction({
+        programId: params.programId,
+        keys: [
+          { pubkey: params.group, isSigner: false, isWritable: true },
+          { pubkey: params.executionQueue, isSigner: false, isWritable: true },
+          { pubkey: params.admin, isSigner: true, isWritable: true },
+          { pubkey: params.admin, isSigner: true, isWritable: false },
+          { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+        ],
+        data: anchorDiscriminator('execution_queue_resize'),
+      }),
+    ]);
+    queueInfo = await params.connection.getAccountInfo(params.executionQueue);
+    if (!queueInfo) {
+      throw new Error('execution queue account disappeared during resize');
+    }
+  }
+
+  if (!queueNeedsInit(queueInfo.data)) {
+    return;
+  }
+
+  await params.sendAndConfirm([
+    new TransactionInstruction({
+      programId: params.programId,
+      keys: [
+        { pubkey: params.group, isSigner: false, isWritable: true },
+        { pubkey: params.executionQueue, isSigner: false, isWritable: true },
+        { pubkey: params.admin, isSigner: true, isWritable: false },
+      ],
+      data: Buffer.concat([
+        anchorDiscriminator('execution_queue_init'),
+        params.ctmSigner.toBuffer(),
+      ]),
+    }),
+  ]);
 }
 
 async function main(): Promise<void> {
@@ -100,50 +172,21 @@ async function main(): Promise<void> {
       : admin.publicKey;
 
   const queueInfo = await provider.connection.getAccountInfo(executionQueue);
-  let queueBufferKp: Keypair;
-  if (fs.existsSync(EXECUTION_QUEUE_BUFFER_KEYPAIR)) {
-    queueBufferKp = readKeypair(EXECUTION_QUEUE_BUFFER_KEYPAIR);
-  } else {
-    queueBufferKp = Keypair.generate();
-    fs.writeFileSync(
-      EXECUTION_QUEUE_BUFFER_KEYPAIR,
-      JSON.stringify(Array.from(queueBufferKp.secretKey)),
-    );
-  }
-
-  let queueBufferPk = queueBufferKp.publicKey;
-  if (!queueInfo) {
-    const queueBufferInfo = await provider.connection.getAccountInfo(queueBufferKp.publicKey);
-    if (!queueBufferInfo) {
-      const lamports = await provider.connection.getMinimumBalanceForRentExemption(
-        EXECUTION_QUEUE_BUFFER_SPACE,
-      );
-      const createBufferIx = SystemProgram.createAccount({
-        fromPubkey: admin.publicKey,
-        newAccountPubkey: queueBufferKp.publicKey,
-        lamports,
-        space: EXECUTION_QUEUE_BUFFER_SPACE,
-        programId,
-      });
-      const createBufferTx = new Transaction().add(createBufferIx);
-      await provider.sendAndConfirm(createBufferTx, [queueBufferKp]);
-    }
-
-    const ix = new TransactionInstruction({
+  const queueBufferPk = executionQueue;
+  if (
+    !queueInfo ||
+    queueInfo.data.length < EXECUTION_QUEUE_ACCOUNT_SPACE ||
+    queueNeedsInit(queueInfo.data)
+  ) {
+    await ensureExecutionQueue({
+      connection: provider.connection,
+      sendAndConfirm: (instructions) => client.sendAndConfirmTransaction(instructions),
       programId,
-      keys: [
-        { pubkey: group.publicKey, isSigner: false, isWritable: true },
-        { pubkey: executionQueue, isSigner: false, isWritable: true },
-        { pubkey: admin.publicKey, isSigner: true, isWritable: true },
-        { pubkey: admin.publicKey, isSigner: true, isWritable: false },
-        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-        { pubkey: queueBufferKp.publicKey, isSigner: false, isWritable: true },
-      ],
-      data: Buffer.concat([anchorDiscriminator('execution_queue_init'), ctmSigner.toBuffer()]),
+      group: group.publicKey,
+      executionQueue,
+      admin: admin.publicKey,
+      ctmSigner,
     });
-    await client.sendAndConfirmTransaction([ix]);
-  } else if (queueInfo.data.length >= 136) {
-    queueBufferPk = new PublicKey(queueInfo.data.subarray(104, 136));
   }
 
   let mangoAccount = await client.getMangoAccountForOwner(

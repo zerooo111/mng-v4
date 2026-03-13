@@ -7,6 +7,7 @@ LEDGER_DIR="${LOCALNET_DIR}/ledger"
 LOG_DIR="${LOCALNET_DIR}/logs"
 RUN_DIR="${LOCALNET_DIR}/run"
 PID_DIR="${RUN_DIR}/pids"
+EXECUTION_ENGINE_BIN="${ROOT_DIR}/target/debug/service-mango-execution-engine"
 
 PROGRAM_KEYPAIR="${ROOT_DIR}/target/deploy/mango_v4-keypair.json"
 PROGRAM_SO="${ROOT_DIR}/target/deploy/mango_v4.so"
@@ -19,6 +20,8 @@ MB_PAYER_KEYPAIR="${MB_PAYER_KEYPAIR:-/home/ec2-user/.config/solana/id.json}"
 CTM_RELAYER_PAYER_KEYPAIR="${CTM_RELAYER_PAYER_KEYPAIR:-${MB_PAYER_KEYPAIR}}"
 CTM_RELAYER_CTM_KEYPAIR="${CTM_RELAYER_CTM_KEYPAIR:-${MB_PAYER_KEYPAIR}}"
 CTM_RELAYER_BIND_ADDR="${CTM_RELAYER_BIND_ADDR:-127.0.0.1:9090}"
+CTM_RELAYER_IMPL="${CTM_RELAYER_IMPL:-ts}"
+CTM_EXECUTION_ENGINE_HTTP_BIND_ADDR="${CTM_EXECUTION_ENGINE_HTTP_BIND_ADDR:-127.0.0.1:9093}"
 HARNESS_BIND_ADDR="${HARNESS_BIND_ADDR:-127.0.0.1:9091}"
 RESET_VALIDATOR="${RESET_VALIDATOR:-1}"
 BUILD_SBF="${BUILD_SBF:-0}"
@@ -162,6 +165,14 @@ build_if_requested() {
   fi
 }
 
+reset_runtime_artifacts_if_requested() {
+  if [[ "${RESET_VALIDATOR}" != "1" ]]; then
+    return 0
+  fi
+  # Avoid replaying stale relay/harness history after a validator reset.
+  rm -f "${RELAYER_SEQUENCE_STATE_PATH}" "${CONTINUUM_EVENT_LOG_PATH}"
+}
+
 deploy_program() {
   if [[ ! -f "${PROGRAM_SO}" || ! -f "${PROGRAM_KEYPAIR}" ]]; then
     echo "Missing deploy artifacts (${PROGRAM_SO} / ${PROGRAM_KEYPAIR})" >&2
@@ -253,33 +264,98 @@ start_harness() {
 
 start_relayer() {
   local relayer_port
+  local relayer_http_port
   relayer_port="$(bind_port "${CTM_RELAYER_BIND_ADDR}")"
+  relayer_http_port="$(bind_port "${CTM_EXECUTION_ENGINE_HTTP_BIND_ADDR}")"
 
   if pid_is_running "${RELAYER_PID_FILE}"; then
     echo "Relayer already running (pid $(cat "${RELAYER_PID_FILE}"))"
     return 0
   fi
   ensure_port_free_or_owned "${relayer_port}" "${RELAYER_PID_FILE}"
+  if [[ "${CTM_RELAYER_IMPL}" == "rust" ]]; then
+    ensure_port_free_or_owned "${relayer_http_port}" "${RELAYER_PID_FILE}"
+  fi
   local buffer_pk
-  buffer_pk="$(read_cfg_field executionQueueBuffer)"
-  setsid env \
-    CLUSTER_OVERRIDE=devnet \
-    CLUSTER_URL_OVERRIDE="${SOLANA_URL}" \
-    CTM_RELAYER_PROGRAM_ID="${PROGRAM_ID}" \
-    CTM_RELAYER_BIND_ADDR="${CTM_RELAYER_BIND_ADDR}" \
-    CTM_RELAYER_PAYER_KEYPAIR="${CTM_RELAYER_PAYER_KEYPAIR}" \
-    CTM_RELAYER_CTM_KEYPAIR="${CTM_RELAYER_CTM_KEYPAIR}" \
-    CTM_RELAYER_EVENT_SINK_URL="http://${HARNESS_BIND_ADDR}/ingest/relay-intent" \
-    EXECUTION_QUEUE_BUFFER_PK="${buffer_pk}" \
-    CTM_RELAYER_SEQUENCE_STATE_PATH="${RELAYER_SEQUENCE_STATE_PATH}" \
-    CTM_RELAYER_MIN_EXECUTE_SLOT_OFFSET=1 \
-    ./node_modules/.bin/ts-node ts/client/scripts/execution-queue/ctm-sequencer-relayer.ts \
-    >"${LOG_DIR}/ctm-relayer.log" 2>&1 < /dev/null &
+  local group_pk
+  local queue_pk
+  buffer_pk="$(read_cfg_field executionQueueBuffer || true)"
+  group_pk="$(read_cfg_field group)"
+  queue_pk="$(read_cfg_field executionQueue)"
+  if [[ -z "${buffer_pk}" ]]; then
+    buffer_pk="${queue_pk}"
+  fi
+  if [[ "${CTM_RELAYER_IMPL}" == "rust" ]]; then
+    if [[ -x "${EXECUTION_ENGINE_BIN}" ]]; then
+      setsid env \
+        CLUSTER_OVERRIDE=devnet \
+        CLUSTER_URL_OVERRIDE="${SOLANA_URL}" \
+        CTM_RELAYER_PROGRAM_ID="${PROGRAM_ID}" \
+        CTM_RELAYER_BIND_ADDR="${CTM_RELAYER_BIND_ADDR}" \
+        CTM_EXECUTION_ENGINE_HTTP_BIND_ADDR="${CTM_EXECUTION_ENGINE_HTTP_BIND_ADDR}" \
+        CTM_RELAYER_PAYER_KEYPAIR="${CTM_RELAYER_PAYER_KEYPAIR}" \
+        CTM_RELAYER_CTM_KEYPAIR="${CTM_RELAYER_CTM_KEYPAIR}" \
+        CTM_RELAYER_EVENT_SINK_URL="http://${HARNESS_BIND_ADDR}/ingest/relay-intent" \
+        EXECUTION_QUEUE_BUFFER_PK="${buffer_pk}" \
+        EXECUTION_QUEUE_GROUP_PK="${group_pk}" \
+        EXECUTION_QUEUE_PK="${queue_pk}" \
+        EXECUTION_QUEUE_CRANK_LANES_JSON_PATH="${LANE_CONFIG_PATH}" \
+        EXECUTION_QUEUE_CRANK_MAX_ITEMS=8 \
+        EXECUTION_QUEUE_CRANK_INTERVAL_MS=250 \
+        EXECUTION_QUEUE_CRANK_SKIP_PREFLIGHT=true \
+        CTM_RELAYER_SEQUENCE_STATE_PATH="${RELAYER_SEQUENCE_STATE_PATH}" \
+        CTM_RELAYER_MIN_EXECUTE_SLOT_OFFSET=1 \
+        "${EXECUTION_ENGINE_BIN}" \
+        >"${LOG_DIR}/ctm-relayer.log" 2>&1 < /dev/null &
+    else
+      setsid env \
+        CLUSTER_OVERRIDE=devnet \
+        CLUSTER_URL_OVERRIDE="${SOLANA_URL}" \
+        CTM_RELAYER_PROGRAM_ID="${PROGRAM_ID}" \
+        CTM_RELAYER_BIND_ADDR="${CTM_RELAYER_BIND_ADDR}" \
+        CTM_EXECUTION_ENGINE_HTTP_BIND_ADDR="${CTM_EXECUTION_ENGINE_HTTP_BIND_ADDR}" \
+        CTM_RELAYER_PAYER_KEYPAIR="${CTM_RELAYER_PAYER_KEYPAIR}" \
+        CTM_RELAYER_CTM_KEYPAIR="${CTM_RELAYER_CTM_KEYPAIR}" \
+        CTM_RELAYER_EVENT_SINK_URL="http://${HARNESS_BIND_ADDR}/ingest/relay-intent" \
+        EXECUTION_QUEUE_BUFFER_PK="${buffer_pk}" \
+        EXECUTION_QUEUE_GROUP_PK="${group_pk}" \
+        EXECUTION_QUEUE_PK="${queue_pk}" \
+        EXECUTION_QUEUE_CRANK_LANES_JSON_PATH="${LANE_CONFIG_PATH}" \
+        EXECUTION_QUEUE_CRANK_MAX_ITEMS=8 \
+        EXECUTION_QUEUE_CRANK_INTERVAL_MS=250 \
+        EXECUTION_QUEUE_CRANK_SKIP_PREFLIGHT=true \
+        CTM_RELAYER_SEQUENCE_STATE_PATH="${RELAYER_SEQUENCE_STATE_PATH}" \
+        CTM_RELAYER_MIN_EXECUTE_SLOT_OFFSET=1 \
+        cargo run -p service-mango-execution-engine \
+        >"${LOG_DIR}/ctm-relayer.log" 2>&1 < /dev/null &
+    fi
+  else
+    setsid env \
+      CLUSTER_OVERRIDE=devnet \
+      CLUSTER_URL_OVERRIDE="${SOLANA_URL}" \
+      CTM_RELAYER_PROGRAM_ID="${PROGRAM_ID}" \
+      CTM_RELAYER_BIND_ADDR="${CTM_RELAYER_BIND_ADDR}" \
+      CTM_RELAYER_PAYER_KEYPAIR="${CTM_RELAYER_PAYER_KEYPAIR}" \
+      CTM_RELAYER_CTM_KEYPAIR="${CTM_RELAYER_CTM_KEYPAIR}" \
+      CTM_RELAYER_EVENT_SINK_URL="http://${HARNESS_BIND_ADDR}/ingest/relay-intent" \
+      EXECUTION_QUEUE_BUFFER_PK="${buffer_pk}" \
+      CTM_RELAYER_SEQUENCE_STATE_PATH="${RELAYER_SEQUENCE_STATE_PATH}" \
+      CTM_RELAYER_MIN_EXECUTE_SLOT_OFFSET=1 \
+      ./node_modules/.bin/ts-node ts/client/scripts/execution-queue/ctm-sequencer-relayer.ts \
+      >"${LOG_DIR}/ctm-relayer.log" 2>&1 < /dev/null &
+  fi
   echo $! >"${RELAYER_PID_FILE}"
   wait_for_port_listen "${relayer_port}"
+  if [[ "${CTM_RELAYER_IMPL}" == "rust" ]]; then
+    wait_for_http_ok "http://${CTM_EXECUTION_ENGINE_HTTP_BIND_ADDR}/healthz"
+  fi
 }
 
 start_cranker() {
+  if [[ "${CTM_RELAYER_IMPL}" == "rust" ]]; then
+    echo "Cranker disabled: execution handled inside Rust relayer"
+    return 0
+  fi
   if pid_is_running "${CRANKER_PID_FILE}"; then
     echo "Cranker already running (pid $(cat "${CRANKER_PID_FILE}"))"
     return 0
@@ -287,7 +363,10 @@ start_cranker() {
   local group_pk queue_pk buffer_pk
   group_pk="$(read_cfg_field group)"
   queue_pk="$(read_cfg_field executionQueue)"
-  buffer_pk="$(read_cfg_field executionQueueBuffer)"
+  buffer_pk="$(read_cfg_field executionQueueBuffer || true)"
+  if [[ -z "${buffer_pk}" ]]; then
+    buffer_pk="${queue_pk}"
+  fi
   setsid env \
     CLUSTER_OVERRIDE=devnet \
     CLUSTER_URL_OVERRIDE="${SOLANA_URL}" \
@@ -297,6 +376,7 @@ start_cranker() {
     EXECUTION_QUEUE_PROGRAM_ID="${PROGRAM_ID}" \
     EXECUTION_QUEUE_CRANKER_KEYPAIR="${MB_PAYER_KEYPAIR}" \
     EXECUTION_QUEUE_CRANK_LANES_JSON_PATH="${LANE_CONFIG_PATH}" \
+    EXECUTION_QUEUE_CRANK_RELAY_EVENT_LOG_PATH="${CONTINUUM_EVENT_LOG_PATH}" \
     EXECUTION_QUEUE_CRANK_MAX_ITEMS=8 \
     EXECUTION_QUEUE_CRANK_INTERVAL_MS=1000 \
     ./node_modules/.bin/ts-node ts/client/scripts/execution-queue/execution-queue-cranker.ts \
@@ -319,6 +399,7 @@ start_all() {
   start_validator
   build_if_requested
   deploy_program
+  reset_runtime_artifacts_if_requested
   bootstrap_local_state
   start_harness
   start_relayer
@@ -336,6 +417,9 @@ stop_all() {
   stop_if_running "${RELAYER_PID_FILE}" "relayer"
   stop_if_running "${HARNESS_PID_FILE}" "harness"
   stop_if_running "${VALIDATOR_PID_FILE}" "validator"
+  pkill -f 'ts/client/scripts/execution-queue/execution-queue-cranker.ts' 2>/dev/null || true
+  pkill -f 'ts/client/scripts/execution-queue/continuum-state-harness.ts' 2>/dev/null || true
+  pkill -f 'service-mango-execution-engine' 2>/dev/null || true
 }
 
 status_all() {

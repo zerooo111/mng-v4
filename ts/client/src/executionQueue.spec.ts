@@ -169,8 +169,8 @@ describe('Execution Queue Helpers', () => {
       ],
     });
 
-    expect(enqueueLiquidityIx.keys.length).eq(4);
-    expect(executeIx.keys.length).eq(5);
+    expect(enqueueLiquidityIx.keys.length).eq(3);
+    expect(executeIx.keys.length).eq(4);
     expect(executeIx.data.length).eq(10);
   });
 

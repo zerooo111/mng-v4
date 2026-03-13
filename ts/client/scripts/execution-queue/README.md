@@ -18,6 +18,21 @@ CTM_RELAYER_EVENT_SINK_AUTH_TOKEN=<optional-token> \
 yarn ctm-sequencer-relayer
 ```
 
+Rust execution engine drop-in:
+
+```bash
+CTM_RELAYER_BIND_ADDR=127.0.0.1:9090 \
+CTM_EXECUTION_ENGINE_HTTP_BIND_ADDR=127.0.0.1:9093 \
+CLUSTER_URL_OVERRIDE=http://127.0.0.1:8899 \
+CTM_RELAYER_PAYER_KEYPAIR=~/.config/solana/id.json \
+CTM_RELAYER_CTM_KEYPAIR=~/.config/solana/id.json \
+CTM_RELAYER_EVENT_SINK_URL=http://127.0.0.1:9091/ingest/relay-intent \
+cargo run -p service-mango-execution-engine
+```
+
+The startup scripts now support `CTM_RELAYER_IMPL=rust` and keep the same gRPC submit address on `:9090`. The Rust engine exposes `GET /healthz` and `GET /metrics` on `CTM_EXECUTION_ENGINE_HTTP_BIND_ADDR`.
+`EXECUTION_QUEUE_BUFFER_PK` is now optional and treated as an alias of `EXECUTION_QUEUE_PK` for older tooling.
+
 ### gRPC API
 
 Proto: `ts/client/scripts/execution-queue/ctm_sequencer.proto`

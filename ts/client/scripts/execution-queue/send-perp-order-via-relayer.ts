@@ -82,7 +82,8 @@ function executionQueueRemainingAccountsFromMangoIx(
   const remaining = keys.map((k) => ({
     pubkey: k.pubkey,
     isWritable: k.isWritable,
-    isSigner: k.isSigner,
+    // Queue-dispatched instructions must not require user signatures at enqueue time.
+    isSigner: false,
   }));
   remaining[2] = {
     pubkey: executionQueue,

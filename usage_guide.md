@@ -26,7 +26,6 @@ npm run -s execution-queue-local-perp-e2e-bootstrap
 
 CFG="/tmp/execution-queue-e2e-${GROUP_NUM}.json"
 LANES="/tmp/execution-queue-lanes-${GROUP_NUM}.json"
-BUFFER_PK="$(node -p "require('${CFG}').executionQueueBuffer")"
 GROUP_PK="$(node -p "require('${CFG}').group")"
 QUEUE_PK="$(node -p "require('${CFG}').executionQueue")"
 
@@ -39,7 +38,6 @@ env \
   CTM_RELAYER_PAYER_KEYPAIR=/home/ec2-user/.config/solana/id.json \
   CTM_RELAYER_CTM_KEYPAIR=/home/ec2-user/.config/solana/id.json \
   CTM_RELAYER_EVENT_SINK_URL=http://127.0.0.1:9091/ingest/relay-intent \
-  EXECUTION_QUEUE_BUFFER_PK="$BUFFER_PK" \
   CTM_RELAYER_SEQUENCE_STATE_PATH="/tmp/ctm-sequences-${GROUP_NUM}.json" \
   CTM_RELAYER_MIN_EXECUTE_SLOT_OFFSET=1 \
   ./node_modules/.bin/ts-node ts/client/scripts/execution-queue/ctm-sequencer-relayer.ts \
@@ -64,7 +62,6 @@ env \
   CLUSTER_URL_OVERRIDE=http://127.0.0.1:8899 \
   EXECUTION_QUEUE_GROUP_PK="$GROUP_PK" \
   EXECUTION_QUEUE_PK="$QUEUE_PK" \
-  EXECUTION_QUEUE_BUFFER_PK="$BUFFER_PK" \
   EXECUTION_QUEUE_PROGRAM_ID=9nNhSkcxYFujiydpuuhVttUYBqYJQmxCzjrBofBvmutF \
   EXECUTION_QUEUE_CRANKER_KEYPAIR=/home/ec2-user/.config/solana/id.json \
   EXECUTION_QUEUE_CRANK_LANES_JSON_PATH="$LANES" \
@@ -90,7 +87,7 @@ kill $RELAYER_PID $CRANKER_PID $HARNESS_PID
 This branch now includes an end-to-end execution-queue path for CTM-sequenced perp actions, plus local tooling to run and validate it.
 
 ### Program-side execution queue changes
-- Execution queue uses a zero-copy external buffer account (`ExecutionQueueBuffer`) with capacity for 1000 items.
+- Execution queue uses a single zero-copy account with ring-buffer semantics and capacity for 1000 items.
 - CTM enqueue path verifies:
   - CTM ed25519 pre-instruction signature over canonical envelope.
   - User ed25519 pre-instruction signature over canonical intent message.
@@ -231,11 +228,26 @@ env \
   CTM_RELAYER_PAYER_KEYPAIR=/home/ec2-user/.config/solana/id.json \
   CTM_RELAYER_CTM_KEYPAIR=/home/ec2-user/.config/solana/id.json \
   CTM_RELAYER_EVENT_SINK_URL=http://127.0.0.1:9091/ingest/relay-intent \
-  EXECUTION_QUEUE_BUFFER_PK=<from bootstrap output> \
   CTM_RELAYER_SEQUENCE_STATE_PATH=/tmp/ctm-sequences-<GROUP_NUM>.json \
   CTM_RELAYER_MIN_EXECUTE_SLOT_OFFSET=1 \
   ./node_modules/.bin/ts-node ts/client/scripts/execution-queue/ctm-sequencer-relayer.ts
 ```
+
+Rust drop-in replacement:
+
+```bash
+env \
+  CLUSTER_URL_OVERRIDE=http://127.0.0.1:8899 \
+  CTM_RELAYER_BIND_ADDR=127.0.0.1:9090 \
+  CTM_EXECUTION_ENGINE_HTTP_BIND_ADDR=127.0.0.1:9093 \
+  CTM_RELAYER_PAYER_KEYPAIR=/home/ec2-user/.config/solana/id.json \
+  CTM_RELAYER_CTM_KEYPAIR=/home/ec2-user/.config/solana/id.json \
+  CTM_RELAYER_EVENT_SINK_URL=http://127.0.0.1:9091/ingest/relay-intent \
+  cargo run -p service-mango-execution-engine
+```
+
+For local stack scripts, set `CTM_RELAYER_IMPL=rust` before running `startup_local.sh` or `startup_all_local.sh`. The gRPC submit endpoint stays on `127.0.0.1:9090`; engine health and metrics are available on `127.0.0.1:9093`.
+`EXECUTION_QUEUE_BUFFER_PK` is optional and only kept as a compatibility alias to `EXECUTION_QUEUE_PK`.
 
 ## Start Continuum State Harness (Optimistic + Confirmed API)
 
@@ -295,7 +307,6 @@ env \
   CLUSTER_URL_OVERRIDE=http://127.0.0.1:8899 \
   EXECUTION_QUEUE_GROUP_PK=<from bootstrap output> \
   EXECUTION_QUEUE_PK=<from bootstrap output> \
-  EXECUTION_QUEUE_BUFFER_PK=<from bootstrap output> \
   EXECUTION_QUEUE_PROGRAM_ID=9nNhSkcxYFujiydpuuhVttUYBqYJQmxCzjrBofBvmutF \
   EXECUTION_QUEUE_CRANKER_KEYPAIR=/home/ec2-user/.config/solana/id.json \
   EXECUTION_QUEUE_CRANK_LANES_JSON_PATH=/tmp/execution-queue-lanes-<GROUP_NUM>.json \

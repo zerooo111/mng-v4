@@ -28,6 +28,7 @@ import {
 import { MangoClient } from '../../src/client';
 import { DefaultTokenRegisterParams } from '../../src/clientIxParamBuilder';
 import { MANGO_V4_ID } from '../../src/constants';
+import { EXECUTION_QUEUE_ACCOUNT_SPACE } from '../../src/executionQueueLayout';
 
 dotenv.config();
 
@@ -40,9 +41,6 @@ const ADMIN_KEYPAIR =
 const CTM_KEYPAIR = process.env.CTM_RELAYER_CTM_KEYPAIR || ADMIN_KEYPAIR;
 const PROGRAM_ID_OVERRIDE = process.env.CTM_RELAYER_PROGRAM_ID;
 const GROUP_NUM = Number(process.env.EXECUTION_QUEUE_GROUP_NUM || '9101');
-const EXECUTION_QUEUE_BUFFER_KEYPAIR =
-  process.env.EXECUTION_QUEUE_BUFFER_KEYPAIR ||
-  `/tmp/execution-queue-buffer-${GROUP_NUM}.json`;
 const PERP_MARKET_INDEX = Number(process.env.PERP_MARKET_INDEX || '0');
 const MAKER_KEYPAIR_PATH =
   process.env.E2E_MAKER_KEYPAIR_PATH || `/tmp/execution-queue-maker-${GROUP_NUM}.json`;
@@ -53,13 +51,11 @@ const LANE_CONFIG_PATH =
 const OUTPUT_CONFIG_PATH =
   process.env.E2E_OUTPUT_CONFIG_PATH || `/tmp/execution-queue-e2e-${GROUP_NUM}.json`;
 
-const EXECUTION_QUEUE_BUFFER_SPACE = 8 + 32 + 4 + 4 + 1000 * 368;
 const USDC_MINT_DECIMALS = 6;
 const SOL_MINT_DECIMALS = 9;
 const PERP_MARKET_INDEX_TYPED = PERP_MARKET_INDEX as PerpMarketIndex;
 const MAKER_MAX_QUOTE_QTY = Number(process.env.E2E_MAKER_MAX_QUOTE_QTY || '1000');
 const TAKER_MAX_QUOTE_QTY = Number(process.env.E2E_TAKER_MAX_QUOTE_QTY || '1000');
-
 function readOrCreateKeypair(filePath: string): Keypair {
   const resolved = path.resolve(filePath);
   if (fs.existsSync(resolved)) {
@@ -84,6 +80,81 @@ function anchorDiscriminator(ixName: string): Buffer {
     .update(`global:${ixName}`)
     .digest()
     .subarray(0, 8);
+}
+
+function queueNeedsInit(data: Buffer): boolean {
+  return data.length < 8 || data.subarray(0, 8).every((byte) => byte === 0);
+}
+
+async function ensureExecutionQueue(params: {
+  connection: Connection;
+  sendAndConfirm: (instructions: TransactionInstruction[]) => Promise<unknown>;
+  programId: PublicKey;
+  group: PublicKey;
+  executionQueue: PublicKey;
+  admin: PublicKey;
+  ctmSigner: PublicKey;
+}): Promise<void> {
+  let queueInfo = await params.connection.getAccountInfo(params.executionQueue);
+  if (!queueInfo) {
+    await params.sendAndConfirm([
+      new TransactionInstruction({
+        programId: params.programId,
+        keys: [
+          { pubkey: params.group, isSigner: false, isWritable: true },
+          { pubkey: params.executionQueue, isSigner: false, isWritable: true },
+          { pubkey: params.admin, isSigner: true, isWritable: true },
+          { pubkey: params.admin, isSigner: true, isWritable: false },
+          { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+        ],
+        data: anchorDiscriminator('execution_queue_create'),
+      }),
+    ]);
+    queueInfo = await params.connection.getAccountInfo(params.executionQueue);
+  }
+
+  if (!queueInfo) {
+    throw new Error('execution queue account was not created');
+  }
+
+  while (queueInfo.data.length < EXECUTION_QUEUE_ACCOUNT_SPACE) {
+    await params.sendAndConfirm([
+      new TransactionInstruction({
+        programId: params.programId,
+        keys: [
+          { pubkey: params.group, isSigner: false, isWritable: true },
+          { pubkey: params.executionQueue, isSigner: false, isWritable: true },
+          { pubkey: params.admin, isSigner: true, isWritable: true },
+          { pubkey: params.admin, isSigner: true, isWritable: false },
+          { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+        ],
+        data: anchorDiscriminator('execution_queue_resize'),
+      }),
+    ]);
+    queueInfo = await params.connection.getAccountInfo(params.executionQueue);
+    if (!queueInfo) {
+      throw new Error('execution queue account disappeared during resize');
+    }
+  }
+
+  if (!queueNeedsInit(queueInfo.data)) {
+    return;
+  }
+
+  await params.sendAndConfirm([
+    new TransactionInstruction({
+      programId: params.programId,
+      keys: [
+        { pubkey: params.group, isSigner: false, isWritable: true },
+        { pubkey: params.executionQueue, isSigner: false, isWritable: true },
+        { pubkey: params.admin, isSigner: true, isWritable: false },
+      ],
+      data: Buffer.concat([
+        anchorDiscriminator('execution_queue_init'),
+        params.ctmSigner.toBuffer(),
+      ]),
+    }),
+  ]);
 }
 
 function executionQueueRemainingAccountsFromMangoIx(
@@ -275,43 +346,23 @@ async function main(): Promise<void> {
   );
 
   const queueInfo = await provider.connection.getAccountInfo(executionQueue);
-  const queueBuffer = readOrCreateKeypair(EXECUTION_QUEUE_BUFFER_KEYPAIR);
-  let executionQueueBuffer = queueBuffer.publicKey;
+  const executionQueueBuffer = executionQueue;
 
-  if (!queueInfo) {
-    const queueBufferInfo = await provider.connection.getAccountInfo(queueBuffer.publicKey);
-    if (!queueBufferInfo) {
-      const lamports = await provider.connection.getMinimumBalanceForRentExemption(
-        EXECUTION_QUEUE_BUFFER_SPACE,
-      );
-      const createBufferIx = SystemProgram.createAccount({
-        fromPubkey: admin.publicKey,
-        newAccountPubkey: queueBuffer.publicKey,
-        lamports,
-        space: EXECUTION_QUEUE_BUFFER_SPACE,
-        programId,
-      });
-      await provider.sendAndConfirm(new Transaction().add(createBufferIx), [queueBuffer]);
-    }
-
-    const initIx = new TransactionInstruction({
+  if (
+    !queueInfo ||
+    queueInfo.data.length < EXECUTION_QUEUE_ACCOUNT_SPACE ||
+    queueNeedsInit(queueInfo.data)
+  ) {
+    await ensureExecutionQueue({
+      connection: provider.connection,
+      sendAndConfirm: (instructions) =>
+        adminClient.sendAndConfirmTransaction(instructions),
       programId,
-      keys: [
-        { pubkey: group.publicKey, isSigner: false, isWritable: true },
-        { pubkey: executionQueue, isSigner: false, isWritable: true },
-        { pubkey: admin.publicKey, isSigner: true, isWritable: true },
-        { pubkey: admin.publicKey, isSigner: true, isWritable: false },
-        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-        { pubkey: queueBuffer.publicKey, isSigner: false, isWritable: true },
-      ],
-      data: Buffer.concat([
-        anchorDiscriminator('execution_queue_init'),
-        ctm.publicKey.toBuffer(),
-      ]),
+      group: group.publicKey,
+      executionQueue,
+      admin: admin.publicKey,
+      ctmSigner: ctm.publicKey,
     });
-    await adminClient.sendAndConfirmTransaction([initIx]);
-  } else if (queueInfo.data.length >= 136) {
-    executionQueueBuffer = new PublicKey(queueInfo.data.subarray(104, 136));
   }
 
   await group.reloadAll(adminClient);

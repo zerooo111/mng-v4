@@ -1192,12 +1192,16 @@ function buildHttpServer(airdrop: AirdropContext | null): http.Server {
         const owner = decodeURIComponent(url.pathname.slice('/state/users/'.length));
         const view = parseView(url);
         const baseUserState = engine.getUserState(owner, view);
-        const data = await enrichOwnerStateWithOnchain(
-          owner,
-          baseUserState,
-          airdrop,
-          view,
-        );
+        const includeOnchain =
+          (url.searchParams.get('onchain') || 'true').toLowerCase() !== 'false';
+        const data = includeOnchain
+          ? await enrichOwnerStateWithOnchain(
+              owner,
+              baseUserState,
+              airdrop,
+              view,
+            )
+          : baseUserState;
         writeJson(res, 200, {
           view,
           data,
@@ -1211,12 +1215,16 @@ function buildHttpServer(airdrop: AirdropContext | null): http.Server {
         );
         const view = parseView(url);
         const baseBalances = engine.getBalances(owner, view);
-        const data = await enrichOwnerStateWithOnchain(
-          owner,
-          baseBalances,
-          airdrop,
-          view,
-        );
+        const includeOnchain =
+          (url.searchParams.get('onchain') || 'true').toLowerCase() !== 'false';
+        const data = includeOnchain
+          ? await enrichOwnerStateWithOnchain(
+              owner,
+              baseBalances,
+              airdrop,
+              view,
+            )
+          : baseBalances;
         writeJson(res, 200, {
           view,
           data,

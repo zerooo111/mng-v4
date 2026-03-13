@@ -552,6 +552,18 @@ pub mod mango_v4 {
         Ok(())
     }
 
+    pub fn execution_queue_create(ctx: Context<ExecutionQueueCreate>) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_create(ctx)?;
+        Ok(())
+    }
+
+    pub fn execution_queue_resize(ctx: Context<ExecutionQueueResize>) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_resize(ctx)?;
+        Ok(())
+    }
+
     pub fn execution_queue_configure(
         ctx: Context<ExecutionQueueAdmin>,
         params: ExecutionQueueConfigParams,

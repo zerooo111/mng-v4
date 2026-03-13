@@ -1,4 +1,5 @@
 import BN from 'bn.js';
+import { createHash } from 'crypto';
 import nacl from 'tweetnacl';
 import {
   AccountMeta,
@@ -10,6 +11,9 @@ import {
 
 export const EXECUTION_QUEUE_DOMAIN = 'mango-v4-ctm-envelope-v1';
 export const USER_INTENT_DOMAIN = 'mango-v4-user-intent-v1';
+const EXECUTION_QUEUE_DOMAIN_BYTES = Buffer.from(EXECUTION_QUEUE_DOMAIN, 'utf-8');
+const USER_INTENT_DOMAIN_BYTES = Buffer.from(USER_INTENT_DOMAIN, 'utf-8');
+const instructionDiscriminatorCache = new Map<string, Buffer>();
 
 export enum QueuePayloadVariant {
   PerpPlaceOrderV2 = 0,
@@ -58,7 +62,7 @@ export type CtmEnvelopeWire = {
 export type BigNumberish = bigint | BN | number;
 
 export type IntentSigner =
-  | { kind: 'keypair'; privateKey: Uint8Array }
+  | { kind: 'keypair'; privateKey: Uint8Array; publicKey?: Uint8Array }
   | { kind: 'presigned'; publicKey: PublicKey; signature: Uint8Array };
 
 export type QueueSideLike =
@@ -124,7 +128,7 @@ export type BuildExecutionQueueEnqueueCtmParams = {
   programId: PublicKey;
   group: PublicKey;
   executionQueue: PublicKey;
-  executionQueueBuffer: PublicKey;
+  executionQueueBuffer?: PublicKey;
   remainingAccounts: AccountMeta[];
   envelope: CtmEnvelopeWire;
   payload: Uint8Array;
@@ -134,7 +138,7 @@ export type BuildExecutionQueueEnqueueLiquidityParams = {
   programId: PublicKey;
   group: PublicKey;
   executionQueue: PublicKey;
-  executionQueueBuffer: PublicKey;
+  executionQueueBuffer?: PublicKey;
   kind: QueueItemKind.LiquidityDeposit | QueueItemKind.LiquidityWithdraw;
   remainingAccounts: AccountMeta[];
   payload: Uint8Array;
@@ -144,7 +148,7 @@ export type BuildExecutionQueueExecuteParams = {
   programId: PublicKey;
   group: PublicKey;
   executionQueue: PublicKey;
-  executionQueueBuffer: PublicKey;
+  executionQueueBuffer?: PublicKey;
   remainingAccounts: AccountMeta[];
   maxItems: number;
 };
@@ -163,7 +167,7 @@ export type BuildExecutionQueueEnqueueCtmWithIntentParams = {
   programId: PublicKey;
   group: PublicKey;
   executionQueue: PublicKey;
-  executionQueueBuffer: PublicKey;
+  executionQueueBuffer?: PublicKey;
   remainingAccounts: AccountMeta[];
   payload: Uint8Array;
   sequence: BigNumberish;
@@ -255,13 +259,8 @@ function u16ToLe(value: number): Buffer {
   return out;
 }
 
-async function sha256(data: Uint8Array): Promise<Buffer> {
-  if (globalThis.crypto?.subtle) {
-    const digest = await globalThis.crypto.subtle.digest('SHA-256', data);
-    return Buffer.from(digest);
-  }
-  const crypto = await import('crypto');
-  return Buffer.from(crypto.createHash('sha256').update(data).digest());
+function sha256(data: Uint8Array): Buffer {
+  return Buffer.from(createHash('sha256').update(data).digest());
 }
 
 function encodeEnvelope(envelope: CtmEnvelopeWire): Buffer {
@@ -434,23 +433,29 @@ export function encodeLiquidityWithdrawQueuePayload(
   );
 }
 
-export async function anchorInstructionDiscriminator(
-  ixName: string,
-): Promise<Buffer> {
-  const h = await sha256(Buffer.from(`global:${ixName}`, 'utf-8'));
-  return h.subarray(0, 8);
+export function anchorInstructionDiscriminator(ixName: string): Buffer {
+  const cached = instructionDiscriminatorCache.get(ixName);
+  if (cached) {
+    return cached;
+  }
+  const h = sha256(Buffer.from(`global:${ixName}`, 'utf-8'));
+  const discriminator = Buffer.from(h.subarray(0, 8));
+  instructionDiscriminatorCache.set(ixName, discriminator);
+  return discriminator;
 }
 
-export async function hashExecutionQueueAccounts(
-  accounts: AccountMeta[],
-): Promise<Buffer> {
-  const bytes: number[] = [];
+export function hashExecutionQueueAccounts(accounts: AccountMeta[]): Buffer {
+  const bytes = Buffer.alloc(accounts.length * 34);
+  let offset = 0;
   for (const a of accounts) {
-    bytes.push(...a.pubkey.toBytes());
-    bytes.push(a.isSigner ? 1 : 0);
-    bytes.push(a.isWritable ? 1 : 0);
+    bytes.set(a.pubkey.toBytes(), offset);
+    offset += 32;
+    bytes[offset] = a.isSigner ? 1 : 0;
+    offset += 1;
+    bytes[offset] = a.isWritable ? 1 : 0;
+    offset += 1;
   }
-  return await sha256(Buffer.from(bytes));
+  return sha256(bytes);
 }
 
 function mergeEffectiveRuntimeFlags(
@@ -479,32 +484,30 @@ function mergeEffectiveRuntimeFlags(
   });
 }
 
-async function hashExecutionQueueAccountsForCtmEnqueue(
+function hashExecutionQueueAccountsForCtmEnqueue(
   group: PublicKey,
   executionQueue: PublicKey,
   remainingAccounts: AccountMeta[],
-): Promise<Buffer> {
+): Buffer {
   const effectiveRemaining = mergeEffectiveRuntimeFlags(remainingAccounts, [
     { pubkey: group, isSigner: false, isWritable: true },
     { pubkey: executionQueue, isSigner: false, isWritable: true },
     { pubkey: SYSVAR_INSTRUCTIONS_PUBKEY, isSigner: false, isWritable: false },
   ]);
-  return await hashExecutionQueueAccounts(effectiveRemaining);
+  return hashExecutionQueueAccounts(effectiveRemaining);
 }
 
-export async function hashExecutionQueuePayload(
-  payload: Uint8Array,
-): Promise<Buffer> {
-  return await sha256(Buffer.from(payload));
+export function hashExecutionQueuePayload(payload: Uint8Array): Buffer {
+  return sha256(Buffer.from(payload));
 }
 
-export async function buildCtmEnvelopeMessage(
+export function buildCtmEnvelopeMessage(
   group: PublicKey,
   envelope: CtmEnvelopeWire,
-): Promise<Buffer> {
-  return await sha256(
+): Buffer {
+  return sha256(
     Buffer.concat([
-      Buffer.from(EXECUTION_QUEUE_DOMAIN, 'utf-8'),
+      EXECUTION_QUEUE_DOMAIN_BYTES,
       Buffer.from(group.toBytes()),
       u64ToLe(envelope.sequence),
       u64ToLe(envelope.minExecuteSlot),
@@ -516,15 +519,15 @@ export async function buildCtmEnvelopeMessage(
   );
 }
 
-export async function buildUserIntentMessage(
+export function buildUserIntentMessage(
   group: PublicKey,
   mangoAccount: PublicKey,
   userOwner: PublicKey,
   envelope: CtmEnvelopeWire,
-): Promise<Buffer> {
-  return await sha256(
+): Buffer {
+  return sha256(
     Buffer.concat([
-      Buffer.from(USER_INTENT_DOMAIN, 'utf-8'),
+      USER_INTENT_DOMAIN_BYTES,
       Buffer.from(group.toBytes()),
       Buffer.from(mangoAccount.toBytes()),
       Buffer.from(userOwner.toBytes()),
@@ -535,22 +538,22 @@ export async function buildUserIntentMessage(
   );
 }
 
-export async function buildExecutionQueueUserIntent(
+export function buildExecutionQueueUserIntent(
   params: BuildExecutionQueueUserIntentParams,
-): Promise<{
+): {
   envelopeLike: CtmEnvelopeWire;
   payloadHash: Buffer;
   accountsHash: Buffer;
   userIntentMessage: Buffer;
-}> {
-  const payloadHash = await hashExecutionQueuePayload(params.payload);
+} {
+  const payloadHash = hashExecutionQueuePayload(params.payload);
   const accountsHash = params.executionQueue
-    ? await hashExecutionQueueAccountsForCtmEnqueue(
+    ? hashExecutionQueueAccountsForCtmEnqueue(
         params.group,
         params.executionQueue,
         params.remainingAccounts,
       )
-    : await hashExecutionQueueAccounts(params.remainingAccounts);
+    : hashExecutionQueueAccounts(params.remainingAccounts);
   const envelopeLike: CtmEnvelopeWire = {
     sequence: 0n,
     minExecuteSlot: 0n,
@@ -559,7 +562,7 @@ export async function buildExecutionQueueUserIntent(
     accountsHash,
     expiresAtSlot: 0n,
   };
-  const userIntentMessage = await buildUserIntentMessage(
+  const userIntentMessage = buildUserIntentMessage(
     params.group,
     params.mangoAccount,
     params.userOwner,
@@ -586,9 +589,12 @@ export function buildIntentEd25519Instruction(
     if (signer.privateKey.length !== 64) {
       throw new Error('keypair privateKey must be 64 bytes');
     }
-    return Ed25519Program.createInstructionWithPrivateKey({
-      privateKey: signer.privateKey,
+    const publicKey = signer.publicKey ?? signer.privateKey.subarray(32, 64);
+    const signature = nacl.sign.detached(message, signer.privateKey);
+    return Ed25519Program.createInstructionWithPublicKey({
+      publicKey,
       message,
+      signature,
     });
   }
   if (signer.signature.length !== 64) {
@@ -601,10 +607,10 @@ export function buildIntentEd25519Instruction(
   });
 }
 
-export async function buildExecutionQueueEnqueueCtmIx(
+export function buildExecutionQueueEnqueueCtmIx(
   params: BuildExecutionQueueEnqueueCtmParams,
-): Promise<TransactionInstruction> {
-  const discriminator = await anchorInstructionDiscriminator(
+): TransactionInstruction {
+  const discriminator = anchorInstructionDiscriminator(
     'execution_queue_enqueue_ctm',
   );
 
@@ -629,11 +635,6 @@ export async function buildExecutionQueueEnqueueCtmIx(
       isSigner: false,
       isWritable: false,
     },
-    {
-      pubkey: params.executionQueueBuffer,
-      isSigner: false,
-      isWritable: true,
-    },
   ];
 
   return new TransactionInstruction({
@@ -643,9 +644,9 @@ export async function buildExecutionQueueEnqueueCtmIx(
   });
 }
 
-export async function buildExecutionQueueEnqueueLiquidityIx(
+export function buildExecutionQueueEnqueueLiquidityIx(
   params: BuildExecutionQueueEnqueueLiquidityParams,
-): Promise<TransactionInstruction> {
+): TransactionInstruction {
   if (
     params.kind !== QueueItemKind.LiquidityDeposit &&
     params.kind !== QueueItemKind.LiquidityWithdraw
@@ -653,7 +654,7 @@ export async function buildExecutionQueueEnqueueLiquidityIx(
     throw new Error('enqueue_liquidity requires a liquidity kind');
   }
 
-  const discriminator = await anchorInstructionDiscriminator(
+  const discriminator = anchorInstructionDiscriminator(
     'execution_queue_enqueue_liquidity',
   );
   const data = Buffer.concat([
@@ -673,20 +674,15 @@ export async function buildExecutionQueueEnqueueLiquidityIx(
         isSigner: false,
         isWritable: false,
       },
-      {
-        pubkey: params.executionQueueBuffer,
-        isSigner: false,
-        isWritable: true,
-      },
     ],
     data,
   });
 }
 
-export async function buildExecutionQueueExecuteIx(
+export function buildExecutionQueueExecuteIx(
   params: BuildExecutionQueueExecuteParams,
-): Promise<TransactionInstruction> {
-  const discriminator = await anchorInstructionDiscriminator(
+): TransactionInstruction {
+  const discriminator = anchorInstructionDiscriminator(
     'execution_queue_execute',
   );
   const data = Buffer.concat([discriminator, u16ToLe(params.maxItems)]);
@@ -701,19 +697,14 @@ export async function buildExecutionQueueExecuteIx(
         isSigner: false,
         isWritable: false,
       },
-      {
-        pubkey: params.executionQueueBuffer,
-        isSigner: false,
-        isWritable: true,
-      },
     ],
     data,
   });
 }
 
-export async function buildExecutionQueueEnqueueCtmWithIntentIxs(
+export function buildExecutionQueueEnqueueCtmWithIntentIxs(
   params: BuildExecutionQueueEnqueueCtmWithIntentParams,
-): Promise<{
+): {
   envelope: CtmEnvelopeWire;
   userIntentMessage: Buffer;
   ctmEnvelopeMessage: Buffer;
@@ -721,14 +712,14 @@ export async function buildExecutionQueueEnqueueCtmWithIntentIxs(
   ctmEnvelopePreInstruction: TransactionInstruction;
   enqueueInstruction: TransactionInstruction;
   instructions: TransactionInstruction[];
-}> {
+} {
   const kind = params.kind ?? QueueItemKind.CtmWrapped;
   if (kind !== QueueItemKind.CtmWrapped) {
     throw new Error('enqueue_ctm requires QueueItemKind.CtmWrapped');
   }
 
-  const payloadHash = await hashExecutionQueuePayload(params.payload);
-  const accountsHash = await hashExecutionQueueAccountsForCtmEnqueue(
+  const payloadHash = hashExecutionQueuePayload(params.payload);
+  const accountsHash = hashExecutionQueueAccountsForCtmEnqueue(
     params.group,
     params.executionQueue,
     params.remainingAccounts,
@@ -742,13 +733,13 @@ export async function buildExecutionQueueEnqueueCtmWithIntentIxs(
     expiresAtSlot: toBigInt(params.expiresAtSlot ?? 0),
   };
 
-  const userIntentMessage = await buildUserIntentMessage(
+  const userIntentMessage = buildUserIntentMessage(
     params.group,
     params.mangoAccount,
     params.userOwner,
     envelope,
   );
-  const ctmEnvelopeMessage = await buildCtmEnvelopeMessage(params.group, envelope);
+  const ctmEnvelopeMessage = buildCtmEnvelopeMessage(params.group, envelope);
 
   const userIntentPreInstruction = buildIntentEd25519Instruction(
     userIntentMessage,
@@ -758,7 +749,7 @@ export async function buildExecutionQueueEnqueueCtmWithIntentIxs(
     ctmEnvelopeMessage,
     params.ctmSigner,
   );
-  const enqueueInstruction = await buildExecutionQueueEnqueueCtmIx({
+  const enqueueInstruction = buildExecutionQueueEnqueueCtmIx({
     programId: params.programId,
     group: params.group,
     executionQueue: params.executionQueue,

@@ -25,6 +25,7 @@ export * from './continuumHarness';
 export * from './continuumHarnessClient';
 export * from './error';
 export * from './executionQueue';
+export * from './executionQueueLayout';
 export * from './mango_v4';
 export * from './numbers/I80F48';
 export * from './risk';

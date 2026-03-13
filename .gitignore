@@ -19,4 +19,6 @@ yarn-error.log
 err-txs
 
 .localnet
+.localnet.bak.*
+bin/
 third-party

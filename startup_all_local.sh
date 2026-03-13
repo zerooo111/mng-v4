@@ -11,6 +11,7 @@ LOG_DIR="${LOCALNET_DIR}/logs"
 RUN_DIR="${LOCALNET_DIR}/run"
 PID_DIR="${RUN_DIR}/pids"
 FRONTEND_RUN_DIR="${FRONTEND_DIR}/.localdev"
+EXECUTION_ENGINE_BIN="${MNG_DIR}/target/debug/service-mango-execution-engine"
 
 SOLANA_URL="${SOLANA_URL:-http://127.0.0.1:8899}"
 FRONTEND_HOST="${FRONTEND_HOST:-127.0.0.1}"
@@ -20,6 +21,8 @@ PERP_MARKET_INDEX="${PERP_MARKET_INDEX:-0}"
 MB_PAYER_KEYPAIR="${MB_PAYER_KEYPAIR:-/home/ec2-user/.config/solana/id.json}"
 CTM_RELAYER_PAYER_KEYPAIR="${CTM_RELAYER_PAYER_KEYPAIR:-${MB_PAYER_KEYPAIR}}"
 CTM_RELAYER_CTM_KEYPAIR="${CTM_RELAYER_CTM_KEYPAIR:-${MB_PAYER_KEYPAIR}}"
+CTM_RELAYER_IMPL="${CTM_RELAYER_IMPL:-ts}"
+CTM_EXECUTION_ENGINE_HTTP_BIND_ADDR="${CTM_EXECUTION_ENGINE_HTTP_BIND_ADDR:-127.0.0.1:9093}"
 HARNESS_ENABLE_AIRDROP="${HARNESS_ENABLE_AIRDROP:-true}"
 HARNESS_AIRDROP_DEPOSIT_UI_AMOUNT="${HARNESS_AIRDROP_DEPOSIT_UI_AMOUNT:-1000}"
 
@@ -159,6 +162,8 @@ stop_all() {
   pkill -f 'ts/client/scripts/execution-queue/ctm-relayer-http-bridge.ts' 2>/dev/null || true
   pkill -f 'ts/client/scripts/execution-queue/continuum-state-harness.ts' 2>/dev/null || true
   pkill -f 'ts/client/scripts/execution-queue/ctm-sequencer-relayer.ts' 2>/dev/null || true
+  pkill -f 'ts/client/scripts/execution-queue/execution-queue-cranker.ts' 2>/dev/null || true
+  pkill -f 'service-mango-execution-engine' 2>/dev/null || true
   pkill -f 'solana -u .* program deploy .*mango_v4.so' 2>/dev/null || true
   pkill -f 'solana-test-validator --ledger /home/ec2-user/stagin4/mng-v4/.localnet/ledger' 2>/dev/null || true
   pkill -f "vite --host ${FRONTEND_HOST} --port ${FRONTEND_PORT}" 2>/dev/null || true
@@ -421,9 +426,14 @@ start_harness_and_relayer() {
     exit 1
   fi
   local buffer_pk usdc_mint group_pk
-  buffer_pk="$(read_cfg_field executionQueueBuffer)"
+  buffer_pk="$(read_cfg_field executionQueueBuffer || true)"
   usdc_mint="$(read_cfg_field usdcMint)"
   group_pk="$(read_cfg_field group)"
+  local queue_pk
+  queue_pk="$(read_cfg_field executionQueue)"
+  if [[ -z "${buffer_pk}" ]]; then
+    buffer_pk="${queue_pk}"
+  fi
 
   setsid env \
     TS_NODE_TRANSPILE_ONLY="${TS_NODE_TRANSPILE_ONLY}" \
@@ -448,20 +458,66 @@ start_harness_and_relayer() {
     "${HARNESS_PID_FILE}" \
     "${LOG_DIR}/continuum-harness.log"
 
-  setsid env \
-    TS_NODE_TRANSPILE_ONLY="${TS_NODE_TRANSPILE_ONLY}" \
-    CLUSTER_OVERRIDE=devnet \
-    CLUSTER_URL_OVERRIDE="${SOLANA_URL}" \
-    CTM_RELAYER_PROGRAM_ID="${PROGRAM_ID_EFFECTIVE}" \
-    CTM_RELAYER_BIND_ADDR=127.0.0.1:9090 \
-    CTM_RELAYER_PAYER_KEYPAIR="${CTM_RELAYER_PAYER_KEYPAIR}" \
-    CTM_RELAYER_CTM_KEYPAIR="${CTM_RELAYER_CTM_KEYPAIR}" \
-    CTM_RELAYER_EVENT_SINK_URL=http://127.0.0.1:9091/ingest/relay-intent \
-    EXECUTION_QUEUE_BUFFER_PK="${buffer_pk}" \
-    CTM_RELAYER_SEQUENCE_STATE_PATH="${RELAYER_SEQUENCE_STATE_PATH}" \
-    CTM_RELAYER_MIN_EXECUTE_SLOT_OFFSET=1 \
-    ./node_modules/.bin/ts-node ts/client/scripts/execution-queue/ctm-sequencer-relayer.ts \
-    >"${LOG_DIR}/ctm-relayer.log" 2>&1 < /dev/null &
+  if [[ "${CTM_RELAYER_IMPL}" == "rust" ]]; then
+    if [[ -x "${EXECUTION_ENGINE_BIN}" ]]; then
+      setsid env \
+        CLUSTER_OVERRIDE=devnet \
+        CLUSTER_URL_OVERRIDE="${SOLANA_URL}" \
+        CTM_RELAYER_PROGRAM_ID="${PROGRAM_ID_EFFECTIVE}" \
+        CTM_RELAYER_BIND_ADDR=127.0.0.1:9090 \
+        CTM_EXECUTION_ENGINE_HTTP_BIND_ADDR="${CTM_EXECUTION_ENGINE_HTTP_BIND_ADDR}" \
+        CTM_RELAYER_PAYER_KEYPAIR="${CTM_RELAYER_PAYER_KEYPAIR}" \
+        CTM_RELAYER_CTM_KEYPAIR="${CTM_RELAYER_CTM_KEYPAIR}" \
+        CTM_RELAYER_EVENT_SINK_URL=http://127.0.0.1:9091/ingest/relay-intent \
+        EXECUTION_QUEUE_BUFFER_PK="${buffer_pk}" \
+        EXECUTION_QUEUE_GROUP_PK="${group_pk}" \
+        EXECUTION_QUEUE_PK="${queue_pk}" \
+        EXECUTION_QUEUE_CRANK_LANES_JSON_PATH="${RUN_DIR}/execution-queue-lanes-${GROUP_NUM}.json" \
+        EXECUTION_QUEUE_CRANK_MAX_ITEMS=8 \
+        EXECUTION_QUEUE_CRANK_INTERVAL_MS=250 \
+        EXECUTION_QUEUE_CRANK_SKIP_PREFLIGHT=true \
+        CTM_RELAYER_SEQUENCE_STATE_PATH="${RELAYER_SEQUENCE_STATE_PATH}" \
+        CTM_RELAYER_MIN_EXECUTE_SLOT_OFFSET=1 \
+        "${EXECUTION_ENGINE_BIN}" \
+        >"${LOG_DIR}/ctm-relayer.log" 2>&1 < /dev/null &
+    else
+      setsid env \
+        CLUSTER_OVERRIDE=devnet \
+        CLUSTER_URL_OVERRIDE="${SOLANA_URL}" \
+        CTM_RELAYER_PROGRAM_ID="${PROGRAM_ID_EFFECTIVE}" \
+        CTM_RELAYER_BIND_ADDR=127.0.0.1:9090 \
+        CTM_EXECUTION_ENGINE_HTTP_BIND_ADDR="${CTM_EXECUTION_ENGINE_HTTP_BIND_ADDR}" \
+        CTM_RELAYER_PAYER_KEYPAIR="${CTM_RELAYER_PAYER_KEYPAIR}" \
+        CTM_RELAYER_CTM_KEYPAIR="${CTM_RELAYER_CTM_KEYPAIR}" \
+        CTM_RELAYER_EVENT_SINK_URL=http://127.0.0.1:9091/ingest/relay-intent \
+        EXECUTION_QUEUE_BUFFER_PK="${buffer_pk}" \
+        EXECUTION_QUEUE_GROUP_PK="${group_pk}" \
+        EXECUTION_QUEUE_PK="${queue_pk}" \
+        EXECUTION_QUEUE_CRANK_LANES_JSON_PATH="${RUN_DIR}/execution-queue-lanes-${GROUP_NUM}.json" \
+        EXECUTION_QUEUE_CRANK_MAX_ITEMS=8 \
+        EXECUTION_QUEUE_CRANK_INTERVAL_MS=250 \
+        EXECUTION_QUEUE_CRANK_SKIP_PREFLIGHT=true \
+        CTM_RELAYER_SEQUENCE_STATE_PATH="${RELAYER_SEQUENCE_STATE_PATH}" \
+        CTM_RELAYER_MIN_EXECUTE_SLOT_OFFSET=1 \
+        cargo run -p service-mango-execution-engine \
+        >"${LOG_DIR}/ctm-relayer.log" 2>&1 < /dev/null &
+    fi
+  else
+    setsid env \
+      TS_NODE_TRANSPILE_ONLY="${TS_NODE_TRANSPILE_ONLY}" \
+      CLUSTER_OVERRIDE=devnet \
+      CLUSTER_URL_OVERRIDE="${SOLANA_URL}" \
+      CTM_RELAYER_PROGRAM_ID="${PROGRAM_ID_EFFECTIVE}" \
+      CTM_RELAYER_BIND_ADDR=127.0.0.1:9090 \
+      CTM_RELAYER_PAYER_KEYPAIR="${CTM_RELAYER_PAYER_KEYPAIR}" \
+      CTM_RELAYER_CTM_KEYPAIR="${CTM_RELAYER_CTM_KEYPAIR}" \
+      CTM_RELAYER_EVENT_SINK_URL=http://127.0.0.1:9091/ingest/relay-intent \
+      EXECUTION_QUEUE_BUFFER_PK="${buffer_pk}" \
+      CTM_RELAYER_SEQUENCE_STATE_PATH="${RELAYER_SEQUENCE_STATE_PATH}" \
+      CTM_RELAYER_MIN_EXECUTE_SLOT_OFFSET=1 \
+      ./node_modules/.bin/ts-node ts/client/scripts/execution-queue/ctm-sequencer-relayer.ts \
+      >"${LOG_DIR}/ctm-relayer.log" 2>&1 < /dev/null &
+  fi
   echo $! >"${RELAYER_PID_FILE}"
   wait_for_port_or_fail \
     "relayer" \
@@ -469,6 +525,14 @@ start_harness_and_relayer() {
     "${RELAYER_START_TIMEOUT_SECS}" \
     "${RELAYER_PID_FILE}" \
     "${LOG_DIR}/ctm-relayer.log"
+  if [[ "${CTM_RELAYER_IMPL}" == "rust" ]]; then
+    wait_for_http_or_fail \
+      "execution-engine" \
+      "http://${CTM_EXECUTION_ENGINE_HTTP_BIND_ADDR}/healthz" \
+      "${RELAYER_START_TIMEOUT_SECS}" \
+      "${RELAYER_PID_FILE}" \
+      "${LOG_DIR}/ctm-relayer.log"
+  fi
 }
 
 start_bridge() {
@@ -549,7 +613,7 @@ status_all() {
     fi
   fi
   echo "ports:"
-  ss -ltn | rg ':(443|5173|8899|9090|9091|9092)\b' || true
+  ss -ltn | rg ':(443|5173|8899|9090|9091|9092|9093)\b' || true
   echo "health:"
   if curl -fsS "http://127.0.0.1:9091/healthz" >/dev/null 2>&1; then
     echo "  harness: ok"
@@ -560,6 +624,13 @@ status_all() {
     echo "  bridge:  ok"
   else
     echo "  bridge:  fail"
+  fi
+  if [[ "${CTM_RELAYER_IMPL}" == "rust" ]]; then
+    if curl -fsS "http://${CTM_EXECUTION_ENGINE_HTTP_BIND_ADDR}/healthz" >/dev/null 2>&1; then
+      echo "  execution_engine: ok"
+    else
+      echo "  execution_engine: fail"
+    fi
   fi
   if curl -fsS "http://${FRONTEND_HOST}:${FRONTEND_PORT}/" >/dev/null 2>&1; then
     echo "  frontend: ok"
