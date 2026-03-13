@@ -692,11 +692,6 @@ export function buildExecutionQueueExecuteIx(
       { pubkey: params.group, isSigner: false, isWritable: true },
       { pubkey: params.executionQueue, isSigner: false, isWritable: true },
       ...params.remainingAccounts,
-      {
-        pubkey: params.programId,
-        isSigner: false,
-        isWritable: false,
-      },
     ],
     data,
   });

@@ -27,7 +27,9 @@ async function main(): Promise<void> {
     json({
       msg: 'queue',
       capacity: header.capacity,
-      head: header.head,
+      liquidityHead: header.liquidityHead,
+      ctmCount: header.ctmCount,
+      liquidityCount: header.liquidityCount,
       count: header.count,
       next: header.nextSequence,
       max: header.maxSeenSequence,
@@ -50,7 +52,7 @@ async function main(): Promise<void> {
   console.log(
     json({
       msg: 'head',
-      logicalIdx: headItem.logicalIndex,
+      section: headItem.section,
       physicalIdx: headItem.physicalIndex,
       sequence: headItem.sequence,
       kind: headItem.kind,

@@ -22,6 +22,7 @@ CTM_RELAYER_CTM_KEYPAIR="${CTM_RELAYER_CTM_KEYPAIR:-${MB_PAYER_KEYPAIR}}"
 CTM_RELAYER_BIND_ADDR="${CTM_RELAYER_BIND_ADDR:-127.0.0.1:9090}"
 CTM_RELAYER_IMPL="${CTM_RELAYER_IMPL:-ts}"
 CTM_EXECUTION_ENGINE_HTTP_BIND_ADDR="${CTM_EXECUTION_ENGINE_HTTP_BIND_ADDR:-127.0.0.1:9093}"
+EXECUTION_QUEUE_ENGINE_ENABLED="${EXECUTION_QUEUE_ENGINE_ENABLED:-false}"
 HARNESS_BIND_ADDR="${HARNESS_BIND_ADDR:-127.0.0.1:9091}"
 RESET_VALIDATOR="${RESET_VALIDATOR:-1}"
 BUILD_SBF="${BUILD_SBF:-0}"
@@ -170,10 +171,18 @@ reset_runtime_artifacts_if_requested() {
     return 0
   fi
   # Avoid replaying stale relay/harness history after a validator reset.
-  rm -f "${RELAYER_SEQUENCE_STATE_PATH}" "${CONTINUUM_EVENT_LOG_PATH}"
+  rm -f \
+    "${RELAYER_SEQUENCE_STATE_PATH}" \
+    "${CONTINUUM_EVENT_LOG_PATH}" \
+    "${E2E_OUTPUT_CONFIG_PATH}" \
+    "${BUFFER_LAYOUT_PATH}" \
+    "${LANE_CONFIG_PATH}"
 }
 
 deploy_program() {
+  if [[ "${PRELOAD_PROGRAM_IN_VALIDATOR:-1}" == "1" ]]; then
+    return 0
+  fi
   if [[ ! -f "${PROGRAM_SO}" || ! -f "${PROGRAM_KEYPAIR}" ]]; then
     echo "Missing deploy artifacts (${PROGRAM_SO} / ${PROGRAM_KEYPAIR})" >&2
     exit 1
@@ -222,8 +231,13 @@ start_validator() {
   if [[ "${RESET_VALIDATOR}" == "1" ]]; then
     reset_flag+=(--reset)
   fi
+  local preload_args=()
+  if [[ "${PRELOAD_PROGRAM_IN_VALIDATOR:-1}" == "1" ]]; then
+    preload_args+=(--bpf-program "${PROGRAM_ID}" "${PROGRAM_SO}")
+  fi
   setsid solana-test-validator \
     --ledger "${LEDGER_DIR}" \
+    "${preload_args[@]}" \
     "${reset_flag[@]}" \
     >"${LOG_DIR}/validator.log" 2>&1 &
   echo $! >"${VALIDATOR_PID_FILE}"
@@ -299,6 +313,7 @@ start_relayer() {
         EXECUTION_QUEUE_BUFFER_PK="${buffer_pk}" \
         EXECUTION_QUEUE_GROUP_PK="${group_pk}" \
         EXECUTION_QUEUE_PK="${queue_pk}" \
+        EXECUTION_QUEUE_ENGINE_ENABLED="${EXECUTION_QUEUE_ENGINE_ENABLED}" \
         EXECUTION_QUEUE_CRANK_LANES_JSON_PATH="${LANE_CONFIG_PATH}" \
         EXECUTION_QUEUE_CRANK_MAX_ITEMS=8 \
         EXECUTION_QUEUE_CRANK_INTERVAL_MS=250 \
@@ -320,6 +335,7 @@ start_relayer() {
         EXECUTION_QUEUE_BUFFER_PK="${buffer_pk}" \
         EXECUTION_QUEUE_GROUP_PK="${group_pk}" \
         EXECUTION_QUEUE_PK="${queue_pk}" \
+        EXECUTION_QUEUE_ENGINE_ENABLED="${EXECUTION_QUEUE_ENGINE_ENABLED}" \
         EXECUTION_QUEUE_CRANK_LANES_JSON_PATH="${LANE_CONFIG_PATH}" \
         EXECUTION_QUEUE_CRANK_MAX_ITEMS=8 \
         EXECUTION_QUEUE_CRANK_INTERVAL_MS=250 \
@@ -352,7 +368,7 @@ start_relayer() {
 }
 
 start_cranker() {
-  if [[ "${CTM_RELAYER_IMPL}" == "rust" ]]; then
+  if [[ "${CTM_RELAYER_IMPL}" == "rust" && "${EXECUTION_QUEUE_ENGINE_ENABLED}" == "true" ]]; then
     echo "Cranker disabled: execution handled inside Rust relayer"
     return 0
   fi

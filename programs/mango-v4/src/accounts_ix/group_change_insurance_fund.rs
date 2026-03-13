@@ -14,12 +14,12 @@ pub struct GroupChangeInsuranceFund<'info> {
     pub admin: Signer<'info>,
 
     #[account(mut)]
-    pub insurance_vault: Account<'info, TokenAccount>,
+    pub insurance_vault: Box<Account<'info, TokenAccount>>,
 
     #[account(mut)]
-    pub withdraw_destination: Account<'info, TokenAccount>,
+    pub withdraw_destination: Box<Account<'info, TokenAccount>>,
 
-    pub new_insurance_mint: Account<'info, Mint>,
+    pub new_insurance_mint: Box<Account<'info, Mint>>,
 
     #[account(
         init,
@@ -29,7 +29,7 @@ pub struct GroupChangeInsuranceFund<'info> {
         token::mint = new_insurance_mint,
         payer = payer
     )]
-    pub new_insurance_vault: Account<'info, TokenAccount>,
+    pub new_insurance_vault: Box<Account<'info, TokenAccount>>,
 
     #[account(mut)]
     pub payer: Signer<'info>,

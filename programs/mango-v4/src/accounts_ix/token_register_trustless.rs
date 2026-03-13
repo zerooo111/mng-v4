@@ -8,15 +8,11 @@ const FIRST_BANK_NUM: u32 = 0;
 #[derive(Accounts)]
 #[instruction(token_index: TokenIndex)]
 pub struct TokenRegisterTrustless<'info> {
-    #[account(
-        mut,
-        constraint = group.load()?.admin == admin.key() || group.load()?.fast_listing_admin == admin.key(),
-        constraint = group.load()?.is_ix_enabled(IxGate::TokenRegisterTrustless) @ MangoError::IxIsDisabled,
-    )]
+    #[account(mut)]
     pub group: AccountLoader<'info, Group>,
     pub admin: Signer<'info>,
 
-    pub mint: Account<'info, Mint>,
+    pub mint: Box<Account<'info, Mint>>,
 
     #[account(
         init,
@@ -36,7 +32,7 @@ pub struct TokenRegisterTrustless<'info> {
         token::mint = mint,
         payer = payer
     )]
-    pub vault: Account<'info, TokenAccount>,
+    pub vault: Box<Account<'info, TokenAccount>>,
 
     #[account(
         init,

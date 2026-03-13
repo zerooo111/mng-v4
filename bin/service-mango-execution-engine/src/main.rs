@@ -15,11 +15,12 @@ use anchor_lang::InstructionData;
 use mango_v4::{
     instructions::CtmEnvelope,
     state::{
-        EXECUTION_QUEUE_COUNT_OFFSET, EXECUTION_QUEUE_HEAD_OFFSET,
+        EXECUTION_QUEUE_COUNT_OFFSET, EXECUTION_QUEUE_CTM_CAPACITY, EXECUTION_QUEUE_CTM_ITEMS_OFFSET,
+        EXECUTION_QUEUE_HEAD_OFFSET,
         EXECUTION_QUEUE_ITEM_ACCOUNTS_HASH_OFFSET, EXECUTION_QUEUE_ITEM_KIND_OFFSET,
         EXECUTION_QUEUE_ITEM_SIZE, EXECUTION_QUEUE_ITEM_STATUS_OFFSET,
-        EXECUTION_QUEUE_ITEM_SEQUENCE_OFFSET, EXECUTION_QUEUE_ITEMS_OFFSET,
-        EXECUTION_QUEUE_NEXT_SEQUENCE_OFFSET,
+        EXECUTION_QUEUE_ITEM_SEQUENCE_OFFSET, EXECUTION_QUEUE_LIQUIDITY_CAPACITY,
+        EXECUTION_QUEUE_LIQUIDITY_ITEMS_OFFSET, EXECUTION_QUEUE_NEXT_SEQUENCE_OFFSET,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -1269,7 +1270,6 @@ fn build_execute_instruction(
         AccountMeta::new(execution_queue, false),
     ];
     accounts.extend_from_slice(remaining_accounts);
-    accounts.push(AccountMeta::new_readonly(program_id, false));
     Instruction {
         program_id,
         accounts,
@@ -1310,7 +1310,7 @@ fn inspect_queue_head(queue_data: &[u8]) -> QueueHead {
         };
     }
 
-    let head = if queue_data.len() >= EXECUTION_QUEUE_HEAD_OFFSET + 4 {
+    let liquidity_head = if queue_data.len() >= EXECUTION_QUEUE_HEAD_OFFSET + 4 {
         u32::from_le_bytes(
             queue_data[EXECUTION_QUEUE_HEAD_OFFSET..EXECUTION_QUEUE_HEAD_OFFSET + 4]
                 .try_into()
@@ -1319,37 +1319,23 @@ fn inspect_queue_head(queue_data: &[u8]) -> QueueHead {
     } else {
         0
     };
-    let capacity = queue_data
-        .len()
-        .saturating_sub(EXECUTION_QUEUE_ITEMS_OFFSET)
-        / EXECUTION_QUEUE_ITEM_SIZE;
-    if capacity == 0 {
-        return QueueHead {
-            count,
-            next_sequence,
-            head_accounts_hash: None,
-        };
-    }
-    let mut logical_index = 0usize;
-    while logical_index < count as usize {
-        let physical_index = (head + logical_index) % capacity;
-        let offset = EXECUTION_QUEUE_ITEMS_OFFSET + physical_index * EXECUTION_QUEUE_ITEM_SIZE;
-        if offset + EXECUTION_QUEUE_ITEM_SIZE > queue_data.len() {
-            break;
-        }
+    let ctm_offset =
+        EXECUTION_QUEUE_CTM_ITEMS_OFFSET
+            + (next_sequence as usize % EXECUTION_QUEUE_CTM_CAPACITY) * EXECUTION_QUEUE_ITEM_SIZE;
+    if ctm_offset + EXECUTION_QUEUE_ITEM_SIZE <= queue_data.len() {
         let sequence = u64::from_le_bytes(
-            queue_data
-                [offset + EXECUTION_QUEUE_ITEM_SEQUENCE_OFFSET..offset + EXECUTION_QUEUE_ITEM_SEQUENCE_OFFSET + 8]
+            queue_data[ctm_offset + EXECUTION_QUEUE_ITEM_SEQUENCE_OFFSET
+                ..ctm_offset + EXECUTION_QUEUE_ITEM_SEQUENCE_OFFSET + 8]
                 .try_into()
                 .unwrap_or([0; 8]),
         );
-        let kind = queue_data[offset + EXECUTION_QUEUE_ITEM_KIND_OFFSET];
-        let status = queue_data[offset + EXECUTION_QUEUE_ITEM_STATUS_OFFSET];
+        let kind = queue_data[ctm_offset + EXECUTION_QUEUE_ITEM_KIND_OFFSET];
+        let status = queue_data[ctm_offset + EXECUTION_QUEUE_ITEM_STATUS_OFFSET];
         if status == 1 && kind == 0 && sequence == next_sequence {
             let mut hash = [0u8; 32];
             hash.copy_from_slice(
-                &queue_data[offset + EXECUTION_QUEUE_ITEM_ACCOUNTS_HASH_OFFSET
-                    ..offset + EXECUTION_QUEUE_ITEM_ACCOUNTS_HASH_OFFSET + 32],
+                &queue_data[ctm_offset + EXECUTION_QUEUE_ITEM_ACCOUNTS_HASH_OFFSET
+                    ..ctm_offset + EXECUTION_QUEUE_ITEM_ACCOUNTS_HASH_OFFSET + 32],
             );
             return QueueHead {
                 count,
@@ -1357,7 +1343,24 @@ fn inspect_queue_head(queue_data: &[u8]) -> QueueHead {
                 head_accounts_hash: Some(hash),
             };
         }
-        logical_index += 1;
+    }
+
+    let liq_offset = EXECUTION_QUEUE_LIQUIDITY_ITEMS_OFFSET
+        + (liquidity_head % EXECUTION_QUEUE_LIQUIDITY_CAPACITY) * EXECUTION_QUEUE_ITEM_SIZE;
+    if liq_offset + EXECUTION_QUEUE_ITEM_SIZE <= queue_data.len() {
+        let status = queue_data[liq_offset + EXECUTION_QUEUE_ITEM_STATUS_OFFSET];
+        if status == 1 {
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(
+                &queue_data[liq_offset + EXECUTION_QUEUE_ITEM_ACCOUNTS_HASH_OFFSET
+                    ..liq_offset + EXECUTION_QUEUE_ITEM_ACCOUNTS_HASH_OFFSET + 32],
+            );
+            return QueueHead {
+                count,
+                next_sequence,
+                head_accounts_hash: Some(hash),
+            };
+        }
     }
 
     QueueHead {

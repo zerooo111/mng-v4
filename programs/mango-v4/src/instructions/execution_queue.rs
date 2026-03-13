@@ -10,6 +10,7 @@ use anchor_lang::solana_program::program::{invoke, invoke_signed};
 use anchor_lang::solana_program::system_instruction;
 use anchor_lang::solana_program::sysvar::instructions as tx_instructions;
 use anchor_lang::InstructionData;
+use std::collections::BTreeMap;
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
 pub struct ExecutionQueueConfigParams {
@@ -133,14 +134,13 @@ struct DecodedQueuePayload {
 
 #[derive(Clone, Debug)]
 struct ExecutableCandidate {
-    idx: usize,
     sequence: u64,
     kind: u8,
     payload: Vec<u8>,
     payload_hash: [u8; 32],
     accounts_hash: [u8; 32],
     retries: u8,
-    is_ctm_lane: bool,
+    is_ctm: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -171,14 +171,15 @@ fn split_dispatch_accounts<'a, 'info>(
         !without_alias.is_empty(),
         MangoError::ExecutionQueueDispatchAccountLayoutInvalid
     );
-    let dispatch_program_ai = without_alias
-        .last()
-        .ok_or_else(|| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?;
-    require!(
-        *dispatch_program_ai.key == crate::id(),
-        MangoError::ExecutionQueueDispatchAccountLayoutInvalid
-    );
-    Ok((&without_alias[..without_alias.len() - 1], without_alias))
+    let dispatch_program_ai = without_alias.last();
+    if dispatch_program_ai
+        .map(|ai| *ai.key == crate::id())
+        .unwrap_or(false)
+    {
+        Ok((&without_alias[..without_alias.len() - 1], without_alias))
+    } else {
+        Ok((without_alias, without_alias))
+    }
 }
 
 fn hash_accounts(accounts: &[AccountMeta]) -> [u8; 32] {
@@ -393,6 +394,80 @@ fn build_dispatch_ix_data(payload: &DecodedQueuePayload) -> Vec<u8> {
     }
 }
 
+fn build_perp_place_order_from_queue_payload(payload: &PerpPlaceOrderV2Payload) -> Result<Order> {
+    require_gte!(payload.price_lots, 0);
+
+    let time_in_force = match Order::tif_from_expiry(payload.expiry_timestamp) {
+        Some(t) => t,
+        None => {
+            msg!("Order is already expired");
+            return err!(MangoError::SomeError);
+        }
+    };
+
+    Ok(Order {
+        side: payload.side,
+        max_base_lots: payload.max_base_lots,
+        max_quote_lots: payload.max_quote_lots,
+        client_order_id: payload.client_order_id,
+        reduce_only: payload.reduce_only,
+        time_in_force,
+        self_trade_behavior: payload.self_trade_behavior,
+        params: match payload.order_type {
+            PlaceOrderType::Market => OrderParams::Market,
+            PlaceOrderType::ImmediateOrCancel => OrderParams::ImmediateOrCancel {
+                price_lots: payload.price_lots,
+            },
+            _ => OrderParams::Fixed {
+                price_lots: payload.price_lots,
+                order_type: payload.order_type.to_post_order_type()?,
+            },
+        },
+    })
+}
+
+fn dispatch_perp_place_order_v2<'info>(
+    payload: &PerpPlaceOrderV2Payload,
+    dispatch_accounts: &[AccountInfo<'info>],
+) -> Result<()> {
+    require!(
+        dispatch_accounts.len() >= 8,
+        MangoError::ExecutionQueueDispatchAccountLayoutInvalid
+    );
+
+    let mut owner_ai = dispatch_accounts[2].clone();
+    owner_ai.is_signer = true;
+
+    let mut accounts = PerpPlaceOrder {
+        group: AccountLoader::try_from(&dispatch_accounts[0])
+            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
+        account: AccountLoader::try_from(&dispatch_accounts[1])
+            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
+        owner: Signer::try_from(&owner_ai)
+            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
+        perp_market: AccountLoader::try_from(&dispatch_accounts[3])
+            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
+        bids: AccountLoader::try_from(&dispatch_accounts[4])
+            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
+        asks: AccountLoader::try_from(&dispatch_accounts[5])
+            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
+        event_queue: AccountLoader::try_from(&dispatch_accounts[6])
+            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
+        oracle: UncheckedAccount::try_from(dispatch_accounts[7].clone()),
+    };
+
+    let order = build_perp_place_order_from_queue_payload(payload)?;
+    let program_id = crate::id();
+    let ctx = Context::new(
+        &program_id,
+        &mut accounts,
+        &dispatch_accounts[8..],
+        BTreeMap::new(),
+    );
+    crate::instructions::perp_place_order(ctx, order, payload.limit)?;
+    Ok(())
+}
+
 fn dispatch_queue_payload(
     payload: &DecodedQueuePayload,
     dispatch_accounts: &[AccountInfo],
@@ -401,6 +476,18 @@ fn dispatch_queue_payload(
     execution_queue_key: Pubkey,
     execution_queue_bump: u8,
 ) -> Result<()> {
+    if let QueuePayloadBody::PerpPlaceOrderV2(place) = &payload.body {
+        return dispatch_perp_place_order_v2(place, dispatch_accounts);
+    }
+
+    require!(
+        invoke_accounts
+            .last()
+            .map(|ai| *ai.key == crate::id())
+            .unwrap_or(false),
+        MangoError::ExecutionQueueDispatchAccountLayoutInvalid
+    );
+
     let mut metas = account_metas_from_infos(dispatch_accounts);
     if variant_uses_queue_owner_signer(payload.variant) {
         require!(
@@ -718,7 +805,6 @@ pub fn execution_queue_enqueue_ctm(
         queue.paused_ingress == 0,
         MangoError::ExecutionQueueIngressPaused
     );
-    require!(!queue.is_full(), MangoError::ExecutionQueueFull);
 
     let payload_hash = hashv(&[&payload]).to_bytes();
     require!(
@@ -769,15 +855,6 @@ pub fn execution_queue_enqueue_ctm(
         envelope.sequence >= queue.header.next_sequence_to_execute,
         MangoError::InvalidSequenceNumber
     );
-    require!(
-        !(0..queue.len()).any(|i| {
-            let item = queue.item(i);
-            item.status == QueueItemStatus::Pending as u8
-                && item.kind == QueueItemKind::CtmWrapped as u8
-                && item.sequence == envelope.sequence
-        }),
-        MangoError::ExecutionQueueDuplicateSequence
-    );
 
     let msg_hash = canonical_envelope_message(ctx.accounts.group.key(), &envelope);
     verify_ed25519_preinstruction(
@@ -813,7 +890,7 @@ pub fn execution_queue_enqueue_ctm(
     item.accounts_hash = envelope.accounts_hash;
     item.payload[..payload.len()].copy_from_slice(&payload);
 
-    queue.push_back(item)?;
+    queue.push_ctm(item)?;
     queue.header.max_seen_sequence = queue.header.max_seen_sequence.max(envelope.sequence);
 
     emit!(QueueItemEnqueued {
@@ -863,7 +940,6 @@ pub fn execution_queue_enqueue_liquidity(
         queue.paused_ingress == 0,
         MangoError::ExecutionQueueIngressPaused
     );
-    require!(!queue.is_full(), MangoError::ExecutionQueueFull);
 
     let payload_hash = hashv(&[&payload]).to_bytes();
     let accounts_hash = hash_accounts(&account_metas_from_infos(dispatch_accounts));
@@ -879,7 +955,7 @@ pub fn execution_queue_enqueue_liquidity(
     item.accounts_hash = accounts_hash;
     item.payload[..payload.len()].copy_from_slice(&payload);
 
-    queue.push_back(item)?;
+    queue.push_liquidity(item)?;
 
     emit!(QueueItemEnqueued {
         group: ctx.accounts.group.key(),
@@ -917,88 +993,72 @@ pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u
 
     for _ in 0..max_items {
         let mut candidate: Option<ExecutableCandidate> = None;
-        let mut blocked_on_min_slot = false;
+        let mut blocked = false;
 
         {
             let mut queue = ctx.accounts.execution_queue.load_mut()?;
-            let next_seq = queue.header.next_sequence_to_execute;
-            let ctm_index = (0..queue.len()).position(|logical_idx| {
-                let item = queue.item(logical_idx);
-                item.status == QueueItemStatus::Pending as u8
-                    && item.kind == QueueItemKind::CtmWrapped as u8
-                    && item.sequence == next_seq
-            });
-
-            if let Some(idx) = ctm_index {
-                let item = *queue.item(idx);
+            if let Some(item) = queue.current_ctm_head().copied() {
                 if clock.slot < item.min_execute_slot {
-                    blocked_on_min_slot = true;
+                    blocked = true;
                 } else {
                     let payload_len = item.payload_len as usize;
                     candidate = Some(ExecutableCandidate {
-                        idx,
                         sequence: item.sequence,
                         kind: item.kind,
                         payload: item.payload[..payload_len].to_vec(),
                         payload_hash: item.payload_hash,
                         accounts_hash: item.accounts_hash,
                         retries: item.retries,
-                        is_ctm_lane: true,
+                        is_ctm: true,
                     });
                 }
-            } else {
-                let can_skip_gap = queue.header.max_seen_sequence >= next_seq;
-                if can_skip_gap {
-                    if queue.header.gap_observed_slot == 0 {
-                        queue.header.gap_observed_slot = clock.slot;
-                    }
-                    if clock.slot
-                        >= queue
-                            .header
-                            .gap_observed_slot
-                            .saturating_add(queue.header.gap_wait_slots)
-                    {
-                        emit!(QueueItemProcessed {
-                            group: ctx.accounts.group.key(),
-                            sequence: next_seq,
-                            kind: QueueItemKind::CtmWrapped as u8,
-                            status: QueueItemStatus::Skipped as u8,
-                        });
-                        queue.header.next_sequence_to_execute =
-                            queue.header.next_sequence_to_execute.saturating_add(1);
-                        queue.header.gap_observed_slot = 0;
-                        continue;
-                    }
+            } else if queue.header.ctm_count > 0
+                && queue.header.max_seen_sequence >= queue.header.next_sequence_to_execute
+            {
+                if queue.header.gap_observed_slot == 0 {
+                    queue.header.gap_observed_slot = clock.slot;
                 }
-
-                let liq_index = (0..queue.len())
-                    .filter(|logical_idx| {
-                        let it = queue.item(*logical_idx);
-                        it.status == QueueItemStatus::Pending as u8
-                            && (it.kind == QueueItemKind::LiquidityDeposit as u8
-                                || it.kind == QueueItemKind::LiquidityWithdraw as u8)
-                            && clock.slot >= it.min_execute_slot
-                    })
-                    .min_by_key(|logical_idx| queue.item(*logical_idx).ingress_slot);
-
-                if let Some(idx) = liq_index {
-                    let item = *queue.item(idx);
+                if clock.slot
+                    >= queue
+                        .header
+                        .gap_observed_slot
+                        .saturating_add(queue.header.gap_wait_slots)
+                {
+                    emit!(QueueItemProcessed {
+                        group: ctx.accounts.group.key(),
+                        sequence: queue.header.next_sequence_to_execute,
+                        kind: QueueItemKind::CtmWrapped as u8,
+                        status: QueueItemStatus::Skipped as u8,
+                    });
+                    queue.header.next_sequence_to_execute =
+                        queue.header.next_sequence_to_execute.saturating_add(1);
+                    queue.header.gap_observed_slot = 0;
+                    continue;
+                }
+                blocked = true;
+            } else if let Some(item) = queue.liquidity_head_item().copied() {
+                if item.status != QueueItemStatus::Pending as u8 {
+                    let _ = queue.pop_liquidity_head();
+                    continue;
+                }
+                if clock.slot < item.min_execute_slot {
+                    blocked = true;
+                } else {
                     let payload_len = item.payload_len as usize;
                     candidate = Some(ExecutableCandidate {
-                        idx,
                         sequence: item.sequence,
                         kind: item.kind,
                         payload: item.payload[..payload_len].to_vec(),
                         payload_hash: item.payload_hash,
                         accounts_hash: item.accounts_hash,
                         retries: item.retries,
-                        is_ctm_lane: false,
+                        is_ctm: false,
                     });
                 }
             }
         }
 
-        if blocked_on_min_slot {
+        if blocked {
             break;
         }
 
@@ -1011,11 +1071,10 @@ pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u
             Ok(p) => p,
             Err(_) => {
                 let mut queue = ctx.accounts.execution_queue.load_mut()?;
-                queue.remove_logical_index(candidate.idx)?;
-                if candidate.is_ctm_lane {
-                    queue.header.next_sequence_to_execute =
-                        queue.header.next_sequence_to_execute.saturating_add(1);
-                    queue.header.gap_observed_slot = 0;
+                if candidate.is_ctm {
+                    queue.clear_current_ctm_head_and_advance();
+                } else {
+                    let _ = queue.pop_liquidity_head();
                 }
                 emit!(QueueItemProcessed {
                     group: ctx.accounts.group.key(),
@@ -1030,11 +1089,10 @@ pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u
         let payload_kind = queue_item_kind_for_payload_variant(decoded_payload.variant);
         if computed_payload_hash != candidate.payload_hash || payload_kind != candidate.kind {
             let mut queue = ctx.accounts.execution_queue.load_mut()?;
-            queue.remove_logical_index(candidate.idx)?;
-            if candidate.is_ctm_lane {
-                queue.header.next_sequence_to_execute =
-                    queue.header.next_sequence_to_execute.saturating_add(1);
-                queue.header.gap_observed_slot = 0;
+            if candidate.is_ctm {
+                queue.clear_current_ctm_head_and_advance();
+            } else {
+                let _ = queue.pop_liquidity_head();
             }
             emit!(QueueItemProcessed {
                 group: ctx.accounts.group.key(),
@@ -1063,11 +1121,10 @@ pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u
         );
         if dispatch_result.is_ok() {
             let mut queue = ctx.accounts.execution_queue.load_mut()?;
-            queue.remove_logical_index(candidate.idx)?;
-            if candidate.is_ctm_lane {
-                queue.header.next_sequence_to_execute =
-                    queue.header.next_sequence_to_execute.saturating_add(1);
-                queue.header.gap_observed_slot = 0;
+            if candidate.is_ctm {
+                queue.clear_current_ctm_head_and_advance();
+            } else {
+                let _ = queue.pop_liquidity_head();
             }
             emit!(QueueItemProcessed {
                 group: ctx.accounts.group.key(),
@@ -1079,13 +1136,12 @@ pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u
         }
 
         let next_retry = candidate.retries.saturating_add(1);
-        if next_retry >= EXECUTION_QUEUE_MAX_RETRIES {
+        if candidate.is_ctm || next_retry >= EXECUTION_QUEUE_MAX_RETRIES {
             let mut queue = ctx.accounts.execution_queue.load_mut()?;
-            queue.remove_logical_index(candidate.idx)?;
-            if candidate.is_ctm_lane {
-                queue.header.next_sequence_to_execute =
-                    queue.header.next_sequence_to_execute.saturating_add(1);
-                queue.header.gap_observed_slot = 0;
+            if candidate.is_ctm {
+                queue.clear_current_ctm_head_and_advance();
+            } else {
+                let _ = queue.pop_liquidity_head();
             }
             emit!(QueueItemProcessed {
                 group: ctx.accounts.group.key(),
@@ -1097,13 +1153,7 @@ pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u
         }
 
         let mut queue = ctx.accounts.execution_queue.load_mut()?;
-        let item = queue.item_mut(candidate.idx);
-        if item.status == QueueItemStatus::Pending as u8 {
-            if item.first_failure_slot == 0 {
-                item.first_failure_slot = clock.slot;
-            }
-            item.retries = next_retry;
-        }
+        queue.rotate_liquidity_head_with_retry(clock.slot, next_retry, 1)?;
         break;
     }
 

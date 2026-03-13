@@ -16,7 +16,7 @@ pub struct GroupCreate<'info> {
 
     pub creator: Signer<'info>,
 
-    pub insurance_mint: Account<'info, Mint>,
+    pub insurance_mint: Box<Account<'info, Mint>>,
 
     #[account(
         init,
@@ -26,7 +26,7 @@ pub struct GroupCreate<'info> {
         token::mint = insurance_mint,
         payer = payer
     )]
-    pub insurance_vault: Account<'info, TokenAccount>,
+    pub insurance_vault: Box<Account<'info, TokenAccount>>,
 
     #[account(mut)]
     pub payer: Signer<'info>,

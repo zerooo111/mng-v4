@@ -1,8 +1,10 @@
 import { AnchorProvider, Wallet } from '@coral-xyz/anchor';
 import {
   createAssociatedTokenAccountIdempotent,
+  createInitializeAccount3Instruction,
   createMint,
   mintTo,
+  TOKEN_PROGRAM_ID,
 } from '@solana/spl-token';
 import {
   AccountMeta,
@@ -25,6 +27,7 @@ import {
   PerpOrderType,
   PerpSelfTradeBehavior,
 } from '../../src/accounts/perp';
+import { TokenIndex } from '../../src/accounts/bank';
 import { MangoClient } from '../../src/client';
 import { DefaultTokenRegisterParams } from '../../src/clientIxParamBuilder';
 import { MANGO_V4_ID } from '../../src/constants';
@@ -53,9 +56,19 @@ const OUTPUT_CONFIG_PATH =
 
 const USDC_MINT_DECIMALS = 6;
 const SOL_MINT_DECIMALS = 9;
+const BANK_ACCOUNT_SPACE = 8 + 3072;
+const MINT_INFO_ACCOUNT_SPACE = 8 + 3056;
+const USDC_TOKEN_INDEX = 0 as TokenIndex;
 const PERP_MARKET_INDEX_TYPED = PERP_MARKET_INDEX as PerpMarketIndex;
 const MAKER_MAX_QUOTE_QTY = Number(process.env.E2E_MAKER_MAX_QUOTE_QTY || '1000');
 const TAKER_MAX_QUOTE_QTY = Number(process.env.E2E_TAKER_MAX_QUOTE_QTY || '1000');
+
+type PriorBootstrapConfig = {
+  group?: string;
+  usdcMint?: string | null;
+  solMint?: string | null;
+};
+
 function readOrCreateKeypair(filePath: string): Keypair {
   const resolved = path.resolve(filePath);
   if (fs.existsSync(resolved)) {
@@ -73,6 +86,18 @@ function readKeypair(rawPathOrJson: string): Keypair {
     ? fs.readFileSync(maybeFile, 'utf-8')
     : rawPathOrJson;
   return Keypair.fromSecretKey(Uint8Array.from(JSON.parse(raw)));
+}
+
+function readPriorBootstrapConfig(): PriorBootstrapConfig | null {
+  const resolved = path.resolve(OUTPUT_CONFIG_PATH);
+  if (!fs.existsSync(resolved)) {
+    return null;
+  }
+  try {
+    return JSON.parse(fs.readFileSync(resolved, 'utf-8')) as PriorBootstrapConfig;
+  } catch {
+    return null;
+  }
 }
 
 function anchorDiscriminator(ixName: string): Buffer {
@@ -157,6 +182,91 @@ async function ensureExecutionQueue(params: {
   ]);
 }
 
+async function bootstrapTokenRegister(params: {
+  connection: Connection;
+  adminClient: MangoClient;
+  programId: PublicKey;
+  group: PublicKey;
+  admin: Keypair;
+  mint: PublicKey;
+  oracle: PublicKey;
+  fallbackOracle: PublicKey;
+  tokenIndex: TokenIndex;
+  name: string;
+  groupInsuranceFund: boolean;
+}): Promise<void> {
+  const bank = Keypair.generate();
+  const mintInfo = Keypair.generate();
+  const vault = Keypair.generate();
+  const bankLamports = await params.connection.getMinimumBalanceForRentExemption(
+    BANK_ACCOUNT_SPACE,
+  );
+  const mintInfoLamports =
+    await params.connection.getMinimumBalanceForRentExemption(
+      MINT_INFO_ACCOUNT_SPACE,
+    );
+  const vaultLamports = await params.connection.getMinimumBalanceForRentExemption(165);
+  const createIxs = [
+    SystemProgram.createAccount({
+      fromPubkey: params.admin.publicKey,
+      newAccountPubkey: bank.publicKey,
+      lamports: bankLamports,
+      space: BANK_ACCOUNT_SPACE,
+      programId: params.programId,
+    }),
+    SystemProgram.createAccount({
+      fromPubkey: params.admin.publicKey,
+      newAccountPubkey: mintInfo.publicKey,
+      lamports: mintInfoLamports,
+      space: MINT_INFO_ACCOUNT_SPACE,
+      programId: params.programId,
+    }),
+    SystemProgram.createAccount({
+      fromPubkey: params.admin.publicKey,
+      newAccountPubkey: vault.publicKey,
+      lamports: vaultLamports,
+      space: 165,
+      programId: TOKEN_PROGRAM_ID,
+    }),
+    createInitializeAccount3Instruction(
+      vault.publicKey,
+      params.mint,
+      params.group,
+      TOKEN_PROGRAM_ID,
+    ),
+    new TransactionInstruction({
+      programId: params.programId,
+      keys: [
+        { pubkey: params.group, isSigner: false, isWritable: false },
+        { pubkey: params.admin.publicKey, isSigner: true, isWritable: false },
+        { pubkey: params.mint, isSigner: false, isWritable: false },
+        { pubkey: bank.publicKey, isSigner: false, isWritable: true },
+        { pubkey: vault.publicKey, isSigner: false, isWritable: true },
+        { pubkey: mintInfo.publicKey, isSigner: false, isWritable: true },
+        { pubkey: params.oracle, isSigner: false, isWritable: false },
+        { pubkey: params.fallbackOracle, isSigner: false, isWritable: false },
+      ],
+      data: Buffer.concat([
+        anchorDiscriminator('token_register_bootstrap'),
+        Buffer.from(Uint8Array.of(params.tokenIndex & 0xff, (params.tokenIndex >> 8) & 0xff)),
+        (() => {
+          const nameBuf = Buffer.from(params.name, 'utf8');
+          const lenBuf = Buffer.alloc(4);
+          lenBuf.writeUInt32LE(nameBuf.length, 0);
+          return Buffer.concat([
+            lenBuf,
+            nameBuf,
+            Buffer.from(Uint8Array.of(params.groupInsuranceFund ? 1 : 0)),
+          ]);
+        })(),
+      ]),
+    }),
+  ];
+  await params.adminClient.sendAndConfirmTransaction(createIxs, {
+    additionalSigners: [bank, mintInfo, vault],
+  });
+}
+
 function executionQueueRemainingAccountsFromMangoIx(
   executionQueue: PublicKey,
   keys: { pubkey: PublicKey; isWritable: boolean; isSigner: boolean }[],
@@ -223,25 +333,11 @@ async function main(): Promise<void> {
   const adminClient = await MangoClient.connect(provider, CLUSTER, programId, {
     idsSource: 'get-program-accounts',
   });
+  const priorConfig = readPriorBootstrapConfig();
 
   await airdropIfNeeded(provider.connection, admin.publicKey);
   await airdropIfNeeded(provider.connection, maker.publicKey);
   await airdropIfNeeded(provider.connection, taker.publicKey);
-
-  const usdcMint = await createMint(
-    provider.connection,
-    admin,
-    admin.publicKey,
-    null,
-    USDC_MINT_DECIMALS,
-  );
-  const solMint = await createMint(
-    provider.connection,
-    admin,
-    admin.publicKey,
-    null,
-    SOL_MINT_DECIMALS,
-  );
 
   const groupNumBuf = Buffer.alloc(4);
   groupNumBuf.writeUInt32LE(GROUP_NUM);
@@ -251,10 +347,52 @@ async function main(): Promise<void> {
   );
 
   const groupInfo = await provider.connection.getAccountInfo(groupPk);
+  let usdcMint: PublicKey;
   if (!groupInfo) {
+    usdcMint = await createMint(
+      provider.connection,
+      admin,
+      admin.publicKey,
+      null,
+      USDC_MINT_DECIMALS,
+    );
     await adminClient.groupCreate(GROUP_NUM, true, 0, usdcMint);
+  } else {
+    const existingGroup = await adminClient.getGroup(groupPk);
+    const existingUsdcBank = existingGroup.banksMapByTokenIndex.get(USDC_TOKEN_INDEX)?.[0];
+    if (existingUsdcBank) {
+      usdcMint = existingUsdcBank.mint;
+    } else if (
+      priorConfig?.group === groupPk.toBase58() &&
+      priorConfig.usdcMint
+    ) {
+      usdcMint = new PublicKey(priorConfig.usdcMint);
+    } else {
+      usdcMint = await createMint(
+        provider.connection,
+        admin,
+        admin.publicKey,
+        null,
+        USDC_MINT_DECIMALS,
+      );
+    }
   }
   let group = await adminClient.getGroup(groupPk);
+
+  let solMint: PublicKey | null =
+    priorConfig?.group === groupPk.toBase58() && priorConfig.solMint
+      ? new PublicKey(priorConfig.solMint)
+      : null;
+  const existingPerpMarket = group.perpMarketsMapByMarketIndex.get(PERP_MARKET_INDEX_TYPED);
+  if (!solMint && !existingPerpMarket) {
+    solMint = await createMint(
+      provider.connection,
+      admin,
+      admin.publicKey,
+      null,
+      SOL_MINT_DECIMALS,
+    );
+  }
 
   const usdcOracles = await adminClient.getStubOracle(group, usdcMint);
   const usdcOracle = usdcOracles[0]
@@ -264,13 +402,19 @@ async function main(): Promise<void> {
         return (await adminClient.getStubOracle(group, usdcMint))[0];
       })());
 
-  const solOracles = await adminClient.getStubOracle(group, solMint);
-  const solOracle = solOracles[0]
-    ? solOracles[0]
-    : (await (async () => {
+  const solOracle = existingPerpMarket
+    ? { publicKey: existingPerpMarket.oracle }
+    : await (async () => {
+        if (!solMint) {
+          throw new Error('missing sol mint for perp market bootstrap');
+        }
+        const solOracles = await adminClient.getStubOracle(group, solMint);
+        if (solOracles[0]) {
+          return solOracles[0];
+        }
         await adminClient.stubOracleCreate(group, solMint, 100.0);
         return (await adminClient.getStubOracle(group, solMint))[0];
-      })());
+      })();
 
   let hasUsdcBank = true;
   try {
@@ -280,28 +424,23 @@ async function main(): Promise<void> {
   }
 
   if (!hasUsdcBank) {
-    await adminClient.tokenRegister(
-      group,
-      usdcMint,
-      usdcOracle.publicKey,
-      PublicKey.default,
-      0,
-      'USDC',
-      {
-        ...DefaultTokenRegisterParams,
-        loanFeeRate: 0,
-        loanOriginationFeeRate: 0,
-        maintAssetWeight: 1,
-        initAssetWeight: 1,
-        maintLiabWeight: 1,
-        initLiabWeight: 1,
-        liquidationFee: 0,
-      },
-    );
+    await bootstrapTokenRegister({
+      connection: provider.connection,
+      adminClient,
+      programId,
+      group: group.publicKey,
+      admin,
+      mint: usdcMint,
+      oracle: usdcOracle.publicKey,
+      fallbackOracle: PublicKey.default,
+      tokenIndex: USDC_TOKEN_INDEX,
+      name: 'USDC',
+      groupInsuranceFund: false,
+    });
     await group.reloadAll(adminClient);
   }
 
-  if (!group.perpMarketsMapByMarketIndex.get(PERP_MARKET_INDEX_TYPED)) {
+  if (!existingPerpMarket) {
     await adminClient.perpCreateMarket(
       group,
       solOracle.publicKey,
@@ -516,7 +655,7 @@ async function main(): Promise<void> {
     executionQueueBuffer: executionQueueBuffer.toBase58(),
     ctmSigner: ctm.publicKey.toBase58(),
     usdcMint: usdcMint.toBase58(),
-    solMint: solMint.toBase58(),
+    solMint: solMint?.toBase58() ?? null,
     usdcOracle: usdcOracle.publicKey.toBase58(),
     solOracle: solOracle.publicKey.toBase58(),
     perpMarketIndex: PERP_MARKET_INDEX,

@@ -48,88 +48,70 @@ pub fn token_register(
     collateral_fee_per_day: f32,
 ) -> Result<()> {
     require_neq!(token_index, TokenIndex::MAX);
+    {
+        let group = ctx.accounts.group.load()?;
+        require_keys_eq!(group.admin, ctx.accounts.admin.key());
+        require!(
+            group.is_ix_enabled(IxGate::TokenRegister),
+            MangoError::IxIsDisabled
+        );
+    }
 
     let now_ts: u64 = Clock::get()?.unix_timestamp.try_into().unwrap();
 
     let mut bank = ctx.accounts.bank.load_init()?;
-    *bank = Bank {
-        group: ctx.accounts.group.key(),
-        name: fill_from_str(&name)?,
-        mint: ctx.accounts.mint.key(),
-        vault: ctx.accounts.vault.key(),
-        oracle: ctx.accounts.oracle.key(),
-        deposit_index: INDEX_START,
-        borrow_index: INDEX_START,
-        indexed_deposits: I80F48::ZERO,
-        indexed_borrows: I80F48::ZERO,
-        index_last_updated: now_ts,
-        bank_rate_last_updated: now_ts,
-        // TODO: add a require! verifying relation between the parameters
-        avg_utilization: I80F48::ZERO,
-        adjustment_factor: I80F48::from_num(interest_rate_params.adjustment_factor),
-        util0: I80F48::from_num(interest_rate_params.util0),
-        rate0: I80F48::from_num(interest_rate_params.rate0),
-        util1: I80F48::from_num(interest_rate_params.util1),
-        rate1: I80F48::from_num(interest_rate_params.rate1),
-        max_rate: I80F48::from_num(interest_rate_params.max_rate),
-        collected_fees_native: I80F48::ZERO,
-        loan_origination_fee_rate: I80F48::from_num(loan_origination_fee_rate),
-        loan_fee_rate: I80F48::from_num(loan_fee_rate),
-        maint_asset_weight: I80F48::from_num(maint_asset_weight),
-        init_asset_weight: I80F48::from_num(init_asset_weight),
-        maint_liab_weight: I80F48::from_num(maint_liab_weight),
-        init_liab_weight: I80F48::from_num(init_liab_weight),
-        liquidation_fee: I80F48::from_num(liquidation_fee),
-        dust: I80F48::ZERO,
-        flash_loan_token_account_initial: u64::MAX,
-        flash_loan_approved_amount: 0,
-        token_index,
-        bump: *ctx.bumps.get("bank").ok_or(MangoError::SomeError)?,
-        mint_decimals: ctx.accounts.mint.decimals,
-        bank_num: 0,
-        oracle_config: oracle_config.to_oracle_config(),
-        stable_price_model: StablePriceModel {
-            delay_interval_seconds: stable_price_delay_interval_seconds,
-            delay_growth_limit: stable_price_delay_growth_limit,
-            stable_growth_limit: stable_price_growth_limit,
-            ..StablePriceModel::default()
-        },
-        min_vault_to_deposits_ratio,
-        net_borrow_limit_window_size_ts,
-        last_net_borrows_window_start_ts: now_ts / net_borrow_limit_window_size_ts
-            * net_borrow_limit_window_size_ts,
-        net_borrow_limit_per_window_quote,
-        net_borrows_in_window: 0,
-        borrow_weight_scale_start_quote,
-        deposit_weight_scale_start_quote,
-        reduce_only,
-        force_close: 0,
-        disable_asset_liquidation: u8::from(disable_asset_liquidation),
-        force_withdraw: 0,
-        padding: Default::default(),
-        fees_withdrawn: 0,
-        token_conditional_swap_taker_fee_rate,
-        token_conditional_swap_maker_fee_rate,
-        flash_loan_swap_fee_rate: flash_loan_swap_fee_rate,
-        interest_target_utilization,
-        interest_curve_scaling: interest_curve_scaling.into(),
-        potential_serum_tokens: 0,
-        potential_openbook_tokens: 0,
-        maint_weight_shift_start: 0,
-        maint_weight_shift_end: 0,
-        maint_weight_shift_duration_inv: I80F48::ZERO,
-        maint_weight_shift_asset_target: I80F48::ZERO,
-        maint_weight_shift_liab_target: I80F48::ZERO,
-        fallback_oracle: ctx.accounts.fallback_oracle.key(),
-        deposit_limit,
-        zero_util_rate: I80F48::from_num(zero_util_rate),
-        platform_liquidation_fee: I80F48::from_num(platform_liquidation_fee),
-        collected_liquidation_fees: I80F48::ZERO,
-        collected_collateral_fees: I80F48::ZERO,
-        collateral_fee_per_day,
-        padding2: [0; 4],
-        reserved: [0; 1888],
+    bank.group = ctx.accounts.group.key();
+    bank.name = fill_from_str(&name)?;
+    bank.mint = ctx.accounts.mint.key();
+    bank.vault = ctx.accounts.vault.key();
+    bank.oracle = ctx.accounts.oracle.key();
+    bank.deposit_index = INDEX_START;
+    bank.borrow_index = INDEX_START;
+    bank.index_last_updated = now_ts;
+    bank.bank_rate_last_updated = now_ts;
+    bank.adjustment_factor = I80F48::from_num(interest_rate_params.adjustment_factor);
+    bank.util0 = I80F48::from_num(interest_rate_params.util0);
+    bank.rate0 = I80F48::from_num(interest_rate_params.rate0);
+    bank.util1 = I80F48::from_num(interest_rate_params.util1);
+    bank.rate1 = I80F48::from_num(interest_rate_params.rate1);
+    bank.max_rate = I80F48::from_num(interest_rate_params.max_rate);
+    bank.loan_origination_fee_rate = I80F48::from_num(loan_origination_fee_rate);
+    bank.loan_fee_rate = I80F48::from_num(loan_fee_rate);
+    bank.maint_asset_weight = I80F48::from_num(maint_asset_weight);
+    bank.init_asset_weight = I80F48::from_num(init_asset_weight);
+    bank.maint_liab_weight = I80F48::from_num(maint_liab_weight);
+    bank.init_liab_weight = I80F48::from_num(init_liab_weight);
+    bank.liquidation_fee = I80F48::from_num(liquidation_fee);
+    bank.flash_loan_token_account_initial = u64::MAX;
+    bank.token_index = token_index;
+    bank.bump = *ctx.bumps.get("bank").ok_or(MangoError::SomeError)?;
+    bank.mint_decimals = ctx.accounts.mint.decimals;
+    bank.oracle_config = oracle_config.to_oracle_config();
+    bank.stable_price_model = StablePriceModel {
+        delay_interval_seconds: stable_price_delay_interval_seconds,
+        delay_growth_limit: stable_price_delay_growth_limit,
+        stable_growth_limit: stable_price_growth_limit,
+        ..StablePriceModel::default()
     };
+    bank.min_vault_to_deposits_ratio = min_vault_to_deposits_ratio;
+    bank.net_borrow_limit_window_size_ts = net_borrow_limit_window_size_ts;
+    bank.last_net_borrows_window_start_ts =
+        now_ts / net_borrow_limit_window_size_ts * net_borrow_limit_window_size_ts;
+    bank.net_borrow_limit_per_window_quote = net_borrow_limit_per_window_quote;
+    bank.borrow_weight_scale_start_quote = borrow_weight_scale_start_quote;
+    bank.deposit_weight_scale_start_quote = deposit_weight_scale_start_quote;
+    bank.reduce_only = reduce_only;
+    bank.disable_asset_liquidation = u8::from(disable_asset_liquidation);
+    bank.token_conditional_swap_taker_fee_rate = token_conditional_swap_taker_fee_rate;
+    bank.token_conditional_swap_maker_fee_rate = token_conditional_swap_maker_fee_rate;
+    bank.flash_loan_swap_fee_rate = flash_loan_swap_fee_rate;
+    bank.interest_target_utilization = interest_target_utilization;
+    bank.interest_curve_scaling = interest_curve_scaling.into();
+    bank.fallback_oracle = ctx.accounts.fallback_oracle.key();
+    bank.deposit_limit = deposit_limit;
+    bank.zero_util_rate = I80F48::from_num(zero_util_rate);
+    bank.platform_liquidation_fee = I80F48::from_num(platform_liquidation_fee);
+    bank.collateral_fee_per_day = collateral_fee_per_day;
 
     let oracle_ref = &AccountInfoRef::borrow(ctx.accounts.oracle.as_ref())?;
     if let Ok(oracle_price) = bank.oracle_price(&OracleAccountInfos::from_reader(oracle_ref), None)
@@ -146,20 +128,13 @@ pub fn token_register(
     )?)?;
 
     let mut mint_info = ctx.accounts.mint_info.load_init()?;
-    *mint_info = MintInfo {
-        group: ctx.accounts.group.key(),
-        token_index,
-        group_insurance_fund: if group_insurance_fund { 1 } else { 0 },
-        padding1: Default::default(),
-        mint: ctx.accounts.mint.key(),
-        banks: Default::default(),
-        vaults: Default::default(),
-        oracle: ctx.accounts.oracle.key(),
-        fallback_oracle: ctx.accounts.fallback_oracle.key(),
-        registration_time: Clock::get()?.unix_timestamp.try_into().unwrap(),
-        reserved: [0; 2528],
-    };
-
+    mint_info.group = ctx.accounts.group.key();
+    mint_info.token_index = token_index;
+    mint_info.group_insurance_fund = if group_insurance_fund { 1 } else { 0 };
+    mint_info.mint = ctx.accounts.mint.key();
+    mint_info.oracle = ctx.accounts.oracle.key();
+    mint_info.fallback_oracle = ctx.accounts.fallback_oracle.key();
+    mint_info.registration_time = now_ts;
     mint_info.banks[0] = ctx.accounts.bank.key();
     mint_info.vaults[0] = ctx.accounts.vault.key();
 

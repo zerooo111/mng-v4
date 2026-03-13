@@ -219,6 +219,17 @@ pub mod mango_v4 {
         Ok(())
     }
 
+    pub fn token_register_bootstrap(
+        ctx: Context<TokenRegisterBootstrap>,
+        token_index: TokenIndex,
+        name: String,
+        group_insurance_fund: bool,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::token_register_bootstrap(ctx, token_index, name, group_insurance_fund)?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn token_edit(
         ctx: Context<TokenEdit>,
