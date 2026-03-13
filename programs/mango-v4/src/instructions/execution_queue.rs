@@ -10,7 +10,6 @@ use anchor_lang::solana_program::program::{invoke, invoke_signed};
 use anchor_lang::solana_program::system_instruction;
 use anchor_lang::solana_program::sysvar::instructions as tx_instructions;
 use anchor_lang::InstructionData;
-use std::collections::BTreeMap;
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
 pub struct ExecutionQueueConfigParams {
@@ -430,80 +429,23 @@ fn dispatch_perp_place_order_v2<'info>(
     payload: &PerpPlaceOrderV2Payload,
     dispatch_accounts: &[AccountInfo<'info>],
 ) -> Result<()> {
-    require!(
-        dispatch_accounts.len() >= 8,
-        MangoError::ExecutionQueueDispatchAccountLayoutInvalid
-    );
-
-    let mut owner_ai = dispatch_accounts[2].clone();
-    owner_ai.is_signer = true;
-
-    let mut accounts = PerpPlaceOrder {
-        group: AccountLoader::try_from(&dispatch_accounts[0])
-            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
-        account: AccountLoader::try_from(&dispatch_accounts[1])
-            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
-        owner: Signer::try_from(&owner_ai)
-            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
-        perp_market: AccountLoader::try_from(&dispatch_accounts[3])
-            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
-        bids: AccountLoader::try_from(&dispatch_accounts[4])
-            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
-        asks: AccountLoader::try_from(&dispatch_accounts[5])
-            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
-        event_queue: AccountLoader::try_from(&dispatch_accounts[6])
-            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
-        oracle: UncheckedAccount::try_from(dispatch_accounts[7].clone()),
-    };
-
     let order = build_perp_place_order_from_queue_payload(payload)?;
-    let program_id = crate::id();
-    let ctx = Context::new(
-        &program_id,
-        &mut accounts,
-        &dispatch_accounts[8..],
-        BTreeMap::new(),
-    );
-    crate::instructions::perp_place_order(ctx, order, payload.limit)?;
+    super::perp_place_order::perp_place_order_from_account_infos(
+        dispatch_accounts,
+        order,
+        payload.limit,
+    )?;
     Ok(())
-}
-
-fn queue_owner_signer<'info>(dispatch_accounts: &[AccountInfo<'info>]) -> Result<Signer<'info>> {
-    require!(
-        dispatch_accounts.len() >= 3,
-        MangoError::ExecutionQueueDispatchAccountLayoutInvalid
-    );
-    let mut owner_ai = dispatch_accounts[2].clone();
-    owner_ai.is_signer = true;
-    Signer::try_from(&owner_ai)
-        .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))
 }
 
 fn dispatch_perp_cancel_all_orders<'info>(
     payload: &PerpCancelAllOrdersPayload,
     dispatch_accounts: &[AccountInfo<'info>],
 ) -> Result<()> {
-    require!(
-        dispatch_accounts.len() >= 6,
-        MangoError::ExecutionQueueDispatchAccountLayoutInvalid
-    );
-
-    let mut accounts = PerpCancelAllOrders {
-        group: AccountLoader::try_from(&dispatch_accounts[0])
-            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
-        account: AccountLoader::try_from(&dispatch_accounts[1])
-            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
-        owner: queue_owner_signer(dispatch_accounts)?,
-        perp_market: AccountLoader::try_from(&dispatch_accounts[3])
-            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
-        bids: AccountLoader::try_from(&dispatch_accounts[4])
-            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
-        asks: AccountLoader::try_from(&dispatch_accounts[5])
-            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
-    };
-    let program_id = crate::id();
-    let ctx = Context::new(&program_id, &mut accounts, &dispatch_accounts[6..], BTreeMap::new());
-    crate::instructions::perp_cancel_all_orders(ctx, payload.limit)?;
+    super::perp_cancel_all_orders::perp_cancel_all_orders_from_account_infos(
+        dispatch_accounts,
+        payload.limit,
+    )?;
     Ok(())
 }
 
@@ -511,27 +453,11 @@ fn dispatch_perp_cancel_all_orders_by_side<'info>(
     payload: &PerpCancelAllOrdersBySidePayload,
     dispatch_accounts: &[AccountInfo<'info>],
 ) -> Result<()> {
-    require!(
-        dispatch_accounts.len() >= 6,
-        MangoError::ExecutionQueueDispatchAccountLayoutInvalid
-    );
-
-    let mut accounts = PerpCancelAllOrdersBySide {
-        group: AccountLoader::try_from(&dispatch_accounts[0])
-            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
-        account: AccountLoader::try_from(&dispatch_accounts[1])
-            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
-        owner: queue_owner_signer(dispatch_accounts)?,
-        perp_market: AccountLoader::try_from(&dispatch_accounts[3])
-            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
-        bids: AccountLoader::try_from(&dispatch_accounts[4])
-            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
-        asks: AccountLoader::try_from(&dispatch_accounts[5])
-            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
-    };
-    let program_id = crate::id();
-    let ctx = Context::new(&program_id, &mut accounts, &dispatch_accounts[6..], BTreeMap::new());
-    crate::instructions::perp_cancel_all_orders_by_side(ctx, payload.side_option, payload.limit)?;
+    super::perp_cancel_all_orders_by_side::perp_cancel_all_orders_by_side_from_account_infos(
+        dispatch_accounts,
+        payload.side_option,
+        payload.limit,
+    )?;
     Ok(())
 }
 
@@ -539,27 +465,10 @@ fn dispatch_perp_cancel_order<'info>(
     payload: &PerpCancelOrderPayload,
     dispatch_accounts: &[AccountInfo<'info>],
 ) -> Result<()> {
-    require!(
-        dispatch_accounts.len() >= 6,
-        MangoError::ExecutionQueueDispatchAccountLayoutInvalid
-    );
-
-    let mut accounts = PerpCancelOrder {
-        group: AccountLoader::try_from(&dispatch_accounts[0])
-            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
-        account: AccountLoader::try_from(&dispatch_accounts[1])
-            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
-        owner: queue_owner_signer(dispatch_accounts)?,
-        perp_market: AccountLoader::try_from(&dispatch_accounts[3])
-            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
-        bids: AccountLoader::try_from(&dispatch_accounts[4])
-            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
-        asks: AccountLoader::try_from(&dispatch_accounts[5])
-            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
-    };
-    let program_id = crate::id();
-    let ctx = Context::new(&program_id, &mut accounts, &dispatch_accounts[6..], BTreeMap::new());
-    crate::instructions::perp_cancel_order(ctx, payload.order_id)?;
+    super::perp_cancel_order::perp_cancel_order_from_account_infos(
+        dispatch_accounts,
+        payload.order_id,
+    )?;
     Ok(())
 }
 
@@ -567,27 +476,10 @@ fn dispatch_perp_cancel_order_by_client_order_id<'info>(
     payload: &PerpCancelOrderByClientOrderIdPayload,
     dispatch_accounts: &[AccountInfo<'info>],
 ) -> Result<()> {
-    require!(
-        dispatch_accounts.len() >= 6,
-        MangoError::ExecutionQueueDispatchAccountLayoutInvalid
-    );
-
-    let mut accounts = PerpCancelOrderByClientOrderId {
-        group: AccountLoader::try_from(&dispatch_accounts[0])
-            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
-        account: AccountLoader::try_from(&dispatch_accounts[1])
-            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
-        owner: queue_owner_signer(dispatch_accounts)?,
-        perp_market: AccountLoader::try_from(&dispatch_accounts[3])
-            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
-        bids: AccountLoader::try_from(&dispatch_accounts[4])
-            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
-        asks: AccountLoader::try_from(&dispatch_accounts[5])
-            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?,
-    };
-    let program_id = crate::id();
-    let ctx = Context::new(&program_id, &mut accounts, &dispatch_accounts[6..], BTreeMap::new());
-    crate::instructions::perp_cancel_order_by_client_order_id(ctx, payload.client_order_id)?;
+    super::perp_cancel_order_by_client_order_id::perp_cancel_order_by_client_order_id_from_account_infos(
+        dispatch_accounts,
+        payload.client_order_id,
+    )?;
     Ok(())
 }
 
@@ -814,11 +706,7 @@ fn has_ed25519_preinstruction(
     Ok(false)
 }
 
-fn verify_ed25519_preinstruction(
-    ixs: &AccountInfo,
-    signer: Pubkey,
-    message: &[u8],
-) -> Result<()> {
+fn verify_ed25519_preinstruction(ixs: &AccountInfo, signer: Pubkey, message: &[u8]) -> Result<()> {
     let found = has_ed25519_preinstruction(ixs, signer, message)?;
     require!(found, MangoError::CtmSignatureMissing);
     Ok(())
@@ -1241,9 +1129,7 @@ pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u
             continue;
         }
 
-        if candidate.accounts_hash != [0; 32]
-            && provided_accounts_hash != candidate.accounts_hash
-        {
+        if candidate.accounts_hash != [0; 32] && provided_accounts_hash != candidate.accounts_hash {
             // The caller provided a dispatch lane that doesn't match the head item's account hash.
             // Leave the queue untouched so another execute call with the correct lane can process it.
             break;
@@ -1446,6 +1332,9 @@ mod tests {
 
     #[test]
     fn execution_queue_account_space_matches_state_layout() {
-        assert_eq!(EXECUTION_QUEUE_ACCOUNT_SPACE, 8 + std::mem::size_of::<ExecutionQueue>());
+        assert_eq!(
+            EXECUTION_QUEUE_ACCOUNT_SPACE,
+            8 + std::mem::size_of::<ExecutionQueue>()
+        );
     }
 }

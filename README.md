@@ -17,6 +17,9 @@ DEPLOY_TIMEOUT_SECS=45 DEPLOY_RETRIES=0 ./startup_all_local.sh restart
 ./startup_all_local.sh stop
 ```
 
+The local launcher now defaults to the Rust relayer (`CTM_RELAYER_IMPL=rust`).
+Set `CTM_RELAYER_IMPL=ts` only if you need the legacy TS relayer path.
+
 ## License
 
 See the LICENSE file.

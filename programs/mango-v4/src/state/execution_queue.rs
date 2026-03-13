@@ -240,7 +240,8 @@ impl ExecutionQueue {
         *item = QueueItem::default();
         self.header.ctm_count = self.header.ctm_count.saturating_sub(1);
         self.header.total_count = self.header.total_count.saturating_sub(1);
-        self.header.next_sequence_to_execute = self.header.next_sequence_to_execute.saturating_add(1);
+        self.header.next_sequence_to_execute =
+            self.header.next_sequence_to_execute.saturating_add(1);
         self.header.gap_observed_slot = 0;
     }
 
@@ -282,8 +283,7 @@ impl ExecutionQueue {
         let head = self.header.liquidity_head as usize;
         let item = self.liquidity_items[head];
         self.liquidity_items[head] = QueueItem::default();
-        self.header.liquidity_head =
-            ((head + 1) % EXECUTION_QUEUE_LIQUIDITY_CAPACITY) as u32;
+        self.header.liquidity_head = ((head + 1) % EXECUTION_QUEUE_LIQUIDITY_CAPACITY) as u32;
         self.header.liquidity_count = self.header.liquidity_count.saturating_sub(1);
         self.header.total_count = self.header.total_count.saturating_sub(1);
         Some(item)

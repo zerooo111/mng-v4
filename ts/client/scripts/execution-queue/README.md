@@ -13,7 +13,6 @@ This is the current known-good end-to-end path for local validator testing with:
 ```bash
 PRELOAD_PROGRAM_IN_VALIDATOR=0 \
 RESET_VALIDATOR=1 \
-CTM_RELAYER_IMPL=rust \
 EXECUTION_QUEUE_ENGINE_ENABLED=false \
 ./startup_local.sh restart
 ```
@@ -32,10 +31,10 @@ cd /home/ec2-user/stagin4/mng-v4
 env \
   CLUSTER_OVERRIDE=devnet \
   CLUSTER_URL_OVERRIDE=http://127.0.0.1:8899 \
-  EXECUTION_QUEUE_GROUP_PK=9VYm4QaBhEPEiFfyGxXEDpN7ZTh2muajTDebKrDL4f5k \
-  EXECUTION_QUEUE_PK=HfaFVCt5FnLQfLETidHYopgQ2RqpW5JhR66yfQdtYrFP \
-  EXECUTION_QUEUE_BUFFER_PK=HfaFVCt5FnLQfLETidHYopgQ2RqpW5JhR66yfQdtYrFP \
-  EXECUTION_QUEUE_PROGRAM_ID=9nNhSkcxYFujiydpuuhVttUYBqYJQmxCzjrBofBvmutF \
+  EXECUTION_QUEUE_GROUP_PK=$(node -p "require('./.localnet/run/execution-queue-e2e-9120.json').group") \
+  EXECUTION_QUEUE_PK=$(node -p "require('./.localnet/run/execution-queue-e2e-9120.json').executionQueue") \
+  EXECUTION_QUEUE_BUFFER_PK=$(node -p "require('./.localnet/run/execution-queue-e2e-9120.json').executionQueueBuffer") \
+  EXECUTION_QUEUE_PROGRAM_ID=$(node -p "require('./.localnet/run/execution-queue-e2e-9120.json').programId") \
   EXECUTION_QUEUE_CRANKER_KEYPAIR=/home/ec2-user/.config/solana/id.json \
   EXECUTION_QUEUE_CRANK_LANES_JSON_PATH=.localnet/run/execution-queue-lanes-9120.json \
   EXECUTION_QUEUE_CRANK_RELAY_EVENT_LOG_PATH=.localnet/run/continuum-harness-9120.jsonl \
@@ -48,6 +47,7 @@ env \
 Important:
 - `EXECUTION_QUEUE_PROGRAM_ID` must be set on localnet. If omitted, the cranker falls back to `MANGO_V4_ID[CLUSTER]` and can target the wrong program id.
 - `EXECUTION_QUEUE_ENGINE_ENABLED=false` keeps execute traffic out of the Rust relayer while the external cranker is used.
+- `CTM_RELAYER_IMPL=rust` is now the default startup mode. Set `CTM_RELAYER_IMPL=ts` only if you need the legacy TS relayer path.
 
 ### 3. Run the E2E test
 
@@ -68,12 +68,12 @@ Expected result:
 
 Last validated result on `2026-03-13`:
 - `status: ok`
-- maker sequence `3`
-- taker sequence `4`
-- cancel sequence `5`
+- maker sequence `0`
+- taker sequence `1`
+- cancel sequence `2`
 - final positions:
-  - maker `20000` base lots
-  - taker `-20000` base lots
+  - maker `10000` base lots
+  - taker `-10000` base lots
 
 ### 4. Quick checks
 
@@ -95,13 +95,41 @@ For local integration testing, prefer:
 - Rust relayer for submit
 - external TS cranker for execute
 
-The embedded Rust executor is still under separate debugging and should not be treated as the default clean-path execute runner yet.
+This is now the default local startup path. The embedded Rust executor is still under separate debugging and should not be treated as the default clean-path execute runner yet.
 
-## CTM Sequencer Relayer (gRPC :9090)
+## Rust Relayer (Default gRPC :9090)
 
 Runs a gRPC server that accepts user-signed intents, assigns a **market-specific sequence number**, applies CTM envelope signing, and submits `execution_queue_enqueue_ctm`.
 
 ### Start
+
+```bash
+CTM_RELAYER_BIND_ADDR=0.0.0.0:9090 \
+CTM_EXECUTION_ENGINE_HTTP_BIND_ADDR=127.0.0.1:9093 \
+CLUSTER_OVERRIDE=devnet \
+CLUSTER_URL_OVERRIDE=http://127.0.0.1:8899 \
+CTM_RELAYER_PAYER_KEYPAIR=~/.config/solana/id.json \
+CTM_RELAYER_CTM_KEYPAIR=~/.config/solana/id.json \
+CTM_RELAYER_EVENT_SINK_URL=http://127.0.0.1:9091/ingest/relay-intent \
+EXECUTION_QUEUE_GROUP_PK=<group-pubkey> \
+EXECUTION_QUEUE_PK=<queue-pubkey> \
+EXECUTION_QUEUE_ENGINE_ENABLED=false \
+EXECUTION_QUEUE_CRANK_LANES_JSON_PATH=.localnet/run/execution-queue-lanes-9120.json \
+CTM_RELAYER_SEQUENCE_STATE_PATH=.localnet/run/ctm-sequences-9120.json \
+cargo run -p service-mango-execution-engine
+```
+
+The startup scripts now default to `CTM_RELAYER_IMPL=rust` and keep the same gRPC submit address on `:9090`. The Rust engine exposes `GET /healthz` and `GET /metrics` on `CTM_EXECUTION_ENGINE_HTTP_BIND_ADDR`.
+`EXECUTION_QUEUE_BUFFER_PK` is now optional and treated as an alias of `EXECUTION_QUEUE_PK` for older tooling.
+
+Quick checks:
+
+```bash
+curl -s http://127.0.0.1:9093/healthz
+curl -s http://127.0.0.1:9093/metrics | rg 'execution_engine_(requests|execute|sequence)'
+```
+
+### Legacy TS Relayer Fallback
 
 ```bash
 CTM_RELAYER_BIND_ADDR=0.0.0.0:9090 \
@@ -114,21 +142,6 @@ CTM_RELAYER_EVENT_SINK_URL=http://127.0.0.1:9091/ingest/relay-intent \
 CTM_RELAYER_EVENT_SINK_AUTH_TOKEN=<optional-token> \
 yarn ctm-sequencer-relayer
 ```
-
-Rust execution engine drop-in:
-
-```bash
-CTM_RELAYER_BIND_ADDR=127.0.0.1:9090 \
-CTM_EXECUTION_ENGINE_HTTP_BIND_ADDR=127.0.0.1:9093 \
-CLUSTER_URL_OVERRIDE=http://127.0.0.1:8899 \
-CTM_RELAYER_PAYER_KEYPAIR=~/.config/solana/id.json \
-CTM_RELAYER_CTM_KEYPAIR=~/.config/solana/id.json \
-CTM_RELAYER_EVENT_SINK_URL=http://127.0.0.1:9091/ingest/relay-intent \
-cargo run -p service-mango-execution-engine
-```
-
-The startup scripts now support `CTM_RELAYER_IMPL=rust` and keep the same gRPC submit address on `:9090`. The Rust engine exposes `GET /healthz` and `GET /metrics` on `CTM_EXECUTION_ENGINE_HTTP_BIND_ADDR`.
-`EXECUTION_QUEUE_BUFFER_PK` is now optional and treated as an alias of `EXECUTION_QUEUE_PK` for older tooling.
 
 ### gRPC API
 

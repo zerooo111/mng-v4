@@ -167,8 +167,7 @@ pub fn determine_oracle_type(acc_info: &impl KeyedAccountReader) -> Result<Oracl
         return Ok(OracleType::Pyth);
     } else if data[0..8] == StubOracle::discriminator() {
         return Ok(OracleType::Stub);
-    }
-    else if acc_info.owner() == &orca_mainnet_whirlpool::ID {
+    } else if acc_info.owner() == &orca_mainnet_whirlpool::ID {
         return Ok(OracleType::OrcaCLMM);
     } else if acc_info.owner() == &raydium_mainnet::ID {
         return Ok(OracleType::RaydiumCLMM);

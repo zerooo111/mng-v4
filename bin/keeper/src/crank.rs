@@ -370,10 +370,10 @@ pub async fn loop_consume_events(
             ix,
             client.context.compute_estimates.cu_perp_consume_events_base
                 + num_of_events
-                * client
-                .context
-                .compute_estimates
-                .cu_perp_consume_events_per_event,
+                    * client
+                        .context
+                        .compute_estimates
+                        .cu_perp_consume_events_per_event,
         );
         let sig_result = client
             .send_and_confirm_permissionless_tx(ixs.to_instructions())
@@ -491,7 +491,7 @@ pub async fn loop_charge_collateral_fees(
             collateral_fee_interval,
             max_cu_when_batching,
         )
-            .await
+        .await
         {
             Ok(()) => {}
             Err(err) => {
@@ -556,7 +556,7 @@ async fn charge_collateral_fees_inner(
         &ix_to_send,
         max_cu_when_batching,
     )
-        .await;
+    .await;
     info!("charge collateral fees: {:?}", txsigs);
 
     Ok(())

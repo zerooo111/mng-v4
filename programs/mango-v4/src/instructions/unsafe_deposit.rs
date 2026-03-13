@@ -28,8 +28,10 @@ pub fn unsafe_deposit(ctx: Context<UnsafeDeposit>, amount: u64) -> Result<()> {
 
     // Keep net_deposits coherent with the credited amount.
     let oracle_ref = &AccountInfoRef::borrow(ctx.accounts.oracle.as_ref())?;
-    let unsafe_oracle_state =
-        oracle_state_unchecked(&OracleAccountInfos::from_reader(oracle_ref), bank.mint_decimals)?;
+    let unsafe_oracle_state = oracle_state_unchecked(
+        &OracleAccountInfos::from_reader(oracle_ref),
+        bank.mint_decimals,
+    )?;
     let amount_usd = (amount_i80f48 * unsafe_oracle_state.price).to_num::<i64>();
     account.fixed.net_deposits += amount_usd;
 

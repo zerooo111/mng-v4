@@ -2,84 +2,62 @@
 
 ## Quickstart (Single Clean Run)
 
-Run from repo root in one shell (starts relayer + cranker in background, then runs E2E):
+Run from `mng-v4` in one shell. This uses the local launcher, which now defaults to the Rust relayer on `127.0.0.1:9090` and exposes health/metrics on `127.0.0.1:9093`.
 
 ```bash
-export PATH="/tmp/solana-1.16.14/solana-release/bin:$HOME/.cargo/bin:/home/ec2-user/.local/share/solana/install/active_release/bin:$PATH"
-export CLUSTER_OVERRIDE=devnet
-export CLUSTER_URL_OVERRIDE=http://127.0.0.1:8899
-export CTM_RELAYER_PROGRAM_ID=9nNhSkcxYFujiydpuuhVttUYBqYJQmxCzjrBofBvmutF
-export MB_PAYER_KEYPAIR=/home/ec2-user/.config/solana/id.json
-export GROUP_NUM=9110
+cd /home/ec2-user/stagin4/mng-v4
 
-# Build + deploy
-cargo build-sbf --manifest-path programs/mango-v4/Cargo.toml --features enable-gpl
-solana program deploy \
-  --url http://127.0.0.1:8899 \
-  target/deploy/mango_v4.so \
-  --program-id target/deploy/mango_v4-keypair.json
+DEPLOY_TIMEOUT_SECS=45 \
+DEPLOY_RETRIES=0 \
+EXECUTION_QUEUE_ENGINE_ENABLED=false \
+./startup_local.sh restart
+```
 
-# Bootstrap local state
-export EXECUTION_QUEUE_GROUP_NUM=$GROUP_NUM
-export PERP_MARKET_INDEX=0
-npm run -s execution-queue-local-perp-e2e-bootstrap
+Start the external TS cranker in a second shell:
 
-CFG="/tmp/execution-queue-e2e-${GROUP_NUM}.json"
-LANES="/tmp/execution-queue-lanes-${GROUP_NUM}.json"
-GROUP_PK="$(node -p "require('${CFG}').group")"
-QUEUE_PK="$(node -p "require('${CFG}').executionQueue")"
-
-# Start relayer
+```bash
+cd /home/ec2-user/stagin4/mng-v4
 env \
   CLUSTER_OVERRIDE=devnet \
   CLUSTER_URL_OVERRIDE=http://127.0.0.1:8899 \
-  CTM_RELAYER_PROGRAM_ID=9nNhSkcxYFujiydpuuhVttUYBqYJQmxCzjrBofBvmutF \
-  CTM_RELAYER_BIND_ADDR=127.0.0.1:9090 \
-  CTM_RELAYER_PAYER_KEYPAIR=/home/ec2-user/.config/solana/id.json \
-  CTM_RELAYER_CTM_KEYPAIR=/home/ec2-user/.config/solana/id.json \
-  CTM_RELAYER_EVENT_SINK_URL=http://127.0.0.1:9091/ingest/relay-intent \
-  CTM_RELAYER_SEQUENCE_STATE_PATH="/tmp/ctm-sequences-${GROUP_NUM}.json" \
-  CTM_RELAYER_MIN_EXECUTE_SLOT_OFFSET=1 \
-  ./node_modules/.bin/ts-node ts/client/scripts/execution-queue/ctm-sequencer-relayer.ts \
-  >/tmp/ctm-relayer-${GROUP_NUM}.log 2>&1 &
-RELAYER_PID=$!
-
-# Start continuum state harness
-env \
-  CLUSTER_OVERRIDE=devnet \
-  CLUSTER_URL_OVERRIDE=http://127.0.0.1:8899 \
-  CONTINUUM_HARNESS_BIND_ADDR=127.0.0.1:9091 \
-  CONTINUUM_HARNESS_MODE=local \
-  CONTINUUM_HARNESS_PROGRAM_ID=9nNhSkcxYFujiydpuuhVttUYBqYJQmxCzjrBofBvmutF \
-  CONTINUUM_HARNESS_EVENT_LOG_PATH="/tmp/continuum-harness-${GROUP_NUM}.jsonl" \
-  ./node_modules/.bin/ts-node ts/client/scripts/execution-queue/continuum-state-harness.ts \
-  >/tmp/continuum-harness-${GROUP_NUM}.log 2>&1 &
-HARNESS_PID=$!
-
-# Start cranker
-env \
-  CLUSTER_OVERRIDE=devnet \
-  CLUSTER_URL_OVERRIDE=http://127.0.0.1:8899 \
-  EXECUTION_QUEUE_GROUP_PK="$GROUP_PK" \
-  EXECUTION_QUEUE_PK="$QUEUE_PK" \
-  EXECUTION_QUEUE_PROGRAM_ID=9nNhSkcxYFujiydpuuhVttUYBqYJQmxCzjrBofBvmutF \
+  EXECUTION_QUEUE_GROUP_PK=$(node -p "require('./.localnet/run/execution-queue-e2e-9120.json').group") \
+  EXECUTION_QUEUE_PK=$(node -p "require('./.localnet/run/execution-queue-e2e-9120.json').executionQueue") \
+  EXECUTION_QUEUE_BUFFER_PK=$(node -p "require('./.localnet/run/execution-queue-e2e-9120.json').executionQueueBuffer") \
+  EXECUTION_QUEUE_PROGRAM_ID=$(node -p "require('./.localnet/run/execution-queue-e2e-9120.json').programId") \
   EXECUTION_QUEUE_CRANKER_KEYPAIR=/home/ec2-user/.config/solana/id.json \
-  EXECUTION_QUEUE_CRANK_LANES_JSON_PATH="$LANES" \
+  EXECUTION_QUEUE_CRANK_LANES_JSON_PATH=.localnet/run/execution-queue-lanes-9120.json \
+  EXECUTION_QUEUE_CRANK_RELAY_EVENT_LOG_PATH=.localnet/run/continuum-harness-9120.jsonl \
   EXECUTION_QUEUE_CRANK_MAX_ITEMS=8 \
   EXECUTION_QUEUE_CRANK_INTERVAL_MS=1000 \
-  ./node_modules/.bin/ts-node ts/client/scripts/execution-queue/execution-queue-cranker.ts \
-  >/tmp/execution-queue-cranker-${GROUP_NUM}.log 2>&1 &
-CRANKER_PID=$!
+  node -r ts-node/register/transpile-only \
+  ts/client/scripts/execution-queue/execution-queue-cranker.ts
+```
 
-# Run E2E
+Run the E2E flow from the first shell:
+
+```bash
+cd /home/ec2-user/stagin4/mng-v4
+export CLUSTER_OVERRIDE=devnet
+export CLUSTER_URL_OVERRIDE=http://127.0.0.1:8899
 export CTM_RELAYER_ADDR=127.0.0.1:9090
-export E2E_OUTPUT_CONFIG_PATH="$CFG"
+export E2E_OUTPUT_CONFIG_PATH=.localnet/run/execution-queue-e2e-9120.json
 export E2E_MAKER_MAX_QUOTE_QTY=1000
 export E2E_TAKER_MAX_QUOTE_QTY=1000
 npm run -s execution-queue-local-perp-e2e-run
+```
 
-# Optional cleanup
-kill $RELAYER_PID $CRANKER_PID $HARNESS_PID
+Optional cleanup:
+
+```bash
+cd /home/ec2-user/stagin4/mng-v4
+./startup_local.sh stop
+```
+
+Legacy fallback:
+
+```bash
+cd /home/ec2-user/stagin4/mng-v4
+CTM_RELAYER_IMPL=ts ./startup_local.sh restart
 ```
 
 ## What Changed
@@ -87,7 +65,7 @@ kill $RELAYER_PID $CRANKER_PID $HARNESS_PID
 This branch now includes an end-to-end execution-queue path for CTM-sequenced perp actions, plus local tooling to run and validate it.
 
 ### Program-side execution queue changes
-- Execution queue uses a single zero-copy account with ring-buffer semantics and capacity for 1000 items.
+- Execution queue uses a single zero-copy account with ring-buffer semantics and capacity for 1024 CTM items plus 128 liquidity items.
 - CTM enqueue path verifies:
   - CTM ed25519 pre-instruction signature over canonical envelope.
   - User ed25519 pre-instruction signature over canonical intent message.
@@ -217,7 +195,37 @@ This writes config artifacts like:
 - `/tmp/execution-queue-e2e-<GROUP_NUM>.json`
 - `/tmp/execution-queue-lanes-<GROUP_NUM>.json`
 
-## Start CTM Relayer (gRPC :9090)
+## Start Rust Relayer (Default gRPC :9090)
+
+```bash
+env \
+  CLUSTER_OVERRIDE=devnet \
+  CLUSTER_URL_OVERRIDE=http://127.0.0.1:8899 \
+  CTM_RELAYER_BIND_ADDR=127.0.0.1:9090 \
+  CTM_EXECUTION_ENGINE_HTTP_BIND_ADDR=127.0.0.1:9093 \
+  CTM_RELAYER_PAYER_KEYPAIR=/home/ec2-user/.config/solana/id.json \
+  CTM_RELAYER_CTM_KEYPAIR=/home/ec2-user/.config/solana/id.json \
+  CTM_RELAYER_EVENT_SINK_URL=http://127.0.0.1:9091/ingest/relay-intent \
+  EXECUTION_QUEUE_GROUP_PK=<group-pubkey> \
+  EXECUTION_QUEUE_PK=<queue-pubkey> \
+  EXECUTION_QUEUE_ENGINE_ENABLED=false \
+  EXECUTION_QUEUE_CRANK_LANES_JSON_PATH=/tmp/execution-queue-lanes-<GROUP_NUM>.json \
+  CTM_RELAYER_SEQUENCE_STATE_PATH=/tmp/ctm-sequences-<GROUP_NUM>.json \
+  CTM_RELAYER_MIN_EXECUTE_SLOT_OFFSET=1 \
+  cargo run -p service-mango-execution-engine
+```
+
+Quick checks:
+
+```bash
+curl -s http://127.0.0.1:9093/healthz | jq
+curl -s http://127.0.0.1:9093/metrics | rg 'execution_engine_(requests|execute|sequence)'
+```
+
+The local stack scripts now default to `CTM_RELAYER_IMPL=rust`. Set `CTM_RELAYER_IMPL=ts` only if you need the legacy TS relayer path. The gRPC submit endpoint stays on `127.0.0.1:9090`; engine health and metrics are available on `127.0.0.1:9093`.
+`EXECUTION_QUEUE_BUFFER_PK` is optional and only kept as a compatibility alias to `EXECUTION_QUEUE_PK`.
+
+### Legacy TS Relayer Fallback
 
 ```bash
 env \
@@ -232,22 +240,6 @@ env \
   CTM_RELAYER_MIN_EXECUTE_SLOT_OFFSET=1 \
   ./node_modules/.bin/ts-node ts/client/scripts/execution-queue/ctm-sequencer-relayer.ts
 ```
-
-Rust drop-in replacement:
-
-```bash
-env \
-  CLUSTER_URL_OVERRIDE=http://127.0.0.1:8899 \
-  CTM_RELAYER_BIND_ADDR=127.0.0.1:9090 \
-  CTM_EXECUTION_ENGINE_HTTP_BIND_ADDR=127.0.0.1:9093 \
-  CTM_RELAYER_PAYER_KEYPAIR=/home/ec2-user/.config/solana/id.json \
-  CTM_RELAYER_CTM_KEYPAIR=/home/ec2-user/.config/solana/id.json \
-  CTM_RELAYER_EVENT_SINK_URL=http://127.0.0.1:9091/ingest/relay-intent \
-  cargo run -p service-mango-execution-engine
-```
-
-For local stack scripts, set `CTM_RELAYER_IMPL=rust` before running `startup_local.sh` or `startup_all_local.sh`. The gRPC submit endpoint stays on `127.0.0.1:9090`; engine health and metrics are available on `127.0.0.1:9093`.
-`EXECUTION_QUEUE_BUFFER_PK` is optional and only kept as a compatibility alias to `EXECUTION_QUEUE_PK`.
 
 ## Start Continuum State Harness (Optimistic + Confirmed API)
 
