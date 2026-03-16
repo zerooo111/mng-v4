@@ -26,6 +26,8 @@ import {
   encodePerpPlaceOrderV2QueuePayload,
   signExecutionQueueIntentMessage,
 } from '../../src/executionQueue';
+import { decodeExecutionQueueCount } from '../../src/executionQueueLayout';
+import { runtimeConfigPath } from './scriptEnv';
 
 dotenv.config();
 
@@ -106,7 +108,7 @@ type E2EConfig = {
 const CONFIG_PATH =
   process.env.QUOTER_CONFIG_PATH ||
   process.env.E2E_OUTPUT_CONFIG_PATH ||
-  '/tmp/execution-queue-e2e-9101.json';
+  runtimeConfigPath('execution-queue-e2e-9101.json');
 const CLUSTER_URL_OVERRIDE = process.env.CLUSTER_URL_OVERRIDE;
 const CLUSTER_WS_URL_OVERRIDE =
   process.env.CLUSTER_WS_URL_OVERRIDE || process.env.MB_CLUSTER_WS_URL || '';
@@ -150,6 +152,9 @@ const LOG_EACH_ORDER = (process.env.QUOTER_LOG_EACH_ORDER || 'true') === 'true';
 const NONBLOCKING_SUBMIT =
   (process.env.QUOTER_NONBLOCKING_SUBMIT || 'false') === 'true';
 const MAX_INFLIGHT = Number(process.env.QUOTER_MAX_INFLIGHT || '200');
+const BOT_DISPATCH_MODE = (
+  process.env.QUOTER_BOT_DISPATCH_MODE || 'all'
+).toLowerCase();
 const RELAYER_RPC_TIMEOUT_MS = Number(
   process.env.QUOTER_RELAYER_RPC_TIMEOUT_MS || '5000',
 );
@@ -165,6 +170,11 @@ const BOT_SIDES = (process.env.QUOTER_BOT_SIDES || 'bid,ask')
   .map((v) => v.trim().toLowerCase())
   .filter((v) => v.length > 0);
 const DEBUG_STARTUP = (process.env.QUOTER_DEBUG_STARTUP || 'false') === 'true';
+const REPORT_PATH = process.env.QUOTER_REPORT_PATH || '';
+const RELAYER_METRICS_URL =
+  process.env.QUOTER_RELAYER_METRICS_URL || 'http://127.0.0.1:9093/metrics';
+const MAX_TICKS = Number(process.env.QUOTER_MAX_TICKS || '0');
+const MAX_RUNTIME_MS = Number(process.env.QUOTER_MAX_RUNTIME_MS || '0');
 
 function startupDebug(msg: string): void {
   if (!DEBUG_STARTUP) {
@@ -195,25 +205,52 @@ function sideToString(side: PerpOrderSide): 'bid' | 'ask' {
   return side === PerpOrderSide.bid ? 'bid' : 'ask';
 }
 
-function executionQueueRemainingAccountsFromMangoIx(
-  executionQueue: PublicKey,
-  keys: { pubkey: PublicKey; isWritable: boolean; isSigner: boolean }[],
-): AccountMeta[] {
-  if (keys.length < 3) {
-    throw new Error('expected at least 3 metas in mango instruction');
+function selectBotsForTick(
+  bots: BotRuntime[],
+  currentTick: number,
+): BotRuntime[] {
+  if (BOT_DISPATCH_MODE === 'all' || bots.length <= 1) {
+    return bots;
   }
-  const remaining = keys.map((k) => ({
-    pubkey: k.pubkey,
-    isWritable: k.isWritable,
-    // Queue-dispatched instructions must not require user signatures at enqueue time.
-    isSigner: false,
-  }));
-  remaining[2] = {
-    pubkey: executionQueue,
-    isWritable: remaining[2].isWritable,
-    isSigner: false,
-  };
-  return remaining;
+  if (BOT_DISPATCH_MODE === 'round-robin') {
+    return [bots[(currentTick - 1) % bots.length]];
+  }
+  if (BOT_DISPATCH_MODE === 'random-one') {
+    return [bots[Math.floor(Math.random() * bots.length)]];
+  }
+  throw new Error('QUOTER_BOT_DISPATCH_MODE must be all, round-robin, or random-one');
+}
+
+async function executionQueueCanonicalPerpRemainingAccounts(params: {
+  client: MangoClient;
+  group: Awaited<ReturnType<MangoClient['getGroup']>>;
+  mangoAccount: Awaited<ReturnType<MangoClient['getMangoAccount']>>;
+  marketIndex: PerpMarketIndex;
+  userOwner: PublicKey;
+}): Promise<AccountMeta[]> {
+  const perpMarket = params.group.getPerpMarketByMarketIndex(params.marketIndex);
+  const healthRemainingAccounts = await params.client.buildHealthRemainingAccounts(
+    params.group,
+    [params.mangoAccount],
+    [params.group.getFirstBankForPerpSettlement()],
+    [perpMarket],
+  );
+
+  return [
+    { pubkey: params.group.publicKey, isSigner: false, isWritable: false },
+    { pubkey: params.mangoAccount.publicKey, isSigner: false, isWritable: true },
+    { pubkey: params.userOwner, isSigner: false, isWritable: false },
+    { pubkey: perpMarket.publicKey, isSigner: false, isWritable: true },
+    { pubkey: perpMarket.bids, isSigner: false, isWritable: true },
+    { pubkey: perpMarket.asks, isSigner: false, isWritable: true },
+    { pubkey: perpMarket.eventQueue, isSigner: false, isWritable: true },
+    { pubkey: perpMarket.oracle, isSigner: false, isWritable: false },
+    ...healthRemainingAccounts.map((pubkey) => ({
+      pubkey,
+      isSigner: false,
+      isWritable: false,
+    })),
+  ];
 }
 
 function randomFloat(min: number, max: number): number {
@@ -236,6 +273,35 @@ function randomQuotePrice(
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function parsePrometheusMetrics(text: string): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) {
+      continue;
+    }
+    const [name, value] = trimmed.split(/\s+/, 2);
+    const parsed = Number(value);
+    if (!name || Number.isNaN(parsed)) {
+      continue;
+    }
+    out[name] = parsed;
+  }
+  return out;
+}
+
+async function fetchRelayerMetricsSnapshot(): Promise<Record<string, number> | null> {
+  try {
+    const response = await fetch(RELAYER_METRICS_URL);
+    if (!response.ok) {
+      return null;
+    }
+    return parsePrometheusMetrics(await response.text());
+  } catch {
+    return null;
+  }
 }
 
 function deriveWsEndpoint(httpUrl: string): string | null {
@@ -434,6 +500,15 @@ async function main(): Promise<void> {
   if (!Number.isInteger(MAX_INFLIGHT) || MAX_INFLIGHT <= 0) {
     throw new Error('QUOTER_MAX_INFLIGHT must be an integer > 0');
   }
+  if (
+    BOT_DISPATCH_MODE !== 'all' &&
+    BOT_DISPATCH_MODE !== 'round-robin' &&
+    BOT_DISPATCH_MODE !== 'random-one'
+  ) {
+    throw new Error(
+      'QUOTER_BOT_DISPATCH_MODE must be all, round-robin, or random-one',
+    );
+  }
   if (!Number.isInteger(CANCEL_EVERY_TICKS) || CANCEL_EVERY_TICKS <= 0) {
     throw new Error('QUOTER_CANCEL_EVERY_TICKS must be an integer > 0');
   }
@@ -546,6 +621,7 @@ async function main(): Promise<void> {
         refreshMs: COINGECKO_REFRESH_MS,
       },
       parallelBotExecution: PARALLEL_BOT_EXECUTION,
+      botDispatchMode: BOT_DISPATCH_MODE,
       logEachOrder: LOG_EACH_ORDER,
       nonblockingSubmit: NONBLOCKING_SUBMIT,
       maxInFlight: MAX_INFLIGHT,
@@ -564,11 +640,22 @@ async function main(): Promise<void> {
   let totalCancelIntents = 0;
   let ticks = 0;
   const startedAtMs = Date.now();
+  let peakAvgPlaceTps = 0;
+  let peakAvgIntentTps = 0;
+  let peakWindowPlaceTps = 0;
+  let peakWindowIntentTps = 0;
+  let maxInFlightObserved = 0;
+  let tickErrorCount = 0;
+  let lastStatsAtMs = startedAtMs;
+  let lastStatsPlaceIntents = 0;
+  let lastStatsIntentCount = 0;
+  let stopReason = 'signal';
   let cachedCoinGeckoPriceUi: number | null = null;
   let cachedCoinGeckoTsMs = 0;
   const inFlight = new Set<Promise<void>>();
 
   const handleTickError = (err: unknown) => {
+    tickErrorCount += 1;
     const errText = err instanceof Error ? err.message : `${err}`;
     if (isRelayerTransportError(errText)) {
       try {
@@ -587,7 +674,73 @@ async function main(): Promise<void> {
     );
   };
 
+  const writeReport = async () => {
+    if (!REPORT_PATH) {
+      return;
+    }
+    const elapsedMs = Date.now() - startedAtMs;
+    const elapsedSec = Math.max(1, elapsedMs / 1000);
+    const queueAccountInfo = await connection
+      .getAccountInfo(executionQueuePk, COMMITMENT)
+      .catch(() => null);
+    const relayerMetrics = await fetchRelayerMetricsSnapshot();
+    const report = {
+      ts: new Date().toISOString(),
+      stopReason,
+      ticks,
+      bots: bots.length,
+      elapsedMs,
+      totalPlaceIntents,
+      totalCancelIntents,
+      avgPlaceTps: totalPlaceIntents / elapsedSec,
+      avgIntentTps: (totalPlaceIntents + totalCancelIntents) / elapsedSec,
+      peakAvgPlaceTps,
+      peakAvgIntentTps,
+      peakWindowPlaceTps,
+      peakWindowIntentTps,
+      maxInFlightObserved,
+      tickErrorCount,
+      queueCount: queueAccountInfo?.data
+        ? decodeExecutionQueueCount(queueAccountInfo.data)
+        : null,
+      relayerMetrics,
+      config: {
+        intervalMs: INTERVAL_MS,
+        nonblockingSubmit: NONBLOCKING_SUBMIT,
+        maxInFlight: MAX_INFLIGHT,
+        cancelBeforePlace: CANCEL_BEFORE_PLACE,
+        cancelMode: CANCEL_MODE,
+        cancelEveryTicks: CANCEL_EVERY_TICKS,
+        orderLimit: ORDER_LIMIT,
+        botDispatchMode: BOT_DISPATCH_MODE,
+        priceRangeBps: PRICE_RANGE_BPS,
+        minExecuteSlotOffset: MIN_EXECUTE_SLOT_OFFSET.toString(),
+      },
+    };
+    const reportPath = path.resolve(REPORT_PATH);
+    fs.mkdirSync(path.dirname(reportPath), { recursive: true });
+    fs.writeFileSync(reportPath, JSON.stringify(report, null, 2));
+    console.log(
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        msg: 'quoter-report-written',
+        reportPath,
+        stopReason,
+        peakWindowPlaceTps,
+        peakWindowIntentTps,
+      }),
+    );
+  };
+
   while (running) {
+    if (MAX_TICKS > 0 && ticks >= MAX_TICKS) {
+      stopReason = 'max_ticks';
+      break;
+    }
+    if (MAX_RUNTIME_MS > 0 && Date.now() - startedAtMs >= MAX_RUNTIME_MS) {
+      stopReason = 'max_runtime_ms';
+      break;
+    }
     const tickStart = Date.now();
     try {
       const currentTick = ticks + 1;
@@ -659,26 +812,25 @@ async function main(): Promise<void> {
       }
       const minExecuteSlot =
         BigInt(await connection.getSlot(COMMITMENT)) + MIN_EXECUTE_SLOT_OFFSET;
+      const botsForTick = selectBotsForTick(bots, currentTick);
 
       const runBotTick = async (bot: BotRuntime) => {
         const mangoAccount = bot.mangoAccount;
         const perpMarket = bot.group.getPerpMarketByMarketIndex(marketIndex);
+        const canonicalRemainingAccounts =
+          await executionQueueCanonicalPerpRemainingAccounts({
+            client: bot.client,
+            group: bot.group,
+            mangoAccount,
+            marketIndex,
+            userOwner: bot.keypair.publicKey,
+          });
 
         const shouldCancelThisTick =
           CANCEL_BEFORE_PLACE && currentTick % CANCEL_EVERY_TICKS === 0;
         if (shouldCancelThisTick) {
           if (CANCEL_MODE === 'client-id') {
             if (bot.lastPlacedClientOrderId !== null) {
-              const cancelIx = await bot.client.perpCancelOrderByClientOrderIdIx(
-                bot.group,
-                mangoAccount,
-                marketIndex,
-                new BN(bot.lastPlacedClientOrderId),
-              );
-              const cancelRemaining = executionQueueRemainingAccountsFromMangoIx(
-                executionQueuePk,
-                cancelIx.keys,
-              );
               const cancelPayload = encodePerpCancelOrderByClientOrderIdQueuePayload({
                 clientOrderId: BigInt(bot.lastPlacedClientOrderId),
               });
@@ -688,7 +840,7 @@ async function main(): Promise<void> {
                 executionQueue: executionQueuePk,
                 market: marketIndex,
                 payload: cancelPayload,
-                remainingAccounts: cancelRemaining,
+                remainingAccounts: canonicalRemainingAccounts,
                 userOwner: bot.keypair.publicKey,
                 userSecretKey: bot.keypair.secretKey,
                 mangoAccount: mangoAccount.publicKey,
@@ -697,16 +849,6 @@ async function main(): Promise<void> {
               totalCancelIntents += 1;
             }
           } else {
-            const cancelIx = await bot.client.perpCancelAllOrdersIx(
-              bot.group,
-              mangoAccount,
-              marketIndex,
-              CANCEL_LIMIT,
-            );
-            const cancelRemaining = executionQueueRemainingAccountsFromMangoIx(
-              executionQueuePk,
-              cancelIx.keys,
-            );
             const cancelPayload = encodePerpCancelAllOrdersQueuePayload({
               limit: CANCEL_LIMIT,
             });
@@ -716,7 +858,7 @@ async function main(): Promise<void> {
               executionQueue: executionQueuePk,
               market: marketIndex,
               payload: cancelPayload,
-              remainingAccounts: cancelRemaining,
+              remainingAccounts: canonicalRemainingAccounts,
               userOwner: bot.keypair.publicKey,
               userSecretKey: bot.keypair.secretKey,
               mangoAccount: mangoAccount.publicKey,
@@ -734,25 +876,6 @@ async function main(): Promise<void> {
         // a targeted cancel on the next cycle without waiting for the place RPC to return.
         bot.lastPlacedClientOrderId = clientOrderId;
 
-        const placeIx = await bot.client.perpPlaceOrderV2Ix(
-          bot.group,
-          mangoAccount,
-          marketIndex,
-          bot.side,
-          quotePrice,
-          sizeSol,
-          maxQuoteQty,
-          clientOrderId,
-          PerpOrderType.limit,
-          PerpSelfTradeBehavior.decrementTake,
-          false,
-          0,
-          ORDER_LIMIT,
-        );
-        const remainingAccounts = executionQueueRemainingAccountsFromMangoIx(
-          executionQueuePk,
-          placeIx.keys,
-        );
         const payload = encodePerpPlaceOrderV2QueuePayload({
           side: bot.side,
           priceLots: BigInt(perpMarket.uiPriceToLots(quotePrice).toString()),
@@ -772,7 +895,7 @@ async function main(): Promise<void> {
           executionQueue: executionQueuePk,
           market: marketIndex,
           payload,
-          remainingAccounts,
+          remainingAccounts: canonicalRemainingAccounts,
           userOwner: bot.keypair.publicKey,
           userSecretKey: bot.keypair.secretKey,
           mangoAccount: mangoAccount.publicKey,
@@ -800,7 +923,7 @@ async function main(): Promise<void> {
 
       if (NONBLOCKING_SUBMIT) {
         if (PARALLEL_BOT_EXECUTION) {
-          for (const bot of bots) {
+          for (const bot of botsForTick) {
             while (inFlight.size >= MAX_INFLIGHT) {
               await Promise.race(inFlight);
             }
@@ -817,7 +940,7 @@ async function main(): Promise<void> {
             await Promise.race(inFlight);
           }
           const sequence = (async () => {
-            for (const bot of bots) {
+            for (const bot of botsForTick) {
               await runBotTick(bot);
             }
           })().catch((err) => {
@@ -829,18 +952,33 @@ async function main(): Promise<void> {
           });
         }
       } else if (PARALLEL_BOT_EXECUTION) {
-        await Promise.all(bots.map((bot) => runBotTick(bot)));
+        await Promise.all(botsForTick.map((bot) => runBotTick(bot)));
       } else {
-        for (const bot of bots) {
+        for (const bot of botsForTick) {
           await runBotTick(bot);
         }
       }
 
       ticks += 1;
+      maxInFlightObserved = Math.max(maxInFlightObserved, inFlight.size);
       if (LOG_TPS_EVERY_TICKS > 0 && ticks % LOG_TPS_EVERY_TICKS === 0) {
-        const elapsedSec = Math.max(1, (Date.now() - startedAtMs) / 1000);
+        const nowMs = Date.now();
+        const elapsedSec = Math.max(1, (nowMs - startedAtMs) / 1000);
         const avgPlaceTps = totalPlaceIntents / elapsedSec;
         const avgIntentTps = (totalPlaceIntents + totalCancelIntents) / elapsedSec;
+        const totalIntentCount = totalPlaceIntents + totalCancelIntents;
+        const windowElapsedSec = Math.max(1, (nowMs - lastStatsAtMs) / 1000);
+        const windowPlaceTps =
+          (totalPlaceIntents - lastStatsPlaceIntents) / windowElapsedSec;
+        const windowIntentTps =
+          (totalIntentCount - lastStatsIntentCount) / windowElapsedSec;
+        peakAvgPlaceTps = Math.max(peakAvgPlaceTps, avgPlaceTps);
+        peakAvgIntentTps = Math.max(peakAvgIntentTps, avgIntentTps);
+        peakWindowPlaceTps = Math.max(peakWindowPlaceTps, windowPlaceTps);
+        peakWindowIntentTps = Math.max(peakWindowIntentTps, windowIntentTps);
+        lastStatsAtMs = nowMs;
+        lastStatsPlaceIntents = totalPlaceIntents;
+        lastStatsIntentCount = totalIntentCount;
         console.log(
           JSON.stringify({
             ts: new Date().toISOString(),
@@ -851,6 +989,12 @@ async function main(): Promise<void> {
             totalCancelIntents,
             avgPlaceTps,
             avgIntentTps,
+            windowPlaceTps,
+            windowIntentTps,
+            peakAvgPlaceTps,
+            peakAvgIntentTps,
+            peakWindowPlaceTps,
+            peakWindowIntentTps,
             cancelBeforePlace: CANCEL_BEFORE_PLACE,
             cancelEveryTicks: CANCEL_EVERY_TICKS,
             inFlight: inFlight.size,
@@ -869,6 +1013,7 @@ async function main(): Promise<void> {
   if (inFlight.size > 0) {
     await Promise.allSettled(Array.from(inFlight));
   }
+  await writeReport();
 }
 
 main().catch((err) => {

@@ -5,6 +5,7 @@ import * as dotenv from 'dotenv';
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 import { Pool } from 'pg';
+import { runtimeConfigPath } from './scriptEnv';
 
 dotenv.config();
 
@@ -51,8 +52,8 @@ const RELAYER_GRPC_ADDR = process.env.CTM_RELAYER_ADDR || '127.0.0.1:9090';
 const E2E_CONFIG_PATH =
   process.env.E2E_OUTPUT_CONFIG_PATH ||
   (process.env.EXECUTION_QUEUE_GROUP_NUM
-    ? `/tmp/execution-queue-e2e-${process.env.EXECUTION_QUEUE_GROUP_NUM}.json`
-    : '/tmp/execution-queue-e2e-9101.json');
+    ? runtimeConfigPath(`execution-queue-e2e-${process.env.EXECUTION_QUEUE_GROUP_NUM}.json`)
+    : runtimeConfigPath('execution-queue-e2e-9101.json'));
 const LANE_CONFIG_PATH_OVERRIDE = process.env.EXECUTION_QUEUE_CRANK_LANES_JSON_PATH || '';
 
 const TSDB_ENABLED = (process.env.FERMI_TSDB_ENABLED || 'true').toLowerCase() !== 'false';

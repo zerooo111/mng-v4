@@ -19,25 +19,21 @@ pub struct Serum3RegisterMarket<'info> {
     /// CHECK: Can register any serum market
     pub serum_market_external: UncheckedAccount<'info>,
 
+    /// CHECK: Fresh PDA account created and initialized in the instruction body.
     #[account(
-        init,
-        // using the serum_market_external in the seed guards against registering the same market twice
+        mut,
         seeds = [b"Serum3Market".as_ref(), group.key().as_ref(), serum_market_external.key().as_ref()],
         bump,
-        payer = payer,
-        space = 8 + std::mem::size_of::<Serum3Market>(),
     )]
-    pub serum_market: AccountLoader<'info, Serum3Market>,
+    pub serum_market: UncheckedAccount<'info>,
 
+    /// CHECK: Fresh PDA account created and initialized in the instruction body.
     #[account(
-        init,
-        // block using the same market index twice
+        mut,
         seeds = [b"Serum3Index".as_ref(), group.key().as_ref(), &market_index.to_le_bytes()],
         bump,
-        payer = payer,
-        space = 8 + std::mem::size_of::<Serum3MarketIndexReservation>(),
     )]
-    pub index_reservation: AccountLoader<'info, Serum3MarketIndexReservation>,
+    pub index_reservation: UncheckedAccount<'info>,
 
     #[account(has_one = group)]
     pub quote_bank: AccountLoader<'info, Bank>,

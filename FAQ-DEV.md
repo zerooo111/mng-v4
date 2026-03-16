@@ -103,6 +103,68 @@ No solution yet! Please open an issue if you know how to fix this.
 As of now the problem can be ignored as long as the method is not called.
 
 
+## `cargo build-sbf` finishes but the fresh `mango_v4.so` artifact is still unusable
+
+This is the current local blocker as of 2026-03-13.
+
+Symptom:
+
+- `cargo build-sbf --manifest-path programs/mango-v4/Cargo.toml --features enable-gpl` prints `Finished release profile [optimized]`
+- the same build also prints many hard `Error:` lines for Anchor-generated `Accounts::try_accounts`
+- startup scripts keep deploying `target/deploy/mango_v4.so`, so local validator restarts can silently keep using a stale artifact when a clean rebuild is not actually available
+
+Current failing contexts in this repo:
+
+- `programs/mango-v4/src/accounts_ix/openbook_v2_liq_force_cancel_orders.rs`
+- `programs/mango-v4/src/accounts_ix/openbook_v2_place_order.rs`
+- `programs/mango-v4/src/accounts_ix/serum3_register_market.rs`
+- `programs/mango-v4/src/accounts_ix/token_add_bank.rs`
+- `programs/mango-v4/src/accounts_ix/token_register.rs`
+- `programs/mango-v4/src/accounts_ix/token_register_trustless.rs`
+
+Representative current failures:
+
+- `OpenbookV2LiqForceCancelOrders::try_accounts`: stack offset `5056` exceeds `4096` by `960`
+- `OpenbookV2PlaceOrder::try_accounts`: stack offset `4400` exceeds `4096` by `304`
+- `Serum3RegisterMarket::try_accounts`: stack offset `4104` exceeds `4096` by `8`
+- `TokenAddBank::try_accounts`: stack offset `5424` exceeds `4096` by `1328`
+- `TokenRegister::try_accounts`: stack offset `5048` exceeds `4096` by `952`
+- `TokenRegisterTrustless::try_accounts`: stack offset `5048` exceeds `4096` by `952`
+
+Reproduce and check explicitly:
+
+```bash
+cargo build-sbf --manifest-path programs/mango-v4/Cargo.toml --features enable-gpl 2>&1 | tee /tmp/mango-build-sbf.log
+rg -n "^Error:" /tmp/mango-build-sbf.log
+```
+
+Important distinction:
+
+- older local failures in this repo were runtime `ProgramFailedToComplete` access violations after deploy
+- the current blocker is earlier: compile-time SBF stack-frame overflow in Anchor-generated `try_accounts`
+
+Why it happens:
+
+- Solana stack frames are limited to 4096 bytes
+- Anchor's generated `try_accounts` function is a common hotspot because it deserializes accounts and runs constraints in one place
+- large `#[derive(Accounts)]` structs with multiple `init`, SPL token accounts, and many constrained accounts can overflow even before instruction logic runs
+
+Current best-practice fixes:
+
+- split large instructions into smaller `Accounts` contexts instead of keeping many `init` and validation paths in one context
+- move rare setup paths into separate instructions so the hot path `try_accounts` frame shrinks
+- prefer account types that avoid eagerly materializing large wrappers when possible
+- keep boxing large SPL account wrappers, but do not expect boxing alone to fix `try_accounts`
+- after any fix, rerun `cargo build-sbf` and grep for `^Error:`; do not trust the final `Finished` line by itself
+
+Useful references:
+
+- Anchor 0.31 release notes: `try_accounts` is the main stack hotspot, and `init` constraints are a major contributor
+  - <https://www.anchor-lang.com/docs/updates/release-notes/0-31-0>
+- Solana program FAQ: stack frame warnings can appear in dependencies too, but used paths must still be reduced below the limit
+  - <https://solana.com/docs/programs/faq>
+
+
 ## Syscall lib binding fails for invalid solana version combinations
 
 *Solution*:
@@ -153,5 +215,4 @@ rustup toolchain list -v
 ```
 
 If toolchain is missing use the *Solana Install Tool* [here](https://docs.solana.com/cli/install-solana-cli-tools) to install it.
-
 

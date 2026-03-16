@@ -4442,15 +4442,23 @@ impl ClientInstruction for PerpLiqNegativePnlOrBankruptcyInstruction {
             oracle: perp_market.oracle,
             settle_bank: settle_mint_info.first_bank(),
             settle_vault: settle_mint_info.first_vault(),
-            settle_oracle: settle_mint_info.oracle,
             insurance_vault: group.insurance_vault,
-            insurance_bank: insurance_mint_info.first_bank(),
             insurance_bank_vault: insurance_mint_info.first_vault(),
-            insurance_oracle: insurance_mint_info.oracle,
-            token_program: Token::id(),
         };
         let mut instruction = make_instruction(program_id, &accounts, &instruction);
         instruction.accounts.extend(health_check_metas);
+        instruction
+            .accounts
+            .push(AccountMeta::new_readonly(settle_mint_info.oracle, false));
+        instruction
+            .accounts
+            .push(AccountMeta::new(insurance_mint_info.first_bank(), false));
+        instruction
+            .accounts
+            .push(AccountMeta::new_readonly(insurance_mint_info.oracle, false));
+        instruction
+            .accounts
+            .push(AccountMeta::new_readonly(Token::id(), false));
 
         (accounts, instruction)
     }

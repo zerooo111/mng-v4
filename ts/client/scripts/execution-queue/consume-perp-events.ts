@@ -4,6 +4,7 @@ import * as dotenv from 'dotenv';
 import fs from 'fs';
 import path from 'path';
 import { MangoClient } from '../../src/client';
+import { runtimeConfigPath } from './scriptEnv';
 
 dotenv.config();
 
@@ -21,7 +22,7 @@ type E2EConfig = {
 const CONFIG_PATH =
   process.env.QUOTER_CONFIG_PATH ||
   process.env.E2E_OUTPUT_CONFIG_PATH ||
-  '/home/ec2-user/stagin4/mng-v4/.localnet/run/execution-queue-e2e-9120.json';
+  runtimeConfigPath('execution-queue-e2e-9120.json');
 const PAYER_KEYPAIR =
   process.env.USER_KEYPAIR_OVERRIDE ||
   process.env.MB_PAYER_KEYPAIR ||

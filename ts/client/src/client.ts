@@ -6404,12 +6404,45 @@ export class MangoClient {
       isSigner: k.isSigner,
       isWritable: k.isWritable,
     }));
-    remainingAccounts[2] = {
-      pubkey: executionQueue,
-      isSigner: false,
-      isWritable: remainingAccounts[2].isWritable,
-    };
     return remainingAccounts;
+  }
+
+  private async executionQueueCanonicalPerpRemainingAccounts(
+    group: Group,
+    mangoAccount: MangoAccount,
+    perpMarketIndex: PerpMarketIndex,
+  ): Promise<AccountMeta[]> {
+    const perpMarket = group.getPerpMarketByMarketIndex(perpMarketIndex);
+    const healthRemainingAccounts: PublicKey[] =
+      await this.buildHealthRemainingAccounts(
+        group,
+        [mangoAccount],
+        [group.getFirstBankForPerpSettlement()],
+        [perpMarket],
+      );
+
+    return [
+      { pubkey: group.publicKey, isSigner: false, isWritable: false },
+      { pubkey: mangoAccount.publicKey, isSigner: false, isWritable: true },
+      {
+        pubkey: (this.program.provider as AnchorProvider).wallet.publicKey,
+        isSigner: false,
+        isWritable: false,
+      },
+      { pubkey: perpMarket.publicKey, isSigner: false, isWritable: true },
+      { pubkey: perpMarket.bids, isSigner: false, isWritable: true },
+      { pubkey: perpMarket.asks, isSigner: false, isWritable: true },
+      { pubkey: perpMarket.eventQueue, isSigner: false, isWritable: true },
+      { pubkey: perpMarket.oracle, isSigner: false, isWritable: false },
+      ...healthRemainingAccounts.map(
+        (pubkey) =>
+          ({
+            pubkey,
+            isSigner: false,
+            isWritable: false,
+          } as AccountMeta),
+      ),
+    ];
   }
 
   public async executionQueueEnqueueCtmWithIntent(
@@ -6500,22 +6533,6 @@ export class MangoClient {
     const resolvedLimit = params.limit ?? 10;
 
     const perpMarket = group.getPerpMarketByMarketIndex(perpMarketIndex);
-    const placeOrderIx = await this.perpPlaceOrderV2Ix(
-      group,
-      mangoAccount,
-      perpMarketIndex,
-      params.side,
-      params.price,
-      params.quantity,
-      params.maxQuoteQuantity,
-      resolvedClientOrderId,
-      resolvedOrderType,
-      resolvedSelfTradeBehavior,
-      resolvedReduceOnly,
-      resolvedExpiryTimestamp,
-      resolvedLimit,
-    );
-
     const payload = encodePerpPlaceOrderV2QueuePayload({
       side: params.side,
       priceLots: BigInt(perpMarket.uiPriceToLots(params.price).toString()),
@@ -6536,9 +6553,10 @@ export class MangoClient {
       {
         executionQueue: params.executionQueue,
         executionQueueBuffer: params.executionQueueBuffer,
-        remainingAccounts: this.executionQueueRemainingAccountsFromMangoIx(
-          placeOrderIx,
-          params.executionQueue,
+        remainingAccounts: await this.executionQueueCanonicalPerpRemainingAccounts(
+          group,
+          mangoAccount,
+          perpMarketIndex,
         ),
         payload,
         sequence: params.sequence,
@@ -6560,12 +6578,6 @@ export class MangoClient {
     params: ExecutionQueuePerpCancelOrderWithIntentParams,
     opts: SendTransactionOpts = {},
   ): Promise<MangoSignatureStatus> {
-    const cancelOrderIx = await this.perpCancelOrderIx(
-      group,
-      mangoAccount,
-      perpMarketIndex,
-      params.orderId,
-    );
     const payload = encodePerpCancelOrderQueuePayload({
       orderId: BigInt(params.orderId.toString()),
     });
@@ -6575,9 +6587,10 @@ export class MangoClient {
       {
         executionQueue: params.executionQueue,
         executionQueueBuffer: params.executionQueueBuffer,
-        remainingAccounts: this.executionQueueRemainingAccountsFromMangoIx(
-          cancelOrderIx,
-          params.executionQueue,
+        remainingAccounts: await this.executionQueueCanonicalPerpRemainingAccounts(
+          group,
+          mangoAccount,
+          perpMarketIndex,
         ),
         payload,
         sequence: params.sequence,
@@ -6599,12 +6612,6 @@ export class MangoClient {
     params: ExecutionQueuePerpCancelOrderByClientIdWithIntentParams,
     opts: SendTransactionOpts = {},
   ): Promise<MangoSignatureStatus> {
-    const cancelOrderIx = await this.perpCancelOrderByClientOrderIdIx(
-      group,
-      mangoAccount,
-      perpMarketIndex,
-      params.clientOrderId,
-    );
     const payload = encodePerpCancelOrderByClientOrderIdQueuePayload({
       clientOrderId: BigInt(params.clientOrderId.toString()),
     });
@@ -6614,9 +6621,10 @@ export class MangoClient {
       {
         executionQueue: params.executionQueue,
         executionQueueBuffer: params.executionQueueBuffer,
-        remainingAccounts: this.executionQueueRemainingAccountsFromMangoIx(
-          cancelOrderIx,
-          params.executionQueue,
+        remainingAccounts: await this.executionQueueCanonicalPerpRemainingAccounts(
+          group,
+          mangoAccount,
+          perpMarketIndex,
         ),
         payload,
         sequence: params.sequence,
@@ -6638,12 +6646,6 @@ export class MangoClient {
     params: ExecutionQueuePerpCancelAllOrdersWithIntentParams,
     opts: SendTransactionOpts = {},
   ): Promise<MangoSignatureStatus> {
-    const cancelAllIx = await this.perpCancelAllOrdersIx(
-      group,
-      mangoAccount,
-      perpMarketIndex,
-      params.limit,
-    );
     const payload = encodePerpCancelAllOrdersQueuePayload({
       limit: params.limit,
     });
@@ -6653,9 +6655,10 @@ export class MangoClient {
       {
         executionQueue: params.executionQueue,
         executionQueueBuffer: params.executionQueueBuffer,
-        remainingAccounts: this.executionQueueRemainingAccountsFromMangoIx(
-          cancelAllIx,
-          params.executionQueue,
+        remainingAccounts: await this.executionQueueCanonicalPerpRemainingAccounts(
+          group,
+          mangoAccount,
+          perpMarketIndex,
         ),
         payload,
         sequence: params.sequence,
@@ -6677,19 +6680,6 @@ export class MangoClient {
     params: ExecutionQueuePerpCancelAllOrdersBySideWithIntentParams,
     opts: SendTransactionOpts = {},
   ): Promise<MangoSignatureStatus> {
-    const perpMarket = group.getPerpMarketByMarketIndex(perpMarketIndex);
-    const cancelAllBySideIx = await this.program.methods
-      .perpCancelAllOrdersBySide(params.sideOption, params.limit)
-      .accounts({
-        group: group.publicKey,
-        account: mangoAccount.publicKey,
-        owner: (this.program.provider as AnchorProvider).wallet.publicKey,
-        perpMarket: perpMarket.publicKey,
-        bids: perpMarket.bids,
-        asks: perpMarket.asks,
-      })
-      .instruction();
-
     const payload = encodePerpCancelAllOrdersBySideQueuePayload({
       side: params.sideOption,
       limit: params.limit,
@@ -6700,9 +6690,10 @@ export class MangoClient {
       {
         executionQueue: params.executionQueue,
         executionQueueBuffer: params.executionQueueBuffer,
-        remainingAccounts: this.executionQueueRemainingAccountsFromMangoIx(
-          cancelAllBySideIx,
-          params.executionQueue,
+        remainingAccounts: await this.executionQueueCanonicalPerpRemainingAccounts(
+          group,
+          mangoAccount,
+          perpMarketIndex,
         ),
         payload,
         sequence: params.sequence,

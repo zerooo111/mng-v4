@@ -17,8 +17,10 @@ DEPLOY_TIMEOUT_SECS=45 DEPLOY_RETRIES=0 ./startup_all_local.sh restart
 ./startup_all_local.sh stop
 ```
 
-The local launcher now defaults to the Rust relayer (`CTM_RELAYER_IMPL=rust`).
-Set `CTM_RELAYER_IMPL=ts` only if you need the legacy TS relayer path.
+The local launcher now defaults to the Rust relayer with the embedded Rust executor/cranker
+(`CTM_RELAYER_IMPL=rust`, `EXECUTION_QUEUE_ENGINE_ENABLED=true`).
+Set `CTM_RELAYER_IMPL=ts` only if you need the legacy TS relayer path, or
+`EXECUTION_QUEUE_ENGINE_ENABLED=false` if you intentionally want the old external cranker flow.
 
 ## License
 

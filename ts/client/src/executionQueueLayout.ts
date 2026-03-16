@@ -3,8 +3,8 @@ export const EXECUTION_QUEUE_LAYOUT = {
   liquidityHeadOffset: 156,
   nextSequenceOffset: 160,
   maxSeenSequenceOffset: 168,
-  ctmCountOffset: 192,
-  liquidityCountOffset: 196,
+  ctmCountOffset: 200,
+  liquidityCountOffset: 204,
   ctmItemsOffset: 280,
   liquidityItemsOffset: 377112,
   ctmCapacity: 1024,
@@ -32,6 +32,8 @@ export type DecodedExecutionQueueHeader = {
   liquidityHead: number;
   ctmCount: number;
   liquidityCount: number;
+  headerInvariantOk: boolean;
+  gapSpan: bigint;
   nextSequence: bigint;
   maxSeenSequence: bigint;
 };
@@ -158,6 +160,12 @@ export function decodeExecutionQueueHeader(data: Buffer): DecodedExecutionQueueH
     liquidityHead,
     ctmCount,
     liquidityCount,
+    headerInvariantOk: totalCount === ctmCount + liquidityCount,
+    gapSpan:
+      decodeExecutionQueueMaxSeenSequence(data) >= decodeExecutionQueueNextSequence(data)
+        ? decodeExecutionQueueMaxSeenSequence(data) -
+          decodeExecutionQueueNextSequence(data)
+        : 0n,
     nextSequence: decodeExecutionQueueNextSequence(data),
     maxSeenSequence: decodeExecutionQueueMaxSeenSequence(data),
   };

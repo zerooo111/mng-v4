@@ -9,6 +9,10 @@ import fs from 'fs';
 import path from 'path';
 import { PerpOrderSide } from '../../src/accounts/perp';
 import { MangoClient } from '../../src/client';
+import {
+  keypairsDir,
+  runtimeConfigPath,
+} from './scriptEnv';
 
 dotenv.config();
 
@@ -36,16 +40,16 @@ type QuoterBotSpec = {
 const CONFIG_PATH =
   process.env.QUOTER_CONFIG_PATH ||
   process.env.E2E_OUTPUT_CONFIG_PATH ||
-  '/tmp/execution-queue-e2e-9101.json';
+  runtimeConfigPath('execution-queue-e2e-9101.json');
 const BOT_COUNT = Number(process.env.QUOTER_BOT_COUNT || '5');
 const ACCOUNT_NUM_START = Number(process.env.QUOTER_BOT_ACCOUNT_NUM_START || '100');
 const DEPOSIT_UI_AMOUNT = Number(process.env.QUOTER_BOT_DEPOSIT_UI_AMOUNT || '10000');
 const KEYPAIR_DIR =
   process.env.QUOTER_BOT_KEYPAIR_DIR ||
-  path.resolve('/home/ec2-user/stagin4/mng-v4/.localnet/run');
+  path.resolve(keypairsDir(), 'quoter-bots');
 const OUTPUT_PATH =
   process.env.QUOTER_BOTS_OUTPUT_PATH ||
-  path.resolve('/home/ec2-user/stagin4/mng-v4/.localnet/run/quoter-bots-9120.json');
+  runtimeConfigPath('quoter-bots-9120.json');
 const FALLBACK_ADMIN =
   process.env.MB_PAYER_KEYPAIR || '/home/ec2-user/.config/solana/id.json';
 const RETRY_MAX_ATTEMPTS = Number(process.env.QUOTER_BOT_RETRY_MAX_ATTEMPTS || '6');
@@ -59,24 +63,12 @@ function readKeypair(rawPathOrJson: string): Keypair {
   return Keypair.fromSecretKey(Uint8Array.from(JSON.parse(raw)));
 }
 
-function readOrCreateKeypair(filePath: string): Keypair {
+function readRequiredKeypair(filePath: string): Keypair {
   const resolved = path.resolve(filePath);
-  fs.mkdirSync(path.dirname(resolved), { recursive: true });
-  if (fs.existsSync(resolved)) {
-    return readKeypair(resolved);
+  if (!fs.existsSync(resolved)) {
+    throw new Error(`missing required quoter bot keypair: ${resolved}`);
   }
-  const kp = Keypair.generate();
-  fs.writeFileSync(resolved, JSON.stringify(Array.from(kp.secretKey)));
-  return kp;
-}
-
-async function airdropIfNeeded(connection: Connection, pubkey: PublicKey): Promise<void> {
-  const balance = await connection.getBalance(pubkey, 'confirmed');
-  if (balance > 2e9) {
-    return;
-  }
-  const sig = await connection.requestAirdrop(pubkey, 5e9);
-  await connection.confirmTransaction(sig, 'confirmed');
+  return readKeypair(resolved);
 }
 
 async function getOrCreateMangoAccount(
@@ -166,8 +158,7 @@ async function main(): Promise<void> {
   const bots: QuoterBotSpec[] = [];
   for (let i = 0; i < BOT_COUNT; i++) {
     const keypairPath = path.resolve(KEYPAIR_DIR, `quoter-bot-${i}.json`);
-    const botKp = readOrCreateKeypair(keypairPath);
-    await airdropIfNeeded(provider.connection, botKp.publicKey);
+    const botKp = readRequiredKeypair(keypairPath);
 
     const botProvider = new AnchorProvider(
       provider.connection,

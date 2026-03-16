@@ -1,7 +1,7 @@
 use std::ops::DerefMut;
 
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self, TokenAccount};
+use anchor_spl::token::{self, accessor};
 
 use fixed::types::I80F48;
 
@@ -15,11 +15,42 @@ use crate::logs::{
 };
 use crate::state::*;
 
-pub fn perp_liq_negative_pnl_or_bankruptcy(
-    ctx: Context<PerpLiqNegativePnlOrBankruptcyV2>,
+pub fn perp_liq_negative_pnl_or_bankruptcy<'info>(
+    ctx: Context<'_, '_, '_, 'info, PerpLiqNegativePnlOrBankruptcyV2<'info>>,
     max_liab_transfer: u64,
 ) -> Result<()> {
+    const EXTRA_CPI_ACCOUNTS: usize = 4;
+    require_gte!(ctx.remaining_accounts.len(), EXTRA_CPI_ACCOUNTS);
+    let (health_remaining, cpi_remaining) = ctx
+        .remaining_accounts
+        .split_at(ctx.remaining_accounts.len() - EXTRA_CPI_ACCOUNTS);
+    let settle_oracle_ai = cpi_remaining[0].clone();
+    let insurance_bank_ai = cpi_remaining[1].clone();
+    let insurance_oracle_ai = cpi_remaining[2].clone();
+    let token_program_ai = cpi_remaining[3].clone();
+
     let mango_group = ctx.accounts.group.key();
+    let group_loader = AccountLoader::<Group>::try_from(&ctx.accounts.group.to_account_info())?;
+    let liqor_loader =
+        AccountLoader::<MangoAccountFixed>::try_from(&ctx.accounts.liqor.to_account_info())?;
+    let liqee_loader =
+        AccountLoader::<MangoAccountFixed>::try_from(&ctx.accounts.liqee.to_account_info())?;
+    let perp_market_loader =
+        AccountLoader::<PerpMarket>::try_from(&ctx.accounts.perp_market.to_account_info())?;
+    let group = group_loader.load()?;
+    require!(
+        group.is_ix_enabled(IxGate::PerpLiqNegativePnlOrBankruptcy),
+        MangoError::IxIsDisabled
+    );
+    require_keys_eq!(group.insurance_vault, ctx.accounts.insurance_vault.key());
+    require_keys_eq!(*ctx.accounts.settle_vault.owner, anchor_spl::token::ID);
+    require_keys_eq!(*ctx.accounts.insurance_vault.owner, anchor_spl::token::ID);
+    require_keys_eq!(
+        *ctx.accounts.insurance_bank_vault.owner,
+        anchor_spl::token::ID
+    );
+    require_keys_eq!(*token_program_ai.key, anchor_spl::token::ID);
+    require!(ctx.accounts.liqor_owner.is_signer, MangoError::SomeError);
 
     let now_slot = Clock::get()?.slot;
     let now_ts = Clock::get()?.unix_timestamp.try_into().unwrap();
@@ -29,24 +60,48 @@ pub fn perp_liq_negative_pnl_or_bankruptcy(
     let perp_oracle_price;
     let settle_token_oracle_price;
     let insurance_token_oracle_price;
+    let insurance_vault_mint;
+    let insurance_vault_amount;
     {
-        let perp_market = ctx.accounts.perp_market.load()?;
+        let perp_market = perp_market_loader.load()?;
+        require_keys_eq!(perp_market.group, ctx.accounts.group.key());
+        require_keys_eq!(perp_market.oracle, ctx.accounts.oracle.key());
         perp_market_index = perp_market.perp_market_index;
         settle_token_index = perp_market.settle_token_index;
         let oracle_ref = &AccountInfoRef::borrow(ctx.accounts.oracle.as_ref())?;
         perp_oracle_price = perp_market
             .oracle_price(&OracleAccountInfos::from_reader(oracle_ref), Some(now_slot))?;
 
-        let settle_bank = ctx.accounts.settle_bank.load()?;
-        let settle_oracle_ref = &AccountInfoRef::borrow(ctx.accounts.settle_oracle.as_ref())?;
+        let settle_bank_loader =
+            AccountLoader::<Bank>::try_from(&ctx.accounts.settle_bank.to_account_info())?;
+        let insurance_bank_loader = AccountLoader::<Bank>::try_from(&insurance_bank_ai)?;
+        let settle_bank = settle_bank_loader.load()?;
+        require_keys_eq!(settle_bank.group, ctx.accounts.group.key());
+        require_eq!(
+            settle_bank.token_index,
+            perp_market.settle_token_index,
+            MangoError::InvalidBank
+        );
+        require_keys_eq!(settle_bank.vault, ctx.accounts.settle_vault.key());
+        require_keys_eq!(settle_bank.oracle, *settle_oracle_ai.key);
+        let settle_oracle_ref = &AccountInfoRef::borrow(&settle_oracle_ai)?;
         settle_token_oracle_price = settle_bank.oracle_price(
             &OracleAccountInfos::from_reader(settle_oracle_ref),
             Some(now_slot),
         )?;
         drop(settle_bank); // could be the same as insurance_bank
 
-        let insurance_bank = ctx.accounts.insurance_bank.load()?;
-        let insurance_oracle_ref = &AccountInfoRef::borrow(ctx.accounts.insurance_oracle.as_ref())?;
+        let insurance_bank = insurance_bank_loader.load()?;
+        require_keys_eq!(insurance_bank.group, ctx.accounts.group.key());
+        require_keys_eq!(
+            insurance_bank.vault,
+            ctx.accounts.insurance_bank_vault.key()
+        );
+        require_keys_eq!(insurance_bank.oracle, *insurance_oracle_ai.key);
+        insurance_vault_mint = accessor::mint(&ctx.accounts.insurance_vault.to_account_info())?;
+        insurance_vault_amount = accessor::amount(&ctx.accounts.insurance_vault.to_account_info())?;
+        require_keys_eq!(insurance_bank.mint, insurance_vault_mint);
+        let insurance_oracle_ref = &AccountInfoRef::borrow(&insurance_oracle_ai)?;
         // We're not getting the insurance token price from the HealthCache because
         // the liqee isn't guaranteed to have an insurance fund token position.
         insurance_token_oracle_price = insurance_bank.oracle_price(
@@ -56,8 +111,12 @@ pub fn perp_liq_negative_pnl_or_bankruptcy(
     }
 
     require_keys_neq!(ctx.accounts.liqor.key(), ctx.accounts.liqee.key());
-    let mut liqee = ctx.accounts.liqee.load_full_mut()?;
-    let mut liqor = ctx.accounts.liqor.load_full_mut()?;
+    let mut liqee = liqee_loader.load_full_mut()?;
+    let mut liqor = liqor_loader.load_full_mut()?;
+    require_keys_eq!(liqee.fixed.group, ctx.accounts.group.key());
+    require!(liqee.fixed.is_operational(), MangoError::AccountIsFrozen);
+    require_keys_eq!(liqor.fixed.group, ctx.accounts.group.key());
+    require!(liqor.fixed.is_operational(), MangoError::AccountIsFrozen);
     // account constraint #1
     require!(
         liqor
@@ -71,7 +130,7 @@ pub fn perp_liq_negative_pnl_or_bankruptcy(
         "liqor account"
     );
 
-    let retriever = ScanningAccountRetriever::new(ctx.remaining_accounts, &mango_group)
+    let retriever = ScanningAccountRetriever::new(health_remaining, &mango_group)
         .context("create account retriever")?;
     let mut liqee_health_cache = new_health_cache(&liqee.borrow(), &retriever, now_ts)?;
     drop(retriever);
@@ -92,16 +151,18 @@ pub fn perp_liq_negative_pnl_or_bankruptcy(
         liqor.ensure_token_position(settle_token_index)?;
     }
 
-    let mut perp_market = ctx.accounts.perp_market.load_mut()?;
+    let mut perp_market = perp_market_loader.load_mut()?;
 
     let (settlement, insurance_transfer) = {
-        let mut settle_bank = ctx.accounts.settle_bank.load_mut()?;
-        let mut insurance_bank_opt =
-            if ctx.accounts.settle_bank.key() != ctx.accounts.insurance_bank.key() {
-                Some(ctx.accounts.insurance_bank.load_mut()?)
-            } else {
-                None
-            };
+        let settle_bank_loader =
+            AccountLoader::<Bank>::try_from(&ctx.accounts.settle_bank.to_account_info())?;
+        let insurance_bank_loader = AccountLoader::<Bank>::try_from(&insurance_bank_ai)?;
+        let mut settle_bank = settle_bank_loader.load_mut()?;
+        let mut insurance_bank_opt = if ctx.accounts.settle_bank.key() != *insurance_bank_ai.key {
+            Some(insurance_bank_loader.load_mut()?)
+        } else {
+            None
+        };
         liquidation_action(
             ctx.accounts.group.key(),
             &mut perp_market,
@@ -110,7 +171,8 @@ pub fn perp_liq_negative_pnl_or_bankruptcy(
             settle_token_oracle_price,
             insurance_bank_opt.as_mut().map(|v| v.deref_mut()),
             insurance_token_oracle_price,
-            &ctx.accounts.insurance_vault,
+            insurance_vault_mint,
+            insurance_vault_amount,
             &mut liqor.borrow_mut(),
             ctx.accounts.liqor.key(),
             &mut liqee.borrow_mut(),
@@ -124,19 +186,26 @@ pub fn perp_liq_negative_pnl_or_bankruptcy(
 
     // Execute the insurance fund transfer if needed
     if insurance_transfer > 0 {
-        let group = ctx.accounts.group.load()?;
+        let group = group_loader.load()?;
         let group_seeds = group_seeds!(group);
-        token::transfer(
-            ctx.accounts.transfer_ctx().with_signer(&[group_seeds]),
-            insurance_transfer,
-        )?;
+        let transfer_ctx = CpiContext::new(
+            token_program_ai,
+            token::Transfer {
+                from: ctx.accounts.insurance_vault.to_account_info(),
+                to: ctx.accounts.insurance_bank_vault.to_account_info(),
+                authority: ctx.accounts.group.to_account_info(),
+            },
+        );
+        token::transfer(transfer_ctx.with_signer(&[group_seeds]), insurance_transfer)?;
     }
 
     //
     // Log positions afterwards
     //
     if settlement > 0 {
-        let settle_bank = ctx.accounts.settle_bank.load()?;
+        let settle_bank_loader =
+            AccountLoader::<Bank>::try_from(&ctx.accounts.settle_bank.to_account_info())?;
+        let settle_bank = settle_bank_loader.load()?;
         let liqor_token_position = liqor.token_position(settle_token_index)?;
         emit_stack(TokenBalanceLog {
             mango_group,
@@ -159,7 +228,8 @@ pub fn perp_liq_negative_pnl_or_bankruptcy(
     }
 
     if insurance_transfer > 0 {
-        let insurance_bank = ctx.accounts.insurance_bank.load()?;
+        let insurance_bank_loader = AccountLoader::<Bank>::try_from(&insurance_bank_ai)?;
+        let insurance_bank = insurance_bank_loader.load()?;
         let liqor_token_position = liqor.token_position(insurance_bank.token_index)?;
         emit_stack(TokenBalanceLog {
             mango_group,
@@ -197,8 +267,7 @@ pub fn perp_liq_negative_pnl_or_bankruptcy(
 
     // Check liqor's health
     if !liqor.fixed.is_in_health_region() {
-        let account_retriever =
-            ScanningAccountRetriever::new(ctx.remaining_accounts, &mango_group)?;
+        let account_retriever = ScanningAccountRetriever::new(health_remaining, &mango_group)?;
         let liqor_health = compute_health(
             &liqor.borrow(),
             HealthType::Init,
@@ -220,7 +289,8 @@ pub(crate) fn liquidation_action(
     settle_token_oracle_price: I80F48,
     insurance_bank_opt: Option<&mut Bank>,
     insurance_token_oracle_price: I80F48,
-    insurance_vault: &TokenAccount,
+    insurance_vault_mint: Pubkey,
+    insurance_vault_amount: u64,
     liqor: &mut MangoAccountRefMut,
     liqor_key: Pubkey,
     liqee: &mut MangoAccountRefMut,
@@ -343,7 +413,7 @@ pub(crate) fn liquidation_action(
 
         // Available insurance fund coverage
         let insurance_vault_amount = if perp_market.elligible_for_group_insurance_fund() {
-            insurance_vault.amount
+            insurance_vault_amount
         } else {
             0
         };
@@ -369,7 +439,7 @@ pub(crate) fn liquidation_action(
         // Try using the insurance fund if possible
         if insurance_transfer > 0 {
             let insurance_bank = insurance_bank_opt.unwrap_or(settle_bank);
-            require_keys_eq!(insurance_bank.mint, insurance_vault.mint);
+            require_keys_eq!(insurance_bank.mint, insurance_vault_mint);
 
             // moving insurance assets into the insurance bank vault happens outside
             // of this function to ensure this is unittestable!
@@ -548,13 +618,6 @@ mod tests {
                     .unwrap()
             };
 
-            // There's no way to construct a TokenAccount directly...
-            let mut buffer = [0u8; 165];
-            use solana_program::program_pack::Pack;
-            setup.insurance_vault.pack_into_slice(&mut buffer);
-            let insurance_vault =
-                TokenAccount::try_deserialize_unchecked(&mut &buffer[..]).unwrap();
-
             liquidation_action(
                 setup.group.key(),
                 setup.perp_market.data(),
@@ -563,7 +626,8 @@ mod tests {
                 settle_price,
                 Some(setup.insurance_bank.data()),
                 insurance_price,
-                &insurance_vault,
+                setup.insurance_vault.mint,
+                setup.insurance_vault.amount,
                 &mut setup.liqor.borrow_mut(),
                 Pubkey::new_unique(),
                 &mut setup.liqee.borrow_mut(),

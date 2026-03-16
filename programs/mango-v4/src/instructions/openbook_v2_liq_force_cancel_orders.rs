@@ -1,4 +1,5 @@
 use anchor_lang::prelude::*;
+use anchor_spl::token::accessor;
 use openbook_v2::cpi::accounts::{CancelOrder, SettleFunds};
 
 use crate::accounts_ix::*;
@@ -12,16 +13,62 @@ use crate::serum3_cpi::OpenOrdersSlim;
 use crate::state::*;
 use crate::util::clock_now;
 
-pub fn openbook_v2_liq_force_cancel_orders(
-    ctx: Context<OpenbookV2LiqForceCancelOrders>,
+pub fn openbook_v2_liq_force_cancel_orders<'info>(
+    ctx: Context<'_, '_, '_, 'info, OpenbookV2LiqForceCancelOrders<'info>>,
     limit: u8,
 ) -> Result<()> {
+    const EXTRA_CPI_ACCOUNTS: usize = 8;
+    require_gte!(ctx.remaining_accounts.len(), EXTRA_CPI_ACCOUNTS);
+    let (health_remaining, cpi_remaining) = ctx
+        .remaining_accounts
+        .split_at(ctx.remaining_accounts.len() - EXTRA_CPI_ACCOUNTS);
+    let bids_ai = cpi_remaining[0].clone();
+    let asks_ai = cpi_remaining[1].clone();
+    let event_heap_ai = cpi_remaining[2].clone();
+    let market_base_vault_ai = cpi_remaining[3].clone();
+    let market_quote_vault_ai = cpi_remaining[4].clone();
+    let market_vault_signer_ai = cpi_remaining[5].clone();
+    let token_program_ai = cpi_remaining[6].clone();
+    let system_program_ai = cpi_remaining[7].clone();
+
+    let group_loader = AccountLoader::<Group>::try_from(&ctx.accounts.group.to_account_info())?;
+    let group = group_loader.load()?;
+    require!(
+        group.is_ix_enabled(IxGate::OpenbookV2LiqForceCancelOrders),
+        MangoError::IxIsDisabled
+    );
+    require!(ctx.accounts.payer.is_signer, MangoError::SomeError);
+    require_keys_eq!(*token_program_ai.key, anchor_spl::token::ID);
+    require_keys_eq!(*system_program_ai.key, anchor_lang::system_program::ID);
+
+    let account_loader =
+        AccountLoader::<MangoAccountFixed>::try_from(&ctx.accounts.account.to_account_info())?;
     //
     // Validation
     //
-    let openbook_market = ctx.accounts.openbook_v2_market.load()?;
+    let openbook_market_loader = AccountLoader::<OpenbookV2Market>::try_from(
+        &ctx.accounts.openbook_v2_market.to_account_info(),
+    )?;
+    let openbook_market = openbook_market_loader.load()?;
+    let open_orders_loader = AccountLoader::<openbook_v2::state::OpenOrdersAccount>::try_from(
+        &ctx.accounts.open_orders.to_account_info(),
+    )?;
+    let quote_bank_loader =
+        AccountLoader::<Bank>::try_from(&ctx.accounts.quote_bank.to_account_info())?;
+    let base_bank_loader =
+        AccountLoader::<Bank>::try_from(&ctx.accounts.base_bank.to_account_info())?;
+    require_keys_eq!(openbook_market.group, ctx.accounts.group.key());
+    require_keys_eq!(
+        openbook_market.openbook_v2_market_external,
+        ctx.accounts.openbook_v2_market_external.key()
+    );
+    require_keys_eq!(
+        openbook_market.openbook_v2_program,
+        ctx.accounts.openbook_v2_program.key()
+    );
     {
-        let account = ctx.accounts.account.load_full()?;
+        let account = account_loader.load_full()?;
+        require_keys_eq!(account.fixed.group, ctx.accounts.group.key());
 
         // Validate open_orders #2
         require!(
@@ -33,7 +80,8 @@ pub fn openbook_v2_liq_force_cancel_orders(
         );
 
         // Validate banks and vaults #3
-        let quote_bank = ctx.accounts.quote_bank.load()?;
+        let quote_bank = quote_bank_loader.load()?;
+        require_keys_eq!(quote_bank.group, ctx.accounts.group.key());
         require!(
             quote_bank.vault == ctx.accounts.quote_vault.key(),
             MangoError::SomeError
@@ -42,7 +90,8 @@ pub fn openbook_v2_liq_force_cancel_orders(
             quote_bank.token_index == openbook_market.quote_token_index,
             MangoError::SomeError
         );
-        let base_bank = ctx.accounts.base_bank.load()?;
+        let base_bank = base_bank_loader.load()?;
+        require_keys_eq!(base_bank.group, ctx.accounts.group.key());
         require!(
             base_bank.vault == ctx.accounts.base_vault.key(),
             MangoError::SomeError
@@ -59,9 +108,9 @@ pub fn openbook_v2_liq_force_cancel_orders(
     // Early return if if liquidation is not allowed or if market is not in force close
     //
     let mut health_cache = {
-        let mut account = ctx.accounts.account.load_full_mut()?;
+        let mut account = account_loader.load_full_mut()?;
         let retriever =
-            new_fixed_order_account_retriever(ctx.remaining_accounts, &account.borrow(), now_slot)?;
+            new_fixed_order_account_retriever(health_remaining, &account.borrow(), now_slot)?;
         let health_cache = new_health_cache(&account.borrow(), &retriever, now_ts)
             .context("create health cache")?;
 
@@ -79,15 +128,29 @@ pub fn openbook_v2_liq_force_cancel_orders(
     //
     // Charge any open loan origination fees
     //
-    let openbook_market_external = ctx.accounts.openbook_v2_market_external.load()?;
+    let openbook_market_external_loader = AccountLoader::<openbook_v2::state::Market>::try_from(
+        &ctx.accounts.openbook_v2_market_external.to_account_info(),
+    )?;
+    let openbook_market_external = openbook_market_external_loader.load()?;
+    require_keys_eq!(openbook_market_external.bids, *bids_ai.key);
+    require_keys_eq!(openbook_market_external.asks, *asks_ai.key);
+    require_keys_eq!(openbook_market_external.event_heap, *event_heap_ai.key);
+    require_keys_eq!(
+        openbook_market_external.market_base_vault,
+        *market_base_vault_ai.key
+    );
+    require_keys_eq!(
+        openbook_market_external.market_quote_vault,
+        *market_quote_vault_ai.key
+    );
     let base_lot_size: u64 = openbook_market_external.base_lot_size.try_into().unwrap();
     let quote_lot_size: u64 = openbook_market_external.quote_lot_size.try_into().unwrap();
     let before_oo = {
-        let open_orders = ctx.accounts.open_orders.load()?;
+        let open_orders = open_orders_loader.load()?;
         let before_oo = OpenOrdersSlim::from_oo_v2(&open_orders, base_lot_size, quote_lot_size);
-        let mut account = ctx.accounts.account.load_full_mut()?;
-        let mut base_bank = ctx.accounts.base_bank.load_mut()?;
-        let mut quote_bank = ctx.accounts.quote_bank.load_mut()?;
+        let mut account = account_loader.load_full_mut()?;
+        let mut base_bank = base_bank_loader.load_mut()?;
+        let mut quote_bank = quote_bank_loader.load_mut()?;
         charge_loan_origination_fees(
             &ctx.accounts.group.key(),
             &ctx.accounts.account.key(),
@@ -106,25 +169,33 @@ pub fn openbook_v2_liq_force_cancel_orders(
     //
     // Before-settle tracking
     //
-    let before_base_vault = ctx.accounts.base_vault.amount;
-    let before_quote_vault = ctx.accounts.quote_vault.amount;
+    let before_base_vault = accessor::amount(&ctx.accounts.base_vault.to_account_info())?;
+    let before_quote_vault = accessor::amount(&ctx.accounts.quote_vault.to_account_info())?;
 
     //
     // Cancel all and settle
     //
-    let mango_account_seeds_data = ctx.accounts.account.load()?.pda_seeds();
+    let mango_account_seeds_data = account_loader.load()?.pda_seeds();
     let seeds = &mango_account_seeds_data.signer_seeds();
-    cpi_cancel_all_orders(ctx.accounts, &[seeds], limit)?;
+    cpi_cancel_all_orders(ctx.accounts, &[seeds], limit, &bids_ai, &asks_ai)?;
     // this requires a mut ctx.accounts.account for no reason
     drop(openbook_market_external);
-    cpi_settle_funds(ctx.accounts, &[seeds])?;
+    cpi_settle_funds(
+        ctx.accounts,
+        &[seeds],
+        &market_base_vault_ai,
+        &market_quote_vault_ai,
+        &market_vault_signer_ai,
+        &token_program_ai,
+        &system_program_ai,
+    )?;
 
     //
     // After-settle tracking
     //
     let after_oo;
     {
-        let open_orders = ctx.accounts.open_orders.load()?;
+        let open_orders = open_orders_loader.load()?;
         after_oo = OpenOrdersSlim::from_oo_v2(&open_orders, base_lot_size, quote_lot_size);
 
         emit_stack(OpenbookV2OpenOrdersBalanceLog {
@@ -141,16 +212,14 @@ pub fn openbook_v2_liq_force_cancel_orders(
         });
     };
 
-    ctx.accounts.base_vault.reload()?;
-    ctx.accounts.quote_vault.reload()?;
-    let after_base_vault = ctx.accounts.base_vault.amount;
-    let after_quote_vault = ctx.accounts.quote_vault.amount;
+    let after_base_vault = accessor::amount(&ctx.accounts.base_vault.to_account_info())?;
+    let after_quote_vault = accessor::amount(&ctx.accounts.quote_vault.to_account_info())?;
 
-    let mut account = ctx.accounts.account.load_full_mut()?;
-    let mut base_bank = ctx.accounts.base_bank.load_mut()?;
-    let mut quote_bank = ctx.accounts.quote_bank.load_mut()?;
-    let group = ctx.accounts.group.load()?;
-    let open_orders = ctx.accounts.open_orders.load()?;
+    let mut account = account_loader.load_full_mut()?;
+    let mut base_bank = base_bank_loader.load_mut()?;
+    let mut quote_bank = quote_bank_loader.load_mut()?;
+    let group = group_loader.load()?;
+    let open_orders = open_orders_loader.load()?;
     apply_settle_changes(
         &group,
         ctx.accounts.account.key(),
@@ -181,18 +250,19 @@ pub fn openbook_v2_liq_force_cancel_orders(
     Ok(())
 }
 
-fn cpi_cancel_all_orders(
-    ctx: &OpenbookV2LiqForceCancelOrders,
+fn cpi_cancel_all_orders<'info>(
+    ctx: &OpenbookV2LiqForceCancelOrders<'info>,
     seeds: &[&[&[u8]]],
     limit: u8,
+    bids_ai: &AccountInfo<'info>,
+    asks_ai: &AccountInfo<'info>,
 ) -> Result<()> {
-    let group = ctx.group.load()?;
     let cpi_accounts = CancelOrder {
         market: ctx.openbook_v2_market_external.to_account_info(),
         open_orders_account: ctx.open_orders.to_account_info(),
         signer: ctx.account.to_account_info(),
-        bids: ctx.bids.to_account_info(),
-        asks: ctx.asks.to_account_info(),
+        bids: bids_ai.clone(),
+        asks: asks_ai.clone(),
     };
 
     let cpi_ctx = CpiContext::new_with_signer(
@@ -205,21 +275,28 @@ fn cpi_cancel_all_orders(
     openbook_v2::cpi::cancel_all_orders(cpi_ctx, None, limit)
 }
 
-fn cpi_settle_funds(ctx: &OpenbookV2LiqForceCancelOrders, seeds: &[&[&[u8]]]) -> Result<()> {
-    let group = ctx.group.load()?;
+fn cpi_settle_funds<'info>(
+    ctx: &OpenbookV2LiqForceCancelOrders<'info>,
+    seeds: &[&[&[u8]]],
+    market_base_vault_ai: &AccountInfo<'info>,
+    market_quote_vault_ai: &AccountInfo<'info>,
+    market_vault_signer_ai: &AccountInfo<'info>,
+    token_program_ai: &AccountInfo<'info>,
+    system_program_ai: &AccountInfo<'info>,
+) -> Result<()> {
     let cpi_accounts = SettleFunds {
         penalty_payer: ctx.payer.to_account_info(),
         market: ctx.openbook_v2_market_external.to_account_info(),
-        market_authority: ctx.market_vault_signer.to_account_info(),
-        market_base_vault: ctx.market_base_vault.to_account_info(),
-        market_quote_vault: ctx.market_quote_vault.to_account_info(),
+        market_authority: market_vault_signer_ai.clone(),
+        market_base_vault: market_base_vault_ai.clone(),
+        market_quote_vault: market_quote_vault_ai.clone(),
         user_base_account: ctx.base_vault.to_account_info(),
         user_quote_account: ctx.quote_vault.to_account_info(),
         referrer_account: Some(ctx.quote_vault.to_account_info()),
-        token_program: ctx.token_program.to_account_info(),
+        token_program: token_program_ai.clone(),
         owner: ctx.account.to_account_info(),
         open_orders_account: ctx.open_orders.to_account_info(),
-        system_program: ctx.system_program.to_account_info(),
+        system_program: system_program_ai.clone(),
     };
 
     let cpi_ctx = CpiContext::new_with_signer(

@@ -1,5 +1,22 @@
 # Startup Bugs Log
 
+## 2026-03-16
+
+### 1) Devnet frontend order submit can intermittently fail with relayer duplicate-sequence aborts
+- Symptom:
+  - Frontend perps order submit intermittently failed with:
+    - `relay submit failed: 10 ABORTED: execution queue duplicate sequence; relayer cursor reconciled`
+  - Manual retry usually succeeded immediately after the failure.
+- Observations:
+  - The active relayer was the Rust `service-mango-execution-engine`.
+  - The relayer returned this when its reserved sequence collided with onchain queue state and then reconciled its local cursor.
+  - The user intent signature is sequence-independent, so a retry does not require a new wallet signature.
+- Temporary mitigation:
+  - Frontend now retries this specific duplicate-sequence abort automatically a small number of times before surfacing an error.
+- Follow-up:
+  - This still needs server-side investigation in the Rust relayer / execution-engine sequence reconciliation path.
+  - Repeated duplicate-sequence aborts on devnet should be treated as a relayer reliability issue, not as normal frontend behavior.
+
 ## 2026-03-13
 
 ### 1) Stale generated config after validator reset can restart services against dead accounts
@@ -114,3 +131,25 @@
     4. E2E runner
 - Restart rule:
   - If submit is healthy but the queue never drains, verify the cranker is truly alive with a direct foreground run before investigating the program.
+
+### 10) `cargo build-sbf` currently reports stack-frame failures but still leaves a misleading `Finished` line
+- Symptom:
+  - `cargo build-sbf --manifest-path programs/mango-v4/Cargo.toml --features enable-gpl` ended with `Finished release profile [optimized]`.
+  - The same build log contained many hard `Error:` lines for Anchor-generated `Accounts::try_accounts`.
+  - Local restarts then kept behaving like an older program build because the fresh artifact could not be trusted.
+- Root cause:
+  - The active blocker is now compile-time SBF stack overflow in large Anchor account-validation contexts, not the older runtime-only bootstrap access violations.
+  - The currently failing contexts are:
+    - `OpenbookV2LiqForceCancelOrders`
+    - `OpenbookV2PlaceOrder`
+    - `Serum3RegisterMarket`
+    - `TokenAddBank`
+    - `TokenRegister`
+    - `TokenRegisterTrustless`
+- Fix:
+  - Always capture the build log and grep for `^Error:` before treating `target/deploy/mango_v4.so` as fresh.
+  - Reduce stack usage by splitting the large `#[derive(Accounts)]` contexts, especially the `init`-heavy setup paths.
+- Restart rule:
+  - When local runtime behavior does not match recent source edits, verify the artifact first:
+    - `cargo build-sbf ... 2>&1 | tee /tmp/mango-build-sbf.log`
+    - `rg -n "^Error:" /tmp/mango-build-sbf.log`

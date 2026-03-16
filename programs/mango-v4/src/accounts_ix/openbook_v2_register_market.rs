@@ -25,25 +25,21 @@ pub struct OpenbookV2RegisterMarket<'info> {
     )]
     pub openbook_v2_market_external: AccountLoader<'info, Market>,
 
+    /// CHECK: Fresh PDA account created and initialized in the instruction body.
     #[account(
-        init,
-        // using the openbook_v2_market_external in the seed guards against registering the same market twice
+        mut,
         seeds = [b"OpenbookV2Market".as_ref(), group.key().as_ref(), openbook_v2_market_external.key().as_ref()],
         bump,
-        payer = payer,
-        space = 8 + std::mem::size_of::<OpenbookV2Market>(),
     )]
-    pub openbook_v2_market: AccountLoader<'info, OpenbookV2Market>,
+    pub openbook_v2_market: UncheckedAccount<'info>,
 
+    /// CHECK: Fresh PDA account created and initialized in the instruction body.
     #[account(
-        init,
-        // block using the same market index twice
+        mut,
         seeds = [b"OpenbookV2Index".as_ref(), group.key().as_ref(), &market_index.to_le_bytes()],
         bump,
-        payer = payer,
-        space = 8 + std::mem::size_of::<OpenbookV2MarketIndexReservation>(),
     )]
-    pub index_reservation: AccountLoader<'info, OpenbookV2MarketIndexReservation>,
+    pub index_reservation: UncheckedAccount<'info>,
 
     #[account(has_one = group)]
     pub quote_bank: AccountLoader<'info, Bank>,

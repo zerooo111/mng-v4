@@ -2,18 +2,32 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LOCALNET_DIR="${ROOT_DIR}/.localnet"
+STACK_CLUSTER="${STACK_CLUSTER:-localnet}"
+if [[ "${STACK_CLUSTER}" != "localnet" && "${STACK_CLUSTER}" != "devnet" ]]; then
+  echo "STACK_CLUSTER must be localnet or devnet" >&2
+  exit 1
+fi
+STACK_DIR_NAME=".localnet"
+if [[ "${STACK_CLUSTER}" == "devnet" ]]; then
+  STACK_DIR_NAME=".devnet"
+fi
+LOCALNET_DIR="${ROOT_DIR}/${STACK_DIR_NAME}"
 LEDGER_DIR="${LOCALNET_DIR}/ledger"
 LOG_DIR="${LOCALNET_DIR}/logs"
 RUN_DIR="${LOCALNET_DIR}/run"
 PID_DIR="${RUN_DIR}/pids"
 EXECUTION_ENGINE_BIN="${ROOT_DIR}/target/debug/service-mango-execution-engine"
+KEYPAIRS_DIR="${KEYPAIRS_DIR:-${ROOT_DIR}/keypairs}"
 
 PROGRAM_KEYPAIR="${ROOT_DIR}/target/deploy/mango_v4-keypair.json"
 PROGRAM_SO="${ROOT_DIR}/target/deploy/mango_v4.so"
 PROGRAM_ID="${PROGRAM_ID:-9nNhSkcxYFujiydpuuhVttUYBqYJQmxCzjrBofBvmutF}"
 
-SOLANA_URL="${SOLANA_URL:-http://127.0.0.1:8899}"
+DEFAULT_SOLANA_URL="http://127.0.0.1:8899"
+if [[ "${STACK_CLUSTER}" == "devnet" ]]; then
+  DEFAULT_SOLANA_URL="https://api.devnet.solana.com"
+fi
+SOLANA_URL="${SOLANA_URL:-${DEFAULT_SOLANA_URL}}"
 GROUP_NUM="${GROUP_NUM:-9120}"
 PERP_MARKET_INDEX="${PERP_MARKET_INDEX:-0}"
 MB_PAYER_KEYPAIR="${MB_PAYER_KEYPAIR:-/home/ec2-user/.config/solana/id.json}"
@@ -22,16 +36,20 @@ CTM_RELAYER_CTM_KEYPAIR="${CTM_RELAYER_CTM_KEYPAIR:-${MB_PAYER_KEYPAIR}}"
 CTM_RELAYER_BIND_ADDR="${CTM_RELAYER_BIND_ADDR:-127.0.0.1:9090}"
 CTM_RELAYER_IMPL="${CTM_RELAYER_IMPL:-rust}"
 CTM_EXECUTION_ENGINE_HTTP_BIND_ADDR="${CTM_EXECUTION_ENGINE_HTTP_BIND_ADDR:-127.0.0.1:9093}"
-EXECUTION_QUEUE_ENGINE_ENABLED="${EXECUTION_QUEUE_ENGINE_ENABLED:-false}"
+EXECUTION_QUEUE_ENGINE_ENABLED="${EXECUTION_QUEUE_ENGINE_ENABLED:-true}"
 HARNESS_BIND_ADDR="${HARNESS_BIND_ADDR:-127.0.0.1:9091}"
+HARNESS_MODE="${HARNESS_MODE:-$([[ "${STACK_CLUSTER}" == "devnet" ]] && echo devnet || echo local)}"
+HARNESS_ENABLE_AIRDROP="${HARNESS_ENABLE_AIRDROP:-false}"
+HARNESS_AIRDROP_DEPOSIT_UI_AMOUNT="${HARNESS_AIRDROP_DEPOSIT_UI_AMOUNT:-1000}"
 RESET_VALIDATOR="${RESET_VALIDATOR:-1}"
 BUILD_SBF="${BUILD_SBF:-0}"
+SKIP_BOOTSTRAP="${SKIP_BOOTSTRAP:-0}"
 # Some services (notably the harness) can take >60s to become ready on cold starts.
 STARTUP_WAIT_TRIES="${STARTUP_WAIT_TRIES:-180}"
 
 BUFFER_LAYOUT_PATH="${RUN_DIR}/execution-queue-buffer-${GROUP_NUM}.json"
-MAKER_KEYPAIR_PATH="${RUN_DIR}/execution-queue-maker-${GROUP_NUM}.json"
-TAKER_KEYPAIR_PATH="${RUN_DIR}/execution-queue-taker-${GROUP_NUM}.json"
+MAKER_KEYPAIR_PATH="${MAKER_KEYPAIR_PATH:-${KEYPAIRS_DIR}/execution-queue-maker.json}"
+TAKER_KEYPAIR_PATH="${TAKER_KEYPAIR_PATH:-${KEYPAIRS_DIR}/execution-queue-taker.json}"
 LANE_CONFIG_PATH="${RUN_DIR}/execution-queue-lanes-${GROUP_NUM}.json"
 E2E_OUTPUT_CONFIG_PATH="${RUN_DIR}/execution-queue-e2e-${GROUP_NUM}.json"
 RELAYER_SEQUENCE_STATE_PATH="${RUN_DIR}/ctm-sequences-${GROUP_NUM}.json"
@@ -161,6 +179,9 @@ ensure_port_free_or_owned() {
 }
 
 build_if_requested() {
+  if [[ "${STACK_CLUSTER}" == "devnet" ]]; then
+    return 0
+  fi
   if [[ "${BUILD_SBF}" == "1" ]]; then
     cargo build-sbf --manifest-path "${ROOT_DIR}/programs/mango-v4/Cargo.toml" --features enable-gpl
   fi
@@ -168,6 +189,9 @@ build_if_requested() {
 
 reset_runtime_artifacts_if_requested() {
   if [[ "${RESET_VALIDATOR}" != "1" ]]; then
+    return 0
+  fi
+  if [[ "${SKIP_BOOTSTRAP}" == "1" ]]; then
     return 0
   fi
   # Avoid replaying stale relay/harness history after a validator reset.
@@ -180,6 +204,10 @@ reset_runtime_artifacts_if_requested() {
 }
 
 deploy_program() {
+  if [[ "${STACK_CLUSTER}" == "devnet" ]]; then
+    solana -u "${SOLANA_URL}" program show "${PROGRAM_ID}" >/dev/null
+    return 0
+  fi
   if [[ "${PRELOAD_PROGRAM_IN_VALIDATOR:-1}" == "1" ]]; then
     return 0
   fi
@@ -191,7 +219,16 @@ deploy_program() {
 }
 
 bootstrap_local_state() {
+  if [[ "${SKIP_BOOTSTRAP}" == "1" ]]; then
+    if [[ ! -f "${E2E_OUTPUT_CONFIG_PATH}" ]]; then
+      echo "SKIP_BOOTSTRAP=1 but missing config: ${E2E_OUTPUT_CONFIG_PATH}" >&2
+      return 1
+    fi
+    echo "Skipping bootstrap; using existing config ${E2E_OUTPUT_CONFIG_PATH}"
+    return 0
+  fi
   env \
+    STACK_CLUSTER="${STACK_CLUSTER}" \
     CLUSTER_OVERRIDE=devnet \
     CLUSTER_URL_OVERRIDE="${SOLANA_URL}" \
     CTM_RELAYER_PROGRAM_ID="${PROGRAM_ID}" \
@@ -213,6 +250,11 @@ read_cfg_field() {
 }
 
 start_validator() {
+  if [[ "${STACK_CLUSTER}" == "devnet" ]]; then
+    echo "Using external ${STACK_CLUSTER} RPC at ${SOLANA_URL}"
+    wait_for_rpc
+    return 0
+  fi
   local rpc_port ws_port
   rpc_port="$(bind_port "${SOLANA_URL}")"
   ws_port=8900
@@ -258,17 +300,18 @@ start_harness() {
   fi
   ensure_port_free_or_owned "${harness_port}" "${HARNESS_PID_FILE}"
   setsid env \
+    STACK_CLUSTER="${STACK_CLUSTER}" \
     CLUSTER_OVERRIDE=devnet \
     CLUSTER_URL_OVERRIDE="${SOLANA_URL}" \
     CONTINUUM_HARNESS_BIND_ADDR="${HARNESS_BIND_ADDR}" \
-    CONTINUUM_HARNESS_MODE=local \
+    CONTINUUM_HARNESS_MODE="${HARNESS_MODE}" \
     CONTINUUM_HARNESS_PROGRAM_ID="${PROGRAM_ID}" \
     CONTINUUM_HARNESS_EVENT_LOG_PATH="${CONTINUUM_EVENT_LOG_PATH}" \
-    CONTINUUM_HARNESS_ENABLE_AIRDROP=true \
+    CONTINUUM_HARNESS_ENABLE_AIRDROP="${HARNESS_ENABLE_AIRDROP}" \
     CONTINUUM_HARNESS_USDC_MINT="${usdc_mint}" \
     CONTINUUM_HARNESS_AIRDROP_KEYPAIR="${MB_PAYER_KEYPAIR}" \
     CONTINUUM_HARNESS_GROUP_PK="${group_pk}" \
-    CONTINUUM_HARNESS_AIRDROP_DEPOSIT_UI_AMOUNT=1000 \
+    CONTINUUM_HARNESS_AIRDROP_DEPOSIT_UI_AMOUNT="${HARNESS_AIRDROP_DEPOSIT_UI_AMOUNT}" \
     ./node_modules/.bin/ts-node ts/client/scripts/execution-queue/continuum-state-harness.ts \
     >"${LOG_DIR}/continuum-harness.log" 2>&1 < /dev/null &
   echo $! >"${HARNESS_PID_FILE}"
@@ -302,6 +345,7 @@ start_relayer() {
   if [[ "${CTM_RELAYER_IMPL}" == "rust" ]]; then
     if [[ -x "${EXECUTION_ENGINE_BIN}" ]]; then
       setsid env \
+        STACK_CLUSTER="${STACK_CLUSTER}" \
         CLUSTER_OVERRIDE=devnet \
         CLUSTER_URL_OVERRIDE="${SOLANA_URL}" \
         CTM_RELAYER_PROGRAM_ID="${PROGRAM_ID}" \
@@ -316,15 +360,24 @@ start_relayer() {
         EXECUTION_QUEUE_PK="${queue_pk}" \
         EXECUTION_QUEUE_ENGINE_ENABLED="${EXECUTION_QUEUE_ENGINE_ENABLED}" \
         EXECUTION_QUEUE_CRANK_LANES_JSON_PATH="${LANE_CONFIG_PATH}" \
-        EXECUTION_QUEUE_CRANK_MAX_ITEMS=8 \
-        EXECUTION_QUEUE_CRANK_INTERVAL_MS=250 \
+        EXECUTION_QUEUE_CRANK_MAX_ITEMS=32 \
+        EXECUTION_QUEUE_CRANK_INTERVAL_MS=25 \
+        EXECUTION_QUEUE_CRANK_BUSY_INTERVAL_MS=1 \
+        EXECUTION_QUEUE_CRANK_PENDING_TIMEOUT_MS=100 \
+        EXECUTION_QUEUE_CRANK_STATUS_POLL_MS=10 \
+        EXECUTION_QUEUE_CRANK_MAX_PENDING_TXS=20 \
+        EXECUTION_QUEUE_CRANK_HEAD_LOCK_MS=5 \
+        EXECUTION_QUEUE_CRANK_MATCH_HEAD_ONLY=false \
         EXECUTION_QUEUE_CRANK_SKIP_PREFLIGHT=true \
+        CTM_RELAYER_QUEUE_SOFT_LIMIT=1024 \
+        CTM_RELAYER_QUEUE_GAP_SOFT_LIMIT=1024 \
         CTM_RELAYER_SEQUENCE_STATE_PATH="${RELAYER_SEQUENCE_STATE_PATH}" \
         CTM_RELAYER_MIN_EXECUTE_SLOT_OFFSET=1 \
         "${EXECUTION_ENGINE_BIN}" \
         >"${LOG_DIR}/ctm-relayer.log" 2>&1 < /dev/null &
     else
       setsid env \
+        STACK_CLUSTER="${STACK_CLUSTER}" \
         CLUSTER_OVERRIDE=devnet \
         CLUSTER_URL_OVERRIDE="${SOLANA_URL}" \
         CTM_RELAYER_PROGRAM_ID="${PROGRAM_ID}" \
@@ -339,9 +392,17 @@ start_relayer() {
         EXECUTION_QUEUE_PK="${queue_pk}" \
         EXECUTION_QUEUE_ENGINE_ENABLED="${EXECUTION_QUEUE_ENGINE_ENABLED}" \
         EXECUTION_QUEUE_CRANK_LANES_JSON_PATH="${LANE_CONFIG_PATH}" \
-        EXECUTION_QUEUE_CRANK_MAX_ITEMS=8 \
-        EXECUTION_QUEUE_CRANK_INTERVAL_MS=250 \
+        EXECUTION_QUEUE_CRANK_MAX_ITEMS=32 \
+        EXECUTION_QUEUE_CRANK_INTERVAL_MS=25 \
+        EXECUTION_QUEUE_CRANK_BUSY_INTERVAL_MS=1 \
+        EXECUTION_QUEUE_CRANK_PENDING_TIMEOUT_MS=100 \
+        EXECUTION_QUEUE_CRANK_STATUS_POLL_MS=10 \
+        EXECUTION_QUEUE_CRANK_MAX_PENDING_TXS=20 \
+        EXECUTION_QUEUE_CRANK_HEAD_LOCK_MS=5 \
+        EXECUTION_QUEUE_CRANK_MATCH_HEAD_ONLY=false \
         EXECUTION_QUEUE_CRANK_SKIP_PREFLIGHT=true \
+        CTM_RELAYER_QUEUE_SOFT_LIMIT=1024 \
+        CTM_RELAYER_QUEUE_GAP_SOFT_LIMIT=1024 \
         CTM_RELAYER_SEQUENCE_STATE_PATH="${RELAYER_SEQUENCE_STATE_PATH}" \
         CTM_RELAYER_MIN_EXECUTE_SLOT_OFFSET=1 \
         cargo run -p service-mango-execution-engine \
@@ -349,6 +410,7 @@ start_relayer() {
     fi
   else
     setsid env \
+      STACK_CLUSTER="${STACK_CLUSTER}" \
       CLUSTER_OVERRIDE=devnet \
       CLUSTER_URL_OVERRIDE="${SOLANA_URL}" \
       CTM_RELAYER_PROGRAM_ID="${PROGRAM_ID}" \
@@ -386,6 +448,7 @@ start_cranker() {
     buffer_pk="${queue_pk}"
   fi
   nohup env \
+    STACK_CLUSTER="${STACK_CLUSTER}" \
     CLUSTER_OVERRIDE=devnet \
     CLUSTER_URL_OVERRIDE="${SOLANA_URL}" \
     EXECUTION_QUEUE_GROUP_PK="${group_pk}" \
@@ -395,8 +458,8 @@ start_cranker() {
     EXECUTION_QUEUE_CRANKER_KEYPAIR="${MB_PAYER_KEYPAIR}" \
     EXECUTION_QUEUE_CRANK_LANES_JSON_PATH="${LANE_CONFIG_PATH}" \
     EXECUTION_QUEUE_CRANK_RELAY_EVENT_LOG_PATH="${CONTINUUM_EVENT_LOG_PATH}" \
-    EXECUTION_QUEUE_CRANK_MAX_ITEMS=8 \
-    EXECUTION_QUEUE_CRANK_INTERVAL_MS=1000 \
+    EXECUTION_QUEUE_CRANK_MAX_ITEMS=32 \
+    EXECUTION_QUEUE_CRANK_INTERVAL_MS=100 \
     ./node_modules/.bin/ts-node ts/client/scripts/execution-queue/execution-queue-cranker.ts \
     >"${LOG_DIR}/execution-queue-cranker.log" 2>&1 < /dev/null &
   echo $! >"${CRANKER_PID_FILE}"
@@ -413,6 +476,7 @@ run_e2e() {
       buffer_pk="${queue_pk}"
     fi
     env \
+      STACK_CLUSTER="${STACK_CLUSTER}" \
       CLUSTER_OVERRIDE=devnet \
       CLUSTER_URL_OVERRIDE="${SOLANA_URL}" \
       EXECUTION_QUEUE_GROUP_PK="${group_pk}" \
@@ -422,8 +486,8 @@ run_e2e() {
       EXECUTION_QUEUE_CRANKER_KEYPAIR="${MB_PAYER_KEYPAIR}" \
       EXECUTION_QUEUE_CRANK_LANES_JSON_PATH="${LANE_CONFIG_PATH}" \
       EXECUTION_QUEUE_CRANK_RELAY_EVENT_LOG_PATH="${CONTINUUM_EVENT_LOG_PATH}" \
-      EXECUTION_QUEUE_CRANK_MAX_ITEMS=8 \
-      EXECUTION_QUEUE_CRANK_INTERVAL_MS=1000 \
+      EXECUTION_QUEUE_CRANK_MAX_ITEMS=32 \
+      EXECUTION_QUEUE_CRANK_INTERVAL_MS=100 \
       node -r ts-node/register/transpile-only ts/client/scripts/execution-queue/execution-queue-cranker.ts \
       >"${LOG_DIR}/execution-queue-cranker.log" 2>&1 < /dev/null &
     temp_cranker_pid="$!"
@@ -432,6 +496,7 @@ run_e2e() {
 
   local exit_code=0
   env \
+    STACK_CLUSTER="${STACK_CLUSTER}" \
     CLUSTER_OVERRIDE=devnet \
     CLUSTER_URL_OVERRIDE="${SOLANA_URL}" \
     CTM_RELAYER_ADDR="${CTM_RELAYER_BIND_ADDR}" \
@@ -457,28 +522,39 @@ start_all() {
   start_harness
   start_relayer
   start_cranker
-  echo "Local stack started:"
-  echo "  validator rpc: ${SOLANA_URL}"
+  echo "${STACK_CLUSTER} stack started:"
+  echo "  rpc:           ${SOLANA_URL}"
   echo "  relayer grpc:  ${CTM_RELAYER_BIND_ADDR}"
   echo "  harness http:  ${HARNESS_BIND_ADDR}"
   echo "  e2e config:    ${E2E_OUTPUT_CONFIG_PATH}"
   echo "  logs dir:      ${LOG_DIR}"
+  echo "  keypairs dir:  ${KEYPAIRS_DIR}"
 }
 
 stop_all() {
   stop_if_running "${CRANKER_PID_FILE}" "cranker"
   stop_if_running "${RELAYER_PID_FILE}" "relayer"
   stop_if_running "${HARNESS_PID_FILE}" "harness"
-  stop_if_running "${VALIDATOR_PID_FILE}" "validator"
+  if [[ "${STACK_CLUSTER}" != "devnet" ]]; then
+    stop_if_running "${VALIDATOR_PID_FILE}" "validator"
+  fi
   pkill -f 'ts/client/scripts/execution-queue/execution-queue-cranker.ts' 2>/dev/null || true
   pkill -f 'ts/client/scripts/execution-queue/continuum-state-harness.ts' 2>/dev/null || true
   pkill -f 'service-mango-execution-engine' 2>/dev/null || true
 }
 
 status_all() {
-  local names=("validator" "harness" "relayer" "cranker")
+  if [[ "${STACK_CLUSTER}" == "devnet" ]]; then
+    echo "validator: external (${SOLANA_URL})"
+  else
+    if pid_is_running "${VALIDATOR_PID_FILE}"; then
+      echo "validator: running (pid $(cat "${VALIDATOR_PID_FILE}"))"
+    else
+      echo "validator: stopped"
+    fi
+  fi
+  local names=("harness" "relayer" "cranker")
   local pid_files=(
-    "${VALIDATOR_PID_FILE}"
     "${HARNESS_PID_FILE}"
     "${RELAYER_PID_FILE}"
     "${CRANKER_PID_FILE}"
@@ -502,14 +578,17 @@ usage() {
 Usage: $(basename "$0") <start|stop|status|restart|run-e2e>
 
 Environment overrides:
+  STACK_CLUSTER=${STACK_CLUSTER}
   GROUP_NUM=${GROUP_NUM}
   SOLANA_URL=${SOLANA_URL}
   PROGRAM_ID=${PROGRAM_ID}
+  KEYPAIRS_DIR=${KEYPAIRS_DIR}
   MB_PAYER_KEYPAIR=${MB_PAYER_KEYPAIR}
   CTM_RELAYER_BIND_ADDR=${CTM_RELAYER_BIND_ADDR}
   HARNESS_BIND_ADDR=${HARNESS_BIND_ADDR}
   RESET_VALIDATOR=${RESET_VALIDATOR}
   BUILD_SBF=${BUILD_SBF}
+  SKIP_BOOTSTRAP=${SKIP_BOOTSTRAP}
 EOF
 }
 

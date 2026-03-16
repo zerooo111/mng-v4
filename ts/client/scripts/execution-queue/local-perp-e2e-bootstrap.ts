@@ -32,11 +32,16 @@ import { MangoClient } from '../../src/client';
 import { DefaultTokenRegisterParams } from '../../src/clientIxParamBuilder';
 import { MANGO_V4_ID } from '../../src/constants';
 import { EXECUTION_QUEUE_ACCOUNT_SPACE } from '../../src/executionQueueLayout';
+import {
+  defaultClusterUrl,
+  keypairPath,
+  runtimeConfigPath,
+} from './scriptEnv';
 
 dotenv.config();
 
 const CLUSTER: Cluster = (process.env.CLUSTER_OVERRIDE as Cluster) || 'devnet';
-const CLUSTER_URL = process.env.CLUSTER_URL_OVERRIDE || 'http://127.0.0.1:8899';
+const CLUSTER_URL = process.env.CLUSTER_URL_OVERRIDE || defaultClusterUrl();
 const ADMIN_KEYPAIR =
   process.env.CTM_RELAYER_PAYER_KEYPAIR ||
   process.env.MB_PAYER_KEYPAIR ||
@@ -46,13 +51,17 @@ const PROGRAM_ID_OVERRIDE = process.env.CTM_RELAYER_PROGRAM_ID;
 const GROUP_NUM = Number(process.env.EXECUTION_QUEUE_GROUP_NUM || '9101');
 const PERP_MARKET_INDEX = Number(process.env.PERP_MARKET_INDEX || '0');
 const MAKER_KEYPAIR_PATH =
-  process.env.E2E_MAKER_KEYPAIR_PATH || `/tmp/execution-queue-maker-${GROUP_NUM}.json`;
+  process.env.E2E_MAKER_KEYPAIR_PATH ||
+  keypairPath('execution-queue-maker.json');
 const TAKER_KEYPAIR_PATH =
-  process.env.E2E_TAKER_KEYPAIR_PATH || `/tmp/execution-queue-taker-${GROUP_NUM}.json`;
+  process.env.E2E_TAKER_KEYPAIR_PATH ||
+  keypairPath('execution-queue-taker.json');
 const LANE_CONFIG_PATH =
-  process.env.E2E_LANE_CONFIG_PATH || `/tmp/execution-queue-lanes-${GROUP_NUM}.json`;
+  process.env.E2E_LANE_CONFIG_PATH ||
+  runtimeConfigPath(`execution-queue-lanes-${GROUP_NUM}.json`);
 const OUTPUT_CONFIG_PATH =
-  process.env.E2E_OUTPUT_CONFIG_PATH || `/tmp/execution-queue-e2e-${GROUP_NUM}.json`;
+  process.env.E2E_OUTPUT_CONFIG_PATH ||
+  runtimeConfigPath(`execution-queue-e2e-${GROUP_NUM}.json`);
 
 const USDC_MINT_DECIMALS = 6;
 const SOL_MINT_DECIMALS = 9;
@@ -69,15 +78,13 @@ type PriorBootstrapConfig = {
   solMint?: string | null;
 };
 
-function readOrCreateKeypair(filePath: string): Keypair {
+function readRequiredKeypair(filePath: string): Keypair {
   const resolved = path.resolve(filePath);
-  if (fs.existsSync(resolved)) {
-    const raw = fs.readFileSync(resolved, 'utf-8');
-    return Keypair.fromSecretKey(Uint8Array.from(JSON.parse(raw)));
+  if (!fs.existsSync(resolved)) {
+    throw new Error(`missing required keypair file: ${resolved}`);
   }
-  const kp = Keypair.generate();
-  fs.writeFileSync(resolved, JSON.stringify(Array.from(kp.secretKey)));
-  return kp;
+  const raw = fs.readFileSync(resolved, 'utf-8');
+  return Keypair.fromSecretKey(Uint8Array.from(JSON.parse(raw)));
 }
 
 function readKeypair(rawPathOrJson: string): Keypair {
@@ -267,33 +274,36 @@ async function bootstrapTokenRegister(params: {
   });
 }
 
-function executionQueueRemainingAccountsFromMangoIx(
-  executionQueue: PublicKey,
-  keys: { pubkey: PublicKey; isWritable: boolean; isSigner: boolean }[],
-): AccountMeta[] {
-  if (keys.length < 3) {
-    throw new Error('expected at least 3 metas in mango instruction');
-  }
-  const remaining = keys.map((k) => ({
-    pubkey: k.pubkey,
-    isWritable: k.isWritable,
-    isSigner: k.isSigner,
-  }));
-  remaining[2] = {
-    pubkey: executionQueue,
-    isWritable: remaining[2].isWritable,
-    isSigner: false,
-  };
-  return remaining;
-}
+async function executionQueueCanonicalPerpRemainingAccounts(params: {
+  client: MangoClient;
+  group: Awaited<ReturnType<MangoClient['getGroup']>>;
+  mangoAccount: Awaited<ReturnType<MangoClient['getMangoAccount']>>;
+  marketIndex: PerpMarketIndex;
+  userOwner: PublicKey;
+}): Promise<AccountMeta[]> {
+  const perpMarket = params.group.getPerpMarketByMarketIndex(params.marketIndex);
+  const healthRemainingAccounts = await params.client.buildHealthRemainingAccounts(
+    params.group,
+    [params.mangoAccount],
+    [params.group.getFirstBankForPerpSettlement()],
+    [perpMarket],
+  );
 
-async function airdropIfNeeded(connection: Connection, pubkey: PublicKey): Promise<void> {
-  const balance = await connection.getBalance(pubkey, 'confirmed');
-  if (balance > 2e9) {
-    return;
-  }
-  const sig = await connection.requestAirdrop(pubkey, 5e9);
-  await connection.confirmTransaction(sig, 'confirmed');
+  return [
+    { pubkey: params.group.publicKey, isSigner: false, isWritable: false },
+    { pubkey: params.mangoAccount.publicKey, isSigner: false, isWritable: true },
+    { pubkey: params.userOwner, isSigner: false, isWritable: false },
+    { pubkey: perpMarket.publicKey, isSigner: false, isWritable: true },
+    { pubkey: perpMarket.bids, isSigner: false, isWritable: true },
+    { pubkey: perpMarket.asks, isSigner: false, isWritable: true },
+    { pubkey: perpMarket.eventQueue, isSigner: false, isWritable: true },
+    { pubkey: perpMarket.oracle, isSigner: false, isWritable: false },
+    ...healthRemainingAccounts.map((pubkey) => ({
+      pubkey,
+      isSigner: false,
+      isWritable: false,
+    })),
+  ];
 }
 
 async function getOrCreateMangoAccount(
@@ -318,8 +328,8 @@ async function getOrCreateMangoAccount(
 async function main(): Promise<void> {
   const admin = readKeypair(ADMIN_KEYPAIR);
   const ctm = readKeypair(CTM_KEYPAIR);
-  const maker = readOrCreateKeypair(MAKER_KEYPAIR_PATH);
-  const taker = readOrCreateKeypair(TAKER_KEYPAIR_PATH);
+  const maker = readRequiredKeypair(MAKER_KEYPAIR_PATH);
+  const taker = readRequiredKeypair(TAKER_KEYPAIR_PATH);
 
   const provider = new AnchorProvider(
     new Connection(CLUSTER_URL, AnchorProvider.defaultOptions()),
@@ -334,10 +344,6 @@ async function main(): Promise<void> {
     idsSource: 'get-program-accounts',
   });
   const priorConfig = readPriorBootstrapConfig();
-
-  await airdropIfNeeded(provider.connection, admin.publicKey);
-  await airdropIfNeeded(provider.connection, maker.publicKey);
-  await airdropIfNeeded(provider.connection, taker.publicKey);
 
   const groupNumBuf = Buffer.alloc(4);
   groupNumBuf.writeUInt32LE(GROUP_NUM);
@@ -383,7 +389,9 @@ async function main(): Promise<void> {
     priorConfig?.group === groupPk.toBase58() && priorConfig.solMint
       ? new PublicKey(priorConfig.solMint)
       : null;
-  const existingPerpMarket = group.perpMarketsMapByMarketIndex.get(PERP_MARKET_INDEX_TYPED);
+  let existingPerpMarket = group.perpMarketsMapByMarketIndex.get(
+    PERP_MARKET_INDEX_TYPED,
+  );
   if (!solMint && !existingPerpMarket) {
     solMint = await createMint(
       provider.connection,
@@ -441,41 +449,58 @@ async function main(): Promise<void> {
   }
 
   if (!existingPerpMarket) {
-    await adminClient.perpCreateMarket(
-      group,
-      solOracle.publicKey,
+    await group.reloadAll(adminClient);
+    existingPerpMarket = group.perpMarketsMapByMarketIndex.get(
       PERP_MARKET_INDEX_TYPED,
-      'SOL-PERP',
-      {
-        confFilter: 0.1,
-        maxStalenessSlots: null,
-      },
-      6,
-      10,
-      100,
-      0.9,
-      0.8,
-      1.1,
-      1.2,
-      0.0,
-      0.0,
-      0.05,
-      -0.001,
-      0.002,
-      0,
-      -0.1,
-      0.1,
-      10,
-      false,
-      0,
-      0,
-      0,
-      0,
-      -1.0,
-      2 * 60 * 60,
-      0.025,
-      0.0,
     );
+  }
+
+  if (!existingPerpMarket) {
+    try {
+      await adminClient.perpCreateMarket(
+        group,
+        solOracle.publicKey,
+        PERP_MARKET_INDEX_TYPED,
+        'SOL-PERP',
+        {
+          confFilter: 0.1,
+          maxStalenessSlots: null,
+        },
+        6,
+        10,
+        100,
+        0.9,
+        0.8,
+        1.1,
+        1.2,
+        0.0,
+        0.0,
+        0.05,
+        -0.001,
+        0.002,
+        0,
+        -0.1,
+        0.1,
+        10,
+        false,
+        0,
+        0,
+        0,
+        0,
+        -1.0,
+        2 * 60 * 60,
+        0.025,
+        0.0,
+      );
+    } catch (err) {
+      await group.reloadAll(adminClient);
+      existingPerpMarket = group.perpMarketsMapByMarketIndex.get(
+        PERP_MARKET_INDEX_TYPED,
+      );
+      if (!existingPerpMarket) {
+        throw err;
+      }
+    }
     await group.reloadAll(adminClient);
   }
 
@@ -571,50 +596,27 @@ async function main(): Promise<void> {
   await makerClient.tokenDeposit(makerGroup, makerAccount, usdcMint, 10000);
   await takerClient.tokenDeposit(takerGroup, takerAccount, usdcMint, 10000);
 
-  const makerPlaceIx = await makerClient.perpPlaceOrderV2Ix(
-    makerGroup,
-    makerAccount,
-    PERP_MARKET_INDEX_TYPED,
-    PerpOrderSide.bid,
-    99,
-    2,
-    MAKER_MAX_QUOTE_QTY,
-    Date.now(),
-    PerpOrderType.limit,
-    PerpSelfTradeBehavior.decrementTake,
-    false,
-    0,
-    20,
-  );
-  const takerPlaceIx = await takerClient.perpPlaceOrderV2Ix(
-    takerGroup,
-    takerAccount,
-    PERP_MARKET_INDEX_TYPED,
-    PerpOrderSide.ask,
-    98,
-    1,
-    TAKER_MAX_QUOTE_QTY,
-    Date.now() + 1,
-    PerpOrderType.limit,
-    PerpSelfTradeBehavior.decrementTake,
-    false,
-    0,
-    20,
-  );
-  const makerCancelAllIx = await makerClient.perpCancelAllOrdersIx(
-    makerGroup,
-    makerAccount,
-    PERP_MARKET_INDEX_TYPED,
-    255,
-  );
+  const makerCanonicalRemainingAccounts =
+    await executionQueueCanonicalPerpRemainingAccounts({
+      client: makerClient,
+      group: makerGroup,
+      mangoAccount: makerAccount,
+      marketIndex: PERP_MARKET_INDEX_TYPED,
+      userOwner: maker.publicKey,
+    });
+  const takerCanonicalRemainingAccounts =
+    await executionQueueCanonicalPerpRemainingAccounts({
+      client: takerClient,
+      group: takerGroup,
+      mangoAccount: takerAccount,
+      marketIndex: PERP_MARKET_INDEX_TYPED,
+      userOwner: taker.publicKey,
+    });
 
   const lanes = [
     {
       name: 'maker-place',
-      remainingAccounts: executionQueueRemainingAccountsFromMangoIx(
-        executionQueue,
-        makerPlaceIx.keys,
-      ).map((a) => ({
+      remainingAccounts: makerCanonicalRemainingAccounts.map((a) => ({
         pubkey: a.pubkey.toBase58(),
         isWritable: a.isWritable,
         isSigner: !!a.isSigner,
@@ -622,10 +624,7 @@ async function main(): Promise<void> {
     },
     {
       name: 'taker-place',
-      remainingAccounts: executionQueueRemainingAccountsFromMangoIx(
-        executionQueue,
-        takerPlaceIx.keys,
-      ).map((a) => ({
+      remainingAccounts: takerCanonicalRemainingAccounts.map((a) => ({
         pubkey: a.pubkey.toBase58(),
         isWritable: a.isWritable,
         isSigner: !!a.isSigner,
@@ -633,16 +632,14 @@ async function main(): Promise<void> {
     },
     {
       name: 'maker-cancel-all',
-      remainingAccounts: executionQueueRemainingAccountsFromMangoIx(
-        executionQueue,
-        makerCancelAllIx.keys,
-      ).map((a) => ({
+      remainingAccounts: makerCanonicalRemainingAccounts.map((a) => ({
         pubkey: a.pubkey.toBase58(),
         isWritable: a.isWritable,
         isSigner: !!a.isSigner,
       })),
     },
   ];
+  fs.mkdirSync(path.dirname(path.resolve(LANE_CONFIG_PATH)), { recursive: true });
   fs.writeFileSync(LANE_CONFIG_PATH, JSON.stringify(lanes, null, 2));
 
   const out = {
@@ -685,6 +682,7 @@ async function main(): Promise<void> {
     },
   };
 
+  fs.mkdirSync(path.dirname(path.resolve(OUTPUT_CONFIG_PATH)), { recursive: true });
   fs.writeFileSync(OUTPUT_CONFIG_PATH, JSON.stringify(out, null, 2));
   console.log(JSON.stringify({ configPath: OUTPUT_CONFIG_PATH, ...out }, null, 2));
 }

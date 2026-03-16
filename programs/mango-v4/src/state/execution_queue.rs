@@ -150,7 +150,7 @@ impl ExecutionQueue {
             next_sequence_to_execute: 0,
             max_seen_sequence: 0,
             gap_observed_slot: 0,
-            gap_wait_slots: 50,
+            gap_wait_slots: 2,
             liquidity_delay_slots: 25,
             ctm_count: 0,
             liquidity_count: 0,
@@ -243,6 +243,60 @@ impl ExecutionQueue {
         self.header.next_sequence_to_execute =
             self.header.next_sequence_to_execute.saturating_add(1);
         self.header.gap_observed_slot = 0;
+    }
+
+    /// Scan forward from next_sequence_to_execute for the first pending CTM item
+    /// whose accounts_hash matches the provided hash, within a bounded window.
+    /// Returns (sequence, copied item) if found.
+    pub fn find_matching_ctm_item(
+        &self,
+        accounts_hash: &[u8; 32],
+        scan_limit: u16,
+    ) -> Option<(u64, QueueItem)> {
+        let base = self.header.next_sequence_to_execute;
+        let max = self.header.max_seen_sequence;
+        let limit = (scan_limit as u64).min(EXECUTION_QUEUE_CTM_CAPACITY as u64);
+        let mut seq = base;
+        while seq <= max && seq < base.saturating_add(limit) {
+            let item = self.ctm_item(seq);
+            if item.status == QueueItemStatus::Pending as u8
+                && item.sequence == seq
+                && &item.accounts_hash == accounts_hash
+            {
+                return Some((seq, *item));
+            }
+            seq = seq.saturating_add(1);
+        }
+        None
+    }
+
+    /// Clear a specific CTM item by sequence without advancing next_sequence_to_execute.
+    /// Used for out-of-order lane execution.
+    pub fn clear_ctm_item_at(&mut self, sequence: u64) {
+        let item = self.ctm_item_mut(sequence);
+        *item = QueueItem::default();
+        self.header.ctm_count = self.header.ctm_count.saturating_sub(1);
+        self.header.total_count = self.header.total_count.saturating_sub(1);
+        // Advance head past any now-cleared slots at the front
+        while self.header.ctm_count > 0
+            && self.header.max_seen_sequence >= self.header.next_sequence_to_execute
+        {
+            let head = self.ctm_item(self.header.next_sequence_to_execute);
+            if head.status == QueueItemStatus::Pending as u8
+                && head.sequence == self.header.next_sequence_to_execute
+            {
+                break; // real pending head found, stop
+            }
+            if head.status == QueueItemStatus::Empty as u8
+                || head.sequence != self.header.next_sequence_to_execute
+            {
+                self.header.next_sequence_to_execute =
+                    self.header.next_sequence_to_execute.saturating_add(1);
+                self.header.gap_observed_slot = 0;
+            } else {
+                break;
+            }
+        }
     }
 
     pub fn liquidity_tail_index(&self) -> usize {

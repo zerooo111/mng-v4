@@ -4,6 +4,7 @@ import * as dotenv from 'dotenv';
 import fs from 'fs';
 import path from 'path';
 import { MangoClient } from '../../src/client';
+import { runtimeConfigPath } from './scriptEnv';
 
 dotenv.config();
 
@@ -28,11 +29,11 @@ type QuoterBotSpec = {
 const CONFIG_PATH =
   process.env.QUOTER_CONFIG_PATH ||
   process.env.E2E_OUTPUT_CONFIG_PATH ||
-  '/home/ec2-user/stagin4/mng-v4/.localnet/run/execution-queue-e2e-9120.json';
+  runtimeConfigPath('execution-queue-e2e-9120.json');
 const BOTS_PATH =
   process.env.QUOTER_BOTS_OUTPUT_PATH ||
   process.env.QUOTER_BOTS_JSON_PATH ||
-  '/home/ec2-user/stagin4/mng-v4/.localnet/run/quoter-bots-9120.json';
+  runtimeConfigPath('quoter-bots-9120.json');
 const LIMIT_PER_TX = Number(process.env.QUOTER_CANCEL_LIMIT_PER_TX || '10');
 const MAX_ROUNDS = Number(process.env.QUOTER_CANCEL_MAX_ROUNDS || '100');
 const MARKET_INDEX_OVERRIDE = process.env.PERP_MARKET_INDEX

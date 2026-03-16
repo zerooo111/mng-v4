@@ -19,6 +19,7 @@ import {
   signExecutionQueueIntentMessage,
 } from '../../src/executionQueue';
 import { decodeExecutionQueueCount } from '../../src/executionQueueLayout';
+import { runtimeConfigPath } from './scriptEnv';
 
 dotenv.config();
 
@@ -57,7 +58,8 @@ type SubmitIntentResponse = {
   tx_signature: string;
 };
 
-const CONFIG_PATH = process.env.E2E_OUTPUT_CONFIG_PATH || '/tmp/execution-queue-e2e-9101.json';
+const CONFIG_PATH =
+  process.env.E2E_OUTPUT_CONFIG_PATH || runtimeConfigPath('execution-queue-e2e-9101.json');
 const RELAYER_ADDR_OVERRIDE = process.env.CTM_RELAYER_ADDR;
 const MAKER_PRICE = Number(process.env.E2E_MAKER_PRICE || '99');
 const MAKER_QTY = Number(process.env.E2E_MAKER_QTY || '2');
@@ -76,24 +78,36 @@ function readKeypair(rawPathOrJson: string): Keypair {
   return Keypair.fromSecretKey(Uint8Array.from(JSON.parse(raw)));
 }
 
-function executionQueueRemainingAccountsFromMangoIx(
-  executionQueue: PublicKey,
-  keys: { pubkey: PublicKey; isWritable: boolean; isSigner: boolean }[],
-): AccountMeta[] {
-  if (keys.length < 3) {
-    throw new Error('expected at least 3 metas in mango instruction');
-  }
-  const remaining = keys.map((k) => ({
-    pubkey: k.pubkey,
-    isWritable: k.isWritable,
-    isSigner: k.isSigner,
-  }));
-  remaining[2] = {
-    pubkey: executionQueue,
-    isWritable: remaining[2].isWritable,
-    isSigner: false,
-  };
-  return remaining;
+async function executionQueueCanonicalPerpRemainingAccounts(params: {
+  client: MangoClient;
+  group: Awaited<ReturnType<MangoClient['getGroup']>>;
+  mangoAccount: Awaited<ReturnType<MangoClient['getMangoAccount']>>;
+  marketIndex: PerpMarketIndex;
+  userOwner: PublicKey;
+}): Promise<AccountMeta[]> {
+  const perpMarket = params.group.getPerpMarketByMarketIndex(params.marketIndex);
+  const healthRemainingAccounts = await params.client.buildHealthRemainingAccounts(
+    params.group,
+    [params.mangoAccount],
+    [params.group.getFirstBankForPerpSettlement()],
+    [perpMarket],
+  );
+
+  return [
+    { pubkey: params.group.publicKey, isSigner: false, isWritable: false },
+    { pubkey: params.mangoAccount.publicKey, isSigner: false, isWritable: true },
+    { pubkey: params.userOwner, isSigner: false, isWritable: false },
+    { pubkey: perpMarket.publicKey, isSigner: false, isWritable: true },
+    { pubkey: perpMarket.bids, isSigner: false, isWritable: true },
+    { pubkey: perpMarket.asks, isSigner: false, isWritable: true },
+    { pubkey: perpMarket.eventQueue, isSigner: false, isWritable: true },
+    { pubkey: perpMarket.oracle, isSigner: false, isWritable: false },
+    ...healthRemainingAccounts.map((pubkey) => ({
+      pubkey,
+      isSigner: false,
+      isWritable: false,
+    })),
+  ];
 }
 
 async function waitForQueueToDrain(
@@ -230,36 +244,20 @@ async function main(): Promise<void> {
   const makerClientOrderId = Date.now();
   const takerClientOrderId = Date.now() + 1;
 
-  const makerPlaceIx = await makerClient.perpPlaceOrderV2Ix(
-    makerGroup,
-    makerAccount,
+  const makerRemainingAccounts = await executionQueueCanonicalPerpRemainingAccounts({
+    client: makerClient,
+    group: makerGroup,
+    mangoAccount: makerAccount,
     marketIndex,
-    PerpOrderSide.bid,
-    MAKER_PRICE,
-    MAKER_QTY,
-    MAKER_MAX_QUOTE_QTY,
-    makerClientOrderId,
-    PerpOrderType.limit,
-    PerpSelfTradeBehavior.decrementTake,
-    false,
-    0,
-    20,
-  );
-  const takerPlaceIx = await takerClient.perpPlaceOrderV2Ix(
-    takerGroup,
-    takerAccount,
+    userOwner: makerKp.publicKey,
+  });
+  const takerRemainingAccounts = await executionQueueCanonicalPerpRemainingAccounts({
+    client: takerClient,
+    group: takerGroup,
+    mangoAccount: takerAccount,
     marketIndex,
-    PerpOrderSide.ask,
-    TAKER_PRICE,
-    TAKER_QTY,
-    TAKER_MAX_QUOTE_QTY,
-    takerClientOrderId,
-    PerpOrderType.limit,
-    PerpSelfTradeBehavior.decrementTake,
-    false,
-    0,
-    20,
-  );
+    userOwner: takerKp.publicKey,
+  });
 
   const makerPayload = encodePerpPlaceOrderV2QueuePayload({
     side: PerpOrderSide.bid,
@@ -299,10 +297,7 @@ async function main(): Promise<void> {
     executionQueue: executionQueuePk,
     market: marketIndex,
     payload: makerPayload,
-    remainingAccounts: executionQueueRemainingAccountsFromMangoIx(
-      executionQueuePk,
-      makerPlaceIx.keys,
-    ),
+    remainingAccounts: makerRemainingAccounts,
     userOwner: makerKp.publicKey,
     userSecretKey: makerKp.secretKey,
     mangoAccount: makerAccount.publicKey,
@@ -315,10 +310,7 @@ async function main(): Promise<void> {
     executionQueue: executionQueuePk,
     market: marketIndex,
     payload: takerPayload,
-    remainingAccounts: executionQueueRemainingAccountsFromMangoIx(
-      executionQueuePk,
-      takerPlaceIx.keys,
-    ),
+    remainingAccounts: takerRemainingAccounts,
     userOwner: takerKp.publicKey,
     userSecretKey: takerKp.secretKey,
     mangoAccount: takerAccount.publicKey,
@@ -360,16 +352,7 @@ async function main(): Promise<void> {
     throw new Error('expected maker to retain partially-filled open order before cancel');
   }
 
-  const cancelIx = await makerClient.perpCancelAllOrdersIx(
-    makerGroup,
-    makerAccount,
-    marketIndex,
-    255,
-  );
-  const cancelRemainingAccounts = executionQueueRemainingAccountsFromMangoIx(
-    executionQueuePk,
-    cancelIx.keys,
-  );
+  const cancelRemainingAccounts = makerRemainingAccounts;
   const cancelPayload = encodePerpCancelAllOrdersQueuePayload({ limit: 255 });
 
   let cancelResp = await submitIntentViaRelayer({

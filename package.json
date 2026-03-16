@@ -26,6 +26,7 @@
     "execution-queue-local-bootstrap": "ts-node ts/client/scripts/execution-queue/local-bootstrap.ts",
     "execution-queue-local-perp-e2e-bootstrap": "ts-node ts/client/scripts/execution-queue/local-perp-e2e-bootstrap.ts",
     "execution-queue-local-perp-e2e-run": "ts-node ts/client/scripts/execution-queue/local-perp-e2e-run.ts",
+    "execution-queue-local-perp-pnl-test": "ts-node ts/client/scripts/execution-queue/local-perp-pnl-test.ts",
     "execution-queue-cranker": "ts-node ts/client/scripts/execution-queue/execution-queue-cranker.ts",
     "execution-queue-random-sol-usdc-quoter": "ts-node ts/client/scripts/execution-queue/random-sol-usdc-quoter-bot.ts",
     "execution-queue-provision-quoter-bots": "ts-node ts/client/scripts/execution-queue/provision-quoter-bots.ts",

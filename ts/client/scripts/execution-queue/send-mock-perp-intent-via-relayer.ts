@@ -15,12 +15,13 @@ import {
   PerpOrderType,
   PerpSelfTradeBehavior,
 } from '../../src/accounts/perp';
+import { defaultClusterUrl } from './scriptEnv';
 
 dotenv.config();
 
 const CLUSTER: Cluster = (process.env.CLUSTER_OVERRIDE as Cluster) || 'devnet';
 const CLUSTER_URL =
-  process.env.CLUSTER_URL_OVERRIDE || process.env.MB_CLUSTER_URL || 'http://127.0.0.1:8899';
+  process.env.CLUSTER_URL_OVERRIDE || process.env.MB_CLUSTER_URL || defaultClusterUrl();
 const USER_KEYPAIR =
   process.env.USER_KEYPAIR_OVERRIDE || process.env.MB_PAYER_KEYPAIR;
 const RELAYER_ADDR = process.env.CTM_RELAYER_ADDR || '127.0.0.1:9090';

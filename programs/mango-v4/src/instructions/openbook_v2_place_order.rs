@@ -8,8 +8,10 @@ use crate::serum3_cpi::{OpenOrdersAmounts, OpenOrdersSlim};
 use crate::state::*;
 use crate::util::clock_now;
 use anchor_lang::prelude::*;
+use anchor_spl::token::accessor;
 use fixed::types::I80F48;
 use openbook_v2::cpi::Return;
+use openbook_v2::state::Market;
 use openbook_v2::state::OpenOrdersAccount;
 use openbook_v2::state::{
     Order as OpenbookV2Order, PlaceOrderType as OpenbookV2OrderType, Side as OpenbookV2Side,
@@ -18,15 +20,58 @@ use openbook_v2::state::{
 
 use crate::accounts_ix::*;
 
-pub fn openbook_v2_place_order(
-    ctx: Context<OpenbookV2PlaceOrder>,
+pub fn openbook_v2_place_order<'info>(
+    ctx: Context<'_, '_, '_, 'info, OpenbookV2PlaceOrder<'info>>,
     order: OpenbookV2Order,
     limit: u8,
 ) -> Result<()> {
+    const EXTRA_CPI_ACCOUNTS: usize = 5;
     require_gte!(order.max_base_lots, 0);
     require_gte!(order.max_quote_lots_including_fees, 0);
+    require_gte!(ctx.remaining_accounts.len(), EXTRA_CPI_ACCOUNTS);
+    let (health_remaining, cpi_remaining) = ctx
+        .remaining_accounts
+        .split_at(ctx.remaining_accounts.len() - EXTRA_CPI_ACCOUNTS);
+    let bids_ai = cpi_remaining[0].clone();
+    let asks_ai = cpi_remaining[1].clone();
+    let event_heap_ai = cpi_remaining[2].clone();
+    let market_vault_ai = cpi_remaining[3].clone();
+    let token_program_ai = cpi_remaining[4].clone();
 
-    let openbook_market = ctx.accounts.openbook_v2_market.load()?;
+    let group_loader = AccountLoader::<Group>::try_from(&ctx.accounts.group.to_account_info())?;
+    let group = group_loader.load()?;
+    require!(
+        group.is_ix_enabled(IxGate::OpenbookV2PlaceOrder),
+        MangoError::IxIsDisabled
+    );
+    require_keys_eq!(*token_program_ai.key, anchor_spl::token::ID);
+    require!(ctx.accounts.authority.is_signer, MangoError::SomeError);
+
+    let account_loader =
+        AccountLoader::<MangoAccountFixed>::try_from(&ctx.accounts.account.to_account_info())?;
+    let openbook_market_loader = AccountLoader::<OpenbookV2Market>::try_from(
+        &ctx.accounts.openbook_v2_market.to_account_info(),
+    )?;
+    let openbook_market = openbook_market_loader.load()?;
+    let open_orders_loader = AccountLoader::<openbook_v2::state::OpenOrdersAccount>::try_from(
+        &ctx.accounts.open_orders.to_account_info(),
+    )?;
+    let openbook_market_external_loader = AccountLoader::<Market>::try_from(
+        &ctx.accounts.openbook_v2_market_external.to_account_info(),
+    )?;
+    let payer_bank_loader =
+        AccountLoader::<Bank>::try_from(&ctx.accounts.payer_bank.to_account_info())?;
+    let receiver_bank_loader =
+        AccountLoader::<Bank>::try_from(&ctx.accounts.receiver_bank.to_account_info())?;
+    require_keys_eq!(openbook_market.group, ctx.accounts.group.key());
+    require_keys_eq!(
+        openbook_market.openbook_v2_market_external,
+        ctx.accounts.openbook_v2_market_external.key()
+    );
+    require_keys_eq!(
+        openbook_market.openbook_v2_program,
+        ctx.accounts.openbook_v2_program.key()
+    );
     require!(
         !openbook_market.is_reduce_only(),
         MangoError::MarketInReduceOnlyMode
@@ -45,7 +90,9 @@ pub fn openbook_v2_place_order(
     // Validation
     //
     {
-        let account = ctx.accounts.account.load_full()?;
+        let account = account_loader.load_full()?;
+        require_keys_eq!(account.fixed.group, ctx.accounts.group.key());
+        require!(account.fixed.is_operational(), MangoError::AccountIsFrozen);
         // account constraint #1
         require!(
             account
@@ -65,10 +112,10 @@ pub fn openbook_v2_place_order(
     }
     // Validate bank and vault #3
     let group_key = ctx.accounts.group.key();
-    let mut account = ctx.accounts.account.load_full_mut()?;
+    let mut account = account_loader.load_full_mut()?;
     let (now_ts, now_slot) = clock_now();
     let retriever = new_fixed_order_account_retriever_with_optional_banks(
-        ctx.remaining_accounts,
+        health_remaining,
         &account.borrow(),
         now_slot,
     )?;
@@ -82,15 +129,14 @@ pub fn openbook_v2_place_order(
     let (receiver_bank, receiver_bank_oracle) =
         retriever.bank_and_oracle(&group_key, receiver_active_index, receiver_token_index)?;
 
+    require_keys_eq!(payer_bank_loader.load()?.group, group_key);
+    require_keys_eq!(receiver_bank_loader.load()?.group, group_key);
     require_keys_eq!(payer_bank.vault, ctx.accounts.payer_vault.key());
 
     // Validate bank token indexes #4
+    require_eq!(payer_bank_loader.load()?.token_index, payer_token_index);
     require_eq!(
-        ctx.accounts.payer_bank.load()?.token_index,
-        payer_token_index
-    );
-    require_eq!(
-        ctx.accounts.receiver_bank.load()?.token_index,
+        receiver_bank_loader.load()?.token_index,
         receiver_token_index
     );
 
@@ -125,17 +171,24 @@ pub fn openbook_v2_place_order(
     let base_lot_size: u64;
     let quote_lot_size: u64;
     {
-        let openbook_market_external = ctx.accounts.openbook_v2_market_external.load()?;
+        let openbook_market_external = openbook_market_external_loader.load()?;
+        require_keys_eq!(openbook_market_external.bids, *bids_ai.key);
+        require_keys_eq!(openbook_market_external.asks, *asks_ai.key);
+        require_keys_eq!(openbook_market_external.event_heap, *event_heap_ai.key);
+        require!(
+            openbook_market_external.is_market_vault(*market_vault_ai.key),
+            MangoError::SomeError
+        );
         base_lot_size = openbook_market_external.base_lot_size.try_into().unwrap();
         quote_lot_size = openbook_market_external.quote_lot_size.try_into().unwrap();
     }
 
-    let before_vault = ctx.accounts.payer_vault.amount;
+    let before_vault = accessor::amount(&ctx.accounts.payer_vault.to_account_info())?;
     let before_oo_free_slots;
     let before_had_bids;
     let before_had_asks;
     let before_oo = {
-        let open_orders = ctx.accounts.open_orders.load()?;
+        let open_orders = open_orders_loader.load()?;
         before_oo_free_slots = MAX_OPEN_ORDERS - open_orders.all_orders_in_use().count();
         before_had_bids = open_orders.position.bids_base_lots != 0;
         before_had_asks = open_orders.position.asks_base_lots != 0;
@@ -166,8 +219,10 @@ pub fn openbook_v2_place_order(
     // Get price lots before the book gets modified
     let price_lots;
     {
-        let bids = ctx.accounts.bids.load_mut()?;
-        let asks = ctx.accounts.asks.load_mut()?;
+        let bids = AccountLoader::<openbook_v2::state::BookSide>::try_from(&bids_ai)?;
+        let asks = AccountLoader::<openbook_v2::state::BookSide>::try_from(&asks_ai)?;
+        let bids = bids.load_mut()?;
+        let asks = asks.load_mut()?;
         let order_book = openbook_v2::state::Orderbook { bids, asks };
         price_lots = order.price(now_ts, None, &order_book)?.0;
     }
@@ -175,14 +230,25 @@ pub fn openbook_v2_place_order(
     //
     // CPI to place order
     //
-    let group = ctx.accounts.group.load()?;
+    let group = group_loader.load()?;
     let group_seeds = group_seeds!(group);
 
-    cpi_place_order(ctx.accounts, &[group_seeds], &order, price_lots, limit)?;
+    cpi_place_order(
+        ctx.accounts,
+        &[group_seeds],
+        &order,
+        price_lots,
+        limit,
+        &bids_ai,
+        &asks_ai,
+        &event_heap_ai,
+        &market_vault_ai,
+        &token_program_ai,
+    )?;
     //
     // After-order tracking
     //
-    let open_orders = ctx.accounts.open_orders.load()?;
+    let open_orders = open_orders_loader.load()?;
     let after_oo_free_slots = MAX_OPEN_ORDERS - open_orders.all_orders_in_use().count();
     let after_oo = OpenOrdersSlim::from_oo_v2(&open_orders, base_lot_size, quote_lot_size);
     let oo_difference = OODifference::new(&before_oo, &after_oo);
@@ -251,8 +317,7 @@ pub fn openbook_v2_place_order(
         referrer_rebates_accrued: after_oo.native_rebates(),
     });
 
-    ctx.accounts.payer_vault.reload()?;
-    let after_vault = ctx.accounts.payer_vault.amount;
+    let after_vault = accessor::amount(&ctx.accounts.payer_vault.to_account_info())?;
 
     // Placing an order cannot increase vault balance
     require_gte!(before_vault, after_vault);
@@ -260,8 +325,8 @@ pub fn openbook_v2_place_order(
     let before_position_native;
     let vault_difference;
     {
-        let mut payer_bank = ctx.accounts.payer_bank.load_mut()?;
-        let mut receiver_bank = ctx.accounts.receiver_bank.load_mut()?;
+        let mut payer_bank = payer_bank_loader.load_mut()?;
+        let mut receiver_bank = receiver_bank_loader.load_mut()?;
         let (base_bank, quote_bank) = match order.side {
             OpenbookV2Side::Bid => (&mut receiver_bank, &mut payer_bank),
             OpenbookV2Side::Ask => (&mut payer_bank, &mut receiver_bank),
@@ -290,7 +355,7 @@ pub fn openbook_v2_place_order(
     // Deposit limit check, receiver side:
     // Placing an order can always increase the receiver bank deposits on fill.
     {
-        let receiver_bank = ctx.accounts.receiver_bank.load()?;
+        let receiver_bank = receiver_bank_loader.load()?;
         receiver_bank
             .check_deposit_and_oo_limit()
             .with_context(|| std::format!("on {}", receiver_bank.name()))?;
@@ -298,7 +363,7 @@ pub fn openbook_v2_place_order(
 
     // Payer bank safety checks like reduce-only, net borrows, vault-to-deposits ratio
     let withdrawn_from_vault = I80F48::from(before_vault - after_vault);
-    let payer_bank = ctx.accounts.payer_bank.load()?;
+    let payer_bank = payer_bank_loader.load()?;
     if withdrawn_from_vault > before_position_native {
         require_msg_typed!(
             !payer_bank.are_borrows_reduce_only(),
@@ -365,8 +430,8 @@ pub fn openbook_v2_place_order(
     }
 
     // Health cache updates for the changed account state
-    let receiver_bank = ctx.accounts.receiver_bank.load()?;
-    let payer_bank = ctx.accounts.payer_bank.load()?;
+    let receiver_bank = receiver_bank_loader.load()?;
+    let payer_bank = payer_bank_loader.load()?;
     // update scaled weights for receiver bank
     health_cache.adjust_token_balance(&receiver_bank, I80F48::ZERO)?;
     vault_difference.adjust_health_cache_token_balance(&mut health_cache, &payer_bank)?;
@@ -531,12 +596,17 @@ fn update_bank_potential_tokens(
     openbook_orders.potential_quote_tokens = new_quote;
 }
 
-fn cpi_place_order(
-    ctx: &OpenbookV2PlaceOrder,
+fn cpi_place_order<'info>(
+    ctx: &OpenbookV2PlaceOrder<'info>,
     seeds: &[&[&[u8]]],
     order: &OpenbookV2Order,
     price_lots: i64,
     limit: u8,
+    bids_ai: &AccountInfo<'info>,
+    asks_ai: &AccountInfo<'info>,
+    event_heap_ai: &AccountInfo<'info>,
+    market_vault_ai: &AccountInfo<'info>,
+    token_program_ai: &AccountInfo<'info>,
 ) -> Result<Return<Option<u128>>> {
     let cpi_accounts = openbook_v2::cpi::accounts::PlaceOrder {
         signer: ctx.group.to_account_info(),
@@ -544,13 +614,13 @@ fn cpi_place_order(
         open_orders_admin: None,
         user_token_account: ctx.payer_vault.to_account_info(),
         market: ctx.openbook_v2_market_external.to_account_info(),
-        bids: ctx.bids.to_account_info(),
-        asks: ctx.asks.to_account_info(),
-        event_heap: ctx.event_heap.to_account_info(),
-        market_vault: ctx.market_vault.to_account_info(),
+        bids: bids_ai.clone(),
+        asks: asks_ai.clone(),
+        event_heap: event_heap_ai.clone(),
+        market_vault: market_vault_ai.clone(),
         oracle_a: None, // we don't yet support markets with oracles
         oracle_b: None,
-        token_program: ctx.token_program.to_account_info(),
+        token_program: token_program_ai.clone(),
     };
 
     let cpi_ctx = CpiContext::new_with_signer(

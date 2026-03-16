@@ -484,10 +484,12 @@ impl Rebalancer {
                 Ok(I80F48::from(2) / token_price)
             };
 
-            let Ok(dust_threshold) = dust_threshold_res
-            else {
+            let Ok(dust_threshold) = dust_threshold_res else {
                 let e = dust_threshold_res.unwrap_err();
-                error!("Cannot rebalance token {}, probably missing USDC market ? - error: {}", token.name, e);
+                error!(
+                    "Cannot rebalance token {}, probably missing USDC market ? - error: {}",
+                    token.name, e
+                );
                 continue;
             };
 
@@ -738,8 +740,7 @@ impl Rebalancer {
         market: &Serum3MarketContext,
         quote: &TokenContext,
     ) -> anyhow::Result<()> {
-        let Ok(open_orders) = account.serum3_orders(*market_index).map(|x| x.open_orders)
-        else {
+        let Ok(open_orders) = account.serum3_orders(*market_index).map(|x| x.open_orders) else {
             return Ok(());
         };
 

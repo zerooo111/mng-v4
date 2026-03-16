@@ -13,7 +13,30 @@ EXECUTION_QUEUE_ENGINE_ENABLED=false \
 ./startup_local.sh restart
 ```
 
-Start the external TS cranker in a second shell:
+## Quickstart (Devnet)
+
+Use the already-deployed devnet program with the same launcher:
+
+```bash
+cd /home/ec2-user/stagin4/mng-v4
+
+STACK_CLUSTER=devnet \
+PROGRAM_ID=9nNhSkcxYFujiydpuuhVttUYBqYJQmxCzjrBofBvmutF \
+./startup_local.sh restart
+```
+
+Devnet mode changes:
+- runtime artifacts are written to `.devnet/run`
+- the launcher uses `https://api.devnet.solana.com` unless `SOLANA_URL` is overridden
+- maker/taker are read from `keypairs/`
+- startup/bootstrap do not auto-fund or auto-generate users
+
+Required persistent keypairs:
+- [execution-queue-maker.json](/home/ec2-user/stagin4/mng-v4/keypairs/execution-queue-maker.json)
+- [execution-queue-taker.json](/home/ec2-user/stagin4/mng-v4/keypairs/execution-queue-taker.json)
+
+The default local path now uses the embedded Rust executor/cranker. Start the external TS cranker
+in a second shell only if you explicitly disable the Rust executor:
 
 ```bash
 cd /home/ec2-user/stagin4/mng-v4
@@ -30,6 +53,7 @@ env \
   EXECUTION_QUEUE_CRANK_MAX_ITEMS=8 \
   EXECUTION_QUEUE_CRANK_INTERVAL_MS=1000 \
   node -r ts-node/register/transpile-only \
+  EXECUTION_QUEUE_ENGINE_ENABLED=false \
   ts/client/scripts/execution-queue/execution-queue-cranker.ts
 ```
 
@@ -59,6 +83,17 @@ Legacy fallback:
 cd /home/ec2-user/stagin4/mng-v4
 CTM_RELAYER_IMPL=ts ./startup_local.sh restart
 ```
+
+## Devnet E2E Run
+
+After the devnet stack is up:
+
+```bash
+cd /home/ec2-user/stagin4/mng-v4
+STACK_CLUSTER=devnet ./startup_local.sh run-e2e
+```
+
+If the saved keypairs need SOL on devnet, fund them manually before bootstrap/E2E.
 
 ## What Changed
 
@@ -118,6 +153,19 @@ export QUOTER_COINGECKO_VS_CURRENCY=usd
 npm run -s execution-queue-random-sol-usdc-quoter
 ```
 
+Single-process multi-bot pacing is also supported:
+
+- `QUOTER_BOT_DISPATCH_MODE=all`: existing behavior, every loaded bot submits each tick
+- `QUOTER_BOT_DISPATCH_MODE=round-robin`: one loaded bot submits per tick, rotating across bots
+- `QUOTER_BOT_DISPATCH_MODE=random-one`: one random loaded bot submits per tick
+
+For the current devnet stack, a helper launcher provisions a small bot set if needed and starts a round-robin SOL/USDC quoter at roughly one order transaction every 5 seconds:
+
+```bash
+cd /home/ec2-user/stagin4
+./start_devnet_quoter_bots.sh restart
+```
+
 ## Prerequisites
 
 - Local validator running at `http://127.0.0.1:8899`
@@ -141,6 +189,17 @@ solana program deploy \
   target/deploy/mango_v4.so \
   --program-id target/deploy/mango_v4-keypair.json
 ```
+
+As of 2026-03-13, treat the build as failed unless the log contains no `^Error:` lines. In this repo, `cargo build-sbf` can still print `Finished release profile [optimized]` while emitting hard SBF stack-frame errors for Anchor-generated `try_accounts`.
+
+Recommended check:
+
+```bash
+cargo build-sbf --manifest-path programs/mango-v4/Cargo.toml --features enable-gpl 2>&1 | tee /tmp/mango-build-sbf.log
+rg -n "^Error:" /tmp/mango-build-sbf.log
+```
+
+If any `Error:` lines are present, do not trust `target/deploy/mango_v4.so` as a fresh artifact.
 
 ## SBF Build Notes (Important)
 
@@ -175,6 +234,47 @@ If future upstream versions are restored:
 3. run:
    - `cargo check --manifest-path programs/mango-v4/Cargo.toml --features enable-gpl`
    - `cargo build-sbf --manifest-path programs/mango-v4/Cargo.toml --features enable-gpl`
+
+## Current SBF Artifact Blocker (2026-03-13)
+
+The old OpenBook and Switchboard cleanup is not the active blocker anymore. The current blocker is compile-time SBF stack-frame overflow in Anchor-generated `Accounts::try_accounts`, which prevents us from trusting a rebuilt `mango_v4.so`.
+
+Currently failing `Accounts` contexts:
+
+- `OpenbookV2LiqForceCancelOrders` in `programs/mango-v4/src/accounts_ix/openbook_v2_liq_force_cancel_orders.rs`
+- `OpenbookV2PlaceOrder` in `programs/mango-v4/src/accounts_ix/openbook_v2_place_order.rs`
+- `Serum3RegisterMarket` in `programs/mango-v4/src/accounts_ix/serum3_register_market.rs`
+- `TokenAddBank` in `programs/mango-v4/src/accounts_ix/token_add_bank.rs`
+- `TokenRegister` in `programs/mango-v4/src/accounts_ix/token_register.rs`
+- `TokenRegisterTrustless` in `programs/mango-v4/src/accounts_ix/token_register_trustless.rs`
+
+Representative current stack overflows:
+
+- `OpenbookV2LiqForceCancelOrders::try_accounts`: `5056 > 4096`
+- `OpenbookV2PlaceOrder::try_accounts`: `4400 > 4096`
+- `Serum3RegisterMarket::try_accounts`: `4104 > 4096`
+- `TokenAddBank::try_accounts`: `5424 > 4096`
+- `TokenRegister::try_accounts`: `5048 > 4096`
+- `TokenRegisterTrustless::try_accounts`: `5048 > 4096`
+
+Why this matters for local testing:
+
+- startup scripts deploy `target/deploy/mango_v4.so`
+- if `cargo build-sbf` emits these stack errors, the local validator restart may still be running an older artifact
+- source changes can then diverge from measured runtime behavior, which is exactly what happened during recent execution-queue optimization work
+
+Recommended fix direction:
+
+1. shrink or split the listed `#[derive(Accounts)]` contexts before expecting a fresh deploy
+2. move setup-heavy `init` flows out of already-large account validation paths
+3. rerun `cargo build-sbf` and verify `rg -n "^Error:" /tmp/mango-build-sbf.log` is empty
+
+Anchor and Solana references:
+
+- Anchor 0.31 release notes: `try_accounts` is the main stack hotspot, and multiple `init` constraints are a known contributor
+  - <https://www.anchor-lang.com/docs/updates/release-notes/0-31-0>
+- Solana program FAQ: stack frame limits are strict and warnings must be resolved for used code paths
+  - <https://solana.com/docs/programs/faq>
 
 ## Local Bootstrap (Group + Queue + Users + Market)
 
@@ -222,7 +322,12 @@ curl -s http://127.0.0.1:9093/healthz | jq
 curl -s http://127.0.0.1:9093/metrics | rg 'execution_engine_(requests|execute|sequence)'
 ```
 
-The local stack scripts now default to `CTM_RELAYER_IMPL=rust`. Set `CTM_RELAYER_IMPL=ts` only if you need the legacy TS relayer path. The gRPC submit endpoint stays on `127.0.0.1:9090`; engine health and metrics are available on `127.0.0.1:9093`.
+The local stack scripts now default to `CTM_RELAYER_IMPL=rust` and
+`EXECUTION_QUEUE_ENGINE_ENABLED=true`, so the Rust relayer also drains the execution queue by
+default. Set `CTM_RELAYER_IMPL=ts` only if you need the legacy TS relayer path, or set
+`EXECUTION_QUEUE_ENGINE_ENABLED=false` if you intentionally want the external TS cranker. The gRPC
+submit endpoint stays on `127.0.0.1:9090`; engine health and metrics are available on
+`127.0.0.1:9093`.
 `EXECUTION_QUEUE_BUFFER_PK` is optional and only kept as a compatibility alias to `EXECUTION_QUEUE_PK`.
 
 ### Legacy TS Relayer Fallback

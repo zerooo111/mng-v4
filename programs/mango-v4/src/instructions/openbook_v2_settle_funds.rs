@@ -13,6 +13,7 @@ use crate::logs::{
 };
 
 use crate::accounts_zerocopy::AccountInfoRef;
+use anchor_spl::token::accessor;
 
 /// Settling means moving free funds from the open orders account
 /// back into the mango account wallet.
@@ -20,16 +21,65 @@ use crate::accounts_zerocopy::AccountInfoRef;
 /// There will be free funds on open_orders when an order was triggered.
 ///
 pub fn openbook_v2_settle_funds<'info>(
-    ctx: Context<OpenbookV2SettleFunds>,
+    ctx: Context<'_, '_, '_, 'info, OpenbookV2SettleFunds<'info>>,
     fees_to_dao: bool,
 ) -> Result<()> {
-    let openbook_market = ctx.accounts.openbook_v2_market.load()?;
+    const EXTRA_CPI_ACCOUNTS: usize = 7;
+    require_gte!(ctx.remaining_accounts.len(), EXTRA_CPI_ACCOUNTS);
+    let (_, cpi_remaining) = ctx
+        .remaining_accounts
+        .split_at(ctx.remaining_accounts.len() - EXTRA_CPI_ACCOUNTS);
+    let market_base_vault_ai = cpi_remaining[0].clone();
+    let market_quote_vault_ai = cpi_remaining[1].clone();
+    let market_vault_signer_ai = cpi_remaining[2].clone();
+    let quote_oracle_ai = cpi_remaining[3].clone();
+    let base_oracle_ai = cpi_remaining[4].clone();
+    let token_program_ai = cpi_remaining[5].clone();
+    let system_program_ai = cpi_remaining[6].clone();
+
+    let group_loader = AccountLoader::<Group>::try_from(&ctx.accounts.group.to_account_info())?;
+    let group = group_loader.load()?;
+    require!(
+        group.is_ix_enabled(IxGate::OpenbookV2SettleFunds),
+        MangoError::IxIsDisabled
+    );
+    require_keys_eq!(*token_program_ai.key, anchor_spl::token::ID);
+    require_keys_eq!(*system_program_ai.key, anchor_lang::system_program::ID);
+    require!(ctx.accounts.authority.is_signer, MangoError::SomeError);
+
+    let account_loader =
+        AccountLoader::<MangoAccountFixed>::try_from(&ctx.accounts.account.to_account_info())?;
+    let openbook_market_loader = AccountLoader::<OpenbookV2Market>::try_from(
+        &ctx.accounts.openbook_v2_market.to_account_info(),
+    )?;
+    let openbook_market = openbook_market_loader.load()?;
+    let open_orders_loader = AccountLoader::<openbook_v2::state::OpenOrdersAccount>::try_from(
+        &ctx.accounts.open_orders.to_account_info(),
+    )?;
+    let openbook_market_external_loader = AccountLoader::<openbook_v2::state::Market>::try_from(
+        &ctx.accounts.openbook_v2_market_external.to_account_info(),
+    )?;
+    let quote_bank_loader =
+        AccountLoader::<Bank>::try_from(&ctx.accounts.quote_bank.to_account_info())?;
+    let base_bank_loader =
+        AccountLoader::<Bank>::try_from(&ctx.accounts.base_bank.to_account_info())?;
+    require_keys_eq!(openbook_market.group, ctx.accounts.group.key());
+    require_keys_eq!(
+        openbook_market.openbook_v2_market_external,
+        ctx.accounts.openbook_v2_market_external.key()
+    );
+    require_keys_eq!(
+        openbook_market.openbook_v2_program,
+        ctx.accounts.openbook_v2_program.key()
+    );
 
     //
     // Validation
     //
     {
-        let account = ctx.accounts.account.load_full()?;
+        let account = account_loader.load_full()?;
+        require_keys_eq!(account.fixed.group, ctx.accounts.group.key());
+        require!(account.fixed.is_operational(), MangoError::AccountIsFrozen);
         // account constraint #1
         require!(
             account
@@ -48,7 +98,8 @@ pub fn openbook_v2_settle_funds<'info>(
         );
 
         // Validate banks and vaults #3
-        let quote_bank = ctx.accounts.quote_bank.load()?;
+        let quote_bank = quote_bank_loader.load()?;
+        require_keys_eq!(quote_bank.group, ctx.accounts.group.key());
         require!(
             quote_bank.vault == ctx.accounts.quote_vault.key(),
             MangoError::SomeError
@@ -57,7 +108,8 @@ pub fn openbook_v2_settle_funds<'info>(
             quote_bank.token_index == openbook_market.quote_token_index,
             MangoError::SomeError
         );
-        let base_bank = ctx.accounts.base_bank.load()?;
+        let base_bank = base_bank_loader.load()?;
+        require_keys_eq!(base_bank.group, ctx.accounts.group.key());
         require!(
             base_bank.vault == ctx.accounts.base_vault.key(),
             MangoError::SomeError
@@ -68,14 +120,10 @@ pub fn openbook_v2_settle_funds<'info>(
         );
 
         // Validate oracles #4
-        require_keys_eq!(
-            base_bank.oracle,
-            ctx.accounts.base_oracle.key(),
-            MangoError::SomeError
-        );
+        require_keys_eq!(base_bank.oracle, *base_oracle_ai.key, MangoError::SomeError);
         require_keys_eq!(
             quote_bank.oracle,
-            ctx.accounts.quote_oracle.key(),
+            *quote_oracle_ai.key,
             MangoError::SomeError
         );
     }
@@ -87,15 +135,23 @@ pub fn openbook_v2_settle_funds<'info>(
     let quote_lot_size: u64;
     let before_oo;
     {
-        let openbook_market_external = ctx.accounts.openbook_v2_market_external.load()?;
+        let openbook_market_external = openbook_market_external_loader.load()?;
+        require_keys_eq!(
+            openbook_market_external.market_base_vault,
+            *market_base_vault_ai.key
+        );
+        require_keys_eq!(
+            openbook_market_external.market_quote_vault,
+            *market_quote_vault_ai.key
+        );
         base_lot_size = openbook_market_external.base_lot_size.try_into().unwrap();
         quote_lot_size = openbook_market_external.quote_lot_size.try_into().unwrap();
 
-        let open_orders = ctx.accounts.open_orders.load()?;
+        let open_orders = open_orders_loader.load()?;
         before_oo = OpenOrdersSlim::from_oo_v2(&open_orders, base_lot_size, quote_lot_size);
-        let mut account = ctx.accounts.account.load_full_mut()?;
-        let mut base_bank = ctx.accounts.base_bank.load_mut()?;
-        let mut quote_bank = ctx.accounts.quote_bank.load_mut()?;
+        let mut account = account_loader.load_full_mut()?;
+        let mut base_bank = base_bank_loader.load_mut()?;
+        let mut quote_bank = quote_bank_loader.load_mut()?;
         charge_loan_origination_fees(
             &ctx.accounts.group.key(),
             &ctx.accounts.account.key(),
@@ -104,38 +160,44 @@ pub fn openbook_v2_settle_funds<'info>(
             &mut quote_bank,
             &mut account.borrow_mut(),
             &before_oo,
-            Some(&ctx.accounts.base_oracle.to_account_info()),
-            Some(&ctx.accounts.quote_oracle.to_account_info()),
+            Some(&base_oracle_ai),
+            Some(&quote_oracle_ai),
         )?;
     }
 
     //
     // Settle
     //
-    let before_base_vault = ctx.accounts.base_vault.amount;
-    let before_quote_vault = ctx.accounts.quote_vault.amount;
-    let mango_account_seeds_data = ctx.accounts.account.load()?.pda_seeds();
+    let before_base_vault = accessor::amount(&ctx.accounts.base_vault.to_account_info())?;
+    let before_quote_vault = accessor::amount(&ctx.accounts.quote_vault.to_account_info())?;
+    let mango_account_seeds_data = account_loader.load()?.pda_seeds();
     let seeds = &mango_account_seeds_data.signer_seeds();
-    cpi_settle_funds(ctx.accounts, &[seeds])?;
+    cpi_settle_funds(
+        ctx.accounts,
+        &[seeds],
+        &market_base_vault_ai,
+        &market_quote_vault_ai,
+        &market_vault_signer_ai,
+        &token_program_ai,
+        &system_program_ai,
+    )?;
 
     //
     // After-settle tracking
     //
     let after_oo = {
-        let open_orders = ctx.accounts.open_orders.load()?;
+        let open_orders = open_orders_loader.load()?;
         OpenOrdersSlim::from_oo_v2(&open_orders, base_lot_size, quote_lot_size)
     };
 
-    ctx.accounts.base_vault.reload()?;
-    ctx.accounts.quote_vault.reload()?;
-    let after_base_vault = ctx.accounts.base_vault.amount;
-    let after_quote_vault = ctx.accounts.quote_vault.amount;
+    let after_base_vault = accessor::amount(&ctx.accounts.base_vault.to_account_info())?;
+    let after_quote_vault = accessor::amount(&ctx.accounts.quote_vault.to_account_info())?;
 
-    let mut account = ctx.accounts.account.load_full_mut()?;
-    let mut base_bank = ctx.accounts.base_bank.load_mut()?;
-    let mut quote_bank = ctx.accounts.quote_bank.load_mut()?;
-    let group = ctx.accounts.group.load()?;
-    let open_orders = ctx.accounts.open_orders.load()?;
+    let mut account = account_loader.load_full_mut()?;
+    let mut base_bank = base_bank_loader.load_mut()?;
+    let mut quote_bank = quote_bank_loader.load_mut()?;
+    let group = group_loader.load()?;
+    let open_orders = open_orders_loader.load()?;
     apply_settle_changes(
         &group,
         ctx.accounts.account.key(),
@@ -151,7 +213,7 @@ pub fn openbook_v2_settle_funds<'info>(
         &after_oo,
         None,
         fees_to_dao,
-        Some(&ctx.accounts.quote_oracle.to_account_info()),
+        Some(&quote_oracle_ai),
         &open_orders,
     )?;
 
@@ -269,20 +331,28 @@ pub fn charge_loan_origination_fees(
     Ok(())
 }
 
-fn cpi_settle_funds<'info>(ctx: &OpenbookV2SettleFunds<'info>, seeds: &[&[&[u8]]]) -> Result<()> {
+fn cpi_settle_funds<'info>(
+    ctx: &OpenbookV2SettleFunds<'info>,
+    seeds: &[&[&[u8]]],
+    market_base_vault_ai: &AccountInfo<'info>,
+    market_quote_vault_ai: &AccountInfo<'info>,
+    market_vault_signer_ai: &AccountInfo<'info>,
+    token_program_ai: &AccountInfo<'info>,
+    system_program_ai: &AccountInfo<'info>,
+) -> Result<()> {
     let cpi_accounts = SettleFunds {
         penalty_payer: ctx.authority.to_account_info(),
         market: ctx.openbook_v2_market_external.to_account_info(),
-        market_authority: ctx.market_vault_signer.to_account_info(),
-        market_base_vault: ctx.market_base_vault.to_account_info(),
-        market_quote_vault: ctx.market_quote_vault.to_account_info(),
+        market_authority: market_vault_signer_ai.clone(),
+        market_base_vault: market_base_vault_ai.clone(),
+        market_quote_vault: market_quote_vault_ai.clone(),
         user_base_account: ctx.base_vault.to_account_info(),
         user_quote_account: ctx.quote_vault.to_account_info(),
         referrer_account: Some(ctx.quote_vault.to_account_info()),
-        token_program: ctx.token_program.to_account_info(),
+        token_program: token_program_ai.clone(),
         owner: ctx.account.to_account_info(),
         open_orders_account: ctx.open_orders.to_account_info(),
-        system_program: ctx.system_program.to_account_info(),
+        system_program: system_program_ai.clone(),
     };
 
     let cpi_ctx = CpiContext::new_with_signer(

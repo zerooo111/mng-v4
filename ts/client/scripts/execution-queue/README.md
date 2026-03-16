@@ -1,14 +1,21 @@
 # Execution Queue Relayer + Cranker
 
-## Working Local E2E Pipeline
+## Working E2E Pipeline
 
-This is the current known-good end-to-end path for local validator testing with:
-- deployed Mango program on local validator
+This is the current maintained path for:
+- local validator testing
+- devnet testing against a deployed Mango program
 - Rust relayer for submit
-- external TS cranker for execute
+- embedded Rust executor/cranker by default
 - one intent per place tx
 
-### 1. Start the local stack
+Safety defaults now in effect:
+- no auto-generated maker/taker keypairs
+- no auto-generated quoter bot keypairs
+- no bootstrap-time SOL auto-funding
+- persistent script keypairs live under `mng-v4/keypairs`
+
+### 1. Start the stack
 
 ```bash
 PRELOAD_PROGRAM_IN_VALIDATOR=0 \
@@ -17,13 +24,22 @@ EXECUTION_QUEUE_ENGINE_ENABLED=false \
 ./startup_local.sh restart
 ```
 
+Devnet:
+
+```bash
+STACK_CLUSTER=devnet \
+PROGRAM_ID=9nNhSkcxYFujiydpuuhVttUYBqYJQmxCzjrBofBvmutF \
+./startup_local.sh restart
+```
+
 Expected healthy ports:
-- validator RPC: `http://127.0.0.1:8899`
+- localnet validator RPC: `http://127.0.0.1:8899`
+- devnet RPC: external, usually `https://api.devnet.solana.com`
 - relayer gRPC: `127.0.0.1:9090`
 - relayer HTTP health/metrics: `http://127.0.0.1:9093`
 - harness HTTP: `http://127.0.0.1:9091`
 
-### 2. Start the cranker in a separate terminal
+### 2. Start the external cranker only if Rust execute is disabled
 
 ```bash
 cd /home/ec2-user/stagin4/mng-v4
@@ -41,13 +57,17 @@ env \
   EXECUTION_QUEUE_CRANK_MAX_ITEMS=8 \
   EXECUTION_QUEUE_CRANK_INTERVAL_MS=1000 \
   node -r ts-node/register/transpile-only \
+  EXECUTION_QUEUE_ENGINE_ENABLED=false \
   ts/client/scripts/execution-queue/execution-queue-cranker.ts
 ```
 
 Important:
 - `EXECUTION_QUEUE_PROGRAM_ID` must be set on localnet. If omitted, the cranker falls back to `MANGO_V4_ID[CLUSTER]` and can target the wrong program id.
-- `EXECUTION_QUEUE_ENGINE_ENABLED=false` keeps execute traffic out of the Rust relayer while the external cranker is used.
+- `EXECUTION_QUEUE_ENGINE_ENABLED=true` is now the default local mode and enables the embedded Rust executor.
+- Set `EXECUTION_QUEUE_ENGINE_ENABLED=false` only when you intentionally want the external TS cranker.
 - `CTM_RELAYER_IMPL=rust` is now the default startup mode. Set `CTM_RELAYER_IMPL=ts` only if you need the legacy TS relayer path.
+- In `STACK_CLUSTER=devnet`, runtime config defaults move from `.localnet/run` to `.devnet/run`.
+- Maker/taker now come from `keypairs/execution-queue-maker.json` and `keypairs/execution-queue-taker.json`.
 
 ### 3. Run the E2E test
 
@@ -59,6 +79,12 @@ E2E_OUTPUT_CONFIG_PATH=.localnet/run/execution-queue-e2e-9120.json \
 E2E_MAKER_MAX_QUOTE_QTY=1000 \
 E2E_TAKER_MAX_QUOTE_QTY=1000 \
 npm run -s execution-queue-local-perp-e2e-run
+```
+
+Devnet launcher equivalent:
+
+```bash
+STACK_CLUSTER=devnet ./startup_local.sh run-e2e
 ```
 
 Expected result:
@@ -93,7 +119,7 @@ Healthy expectations:
 
 For local integration testing, prefer:
 - Rust relayer for submit
-- external TS cranker for execute
+- embedded Rust executor/cranker for execute by default
 
 This is now the default local startup path. The embedded Rust executor is still under separate debugging and should not be treated as the default clean-path execute runner yet.
 
@@ -119,7 +145,10 @@ CTM_RELAYER_SEQUENCE_STATE_PATH=.localnet/run/ctm-sequences-9120.json \
 cargo run -p service-mango-execution-engine
 ```
 
-The startup scripts now default to `CTM_RELAYER_IMPL=rust` and keep the same gRPC submit address on `:9090`. The Rust engine exposes `GET /healthz` and `GET /metrics` on `CTM_EXECUTION_ENGINE_HTTP_BIND_ADDR`.
+The startup scripts now default to `CTM_RELAYER_IMPL=rust` and
+`EXECUTION_QUEUE_ENGINE_ENABLED=true`, while keeping the same gRPC submit address on `:9090`. The
+Rust engine exposes `GET /healthz` and `GET /metrics` on
+`CTM_EXECUTION_ENGINE_HTTP_BIND_ADDR`.
 `EXECUTION_QUEUE_BUFFER_PK` is now optional and treated as an alias of `EXECUTION_QUEUE_PK` for older tooling.
 
 Quick checks:
@@ -128,6 +157,19 @@ Quick checks:
 curl -s http://127.0.0.1:9093/healthz
 curl -s http://127.0.0.1:9093/metrics | rg 'execution_engine_(requests|execute|sequence)'
 ```
+
+Additional executor metrics now exposed by the Rust engine:
+- `execution_engine_submit_parse_avg_ms`
+- `execution_engine_submit_prepare_avg_ms`
+- `execution_engine_submit_send_avg_ms`
+- `execution_engine_execute_head_missing_total`
+- `execution_engine_execute_head_blocked_total`
+- `execution_engine_execute_confirmed_no_advance_total`
+- `execution_engine_execute_targeted_total`
+- `execution_engine_execute_speculative_total`
+
+The executor now defaults to reason-coded head inspection and only uses speculative execute sends
+for queue-gap recovery (`EXECUTION_QUEUE_CRANK_SAFE_SPECULATIVE=true`).
 
 ### Legacy TS Relayer Fallback
 
@@ -240,3 +282,26 @@ yarn execution-queue-cranker
 Notes:
 - Lane account metas must match the `accounts_hash` for queued items.
 - Multiple lanes can be configured (one per market/account-meta set).
+
+## Local Benchmark Reports
+
+`random-sol-usdc-quoter-bot.ts` can now emit a run summary JSON artifact:
+
+```bash
+QUOTER_REPORT_PATH=.localnet/run/quoter-report.json \
+QUOTER_MAX_RUNTIME_MS=20000 \
+QUOTER_COINGECKO_REFRESH_MS=60000 \
+QUOTER_LOG_EACH_ORDER=false \
+./node_modules/.bin/ts-node ts/client/scripts/execution-queue/random-sol-usdc-quoter-bot.ts
+```
+
+Useful knobs:
+- `QUOTER_REPORT_PATH`: write a JSON summary with TPS, queue count, relayer metrics, and errors
+- `QUOTER_MAX_RUNTIME_MS` or `QUOTER_MAX_TICKS`: end the run automatically
+- `QUOTER_RELAYER_METRICS_URL`: override the metrics endpoint for the report snapshot
+
+The report includes:
+- average and peak place TPS / total intent TPS
+- max inflight submits and tick error count
+- end-of-run queue count
+- relayer submit/execute metrics snapshot

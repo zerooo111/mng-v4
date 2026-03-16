@@ -157,6 +157,25 @@ export class Group {
 
   public async reloadAll(client: MangoClient): Promise<void> {
     const ids: Id | undefined = await client.getIds(this.publicKey);
+    const serialReload =
+      (process.env.MANGO_GROUP_RELOAD_SERIAL ||
+        (process.env.STACK_CLUSTER === 'devnet' ? 'true' : 'false')) === 'true';
+
+    if (serialReload) {
+      await this.reloadPriceImpactData();
+      await this.reloadAlts(client);
+      await this.reloadBanks(client, ids);
+      await this.reloadBankOraclePrices(client);
+      await this.reloadVaults(client);
+      await this.reloadPerpMarkets(client, ids);
+      await this.reloadPerpMarketOraclePrices(client);
+      await this.reloadMintInfos(client, ids);
+      await this.reloadSerum3Markets(client, ids);
+      await this.reloadSerum3ExternalMarkets(client, ids);
+      await this.reloadOpenbookV2Markets(client, ids);
+      await this.reloadOpenbookV2ExternalMarkets(client, ids);
+      return;
+    }
 
     // console.time('group.reload');
     await Promise.all([

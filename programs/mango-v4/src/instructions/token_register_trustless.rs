@@ -3,6 +3,9 @@ use fixed::types::I80F48;
 
 use crate::accounts_zerocopy::AccountInfoRef;
 use crate::error::*;
+use crate::instructions::account_init::{
+    create_pda_account, create_token_account_pda, write_discriminator,
+};
 use crate::instructions::INDEX_START;
 use crate::state::*;
 use crate::util::fill_from_str;
@@ -49,7 +52,65 @@ pub fn token_register_trustless(
 
     let net_borrow_limit_window_size_ts = 24 * 60 * 60u64;
 
-    let mut bank = ctx.accounts.bank.load_init()?;
+    let group_key = ctx.accounts.group.key();
+    let mint_key = ctx.accounts.mint.key();
+    let token_index_bytes = token_index.to_le_bytes();
+    let first_bank_num_bytes = 0u32.to_le_bytes();
+
+    let bank_bump = *ctx.bumps.get("bank").ok_or(MangoError::SomeError)?;
+    let bank_seeds = &[
+        b"Bank".as_ref(),
+        group_key.as_ref(),
+        &token_index_bytes,
+        &first_bank_num_bytes,
+        &[bank_bump],
+    ];
+    create_pda_account(
+        &ctx.accounts.payer,
+        &ctx.accounts.bank.to_account_info(),
+        &ctx.accounts.system_program,
+        bank_seeds,
+        8 + std::mem::size_of::<Bank>(),
+        ctx.program_id,
+    )?;
+
+    let vault_bump = *ctx.bumps.get("vault").ok_or(MangoError::SomeError)?;
+    let vault_seeds = &[
+        b"Vault".as_ref(),
+        group_key.as_ref(),
+        &token_index_bytes,
+        &first_bank_num_bytes,
+        &[vault_bump],
+    ];
+    create_token_account_pda(
+        &ctx.accounts.payer,
+        &ctx.accounts.vault.to_account_info(),
+        &ctx.accounts.mint,
+        &ctx.accounts.group.to_account_info(),
+        &ctx.accounts.token_program,
+        &ctx.accounts.system_program,
+        vault_seeds,
+    )?;
+
+    let mint_info_bump = *ctx.bumps.get("mint_info").ok_or(MangoError::SomeError)?;
+    let mint_info_seeds = &[
+        b"MintInfo".as_ref(),
+        group_key.as_ref(),
+        mint_key.as_ref(),
+        &[mint_info_bump],
+    ];
+    create_pda_account(
+        &ctx.accounts.payer,
+        &ctx.accounts.mint_info.to_account_info(),
+        &ctx.accounts.system_program,
+        mint_info_seeds,
+        8 + std::mem::size_of::<MintInfo>(),
+        ctx.program_id,
+    )?;
+
+    let bank_loader =
+        AccountLoader::<Bank>::try_from_unchecked(ctx.program_id, &ctx.accounts.bank)?;
+    let mut bank = bank_loader.load_init()?;
     bank.group = ctx.accounts.group.key();
     bank.name = fill_from_str(&name)?;
     bank.mint = ctx.accounts.mint.key();
@@ -78,7 +139,7 @@ pub fn token_register_trustless(
     bank.platform_liquidation_fee = I80F48::from_num(0.05);
     bank.flash_loan_token_account_initial = u64::MAX;
     bank.token_index = token_index;
-    bank.bump = *ctx.bumps.get("bank").ok_or(MangoError::SomeError)?;
+    bank.bump = bank_bump;
     bank.mint_decimals = ctx.accounts.mint.decimals;
     bank.min_vault_to_deposits_ratio = 0.2;
     bank.net_borrow_limit_window_size_ts = net_borrow_limit_window_size_ts;
@@ -106,7 +167,9 @@ pub fn token_register_trustless(
         ctx.accounts.fallback_oracle.as_ref(),
     )?)?;
 
-    let mut mint_info = ctx.accounts.mint_info.load_init()?;
+    let mint_info_loader =
+        AccountLoader::<MintInfo>::try_from_unchecked(ctx.program_id, &ctx.accounts.mint_info)?;
+    let mut mint_info = mint_info_loader.load_init()?;
     mint_info.group = ctx.accounts.group.key();
     mint_info.token_index = token_index;
     mint_info.mint = ctx.accounts.mint.key();
@@ -125,6 +188,12 @@ pub fn token_register_trustless(
         fallback_oracle: ctx.accounts.fallback_oracle.key(),
         mint_info: ctx.accounts.mint_info.key(),
     });
+
+    drop(mint_info);
+    drop(bank);
+
+    write_discriminator::<Bank>(&ctx.accounts.bank.to_account_info())?;
+    write_discriminator::<MintInfo>(&ctx.accounts.mint_info.to_account_info())?;
 
     Ok(())
 }

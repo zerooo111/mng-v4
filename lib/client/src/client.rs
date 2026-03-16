@@ -1888,16 +1888,19 @@ impl MangoClient {
                         liqee: *liqee.0,
                         settle_bank: settle_token_info.first_bank(),
                         settle_vault: settle_token_info.first_vault(),
-                        settle_oracle: settle_token_info.oracle,
                         insurance_vault: group.insurance_vault,
-                        insurance_bank: insurance_token_info.first_bank(),
                         insurance_bank_vault: insurance_token_info.first_vault(),
-                        insurance_oracle: insurance_token_info.oracle,
-                        token_program: Token::id(),
                     },
                     None,
                 );
                 ams.extend(health_remaining_ams.into_iter());
+                ams.push(AccountMeta::new_readonly(settle_token_info.oracle, false));
+                ams.push(AccountMeta::new(insurance_token_info.first_bank(), false));
+                ams.push(AccountMeta::new_readonly(
+                    insurance_token_info.oracle,
+                    false,
+                ));
+                ams.push(AccountMeta::new_readonly(Token::id(), false));
                 ams
             },
             data: anchor_lang::InstructionData::data(

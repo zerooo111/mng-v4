@@ -1,5 +1,5 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{Token, TokenAccount};
+use anchor_spl::token::Token;
 use openbook_v2::state::OpenOrdersAccount;
 
 use crate::error::*;
@@ -8,75 +8,41 @@ use openbook_v2::{program::OpenbookV2, state::Market};
 
 #[derive(Accounts)]
 pub struct OpenbookV2LiqForceCancelOrders<'info> {
-    #[account(
-        constraint = group.load()?.is_ix_enabled(IxGate::OpenbookV2LiqForceCancelOrders) @ MangoError::IxIsDisabled,
-    )]
-    pub group: AccountLoader<'info, Group>,
+    /// CHECK: validated inline in the instruction body.
+    pub group: UncheckedAccount<'info>,
 
     // Allow force cancel even if account is frozen
-    #[account(
-        mut,
-        has_one = group
-    )]
-    pub account: AccountLoader<'info, MangoAccountFixed>,
+    #[account(mut)]
+    /// CHECK: validated inline in the instruction body.
+    pub account: UncheckedAccount<'info>,
 
     #[account(mut)]
-    pub payer: Signer<'info>,
+    /// CHECK: validated inline in the instruction body.
+    pub payer: UncheckedAccount<'info>,
 
     #[account(mut)]
     /// CHECK: Validated inline by checking against the pubkey stored in the account at #2
-    pub open_orders: AccountLoader<'info, OpenOrdersAccount>,
+    pub open_orders: UncheckedAccount<'info>,
 
-    #[account(
-        has_one = group,
-        has_one = openbook_v2_program,
-        has_one = openbook_v2_market_external,
-    )]
-    pub openbook_v2_market: AccountLoader<'info, OpenbookV2Market>,
+    /// CHECK: validated inline in the instruction body.
+    pub openbook_v2_market: UncheckedAccount<'info>,
 
-    pub openbook_v2_program: Program<'info, OpenbookV2>,
-
-    #[account(
-        mut,
-        has_one = bids,
-        has_one = asks,
-        has_one = event_heap,
-        has_one = market_base_vault,
-        has_one = market_quote_vault,
-    )]
-    pub openbook_v2_market_external: AccountLoader<'info, Market>,
+    /// CHECK: validated inline in the instruction body.
+    pub openbook_v2_program: UncheckedAccount<'info>,
 
     #[account(mut)]
-    /// CHECK: bids will be checked by openbook_v2
-    pub bids: UncheckedAccount<'info>,
-
-    #[account(mut)]
-    /// CHECK: asks will be checked by openbook_v2
-    pub asks: UncheckedAccount<'info>,
-
-    #[account(mut)]
-    /// CHECK: event will be checked by openbook_v2
-    pub event_heap: UncheckedAccount<'info>,
-
-    #[account(mut)]
-    pub market_base_vault: Box<Account<'info, TokenAccount>>,
-
-    #[account(mut)]
-    pub market_quote_vault: Box<Account<'info, TokenAccount>>,
-
-    /// CHECK: Validated by the openbook_v2 cpi call
-    pub market_vault_signer: UncheckedAccount<'info>,
+    /// CHECK: validated inline in the instruction body.
+    pub openbook_v2_market_external: UncheckedAccount<'info>,
 
     // token_index and bank.vault == vault is validated inline at #3
-    #[account(mut, has_one = group)]
-    pub quote_bank: AccountLoader<'info, Bank>,
     #[account(mut)]
-    pub quote_vault: Box<Account<'info, TokenAccount>>,
-    #[account(mut, has_one = group)]
-    pub base_bank: AccountLoader<'info, Bank>,
+    /// CHECK: validated inline in the instruction body.
+    pub quote_bank: UncheckedAccount<'info>,
     #[account(mut)]
-    pub base_vault: Box<Account<'info, TokenAccount>>,
-
-    pub token_program: Program<'info, Token>,
-    pub system_program: Program<'info, System>,
+    pub quote_vault: UncheckedAccount<'info>,
+    #[account(mut)]
+    /// CHECK: validated inline in the instruction body.
+    pub base_bank: UncheckedAccount<'info>,
+    #[account(mut)]
+    pub base_vault: UncheckedAccount<'info>,
 }

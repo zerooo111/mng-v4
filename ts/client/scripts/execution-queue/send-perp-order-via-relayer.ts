@@ -1,5 +1,5 @@
 import { AnchorProvider, BN, Wallet } from '@coral-xyz/anchor';
-import { Cluster, Connection, Keypair, PublicKey } from '@solana/web3.js';
+import { AccountMeta, Cluster, Connection, Keypair, PublicKey } from '@solana/web3.js';
 import * as dotenv from 'dotenv';
 import fs from 'fs';
 import path from 'path';
@@ -72,25 +72,36 @@ function parseOrderType(): PerpOrderType {
   }
 }
 
-function executionQueueRemainingAccountsFromMangoIx(
-  executionQueue: PublicKey,
-  keys: { pubkey: PublicKey; isWritable: boolean; isSigner: boolean }[],
-) {
-  if (keys.length < 3) {
-    throw new Error('expected at least 3 metas in perp instruction');
-  }
-  const remaining = keys.map((k) => ({
-    pubkey: k.pubkey,
-    isWritable: k.isWritable,
-    // Queue-dispatched instructions must not require user signatures at enqueue time.
-    isSigner: false,
-  }));
-  remaining[2] = {
-    pubkey: executionQueue,
-    isWritable: remaining[2].isWritable,
-    isSigner: false,
-  };
-  return remaining;
+async function executionQueueCanonicalPerpRemainingAccounts(params: {
+  client: MangoClient;
+  group: Awaited<ReturnType<MangoClient['getGroup']>>;
+  mangoAccount: Awaited<ReturnType<MangoClient['getMangoAccount']>>;
+  marketIndex: number;
+  userOwner: PublicKey;
+}): Promise<AccountMeta[]> {
+  const perpMarket = params.group.getPerpMarketByMarketIndex(params.marketIndex);
+  const healthRemainingAccounts = await params.client.buildHealthRemainingAccounts(
+    params.group,
+    [params.mangoAccount],
+    [params.group.getFirstBankForPerpSettlement()],
+    [perpMarket],
+  );
+
+  return [
+    { pubkey: params.group.publicKey, isSigner: false, isWritable: false },
+    { pubkey: params.mangoAccount.publicKey, isSigner: false, isWritable: true },
+    { pubkey: params.userOwner, isSigner: false, isWritable: false },
+    { pubkey: perpMarket.publicKey, isSigner: false, isWritable: true },
+    { pubkey: perpMarket.bids, isSigner: false, isWritable: true },
+    { pubkey: perpMarket.asks, isSigner: false, isWritable: true },
+    { pubkey: perpMarket.eventQueue, isSigner: false, isWritable: true },
+    { pubkey: perpMarket.oracle, isSigner: false, isWritable: false },
+    ...healthRemainingAccounts.map((pubkey) => ({
+      pubkey,
+      isSigner: false,
+      isWritable: false,
+    })),
+  ];
 }
 
 async function main(): Promise<void> {
@@ -123,26 +134,13 @@ async function main(): Promise<void> {
   const selfTradeBehavior = PerpSelfTradeBehavior.decrementTake;
   const perpMarket = group.getPerpMarketByMarketIndex(PERP_MARKET_INDEX);
 
-  const placeIx = await client.perpPlaceOrderV2Ix(
+  const remainingAccounts = await executionQueueCanonicalPerpRemainingAccounts({
+    client,
     group,
     mangoAccount,
-    PERP_MARKET_INDEX,
-    side,
-    Math.abs(PRICE),
-    QUANTITY,
-    MAX_QUOTE_QTY,
-    CLIENT_ORDER_ID,
-    orderType,
-    selfTradeBehavior,
-    REDUCE_ONLY,
-    EXPIRY_TIMESTAMP,
-    LIMIT,
-  );
-
-  const remainingAccounts = executionQueueRemainingAccountsFromMangoIx(
-    executionQueue,
-    placeIx.keys,
-  );
+    marketIndex: PERP_MARKET_INDEX,
+    userOwner: user.publicKey,
+  });
 
   const payload = encodePerpPlaceOrderV2QueuePayload({
     side,

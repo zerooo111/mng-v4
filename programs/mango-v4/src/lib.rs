@@ -623,6 +623,18 @@ pub mod mango_v4 {
         Ok(())
     }
 
+    pub fn execution_queue_execute_multi(
+        ctx: Context<ExecutionQueueExecute>,
+        max_items: u16,
+        lane_count: u8,
+        accounts_per_lane: u16,
+        lane_hashes: Vec<[u8; 32]>,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_execute_multi(ctx, max_items, lane_count, accounts_per_lane, lane_hashes)?;
+        Ok(())
+    }
+
     pub fn health_check(
         ctx: Context<HealthCheck>,
         min_health_value: f64,
@@ -844,8 +856,8 @@ pub mod mango_v4 {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn serum3_place_order(
-        ctx: Context<Serum3PlaceOrder>,
+    pub fn serum3_place_order<'info>(
+        ctx: Context<'_, '_, '_, 'info, Serum3PlaceOrder<'info>>,
         side: Serum3Side,
         limit_price: u64,
         max_base_qty: u64,
@@ -873,8 +885,8 @@ pub mod mango_v4 {
 
     /// requires the receiver_bank in the health account list to be writable
     #[allow(clippy::too_many_arguments)]
-    pub fn serum3_place_order_v2(
-        ctx: Context<Serum3PlaceOrder>,
+    pub fn serum3_place_order_v2<'info>(
+        ctx: Context<'_, '_, '_, 'info, Serum3PlaceOrder<'info>>,
         side: Serum3Side,
         limit_price: u64,
         max_base_qty: u64,
@@ -950,8 +962,8 @@ pub mod mango_v4 {
         Ok(())
     }
 
-    pub fn serum3_liq_force_cancel_orders(
-        ctx: Context<Serum3LiqForceCancelOrders>,
+    pub fn serum3_liq_force_cancel_orders<'info>(
+        ctx: Context<'_, '_, '_, 'info, Serum3LiqForceCancelOrders<'info>>,
         limit: u8,
     ) -> Result<()> {
         #[cfg(feature = "enable-gpl")]
@@ -1552,8 +1564,8 @@ pub mod mango_v4 {
         ))
     }
 
-    pub fn perp_liq_negative_pnl_or_bankruptcy_v2(
-        ctx: Context<PerpLiqNegativePnlOrBankruptcyV2>,
+    pub fn perp_liq_negative_pnl_or_bankruptcy_v2<'info>(
+        ctx: Context<'_, '_, '_, 'info, PerpLiqNegativePnlOrBankruptcyV2<'info>>,
         max_liab_transfer: u64,
     ) -> Result<()> {
         #[cfg(feature = "enable-gpl")]
@@ -1912,8 +1924,8 @@ pub mod mango_v4 {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn openbook_v2_place_order(
-        ctx: Context<OpenbookV2PlaceOrder>,
+    pub fn openbook_v2_place_order<'info>(
+        ctx: Context<'_, '_, '_, 'info, OpenbookV2PlaceOrder<'info>>,
         side: OpenbookV2Side,
         price_lots: i64,
         max_base_lots: i64,
@@ -1967,8 +1979,8 @@ pub mod mango_v4 {
         Ok(())
     }
 
-    pub fn openbook_v2_settle_funds(
-        ctx: Context<OpenbookV2SettleFunds>,
+    pub fn openbook_v2_settle_funds<'info>(
+        ctx: Context<'_, '_, '_, 'info, OpenbookV2SettleFunds<'info>>,
         fees_to_dao: bool,
     ) -> Result<()> {
         #[cfg(feature = "enable-gpl")]
@@ -1976,8 +1988,8 @@ pub mod mango_v4 {
         Ok(())
     }
 
-    pub fn openbook_v2_liq_force_cancel_orders(
-        ctx: Context<OpenbookV2LiqForceCancelOrders>,
+    pub fn openbook_v2_liq_force_cancel_orders<'info>(
+        ctx: Context<'_, '_, '_, 'info, OpenbookV2LiqForceCancelOrders<'info>>,
         limit: u8,
     ) -> Result<()> {
         #[cfg(feature = "enable-gpl")]

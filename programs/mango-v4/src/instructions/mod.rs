@@ -88,6 +88,7 @@ mod account_close;
 mod account_create;
 mod account_edit;
 mod account_expand;
+mod account_init;
 mod account_size_migration;
 mod account_toggle_freeze;
 mod admin_perp_withdraw_fees;

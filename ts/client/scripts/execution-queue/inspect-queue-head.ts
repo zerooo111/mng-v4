@@ -4,8 +4,9 @@ import {
   decodeExecutionQueueHeadItem,
   decodeExecutionQueueHeader,
 } from '../../src/executionQueueLayout';
+import { defaultClusterUrl } from './scriptEnv';
 
-const RPC_URL = process.env.CLUSTER_URL_OVERRIDE || 'http://127.0.0.1:8899';
+const RPC_URL = process.env.CLUSTER_URL_OVERRIDE || defaultClusterUrl();
 const QUEUE_PK =
   process.env.EXECUTION_QUEUE_PK || 'HfaFVCt5FnLQfLETidHYopgQ2RqpW5JhR66yfQdtYrFP';
 
@@ -27,6 +28,8 @@ async function main(): Promise<void> {
     json({
       msg: 'queue',
       capacity: header.capacity,
+      headerInvariantOk: header.headerInvariantOk,
+      gapSpan: header.gapSpan,
       liquidityHead: header.liquidityHead,
       ctmCount: header.ctmCount,
       liquidityCount: header.liquidityCount,

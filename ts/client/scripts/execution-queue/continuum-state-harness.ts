@@ -93,22 +93,54 @@ const HARNESS_AIRDROP_AUTO_CREATE_NAME =
 const HARNESS_SANITY_INTERVAL_MS = Number(
   process.env.CONTINUUM_HARNESS_SANITY_INTERVAL_MS || '5000',
 );
+const HARNESS_ONCHAIN_CACHE_TTL_MS = Number(
+  process.env.CONTINUUM_HARNESS_ONCHAIN_CACHE_TTL_MS || '5000',
+);
 
 const engine = new ContinuumStateEngine();
 const sseClients = new Set<ServerResponse>();
 const sanityStateByOwner = new Map<string, string>();
 
-type AirdropContext = {
+type HarnessGroup = Awaited<ReturnType<MangoClient['getGroup']>>;
+
+type HarnessMarketMetadata = {
+  market_index: number;
+  name: string;
+  base_symbol: string;
+  quote_symbol: string;
+  base_mint: string;
+  quote_mint: string;
+  perp_market: string;
+  oracle: string;
+  bids: string;
+  asks: string;
+  event_queue: string;
+  base_decimals: number;
+  quote_decimals: number;
+  base_lot_size: string;
+  quote_lot_size: string;
+  open_interest: string;
+};
+
+type OnchainContext = {
   connection: Connection;
+  groupPk: PublicKey | null;
+  mangoClient: MangoClient | null;
+  usdcMint: PublicKey | null;
+  programId: PublicKey;
+  cachedGroup: HarnessGroup | null;
+  cachedGroupFetchedAtMs: number;
+  cachedMarketMetadata: Record<string, HarnessMarketMetadata> | null;
+  cachedMarketMetadataFetchedAtMs: number;
+};
+
+type AirdropContext = OnchainContext & {
   usdcMint: PublicKey;
   decimals: number;
   faucet: Keypair;
   defaultUiAmount: number;
   maxUiAmount: number;
-  groupPk: PublicKey | null;
-  mangoClient: MangoClient | null;
   depositUiAmount: number;
-  programId: PublicKey;
 };
 
 function ensureDirForFile(filePath: string): void {
@@ -160,6 +192,109 @@ function parsePathAndQuery(req: IncomingMessage): URL {
 function parseView(url: URL): QueueView {
   const view = (url.searchParams.get('view') || 'optimistic').toLowerCase();
   return view === 'confirmed' ? 'confirmed' : 'optimistic';
+}
+
+function baseSymbolFromPerpName(name: string): string {
+  const trimmed = name.trim();
+  if (trimmed.endsWith('-PERP')) {
+    return trimmed.slice(0, -'-PERP'.length);
+  }
+  if (trimmed.includes('/')) {
+    return trimmed.split('/')[0].trim();
+  }
+  return trimmed.split(' ')[0]?.trim() || trimmed;
+}
+
+function symbolToCanonicalMint(symbol: string, usdcMint: PublicKey | null): string {
+  switch (symbol.trim().toUpperCase()) {
+    case 'SOL':
+      return 'So11111111111111111111111111111111111111112';
+    case 'USDC':
+      return usdcMint?.toBase58() || '';
+    default:
+      return '';
+  }
+}
+
+async function getFreshGroup(onchain: OnchainContext | null): Promise<HarnessGroup | null> {
+  if (!onchain?.mangoClient || !onchain.groupPk) {
+    return null;
+  }
+
+  if (
+    onchain.cachedGroup &&
+    Date.now() - onchain.cachedGroupFetchedAtMs < HARNESS_ONCHAIN_CACHE_TTL_MS
+  ) {
+    return onchain.cachedGroup;
+  }
+
+  const group = await onchain.mangoClient.getGroup(onchain.groupPk);
+  await group.reloadAll(onchain.mangoClient);
+  onchain.cachedGroup = group;
+  onchain.cachedGroupFetchedAtMs = Date.now();
+  if (!onchain.usdcMint) {
+    try {
+      onchain.usdcMint = group.getFirstBankForPerpSettlement().mint;
+    } catch {
+      // Leave unset when the settlement bank cannot be resolved.
+    }
+  }
+  return group;
+}
+
+async function getMarketMetadataMap(
+  onchain: OnchainContext | null,
+): Promise<Record<string, HarnessMarketMetadata>> {
+  if (!onchain?.mangoClient || !onchain.groupPk) {
+    return {};
+  }
+
+  if (
+    onchain.cachedMarketMetadata &&
+    Date.now() - onchain.cachedMarketMetadataFetchedAtMs < HARNESS_ONCHAIN_CACHE_TTL_MS
+  ) {
+    return onchain.cachedMarketMetadata;
+  }
+
+  const group = await getFreshGroup(onchain);
+  if (!group) {
+    return {};
+  }
+
+  const metadata: Record<string, HarnessMarketMetadata> = {};
+  for (const [marketIndex, perpMarket] of group.perpMarketsMapByMarketIndex.entries()) {
+    let settleBank;
+    try {
+      settleBank = group.getFirstBankByTokenIndex(perpMarket.settleTokenIndex);
+    } catch {
+      continue;
+    }
+
+    const marketKey = Number(marketIndex).toString();
+    const baseSymbol = baseSymbolFromPerpName(perpMarket.name);
+    metadata[marketKey] = {
+      market_index: Number(marketIndex),
+      name: perpMarket.name,
+      base_symbol: baseSymbol,
+      quote_symbol: settleBank.name,
+      base_mint: symbolToCanonicalMint(baseSymbol, onchain.usdcMint),
+      quote_mint: settleBank.mint.toBase58(),
+      perp_market: perpMarket.publicKey.toBase58(),
+      oracle: perpMarket.oracle.toBase58(),
+      bids: perpMarket.bids.toBase58(),
+      asks: perpMarket.asks.toBase58(),
+      event_queue: perpMarket.eventQueue.toBase58(),
+      base_decimals: perpMarket.baseDecimals,
+      quote_decimals: settleBank.mintDecimals,
+      base_lot_size: perpMarket.baseLotSize.toString(),
+      quote_lot_size: perpMarket.quoteLotSize.toString(),
+      open_interest: perpMarket.openInterest.toString(),
+    };
+  }
+
+  onchain.cachedMarketMetadata = metadata;
+  onchain.cachedMarketMetadataFetchedAtMs = Date.now();
+  return metadata;
 }
 
 function writeSseEvent(res: ServerResponse, eventName: string, data: unknown): void {
@@ -264,16 +399,16 @@ function metricsText(): string {
 }
 
 async function runOnchainBalanceSanityCheck(
-  airdrop: AirdropContext | null,
+  onchain: OnchainContext | null,
 ): Promise<void> {
-  if (!airdrop?.mangoClient || !airdrop.groupPk) {
+  const group = await getFreshGroup(onchain);
+  if (!group || !onchain?.mangoClient || !onchain.usdcMint) {
     return;
   }
 
-  const group = await airdrop.mangoClient.getGroup(airdrop.groupPk);
-  const allAccounts = await airdrop.mangoClient.getAllMangoAccounts(group);
+  const allAccounts = await onchain.mangoClient.getAllMangoAccounts(group);
   const snapshot = engine.getSnapshot('confirmed');
-  const usdcMint = airdrop.usdcMint.toBase58();
+  const usdcMint = onchain.usdcMint.toBase58();
 
   const ownerToOnchain = new Map<
     string,
@@ -452,10 +587,11 @@ function parseOwnerFromAirdropRequest(
 async function enrichOwnerStateWithOnchain(
   ownerRaw: string,
   baseState: any,
-  airdrop: AirdropContext | null,
+  onchain: OnchainContext | null,
   view: QueueView,
 ): Promise<any> {
-  if (!airdrop?.mangoClient || !airdrop.groupPk) {
+  const group = await getFreshGroup(onchain);
+  if (!group || !onchain?.mangoClient) {
     return baseState;
   }
 
@@ -467,8 +603,7 @@ async function enrichOwnerStateWithOnchain(
   }
 
   try {
-    const group = await airdrop.mangoClient.getGroup(airdrop.groupPk);
-    const ownerAccounts = await airdrop.mangoClient.getMangoAccountsForOwner(group, owner);
+    const ownerAccounts = await onchain.mangoClient.getMangoAccountsForOwner(group, owner);
     if (!ownerAccounts.length) {
       return {
         ...baseState,
@@ -533,7 +668,7 @@ async function enrichOwnerStateWithOnchain(
     const tokens = Array.from(tokenTotals.values()).sort(
       (a, b) => a.token_index - b.token_index,
     );
-    const usdcMint = airdrop.usdcMint.toBase58();
+    const usdcMint = onchain.usdcMint?.toBase58() || tokens[0]?.mint || '';
     const usdcToken = tokens.find((t) => t.mint === usdcMint);
     const aggregate = {
       equity: ZERO_I80F48(),
@@ -638,22 +773,21 @@ async function enrichOwnerStateWithOnchain(
 }
 
 async function buildAirdropContext(
-  connection: Connection,
-  programId: PublicKey,
+  onchain: OnchainContext,
 ): Promise<AirdropContext | null> {
   if (!HARNESS_ENABLE_AIRDROP) {
     return null;
   }
-  if (!HARNESS_USDC_MINT.length || !HARNESS_AIRDROP_KEYPAIR.length) {
+  if (!onchain.usdcMint || !HARNESS_AIRDROP_KEYPAIR.length) {
     console.warn(
-      'airdrop endpoint disabled: CONTINUUM_HARNESS_USDC_MINT or CONTINUUM_HARNESS_AIRDROP_KEYPAIR not set',
+      'airdrop endpoint disabled: unable to resolve USDC mint or faucet keypair',
     );
     return null;
   }
 
-  const usdcMint = new PublicKey(HARNESS_USDC_MINT);
+  const usdcMint = onchain.usdcMint;
   const faucet = readKeypair(HARNESS_AIRDROP_KEYPAIR);
-  const mintInfo = await getMint(connection, usdcMint);
+  const mintInfo = await getMint(onchain.connection, usdcMint);
 
   if (!mintInfo.mintAuthority || !mintInfo.mintAuthority.equals(faucet.publicKey)) {
     console.warn(
@@ -661,40 +795,62 @@ async function buildAirdropContext(
     );
   }
 
-  let mangoClient: MangoClient | null = null;
-  let groupPk: PublicKey | null = null;
-  if (HARNESS_GROUP_PK.length) {
-    try {
-      const provider = new AnchorProvider(
-        connection,
-        new Wallet(faucet),
-        AnchorProvider.defaultOptions(),
-      );
-      mangoClient = await MangoClient.connect(provider, CLUSTER, programId, {
-        idsSource: 'get-program-accounts',
-      });
-      groupPk = new PublicKey(HARNESS_GROUP_PK);
-      await mangoClient.getGroup(groupPk);
-    } catch (err) {
-      console.warn(
-        `airdrop-deposit endpoint disabled: failed to initialize group/mango client (${err})`,
-      );
-      mangoClient = null;
-      groupPk = null;
-    }
-  }
-
   return {
-    connection,
+    ...onchain,
     usdcMint,
     decimals: mintInfo.decimals,
     faucet,
     defaultUiAmount: HARNESS_AIRDROP_DEFAULT_UI_AMOUNT,
     maxUiAmount: HARNESS_AIRDROP_MAX_UI_AMOUNT,
+    depositUiAmount: HARNESS_AIRDROP_DEPOSIT_UI_AMOUNT,
+  };
+}
+
+async function buildOnchainContext(
+  connection: Connection,
+  programId: PublicKey,
+): Promise<OnchainContext> {
+  const groupPk = HARNESS_GROUP_PK.length ? new PublicKey(HARNESS_GROUP_PK) : null;
+  let mangoClient: MangoClient | null = null;
+  let cachedGroup: HarnessGroup | null = null;
+  let usdcMint: PublicKey | null =
+    HARNESS_USDC_MINT.length ? new PublicKey(HARNESS_USDC_MINT) : null;
+
+  if (groupPk) {
+    try {
+      const provider = new AnchorProvider(
+        connection,
+        new Wallet(Keypair.generate()),
+        AnchorProvider.defaultOptions(),
+      );
+      mangoClient = await MangoClient.connect(provider, CLUSTER, programId, {
+        idsSource: 'get-program-accounts',
+      });
+      cachedGroup = await mangoClient.getGroup(groupPk);
+      await cachedGroup.reloadAll(mangoClient);
+      if (!usdcMint) {
+        usdcMint = cachedGroup.getFirstBankForPerpSettlement().mint;
+      }
+    } catch (err) {
+      console.warn(
+        `onchain read context disabled: failed to initialize group/mango client (${err})`,
+      );
+      mangoClient = null;
+      cachedGroup = null;
+      usdcMint = HARNESS_USDC_MINT.length ? new PublicKey(HARNESS_USDC_MINT) : null;
+    }
+  }
+
+  return {
+    connection,
     groupPk,
     mangoClient,
-    depositUiAmount: HARNESS_AIRDROP_DEPOSIT_UI_AMOUNT,
+    usdcMint,
     programId,
+    cachedGroup,
+    cachedGroupFetchedAtMs: cachedGroup ? Date.now() : 0,
+    cachedMarketMetadata: null,
+    cachedMarketMetadataFetchedAtMs: 0,
   };
 }
 
@@ -1051,16 +1207,145 @@ async function processAirdropDepositRequest(
   };
 }
 
-function buildHttpServer(airdrop: AirdropContext | null): http.Server {
+async function processDepositContextRequest(
+  url: URL,
+  onchain: OnchainContext | null,
+): Promise<{
+  owner: string;
+  group: string;
+  program_id: string;
+  quote_mint: string;
+  quote_decimals: number;
+  quote_bank: string;
+  quote_vault: string;
+  quote_oracle: string;
+  mango_account: string;
+  mango_account_exists: boolean;
+  account_num: number;
+  health_remaining_accounts: string[];
+  default_ui_amount: number;
+}> {
+  if (!onchain?.mangoClient || !onchain.groupPk) {
+    throw new Error('deposit context unavailable: group/client not configured');
+  }
+
+  const ownerRaw = decodeURIComponent(url.pathname.split('/').pop() || '').trim();
+  if (!ownerRaw.length) {
+    throw new Error('owner is required');
+  }
+  const owner = new PublicKey(ownerRaw);
+  const group = await getFreshGroup(onchain);
+  if (!group) {
+    throw new Error('deposit context unavailable: group could not be loaded');
+  }
+
+  const quoteMint = onchain.usdcMint ?? group.getFirstBankForPerpSettlement().mint;
+  const quoteBank = group.getFirstBankByMint(quoteMint);
+  const requestedAccountNumRaw = url.searchParams.get('account_num');
+  const requestedAccountNum = requestedAccountNumRaw ? Number(requestedAccountNumRaw) : 0;
+  if (
+    !Number.isInteger(requestedAccountNum) ||
+    requestedAccountNum < 0 ||
+    requestedAccountNum > 0xffffffff
+  ) {
+    throw new Error('account_num must be a valid u32');
+  }
+
+  let mangoAccountPk: PublicKey;
+  let mangoAccountExists = false;
+  let healthRemainingAccounts: PublicKey[] = [];
+
+  const requestedMangoAccountRaw = url.searchParams.get('mango_account') || '';
+  if (requestedMangoAccountRaw.length) {
+    const mangoAccount = await onchain.mangoClient.getMangoAccount(
+      new PublicKey(requestedMangoAccountRaw),
+    );
+    if (!mangoAccount.owner.equals(owner)) {
+      throw new Error('mango_account owner mismatch');
+    }
+    if (!mangoAccount.group.equals(group.publicKey)) {
+      throw new Error('mango_account group mismatch');
+    }
+    mangoAccountPk = mangoAccount.publicKey;
+    mangoAccountExists = true;
+    healthRemainingAccounts = await onchain.mangoClient.buildHealthRemainingAccounts(
+      group,
+      [mangoAccount],
+      [quoteBank],
+      [],
+    );
+  } else {
+    const ownerAccounts = await onchain.mangoClient.getMangoAccountsForOwner(group, owner);
+    const requestedAccount = ownerAccounts.find(
+      (account) => account.accountNum === requestedAccountNum,
+    );
+    const mangoAccount = requestedAccount ?? ownerAccounts[0] ?? null;
+    if (mangoAccount) {
+      mangoAccountPk = mangoAccount.publicKey;
+      mangoAccountExists = true;
+      healthRemainingAccounts = await onchain.mangoClient.buildHealthRemainingAccounts(
+        group,
+        [mangoAccount],
+        [quoteBank],
+        [],
+      );
+    } else {
+      [mangoAccountPk] = PublicKey.findProgramAddressSync(
+        [
+          Buffer.from('MangoAccount'),
+          group.publicKey.toBuffer(),
+          owner.toBuffer(),
+          u32ToLe(requestedAccountNum),
+        ],
+        onchain.programId,
+      );
+      const fallbackMap = await onchain.mangoClient.deriveFallbackOracleContexts(group);
+      const fallbackAccounts = fallbackMap.get(quoteBank.oracle.toBase58()) || [];
+      healthRemainingAccounts = [quoteBank.publicKey, quoteBank.oracle];
+      for (const fallback of fallbackAccounts) {
+        if (
+          !fallback.equals(PublicKey.default) &&
+          !healthRemainingAccounts.find((existing) => existing.equals(fallback))
+        ) {
+          healthRemainingAccounts.push(fallback);
+        }
+      }
+    }
+  }
+
+  return {
+    owner: owner.toBase58(),
+    group: group.publicKey.toBase58(),
+    program_id: onchain.programId.toBase58(),
+    quote_mint: quoteMint.toBase58(),
+    quote_decimals: quoteBank.mintDecimals,
+    quote_bank: quoteBank.publicKey.toBase58(),
+    quote_vault: quoteBank.vault.toBase58(),
+    quote_oracle: quoteBank.oracle.toBase58(),
+    mango_account: mangoAccountPk.toBase58(),
+    mango_account_exists: mangoAccountExists,
+    account_num: requestedAccountNum,
+    health_remaining_accounts: healthRemainingAccounts.map((pk) => pk.toBase58()),
+    default_ui_amount: HARNESS_AIRDROP_DEPOSIT_UI_AMOUNT,
+  };
+}
+
+function buildHttpServer(
+  onchain: OnchainContext | null,
+  airdrop: AirdropContext | null,
+): http.Server {
   return http.createServer(async (req, res) => {
     try {
       const url = parsePathAndQuery(req);
       const method = req.method || 'GET';
 
       if (method === 'GET' && url.pathname === '/healthz') {
+        const marketMetadata = await getMarketMetadataMap(onchain);
         writeJson(res, 200, {
           ok: true,
           ...statsSnapshot(),
+          onchain_read_enabled: !!onchain?.groupPk && !!onchain?.mangoClient,
+          market_metadata_total: Object.keys(marketMetadata).length,
           airdrop_enabled: !!airdrop,
           airdrop_deposit_enabled: !!airdrop?.groupPk && !!airdrop?.mangoClient,
           generated_ts_ms: Date.now(),
@@ -1152,6 +1437,26 @@ function buildHttpServer(airdrop: AirdropContext | null): http.Server {
         return;
       }
 
+      if (method === 'GET' && url.pathname.startsWith('/state/deposit-context/')) {
+        try {
+          const result = await processDepositContextRequest(url, onchain);
+          writeJson(res, 200, result);
+        } catch (err: any) {
+          const message = err?.message || `${err}`;
+          const status =
+            message.includes('required') ||
+            message.includes('invalid') ||
+            message.includes('disabled') ||
+            message.includes('mismatch') ||
+            message.includes('not configured') ||
+            message.includes('not found')
+              ? 400
+              : 500;
+          writeJson(res, status, { error: message });
+        }
+        return;
+      }
+
       if (method === 'GET' && url.pathname === '/state/stream') {
         res.statusCode = 200;
         res.setHeader('Content-Type', 'text/event-stream');
@@ -1181,8 +1486,10 @@ function buildHttpServer(airdrop: AirdropContext | null): http.Server {
       if (method === 'GET' && url.pathname.startsWith('/state/markets/')) {
         const market = decodeURIComponent(url.pathname.slice('/state/markets/'.length));
         const view = parseView(url);
+        const marketMetadata = await getMarketMetadataMap(onchain);
         writeJson(res, 200, {
           view,
+          metadata: marketMetadata[market] || null,
           data: engine.getMarketState(market, view),
         });
         return;
@@ -1198,7 +1505,7 @@ function buildHttpServer(airdrop: AirdropContext | null): http.Server {
           ? await enrichOwnerStateWithOnchain(
               owner,
               baseUserState,
-              airdrop,
+              onchain,
               view,
             )
           : baseUserState;
@@ -1221,7 +1528,7 @@ function buildHttpServer(airdrop: AirdropContext | null): http.Server {
           ? await enrichOwnerStateWithOnchain(
               owner,
               baseBalances,
-              airdrop,
+              onchain,
               view,
             )
           : baseBalances;
@@ -1298,8 +1605,12 @@ function buildHttpServer(airdrop: AirdropContext | null): http.Server {
         const view = parseView(url);
         const market = url.searchParams.get('market');
         const snapshot = engine.getSnapshot(view);
+        const marketMetadata = await getMarketMetadataMap(onchain);
         if (!market) {
-          writeJson(res, 200, snapshot);
+          writeJson(res, 200, {
+            ...snapshot,
+            market_metadata: marketMetadata,
+          });
           return;
         }
         const marketState = snapshot.markets[market] || null;
@@ -1313,6 +1624,7 @@ function buildHttpServer(airdrop: AirdropContext | null): http.Server {
           view,
           generated_ts_ms: snapshot.generated_ts_ms,
           market: marketState,
+          market_metadata: marketMetadata[market] || null,
           queue: queueState,
           users,
         });
@@ -1359,7 +1671,8 @@ async function main(): Promise<void> {
 
   replayEventLogIfPresent();
   await maybeBackfillProgramLogs(connection, programId);
-  const airdrop = await buildAirdropContext(connection, programId);
+  const onchain = await buildOnchainContext(connection, programId);
+  const airdrop = await buildAirdropContext(onchain);
 
   engine.subscribe((event) => {
     appendEventLog(event);
@@ -1374,7 +1687,7 @@ async function main(): Promise<void> {
     HARNESS_COMMITMENT,
   );
 
-  const server = buildHttpServer(airdrop);
+  const server = buildHttpServer(onchain, airdrop);
   const { host, port } = parseBindAddress(HARNESS_BIND_ADDR);
 
   setInterval(() => {
@@ -1384,11 +1697,11 @@ async function main(): Promise<void> {
   }, 15000);
 
   setInterval(() => {
-    runOnchainBalanceSanityCheck(airdrop).catch((err) => {
+    runOnchainBalanceSanityCheck(onchain).catch((err) => {
       console.warn(`onchain sanity check failed: ${err}`);
     });
   }, Math.max(1000, HARNESS_SANITY_INTERVAL_MS));
-  runOnchainBalanceSanityCheck(airdrop).catch((err) => {
+  runOnchainBalanceSanityCheck(onchain).catch((err) => {
     console.warn(`initial onchain sanity check failed: ${err}`);
   });
 
@@ -1396,6 +1709,11 @@ async function main(): Promise<void> {
     console.log(
       `Continuum state harness listening on http://${host}:${port}, mode=${HARNESS_MODE}, program=${programId.toBase58()}`,
     );
+    if (onchain?.groupPk && onchain.mangoClient) {
+      console.log(
+        `Onchain read context enabled: group=${onchain.groupPk.toBase58()}, usdc_mint=${onchain.usdcMint?.toBase58() || 'unresolved'}`,
+      );
+    }
     if (airdrop) {
       console.log(
         `USDC airdrop enabled: mint=${airdrop.usdcMint.toBase58()}, default_ui_amount=${airdrop.defaultUiAmount}`,

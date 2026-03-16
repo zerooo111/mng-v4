@@ -11,13 +11,14 @@ use crate::serum3_cpi::{
 };
 use crate::util::clock_now;
 use anchor_lang::prelude::*;
+use anchor_spl::token::accessor;
 
 use fixed::types::I80F48;
 use serum_dex::instruction::NewOrderInstructionV3;
 
 #[allow(clippy::too_many_arguments)]
-pub fn serum3_place_order(
-    ctx: Context<Serum3PlaceOrder>,
+pub fn serum3_place_order<'info>(
+    ctx: Context<'_, '_, '_, 'info, Serum3PlaceOrder<'info>>,
     side: Serum3Side,
     limit_price_lots: u64,
     max_base_qty: u64,
@@ -28,10 +29,39 @@ pub fn serum3_place_order(
     limit: u16,
     require_v2: bool,
 ) -> Result<()> {
+    const EXTRA_CPI_ACCOUNTS: usize = 8;
     // Also required by serum3's place order
     require_gt!(limit_price_lots, 0);
+    require_gte!(ctx.remaining_accounts.len(), EXTRA_CPI_ACCOUNTS);
+    let (health_remaining, cpi_remaining) = ctx
+        .remaining_accounts
+        .split_at(ctx.remaining_accounts.len() - EXTRA_CPI_ACCOUNTS);
+    let market_bids_ai = cpi_remaining[0].clone();
+    let market_asks_ai = cpi_remaining[1].clone();
+    let market_event_queue_ai = cpi_remaining[2].clone();
+    let market_request_queue_ai = cpi_remaining[3].clone();
+    let market_base_vault_ai = cpi_remaining[4].clone();
+    let market_quote_vault_ai = cpi_remaining[5].clone();
+    let payer_oracle_ai = cpi_remaining[6].clone();
+    let token_program_ai = cpi_remaining[7].clone();
 
-    let serum_market = ctx.accounts.serum_market.load()?;
+    require_keys_eq!(*token_program_ai.key, anchor_spl::token::ID);
+    require!(ctx.accounts.owner.is_signer, MangoError::SomeError);
+
+    let group_loader = AccountLoader::<Group>::try_from(&ctx.accounts.group.to_account_info())?;
+    let account_loader =
+        AccountLoader::<MangoAccountFixed>::try_from(&ctx.accounts.account.to_account_info())?;
+    let serum_market_loader =
+        AccountLoader::<Serum3Market>::try_from(&ctx.accounts.serum_market.to_account_info())?;
+    let payer_bank_loader =
+        AccountLoader::<Bank>::try_from(&ctx.accounts.payer_bank.to_account_info())?;
+    let serum_market = serum_market_loader.load()?;
+    require_keys_eq!(serum_market.group, ctx.accounts.group.key());
+    require_keys_eq!(serum_market.serum_program, ctx.accounts.serum_program.key());
+    require_keys_eq!(
+        serum_market.serum_market_external,
+        ctx.accounts.serum_market_external.key()
+    );
     require!(
         !serum_market.is_reduce_only(),
         MangoError::MarketInReduceOnlyMode
@@ -43,7 +73,9 @@ pub fn serum3_place_order(
     let receiver_token_index;
     let payer_token_index;
     {
-        let account = ctx.accounts.account.load_full()?;
+        let account = account_loader.load_full()?;
+        require_keys_eq!(account.fixed.group, ctx.accounts.group.key());
+        require!(account.fixed.is_operational(), MangoError::AccountIsFrozen);
         // account constraint #1
         require!(
             account.fixed.is_owner_or_delegate(ctx.accounts.owner.key()),
@@ -60,8 +92,10 @@ pub fn serum3_place_order(
         );
 
         // Validate bank and vault #3
-        let payer_bank = ctx.accounts.payer_bank.load()?;
+        let payer_bank = payer_bank_loader.load()?;
+        require_keys_eq!(payer_bank.group, ctx.accounts.group.key());
         require_keys_eq!(payer_bank.vault, ctx.accounts.payer_vault.key());
+        require_keys_eq!(payer_bank.oracle, *payer_oracle_ai.key);
         payer_token_index = match side {
             Serum3Side::Bid => serum_market.quote_token_index,
             Serum3Side::Ask => serum_market.base_token_index,
@@ -77,10 +111,10 @@ pub fn serum3_place_order(
     //
     // Pre-health computation
     //
-    let mut account = ctx.accounts.account.load_full_mut()?;
+    let mut account = account_loader.load_full_mut()?;
     let (now_ts, now_slot) = clock_now();
     let retriever = new_fixed_order_account_retriever_with_optional_banks(
-        ctx.remaining_accounts,
+        health_remaining,
         &account.borrow(),
         now_slot,
     )?;
@@ -131,7 +165,7 @@ pub fn serum3_place_order(
     //
     let is_v2_instruction;
     {
-        let group = ctx.accounts.group.load()?;
+        let group = group_loader.load()?;
         let v1_available = group.is_ix_enabled(IxGate::Serum3PlaceOrder);
         let v2_available = group.is_ix_enabled(IxGate::Serum3PlaceOrderV2);
         is_v2_instruction =
@@ -153,7 +187,7 @@ pub fn serum3_place_order(
     // Before-order tracking
     //
 
-    let before_vault = ctx.accounts.payer_vault.amount;
+    let before_vault = accessor::amount(&ctx.accounts.payer_vault.to_account_info())?;
 
     let before_oo_free_slots;
     let before_had_bids;
@@ -213,7 +247,17 @@ pub fn serum3_place_order(
         limit,
         max_ts: i64::MAX,
     };
-    cpi_place_order(ctx.accounts, order)?;
+    cpi_place_order(
+        ctx.accounts,
+        order,
+        &market_request_queue_ai,
+        &market_event_queue_ai,
+        &market_bids_ai,
+        &market_asks_ai,
+        &market_base_vault_ai,
+        &market_quote_vault_ai,
+        &token_program_ai,
+    )?;
 
     //
     // After-order tracking
@@ -291,13 +335,12 @@ pub fn serum3_place_order(
         referrer_rebates_accrued: after_oo.native_rebates(),
     });
 
-    ctx.accounts.payer_vault.reload()?;
-    let after_vault = ctx.accounts.payer_vault.amount;
+    let after_vault = accessor::amount(&ctx.accounts.payer_vault.to_account_info())?;
 
     // Placing an order cannot increase vault balance
     require_gte!(before_vault, after_vault);
 
-    let mut payer_bank = ctx.accounts.payer_bank.load_mut()?;
+    let mut payer_bank = payer_bank_loader.load_mut()?;
 
     // Update the potential token tracking in banks
     // (for init weight scaling, deposit limit checks)
@@ -341,7 +384,7 @@ pub fn serum3_place_order(
     }
 
     // Payer bank safety checks like reduce-only, net borrows, vault-to-deposits ratio
-    let payer_oracle_ref = &AccountInfoRef::borrow(&ctx.accounts.payer_oracle)?;
+    let payer_oracle_ref = &AccountInfoRef::borrow(&payer_oracle_ai)?;
     let payer_bank_oracle =
         payer_bank.oracle_price(&OracleAccountInfos::from_reader(payer_oracle_ref), None)?;
     let withdrawn_from_vault = I80F48::from(before_vault - after_vault);
@@ -743,20 +786,31 @@ fn update_bank_potential_tokens(
     serum_orders.potential_quote_tokens = new_quote;
 }
 
-fn cpi_place_order(ctx: &Serum3PlaceOrder, order: NewOrderInstructionV3) -> Result<()> {
+fn cpi_place_order<'info>(
+    ctx: &Serum3PlaceOrder<'info>,
+    order: NewOrderInstructionV3,
+    market_request_queue_ai: &AccountInfo<'info>,
+    market_event_queue_ai: &AccountInfo<'info>,
+    market_bids_ai: &AccountInfo<'info>,
+    market_asks_ai: &AccountInfo<'info>,
+    market_base_vault_ai: &AccountInfo<'info>,
+    market_quote_vault_ai: &AccountInfo<'info>,
+    token_program_ai: &AccountInfo<'info>,
+) -> Result<()> {
     use crate::serum3_cpi;
 
-    let group = ctx.group.load()?;
+    let group_loader = AccountLoader::<Group>::try_from(&ctx.group.to_account_info())?;
+    let group = group_loader.load()?;
     serum3_cpi::PlaceOrder {
         program: ctx.serum_program.to_account_info(),
         market: ctx.serum_market_external.to_account_info(),
-        request_queue: ctx.market_request_queue.to_account_info(),
-        event_queue: ctx.market_event_queue.to_account_info(),
-        bids: ctx.market_bids.to_account_info(),
-        asks: ctx.market_asks.to_account_info(),
-        base_vault: ctx.market_base_vault.to_account_info(),
-        quote_vault: ctx.market_quote_vault.to_account_info(),
-        token_program: ctx.token_program.to_account_info(),
+        request_queue: market_request_queue_ai.clone(),
+        event_queue: market_event_queue_ai.clone(),
+        bids: market_bids_ai.clone(),
+        asks: market_asks_ai.clone(),
+        base_vault: market_base_vault_ai.clone(),
+        quote_vault: market_quote_vault_ai.clone(),
+        token_program: token_program_ai.clone(),
 
         open_orders: ctx.open_orders.to_account_info(),
         order_payer_token_account: ctx.payer_vault.to_account_info(),

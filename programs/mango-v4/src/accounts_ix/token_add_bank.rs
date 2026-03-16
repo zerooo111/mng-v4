@@ -1,5 +1,5 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{Mint, Token, TokenAccount};
+use anchor_spl::token::{Mint, Token};
 
 use crate::error::*;
 use crate::state::*;
@@ -29,25 +29,21 @@ pub struct TokenAddBank<'info> {
     )]
     pub existing_bank: AccountLoader<'info, Bank>,
 
+    /// CHECK: Fresh PDA account created and initialized in the instruction body.
     #[account(
-        init,
-        // using the token_index in this seed guards against reusing it
+        mut,
         seeds = [b"Bank".as_ref(), group.key().as_ref(), &token_index.to_le_bytes(), &bank_num.to_le_bytes()],
         bump,
-        payer = payer,
-        space = 8 + std::mem::size_of::<Bank>(),
     )]
-    pub bank: AccountLoader<'info, Bank>,
+    pub bank: UncheckedAccount<'info>,
 
+    /// CHECK: Fresh PDA SPL token account created and initialized in the instruction body.
     #[account(
-        init,
+        mut,
         seeds = [b"Vault".as_ref(), group.key().as_ref(), &token_index.to_le_bytes(), &bank_num.to_le_bytes()],
         bump,
-        token::authority = group,
-        token::mint = mint,
-        payer = payer
     )]
-    pub vault: Account<'info, TokenAccount>,
+    pub vault: UncheckedAccount<'info>,
 
     #[account(
         mut,
@@ -62,5 +58,4 @@ pub struct TokenAddBank<'info> {
 
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
-    pub rent: Sysvar<'info, Rent>,
 }

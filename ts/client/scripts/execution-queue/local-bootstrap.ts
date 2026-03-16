@@ -9,11 +9,12 @@ import path from 'path';
 import { MangoClient } from '../../src/client';
 import { MANGO_V4_ID } from '../../src/constants';
 import { EXECUTION_QUEUE_ACCOUNT_SPACE } from '../../src/executionQueueLayout';
+import { defaultClusterUrl } from './scriptEnv';
 
 dotenv.config();
 
 const CLUSTER: Cluster = (process.env.CLUSTER_OVERRIDE as Cluster) || 'devnet';
-const CLUSTER_URL = process.env.CLUSTER_URL_OVERRIDE || 'http://127.0.0.1:8899';
+const CLUSTER_URL = process.env.CLUSTER_URL_OVERRIDE || defaultClusterUrl();
 const PAYER_KEYPAIR =
   process.env.CTM_RELAYER_PAYER_KEYPAIR ||
   process.env.MB_PAYER_KEYPAIR ||
