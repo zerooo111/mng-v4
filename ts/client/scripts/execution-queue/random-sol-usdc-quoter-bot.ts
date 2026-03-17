@@ -14,6 +14,7 @@ import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 import {
   PerpMarketIndex,
+  PerpMarket,
   PerpOrderSide,
   PerpOrderType,
   PerpSelfTradeBehavior,
@@ -115,10 +116,14 @@ const CLUSTER_WS_URL_OVERRIDE =
 const RELAYER_ADDR_OVERRIDE = process.env.CTM_RELAYER_ADDR;
 const COMMITMENT: Commitment =
   (process.env.QUOTER_COMMITMENT as Commitment) || 'confirmed';
-const INTERVAL_MS = Number(process.env.QUOTER_INTERVAL_MS || '5000');
+const INTERVAL_MS = Number(process.env.QUOTER_INTERVAL_MS || '2000');
 const PRICE_RANGE_BPS = Number(process.env.QUOTER_PRICE_RANGE_BPS || '200');
 const SIZE_MIN_SOL = Number(process.env.QUOTER_SIZE_MIN_SOL || '1');
 const SIZE_MAX_SOL = Number(process.env.QUOTER_SIZE_MAX_SOL || '3');
+const ORDER_EXPIRY_SECS = Number(process.env.QUOTER_ORDER_EXPIRY_SECS || '120');
+const CLOSE_POSITION_PROBABILITY_BPS = Number(
+  process.env.QUOTER_CLOSE_POSITION_PROBABILITY_BPS || '1000',
+);
 const MIN_EXECUTE_SLOT_OFFSET = BigInt(
   process.env.QUOTER_MIN_EXECUTE_SLOT_OFFSET || '1',
 );
@@ -269,6 +274,66 @@ function randomQuotePrice(
   const multiplier =
     side === PerpOrderSide.bid ? 1 - fraction : 1 + fraction;
   return Number((referencePrice * multiplier).toFixed(4));
+}
+
+function aggressiveClosePrice(
+  referencePrice: number,
+  side: PerpOrderSide,
+): number {
+  const fraction = PRICE_RANGE_BPS / 10_000;
+  const multiplier =
+    side === PerpOrderSide.bid ? 1 + fraction : 1 - fraction;
+  return Number((referencePrice * multiplier).toFixed(4));
+}
+
+function shouldAttemptClosePosition(): boolean {
+  return Math.random() < CLOSE_POSITION_PROBABILITY_BPS / 10_000;
+}
+
+function orderExpiryTimestampSec(nowMs: number): number {
+  return Math.floor(nowMs / 1000) + ORDER_EXPIRY_SECS;
+}
+
+function getCloseOrderPlan(params: {
+  mangoAccount: Awaited<ReturnType<MangoClient['getMangoAccount']>>;
+  marketIndex: PerpMarketIndex;
+  perpMarket: PerpMarket;
+  referencePrice: number;
+}):
+  | {
+      side: PerpOrderSide;
+      sizeSol: number;
+      quotePrice: number;
+      maxQuoteQty: number;
+    }
+  | null {
+  const position = params.mangoAccount.getPerpPosition(params.marketIndex);
+  if (!position || position.basePositionLots.isZero()) {
+    return null;
+  }
+
+  const basePositionUi = Math.abs(
+    params.perpMarket.baseLotsToUi(position.basePositionLots),
+  );
+  if (!Number.isFinite(basePositionUi) || basePositionUi <= 0) {
+    return null;
+  }
+
+  const side =
+    position.basePositionLots.gt(new BN(0))
+      ? PerpOrderSide.ask
+      : PerpOrderSide.bid;
+  const quotePrice = aggressiveClosePrice(params.referencePrice, side);
+  const maxQuoteQty = Number(
+    (quotePrice * basePositionUi * QUOTE_BUDGET_MULTIPLIER).toFixed(6),
+  );
+
+  return {
+    side,
+    sizeSol: basePositionUi,
+    quotePrice,
+    maxQuoteQty,
+  };
 }
 
 function sleep(ms: number): Promise<void> {
@@ -494,6 +559,18 @@ async function main(): Promise<void> {
   if (SIZE_MIN_SOL <= 0 || SIZE_MAX_SOL < SIZE_MIN_SOL) {
     throw new Error('invalid QUOTER_SIZE_MIN_SOL / QUOTER_SIZE_MAX_SOL');
   }
+  if (!Number.isInteger(ORDER_EXPIRY_SECS) || ORDER_EXPIRY_SECS <= 0) {
+    throw new Error('QUOTER_ORDER_EXPIRY_SECS must be an integer > 0');
+  }
+  if (
+    !Number.isFinite(CLOSE_POSITION_PROBABILITY_BPS) ||
+    CLOSE_POSITION_PROBABILITY_BPS < 0 ||
+    CLOSE_POSITION_PROBABILITY_BPS > 10_000
+  ) {
+    throw new Error(
+      'QUOTER_CLOSE_POSITION_PROBABILITY_BPS must be in [0, 10000]',
+    );
+  }
   if (!Number.isFinite(COINGECKO_REFRESH_MS) || COINGECKO_REFRESH_MS <= 0) {
     throw new Error('QUOTER_COINGECKO_REFRESH_MS must be > 0');
   }
@@ -611,6 +688,8 @@ async function main(): Promise<void> {
       relayerAddr,
       intervalMs: INTERVAL_MS,
       priceRangeBps: PRICE_RANGE_BPS,
+      orderExpirySecs: ORDER_EXPIRY_SECS,
+      closePositionProbabilityBps: CLOSE_POSITION_PROBABILITY_BPS,
       sizeMinSol: SIZE_MIN_SOL,
       sizeMaxSol: SIZE_MAX_SOL,
       referencePrice: {
@@ -715,6 +794,8 @@ async function main(): Promise<void> {
         botDispatchMode: BOT_DISPATCH_MODE,
         priceRangeBps: PRICE_RANGE_BPS,
         minExecuteSlotOffset: MIN_EXECUTE_SLOT_OFFSET.toString(),
+        orderExpirySecs: ORDER_EXPIRY_SECS,
+        closePositionProbabilityBps: CLOSE_POSITION_PROBABILITY_BPS,
       },
     };
     const reportPath = path.resolve(REPORT_PATH);
@@ -815,7 +896,14 @@ async function main(): Promise<void> {
       const botsForTick = selectBotsForTick(bots, currentTick);
 
       const runBotTick = async (bot: BotRuntime) => {
-        const mangoAccount = bot.mangoAccount;
+        const nowMs = Date.now();
+        const shouldClosePosition = shouldAttemptClosePosition();
+        const mangoAccount = shouldClosePosition
+          ? await bot.client.getMangoAccount(bot.mangoAccountPk)
+          : bot.mangoAccount;
+        if (shouldClosePosition) {
+          bot.mangoAccount = mangoAccount;
+        }
         const perpMarket = bot.group.getPerpMarketByMarketIndex(marketIndex);
         const canonicalRemainingAccounts =
           await executionQueueCanonicalPerpRemainingAccounts({
@@ -868,24 +956,40 @@ async function main(): Promise<void> {
           }
         }
 
-        const sizeSol = randomSizeSol();
-        const quotePrice = randomQuotePrice(referencePrice, bot.side);
-        const maxQuoteQty = Number((quotePrice * sizeSol * QUOTE_BUDGET_MULTIPLIER).toFixed(6));
+        const closePlan = shouldClosePosition
+          ? getCloseOrderPlan({
+              mangoAccount,
+              marketIndex,
+              perpMarket,
+              referencePrice,
+            })
+          : null;
+        const action = closePlan ? 'close-position' : 'quote';
+        const side = closePlan ? closePlan.side : bot.side;
+        const sizeSol = closePlan ? closePlan.sizeSol : randomSizeSol();
+        const quotePrice = closePlan
+          ? closePlan.quotePrice
+          : randomQuotePrice(referencePrice, side);
+        const maxQuoteQty = closePlan
+          ? closePlan.maxQuoteQty
+          : Number((quotePrice * sizeSol * QUOTE_BUDGET_MULTIPLIER).toFixed(6));
         const clientOrderId = Date.now() * 1000 + Math.floor(Math.random() * 1000);
         // Record the intended client id before submit so pipelined ticks can issue
         // a targeted cancel on the next cycle without waiting for the place RPC to return.
         bot.lastPlacedClientOrderId = clientOrderId;
 
         const payload = encodePerpPlaceOrderV2QueuePayload({
-          side: bot.side,
+          side,
           priceLots: BigInt(perpMarket.uiPriceToLots(quotePrice).toString()),
           maxBaseLots: BigInt(perpMarket.uiBaseToLots(sizeSol).toString()),
           maxQuoteLots: BigInt(perpMarket.uiQuoteToLots(maxQuoteQty).toString()),
           clientOrderId,
-          orderType: PerpOrderType.limit,
+          orderType: closePlan
+            ? PerpOrderType.immediateOrCancel
+            : PerpOrderType.limit,
           selfTradeBehavior: PerpSelfTradeBehavior.decrementTake,
-          reduceOnly: false,
-          expiryTimestamp: 0,
+          reduceOnly: !!closePlan,
+          expiryTimestamp: orderExpiryTimestampSec(nowMs),
           limit: ORDER_LIMIT,
         });
 
@@ -908,7 +1012,8 @@ async function main(): Promise<void> {
             JSON.stringify({
               ts: new Date().toISOString(),
               bot: bot.name,
-              side: sideToString(bot.side),
+              action,
+              side: sideToString(side),
               referencePrice,
               referenceSource,
               quotePrice,

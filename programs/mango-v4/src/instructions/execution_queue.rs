@@ -790,14 +790,11 @@ fn queue_health_region_begin(
         dispatch_accounts.len() > spec.account_index,
         MangoError::ExecutionQueueDispatchAccountLayoutInvalid
     );
-    let account = AccountLoader::<MangoAccountFixed>::try_from(&dispatch_accounts[spec.account_index])
-        .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?;
+    let account =
+        AccountLoader::<MangoAccountFixed>::try_from(&dispatch_accounts[spec.account_index])
+            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?;
     let mut account = account.load_full_mut()?;
-    require!(
-        !account.fixed.is_in_health_region(),
-        MangoError::SomeError
-    );
-    account.fixed.set_in_health_region(true);
+    require!(!account.fixed.is_in_health_region(), MangoError::SomeError);
 
     let group = account.fixed.group;
     let health_accounts = if dispatch_accounts.len() > spec.health_accounts_start {
@@ -805,11 +802,12 @@ fn queue_health_region_begin(
     } else {
         &[]
     };
-    let account_retriever =
-        ScanningAccountRetriever::new(health_accounts, &group).context("create account retriever")?;
+    let account_retriever = ScanningAccountRetriever::new(health_accounts, &group)
+        .context("create account retriever")?;
     let now_ts: u64 = Clock::get()?.unix_timestamp.try_into().unwrap();
     let health_cache = new_health_cache(&account.borrow(), &account_retriever, now_ts)?;
     let pre_init_health = account.check_health_pre(&health_cache)?;
+    account.fixed.set_in_health_region(true);
     account.fixed.health_region_begin_init_health = pre_init_health.ceil().to_num();
     Ok(())
 }
@@ -822,11 +820,11 @@ fn queue_health_region_end(
         dispatch_accounts.len() > spec.account_index,
         MangoError::ExecutionQueueDispatchAccountLayoutInvalid
     );
-    let account = AccountLoader::<MangoAccountFixed>::try_from(&dispatch_accounts[spec.account_index])
-        .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?;
+    let account =
+        AccountLoader::<MangoAccountFixed>::try_from(&dispatch_accounts[spec.account_index])
+            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?;
     let mut account = account.load_full_mut()?;
     require!(account.fixed.is_in_health_region(), MangoError::SomeError);
-    account.fixed.set_in_health_region(false);
 
     let group = account.fixed.group;
     let health_accounts = if dispatch_accounts.len() > spec.health_accounts_start {
@@ -834,12 +832,13 @@ fn queue_health_region_end(
     } else {
         &[]
     };
-    let account_retriever =
-        ScanningAccountRetriever::new(health_accounts, &group).context("create account retriever")?;
+    let account_retriever = ScanningAccountRetriever::new(health_accounts, &group)
+        .context("create account retriever")?;
     let now_ts: u64 = Clock::get()?.unix_timestamp.try_into().unwrap();
     let health_cache = new_health_cache(&account.borrow(), &account_retriever, now_ts)?;
     let pre_init_health = I80F48::from(account.fixed.health_region_begin_init_health);
     account.check_health_post(&health_cache, pre_init_health)?;
+    account.fixed.set_in_health_region(false);
     account.fixed.health_region_begin_init_health = 0;
     Ok(())
 }
@@ -1281,7 +1280,21 @@ pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u
 
         if active_health_region.is_none() {
             if let Some(spec) = queue_health_region_spec(decoded_payload.variant) {
-                queue_health_region_begin(dispatch_accounts, spec)?;
+                if queue_health_region_begin(dispatch_accounts, spec).is_err() {
+                    let mut queue = ctx.accounts.execution_queue.load_mut()?;
+                    if candidate.is_ctm {
+                        queue.clear_ctm_item_at(candidate.sequence);
+                    } else {
+                        let _ = queue.pop_liquidity_head();
+                    }
+                    emit!(QueueItemProcessed {
+                        group: ctx.accounts.group.key(),
+                        sequence: candidate.sequence,
+                        kind: candidate.kind,
+                        status: QueueItemStatus::Failed as u8,
+                    });
+                    continue;
+                }
                 active_health_region = Some(spec);
             }
         }
@@ -1469,19 +1482,21 @@ pub fn execution_queue_execute_multi(
             let queue = ctx.accounts.execution_queue.load_mut()?;
             let mut found_candidate: Option<(usize, ExecutableCandidate)> = None;
             for (li, lh) in lane_hashes.iter().enumerate() {
-                if let Some((match_seq, match_item)) = queue.find_matching_ctm_item(
-                    lh,
-                    EXECUTION_QUEUE_GAP_SKIP_LIMIT_PER_EXECUTE * 4,
-                ) {
+                if let Some((match_seq, match_item)) =
+                    queue.find_matching_ctm_item(lh, EXECUTION_QUEUE_GAP_SKIP_LIMIT_PER_EXECUTE * 4)
+                {
                     let payload_len = match_item.payload_len as usize;
-                    found_candidate = Some((li, ExecutableCandidate {
-                        sequence: match_seq,
-                        kind: match_item.kind,
-                        payload: match_item.payload[..payload_len].to_vec(),
-                        accounts_hash: match_item.accounts_hash,
-                        retries: match_item.retries,
-                        is_ctm: true,
-                    }));
+                    found_candidate = Some((
+                        li,
+                        ExecutableCandidate {
+                            sequence: match_seq,
+                            kind: match_item.kind,
+                            payload: match_item.payload[..payload_len].to_vec(),
+                            accounts_hash: match_item.accounts_hash,
+                            retries: match_item.retries,
+                            is_ctm: true,
+                        },
+                    ));
                     break;
                 }
             }
@@ -1533,11 +1548,36 @@ pub fn execution_queue_execute_multi(
                 Some((active_lane, active_spec)) if active_lane != lane_idx => {
                     // End current health region and start new one for this lane
                     queue_health_region_end(lane_slices[active_lane], active_spec)?;
-                    queue_health_region_begin(dispatch_accounts, spec)?;
+                    if queue_health_region_begin(dispatch_accounts, spec).is_err() {
+                        let mut queue = ctx.accounts.execution_queue.load_mut()?;
+                        if candidate.is_ctm {
+                            queue.clear_ctm_item_at(candidate.sequence);
+                        }
+                        emit!(QueueItemProcessed {
+                            group: group_key,
+                            sequence: candidate.sequence,
+                            kind: candidate.kind,
+                            status: QueueItemStatus::Failed as u8,
+                        });
+                        active_health_region = None;
+                        continue;
+                    }
                     active_health_region = Some((lane_idx, spec));
                 }
                 None => {
-                    queue_health_region_begin(dispatch_accounts, spec)?;
+                    if queue_health_region_begin(dispatch_accounts, spec).is_err() {
+                        let mut queue = ctx.accounts.execution_queue.load_mut()?;
+                        if candidate.is_ctm {
+                            queue.clear_ctm_item_at(candidate.sequence);
+                        }
+                        emit!(QueueItemProcessed {
+                            group: group_key,
+                            sequence: candidate.sequence,
+                            kind: candidate.kind,
+                            status: QueueItemStatus::Failed as u8,
+                        });
+                        continue;
+                    }
                     active_health_region = Some((lane_idx, spec));
                 }
                 _ => {} // Same lane, keep existing health region

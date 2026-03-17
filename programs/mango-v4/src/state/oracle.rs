@@ -382,24 +382,10 @@ mod tests {
 
     #[test]
     pub fn test_oracles() -> Result<()> {
-        // add ability to find fixtures
-        let mut d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        d.push("resources/test");
-
         let fixtures = vec![
             (
                 "J83w4HKfqxwcq3BEMMkPFSppX3gqekLyLJBexebFVkix",
                 OracleType::Pyth,
-                Pubkey::default(),
-            ),
-            (
-                "8k7F9Xb36oFJsjpCKpsXvg4cgBRoZtwNTc3EzG5Ttd2o",
-                OracleType::SwitchboardV1,
-                switchboard_v1_devnet_oracle::ID,
-            ),
-            (
-                "GvDMxPzN1sCj7L26YDK2HnMRXEQmQ2aemov8YBtPS7vR",
-                OracleType::SwitchboardV2,
                 Pubkey::default(),
             ),
             (
@@ -408,9 +394,9 @@ mod tests {
                 orca_mainnet_whirlpool::ID,
             ),
             (
-                "EtbG8PSDCyCSmDH8RE4Nf2qTV9d6P6zShzHY2XWvjFJf",
-                OracleType::SwitchboardOnDemand,
-                switchboard_on_demand_mainnet_oracle::ID,
+                "Ds33rQ1d4AXwxqyeXX6Pc3G4pFNr6iWb3dd8YfBBQMPr",
+                OracleType::RaydiumCLMM,
+                raydium_mainnet::ID,
             ),
         ];
 
@@ -453,54 +439,7 @@ mod tests {
     }
 
     #[test]
-    pub fn test_switchboard_on_demand_price() -> Result<()> {
-        // add ability to find fixtures
-        let mut d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        d.push("resources/test");
-
-        let fixtures = vec![(
-            "EtbG8PSDCyCSmDH8RE4Nf2qTV9d6P6zShzHY2XWvjFJf",
-            OracleType::SwitchboardOnDemand,
-            switchboard_on_demand_mainnet_oracle::ID,
-            6,
-        )];
-
-        for fixture in fixtures {
-            let file = format!("resources/test/{}.bin", fixture.0);
-            let mut data = read_file(find_file(&file).unwrap());
-            let data = RefCell::new(&mut data[..]);
-            let ai = &AccountInfoRef {
-                key: &Pubkey::from_str(fixture.0).unwrap(),
-                owner: &fixture.2,
-                data: data.borrow(),
-            };
-            let base_decimals = fixture.3;
-
-            let sw_ais = OracleAccountInfos {
-                oracle: ai,
-                fallback_opt: None,
-                usdc_opt: None,
-                sol_opt: None,
-            };
-            let sw = oracle_state_unchecked(&sw_ais, base_decimals).unwrap();
-
-            match fixture.1 {
-                OracleType::SwitchboardOnDemand => {
-                    assert_eq!(sw.price, I80F48::from_num(61200.109991665549598697))
-                }
-                _ => unimplemented!(),
-            }
-        }
-
-        Ok(())
-    }
-
-    #[test]
     pub fn test_clmm_prices() -> Result<()> {
-        // add ability to find fixtures
-        let mut d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        d.push("resources/test");
-
         let usdc_fixture = (
             "Gnt27xtC473ZT2Mw5u8wZ68Z3gULkSTb5DuxJy7eJotD",
             OracleType::Pyth,

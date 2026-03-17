@@ -17,6 +17,20 @@
   - This still needs server-side investigation in the Rust relayer / execution-engine sequence reconciliation path.
   - Repeated duplicate-sequence aborts on devnet should be treated as a relayer reliability issue, not as normal frontend behavior.
 
+### 2) `startup_all_local.sh restart` is the wrong tool for relayer-only fixes on devnet
+- Symptom:
+  - A relayer-only debugging change was followed by `./startup_all_local.sh restart`, which stopped the whole stack and re-entered the full restart path.
+  - On devnet, this also risks unnecessary bootstrap work and RPC churn if `SKIP_BOOTSTRAP` is not set explicitly.
+- Root cause:
+  - `restart` always executes the full `restart_all()` flow, not a scoped relayer restart.
+  - `SKIP_BOOTSTRAP=1` only short-circuits `bootstrap_local_state()`; it does not make `restart` relayer-only.
+- Fix:
+  - Devnet now defaults `SKIP_BOOTSTRAP=1` in [startup_all_local.sh](/home/ec2-user/stagin4/startup_all_local.sh) unless explicitly overridden.
+  - For relayer-only code changes, rebuild the relayer binary and restart only the relayer screen session instead of using the full launcher restart path.
+- Restart rule:
+  - Use full `restart` only when the whole devnet stack really needs to be cycled.
+  - For executor/relayer iteration, keep harness/frontend/nginx up and restart only the relayer process.
+
 ## 2026-03-13
 
 ### 1) Stale generated config after validator reset can restart services against dead accounts

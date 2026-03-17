@@ -1,0 +1,39 @@
+{
+  "cluster": "devnet",
+  "clusterUrl": "https://devnet.helius-rpc.com/?api-key=6475b77b-7c5f-48b4-88f0-4879d4af73cb",
+  "programId": "7ftfLAYEtDrz8xjhaqa6wUYMrjrmbZ3tjw7J7Rb3QA37",
+  "groupNum": 9121,
+  "group": "ETeadYXpyxEP4icqfUzwKaXdmLoh6AurpBJzsF9RbW5P",
+  "executionQueue": "Bm2zdLqzrBAuT8ZnmUCv94cv1VmVRmB9KfKM3FeSzacZ",
+  "executionQueueBuffer": "Bm2zdLqzrBAuT8ZnmUCv94cv1VmVRmB9KfKM3FeSzacZ",
+  "ctmSigner": "4zDJ8FiJu7A3ZHjCwdKF2JPyLYheFRpGVvCvHS32XnhM",
+  "usdcMint": "C59fi4wkiEUFEUvHCrZUstTry1yopAXRqXTp211PvTpj",
+  "solMint": "5RAJCzwjNTuFahxK4ns5PEqjVKpMEC3YHjvV77DhidZj",
+  "usdcOracle": "CL9Ru8qDfP5YriWKD6npbez6DNuLMDVq92GMEBotQbQL",
+  "solOracle": "7CrcrUCkTTQ685UA4xJUH1ogw6To5aB1kuXGZyH1mrK7",
+  "perpMarketIndex": 0,
+  "maker": {
+    "keypairPath": "/home/ec2-user/stagin4/mng-v4/keypairs/execution-queue-maker.json",
+    "owner": "9p74BNtmhvNiJuat8QLTPXbjMjcxaTZAaGPu3FNx26yg",
+    "mangoAccount": "26D9z3tExFNzCtHnUEoi6EzR4KtEE2yte2z5M7ziNBzg",
+    "usdcAta": "ECGhrcvkVHZJCD6bYSP8zLZMEszN3dMxYKv37gNAz4xx"
+  },
+  "taker": {
+    "keypairPath": "/home/ec2-user/stagin4/mng-v4/keypairs/execution-queue-taker.json",
+    "owner": "H5VJ8yV3hsEZBfrzZcHVsUEic64rpZhUnVze8VakkrdK",
+    "mangoAccount": "2ZvcJKVB8TXCXTyjmAccMP5JThwaMew2M1HYNhctKn2A",
+    "usdcAta": "GQdDtCA4SAEiTaCWMWYb331PSkjWY1MAFBfRb9NRaYPH"
+  },
+  "relayer": {
+    "bindAddr": "127.0.0.1:9090",
+    "payerKeypairPath": "/home/ec2-user/.config/solana/id.json",
+    "ctmKeypairPath": "/home/ec2-user/.config/solana/id.json",
+    "sequenceStatePath": "/tmp/ctm-sequences-9121.json"
+  },
+  "cranker": {
+    "keypairPath": "/home/ec2-user/.config/solana/id.json",
+    "laneConfigPath": "/home/ec2-user/stagin4/mng-v4/.devnet/run/execution-queue-lanes-9121.json",
+    "maxItems": 8,
+    "intervalMs": 1000
+  }
+}

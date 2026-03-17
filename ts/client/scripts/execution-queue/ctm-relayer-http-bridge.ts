@@ -272,6 +272,7 @@ async function fetchCandles(
         price
       FROM ${TSDB_TABLE}
       WHERE market = $2
+        AND source <> 'frontend-intent'
         AND ts >= to_timestamp($3::double precision / 1000.0)
         AND ts <= to_timestamp($4::double precision / 1000.0)
     ),

@@ -360,3 +360,106 @@ impl ExecutionQueue {
         self.push_liquidity(item)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_queue() -> ExecutionQueue {
+        let mut queue: ExecutionQueue = unsafe { std::mem::zeroed() };
+        queue.init(
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            1,
+        );
+        queue
+    }
+
+    fn pending_ctm_item(sequence: u64, accounts_hash_seed: u8) -> QueueItem {
+        let mut item = QueueItem::default();
+        item.sequence = sequence;
+        item.kind = QueueItemKind::CtmWrapped as u8;
+        item.status = QueueItemStatus::Pending as u8;
+        item.accounts_hash = [accounts_hash_seed; 32];
+        item
+    }
+
+    fn pending_liquidity_item(sequence: u64, kind: QueueItemKind) -> QueueItem {
+        let mut item = QueueItem::default();
+        item.sequence = sequence;
+        item.kind = kind as u8;
+        item.status = QueueItemStatus::Pending as u8;
+        item
+    }
+
+    #[test]
+    fn push_ctm_rejects_duplicate_pending_sequence() {
+        let mut queue = test_queue();
+        queue.push_ctm(pending_ctm_item(0, 1)).unwrap();
+
+        let result = queue.push_ctm(pending_ctm_item(0, 2));
+        assert!(result.is_err());
+        assert_eq!(queue.header.ctm_count, 1);
+        assert_eq!(queue.header.total_count, 1);
+    }
+
+    #[test]
+    fn clear_ctm_item_at_advances_across_front_gaps() {
+        let mut queue = test_queue();
+        queue.push_ctm(pending_ctm_item(0, 1)).unwrap();
+        queue.push_ctm(pending_ctm_item(1, 2)).unwrap();
+        queue.push_ctm(pending_ctm_item(2, 3)).unwrap();
+        queue.header.max_seen_sequence = 2;
+
+        queue.clear_ctm_item_at(1);
+        assert_eq!(queue.header.next_sequence_to_execute, 0);
+        assert_eq!(queue.header.ctm_count, 2);
+        assert_eq!(queue.header.total_count, 2);
+
+        queue.clear_ctm_item_at(0);
+        assert_eq!(queue.header.next_sequence_to_execute, 2);
+        assert_eq!(queue.header.ctm_count, 1);
+        assert_eq!(queue.header.total_count, 1);
+        assert_eq!(queue.current_ctm_head().unwrap().sequence, 2);
+    }
+
+    #[test]
+    fn find_matching_ctm_item_respects_hash_and_scan_limit() {
+        let mut queue = test_queue();
+        queue.push_ctm(pending_ctm_item(0, 1)).unwrap();
+        queue.push_ctm(pending_ctm_item(3, 9)).unwrap();
+        queue.header.max_seen_sequence = 3;
+
+        assert!(queue.find_matching_ctm_item(&[9; 32], 2).is_none());
+
+        let (sequence, item) = queue.find_matching_ctm_item(&[9; 32], 4).unwrap();
+        assert_eq!(sequence, 3);
+        assert_eq!(item.accounts_hash, [9; 32]);
+    }
+
+    #[test]
+    fn rotate_liquidity_head_with_retry_preserves_fifo_order() {
+        let mut queue = test_queue();
+        queue
+            .push_liquidity(pending_liquidity_item(7, QueueItemKind::LiquidityDeposit))
+            .unwrap();
+        queue
+            .push_liquidity(pending_liquidity_item(8, QueueItemKind::LiquidityWithdraw))
+            .unwrap();
+
+        queue.rotate_liquidity_head_with_retry(50, 3, 7).unwrap();
+
+        let head = queue.liquidity_head_item().unwrap();
+        assert_eq!(head.sequence, 8);
+        assert_eq!(head.kind, QueueItemKind::LiquidityWithdraw as u8);
+
+        let first = queue.pop_liquidity_head().unwrap();
+        let second = queue.pop_liquidity_head().unwrap();
+        assert_eq!(first.sequence, 8);
+        assert_eq!(second.sequence, 7);
+        assert_eq!(second.retries, 3);
+        assert_eq!(second.first_failure_slot, 50);
+        assert_eq!(second.min_execute_slot, 57);
+    }
+}

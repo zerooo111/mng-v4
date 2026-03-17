@@ -265,9 +265,15 @@ describe('Continuum State Harness', () => {
       tx_signature: 'c',
     });
 
-    expect(outOfOrder.getSnapshot('confirmed')).deep.eq(
-      ordered.getSnapshot('confirmed'),
-    );
+    const orderedSnapshot = ordered.getSnapshot('confirmed');
+    const outOfOrderSnapshot = outOfOrder.getSnapshot('confirmed');
+    expect({
+      ...outOfOrderSnapshot,
+      generated_ts_ms: 0,
+    }).deep.eq({
+      ...orderedSnapshot,
+      generated_ts_ms: 0,
+    });
   });
 
   it('tracks divergences for processed events without relay acceptance', () => {
@@ -395,5 +401,123 @@ describe('Continuum State Harness', () => {
 
     const balances = engine.getBalances(makerOwner, 'confirmed');
     expect(balances.totals.total_open_order_base_lots_bid).eq('1');
+  });
+
+  it('deduplicates repeated processed events and tracks skipped queue items', () => {
+    const engine = new ContinuumStateEngine();
+    const group = key();
+    const executionQueue = key();
+    const owner = key();
+    const mangoAccount = key();
+    const market = '12';
+
+    const placePayload = encodePerpPlaceOrderV2QueuePayload({
+      side: QueueSide.Bid,
+      priceLots: 100,
+      maxBaseLots: 1,
+      maxQuoteLots: 100,
+      clientOrderId: 5,
+      orderType: QueuePlaceOrderType.Limit,
+      selfTradeBehavior: QueueSelfTradeBehavior.DecrementTake,
+      reduceOnly: false,
+      expiryTimestamp: 0,
+      limit: 10,
+    });
+
+    engine.ingestRelayIntent({
+      event_type: 'relay_intent_accepted',
+      ts_ms: 1,
+      group,
+      execution_queue: executionQueue,
+      market,
+      sequence: '5',
+      kind: 0,
+      payload_b64: placePayload.toString('base64'),
+      remaining_accounts: [],
+      min_execute_slot: '1',
+      expires_at_slot: '0',
+      user_owner: owner,
+      mango_account: mangoAccount,
+      enqueue_tx_signature: 'enqueue-5',
+    });
+
+    const processedEvent = {
+      event_type: 'queue_item_processed' as const,
+      ts_ms: 2,
+      group,
+      sequence: '5',
+      kind: 0,
+      status: QueueProcessStatus.Skipped,
+      slot: '33',
+      tx_signature: 'skip-5',
+    };
+    engine.ingestQueueProcessed(processedEvent);
+    engine.ingestQueueProcessed(processedEvent);
+
+    const queue = engine.getQueueState(market);
+    expect(queue.processed_count).eq(1);
+    expect(queue.skipped_count).eq(1);
+    expect(queue.failed_count).eq(0);
+    expect(queue.pending_count).eq(0);
+
+    const confirmed = engine.getMarketState(market, 'confirmed');
+    expect(confirmed.open_orders.length).eq(0);
+  });
+
+  it('emits a divergence when processed status changes for the same queue item', () => {
+    const engine = new ContinuumStateEngine();
+    const group = key();
+    const executionQueue = key();
+    const owner = key();
+    const mangoAccount = key();
+    const market = '13';
+
+    const cancelPayload = encodePerpCancelAllOrdersQueuePayload({
+      limit: 10,
+    });
+
+    engine.ingestRelayIntent({
+      event_type: 'relay_intent_accepted',
+      ts_ms: 1,
+      group,
+      execution_queue: executionQueue,
+      market,
+      sequence: '8',
+      kind: 0,
+      payload_b64: cancelPayload.toString('base64'),
+      remaining_accounts: [],
+      min_execute_slot: '1',
+      expires_at_slot: '0',
+      user_owner: owner,
+      mango_account: mangoAccount,
+      enqueue_tx_signature: 'enqueue-8',
+    });
+
+    engine.ingestQueueProcessed({
+      event_type: 'queue_item_processed',
+      ts_ms: 2,
+      group,
+      sequence: '8',
+      kind: 0,
+      status: QueueProcessStatus.Failed,
+      slot: '41',
+      tx_signature: 'failed-8',
+    });
+    engine.ingestQueueProcessed({
+      event_type: 'queue_item_processed',
+      ts_ms: 3,
+      group,
+      sequence: '8',
+      kind: 0,
+      status: QueueProcessStatus.Executed,
+      slot: '42',
+      tx_signature: 'executed-8',
+    });
+
+    const divergences = engine
+      .listDivergences()
+      .filter((d) => d.reason === 'processed_status_changed');
+    expect(divergences.length).eq(1);
+    expect(divergences[0].key).eq(`${group}:8:0`);
   });
 });

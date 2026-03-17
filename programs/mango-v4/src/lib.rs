@@ -42,7 +42,7 @@ use state::{
     TokenIndex, TCS_START_INCENTIVE,
 };
 
-declare_id!("9nNhSkcxYFujiydpuuhVttUYBqYJQmxCzjrBofBvmutF");
+declare_id!("7ftfLAYEtDrz8xjhaqa6wUYMrjrmbZ3tjw7J7Rb3QA37");
 
 #[program]
 pub mod mango_v4 {
@@ -631,7 +631,13 @@ pub mod mango_v4 {
         lane_hashes: Vec<[u8; 32]>,
     ) -> Result<()> {
         #[cfg(feature = "enable-gpl")]
-        instructions::execution_queue_execute_multi(ctx, max_items, lane_count, accounts_per_lane, lane_hashes)?;
+        instructions::execution_queue_execute_multi(
+            ctx,
+            max_items,
+            lane_count,
+            accounts_per_lane,
+            lane_hashes,
+        )?;
         Ok(())
     }
 

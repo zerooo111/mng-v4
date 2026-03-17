@@ -188,8 +188,7 @@ impl Config {
             && executor_group.is_some()
             && executor_queue.is_some();
         let executor_interval_ms = parse_u64_env("EXECUTION_QUEUE_CRANK_INTERVAL_MS", 25)?;
-        let executor_busy_interval_ms =
-            parse_u64_env("EXECUTION_QUEUE_CRANK_BUSY_INTERVAL_MS", 1)?;
+        let executor_busy_interval_ms = parse_u64_env("EXECUTION_QUEUE_CRANK_BUSY_INTERVAL_MS", 1)?;
         let executor_head_lock_ms = parse_u64_env("EXECUTION_QUEUE_CRANK_HEAD_LOCK_MS", 30)?;
         let executor_pending_timeout_ms =
             parse_u64_env("EXECUTION_QUEUE_CRANK_PENDING_TIMEOUT_MS", 500)?;
@@ -815,7 +814,10 @@ impl SequenceStore {
     async fn observe_queue_floor(&self, key: &str, floor: u64) {
         let changed = {
             let mut guard = self.sequences.lock().await;
-            guard.entry(key.to_string()).or_default().observe_queue_floor(floor)
+            guard
+                .entry(key.to_string())
+                .or_default()
+                .observe_queue_floor(floor)
         };
         if changed {
             self.schedule_flush().await;
@@ -1012,6 +1014,7 @@ impl Engine {
         let lines: Vec<&str> = content
             .lines()
             .rev()
+            .filter(|line| line.contains("\"event_type\":\"relay_intent_accepted\""))
             .take(self.config.executor_dynamic_lanes_max_events)
             .collect();
         for line in lines.into_iter().rev() {
@@ -1109,9 +1112,7 @@ impl Engine {
                     )));
                 }
                 let degraded_head_limit = self.config.queue_soft_limit / 2;
-                if !head_available
-                    && degraded_head_limit > 0
-                    && queue_count >= degraded_head_limit
+                if !head_available && degraded_head_limit > 0 && queue_count >= degraded_head_limit
                 {
                     return Err(Status::resource_exhausted(format!(
                         "execution queue head-gap backpressure count={} degraded_limit={} gap_span={}",
@@ -1256,15 +1257,12 @@ impl Engine {
             .observe_submit_stages(parse_elapsed, prepare_elapsed, send_started.elapsed());
         tx.signatures[0] = tx_signature;
         self.sequences.commit_success(&sequence_key, sequence).await;
-        tokio::spawn(
-            self.clone()
-                .watch_submitted_sequence(
-                    sequence_key.clone(),
-                    sequence,
-                    execution_queue,
-                    tx_signature,
-                ),
-        );
+        tokio::spawn(self.clone().watch_submitted_sequence(
+            sequence_key.clone(),
+            sequence,
+            execution_queue,
+            tx_signature,
+        ));
 
         if let Some(executor) = &self.executor {
             if executor.group == group && executor.execution_queue == execution_queue {
@@ -1312,7 +1310,9 @@ impl Engine {
         match inspect_queue_sequence_presence(&account.data, failed_sequence) {
             QueueSequencePresence::PastFloor => {}
             QueueSequencePresence::Pending => {
-                self.sequences.mark_submitted(sequence_key, failed_sequence).await;
+                self.sequences
+                    .mark_submitted(sequence_key, failed_sequence)
+                    .await;
             }
             QueueSequencePresence::Absent => {
                 self.sequences
@@ -1338,12 +1338,8 @@ impl Engine {
                     "submit watcher timed out sequence={} sig={} queue={}",
                     sequence, tx_signature, execution_queue
                 );
-                self.recover_sequence_after_submit_error(
-                    &sequence_key,
-                    sequence,
-                    execution_queue,
-                )
-                .await;
+                self.recover_sequence_after_submit_error(&sequence_key, sequence, execution_queue)
+                    .await;
                 return;
             }
 
@@ -1482,6 +1478,144 @@ impl Engine {
         }
     }
 
+    async fn apply_executor_lane_failure(
+        &self,
+        executor: &Arc<ExecutorState>,
+        lane_hash: [u8; 32],
+        reason: &str,
+    ) {
+        let lane_key = bytes_to_hex(&lane_hash);
+        let now_ms = unix_timestamp_ms();
+        let mut should_backoff = false;
+        let failure_count = {
+            let mut failure_counts = executor.failure_counts.lock().await;
+            let count = failure_counts.entry(lane_key.clone()).or_insert(0);
+            *count = count.saturating_add(1);
+            if *count >= self.config.executor_failure_threshold {
+                *count = 0;
+                should_backoff = true;
+            }
+            *count
+        };
+
+        if should_backoff {
+            executor.backoff_until_ms.lock().await.insert(
+                lane_key.clone(),
+                now_ms.saturating_add(self.config.executor_failure_backoff_ms),
+            );
+            self.metrics
+                .execute_lane_suppressed
+                .fetch_add(1, Ordering::Relaxed);
+            warn!(
+                "executor lane backoff hash={} reason={} backoff_ms={}",
+                lane_key, reason, self.config.executor_failure_backoff_ms
+            );
+        } else {
+            debug!(
+                "executor lane failure hash={} reason={} consecutive_failures={}",
+                lane_key, reason, failure_count
+            );
+        }
+    }
+
+    async fn reconcile_pending_dispatches(
+        &self,
+        executor: &Arc<ExecutorState>,
+        head: &QueueHead,
+        now_ms: u64,
+    ) -> Vec<PendingHeadDispatch> {
+        let pending_snapshot = {
+            let mut pending_dispatches = executor.pending_dispatches.lock().await;
+            let mut retained = Vec::with_capacity(pending_dispatches.len());
+            for pending in pending_dispatches.drain(..) {
+                let pending_age_ms = now_ms.saturating_sub(pending.sent_at_ms);
+                let same_head = pending.sequence == head.next_sequence
+                    && pending.accounts_hash == head.head_accounts_hash;
+                if !same_head {
+                    continue;
+                }
+                if pending_age_ms >= self.config.executor_pending_timeout_ms {
+                    continue;
+                }
+                retained.push(pending);
+            }
+            *pending_dispatches = retained.clone();
+            retained
+        };
+
+        let mut retained = pending_snapshot;
+        let mut polls = Vec::new();
+        for (index, pending) in retained.iter_mut().enumerate() {
+            if now_ms.saturating_sub(pending.last_status_check_ms)
+                < self.config.executor_status_poll_ms
+            {
+                continue;
+            }
+            pending.last_status_check_ms = now_ms;
+            polls.push((index, pending.signature));
+        }
+
+        if polls.is_empty() {
+            return retained;
+        }
+
+        let signatures: Vec<Signature> = polls.iter().map(|(_, signature)| *signature).collect();
+        match self.rpc.get_signature_statuses(&signatures).await {
+            Ok(response) => {
+                let mut failed_indices = HashSet::new();
+                for ((index, signature), status) in
+                    polls.into_iter().zip(response.value.into_iter())
+                {
+                    match status {
+                        Some(status) if status.err.is_none() => {
+                            if !retained[index].no_advance_recorded {
+                                retained[index].no_advance_recorded = true;
+                                self.metrics
+                                    .execute_confirmed_no_advance
+                                    .fetch_add(1, Ordering::Relaxed);
+                                debug!(
+                                    "executor tx confirmed but queue head unchanged sequence={} sig={}",
+                                    retained[index].sequence, signature
+                                );
+                            }
+                        }
+                        Some(status) => {
+                            warn!(
+                                "executor tx failed sequence={} sig={} err={:?}",
+                                retained[index].sequence, signature, status.err
+                            );
+                            self.apply_executor_lane_failure(
+                                executor,
+                                retained[index].lane_hash,
+                                "signature_status_failed",
+                            )
+                            .await;
+                            failed_indices.insert(index);
+                        }
+                        None => {}
+                    }
+                }
+                if !failed_indices.is_empty() {
+                    retained = retained
+                        .into_iter()
+                        .enumerate()
+                        .filter_map(|(index, pending)| {
+                            (!failed_indices.contains(&index)).then_some(pending)
+                        })
+                        .collect();
+                    executor.last_inspect_ms.store(0, Ordering::Relaxed);
+                    *executor.cached_head.lock().await = None;
+                }
+            }
+            Err(err) => {
+                debug!("executor signature status poll failed: {err:?}");
+            }
+        }
+
+        *executor.pending_dispatches.lock().await = retained.clone();
+        retained
+    }
+
     async fn execute_once(&self, executor: &Arc<ExecutorState>) -> Result<ExecuteLoopOutcome> {
         let now_ms = unix_timestamp_ms();
         let last_inspect = executor.last_inspect_ms.load(Ordering::Relaxed);
@@ -1510,25 +1644,11 @@ impl Engine {
             }
         };
 
-        // Clean up pending dispatches based on timeout only (no per-item RPC status polling)
-        let pending_snapshot;
-        {
-            let mut pending_dispatches = executor.pending_dispatches.lock().await;
-            let mut retained = Vec::with_capacity(pending_dispatches.len());
-            for pending in pending_dispatches.drain(..) {
-                let pending_age_ms = now_ms.saturating_sub(pending.sent_at_ms);
-                let same_head = pending.sequence == head.next_sequence
-                    && pending.accounts_hash == head.head_accounts_hash;
-                if !same_head {
-                    continue;
-                }
-                if pending_age_ms >= self.config.executor_pending_timeout_ms {
-                    continue;
-                }
-                retained.push(pending);
-            }
-            *pending_dispatches = retained;
-            pending_snapshot = pending_dispatches.clone();
+        let pending_snapshot = self
+            .reconcile_pending_dispatches(executor, &head, now_ms)
+            .await;
+        if !pending_snapshot.is_empty() {
+            return Ok(ExecuteLoopOutcome::Busy);
         }
 
         let mut lanes = executor.lanes_snapshot().await;
@@ -1729,6 +1849,14 @@ impl Engine {
             }
             Err(err) => {
                 let failure_class = classify_lane_failure(&err);
+                if failure_class.is_deterministic() {
+                    self.apply_executor_lane_failure(
+                        executor,
+                        eligible_lanes[0].hash,
+                        failure_class.as_str(),
+                    )
+                    .await;
+                }
                 warn!(
                     "executor multi-lane send failed class={} err={err:?}",
                     failure_class.as_str(),
@@ -1805,10 +1933,8 @@ impl Engine {
         head_sequence: u64,
     ) -> Result<(VersionedTransaction, RpcSendTransactionConfig)> {
         let chain = self.blockhashes.snapshot().await;
-        let lane_accounts: Vec<Vec<AccountMeta>> = lanes
-            .iter()
-            .map(|l| l.remaining_accounts.clone())
-            .collect();
+        let lane_accounts: Vec<Vec<AccountMeta>> =
+            lanes.iter().map(|l| l.remaining_accounts.clone()).collect();
         // Pass the pre-computed lane hashes (with original flags, not runtime-OR'd)
         let lane_hashes: Vec<[u8; 32]> = lanes.iter().map(|l| l.hash).collect();
         let mut instructions = vec![
@@ -2032,11 +2158,8 @@ fn expand_lane_variants(
     // Hash the lane accounts the same way as the enqueue path:
     // merge fixed accounts (group, exec_queue, sysvar) before hashing.
     // This produces the accounts_hash stored in queue items.
-    let enqueue_hash = hash_execution_queue_accounts_for_ctm_enqueue(
-        group,
-        execution_queue,
-        remaining_accounts,
-    );
+    let enqueue_hash =
+        hash_execution_queue_accounts_for_ctm_enqueue(group, execution_queue, remaining_accounts);
     let raw_accounts = remaining_accounts.to_vec();
     let mut lanes = vec![Lane {
         name: lane_name.clone(),
@@ -2623,7 +2746,11 @@ fn inspect_queue_sequence_presence(queue_data: &[u8], sequence: u64) -> QueueSeq
     if sequence < head.next_sequence {
         return QueueSequencePresence::PastFloor;
     }
-    if sequence >= head.next_sequence.saturating_add(EXECUTION_QUEUE_CTM_CAPACITY as u64) {
+    if sequence
+        >= head
+            .next_sequence
+            .saturating_add(EXECUTION_QUEUE_CTM_CAPACITY as u64)
+    {
         return QueueSequencePresence::Absent;
     }
     let ctm_offset = EXECUTION_QUEUE_CTM_ITEMS_OFFSET
@@ -2796,6 +2923,11 @@ mod tests {
             + (sequence as usize % EXECUTION_QUEUE_CTM_CAPACITY) * EXECUTION_QUEUE_ITEM_SIZE
     }
 
+    fn liquidity_item_offset(head: u32) -> usize {
+        EXECUTION_QUEUE_LIQUIDITY_ITEMS_OFFSET
+            + (head as usize % EXECUTION_QUEUE_LIQUIDITY_CAPACITY) * EXECUTION_QUEUE_ITEM_SIZE
+    }
+
     #[test]
     fn inspect_queue_head_uses_correct_count_offsets() {
         let mut data = vec![0u8; EXECUTION_QUEUE_LIQUIDITY_ITEMS_OFFSET];
@@ -2851,6 +2983,70 @@ mod tests {
     }
 
     #[test]
+    fn inspect_queue_head_falls_back_to_liquidity_when_ctm_head_missing() {
+        let mut data =
+            vec![0u8; EXECUTION_QUEUE_LIQUIDITY_ITEMS_OFFSET + EXECUTION_QUEUE_ITEM_SIZE];
+        write_u32(&mut data, EXECUTION_QUEUE_COUNT_OFFSET, 2);
+        write_u64(&mut data, EXECUTION_QUEUE_NEXT_SEQUENCE_OFFSET, 10);
+        write_u64(&mut data, EXECUTION_QUEUE_MAX_SEEN_SEQUENCE_OFFSET, 10);
+        write_u32(&mut data, EXECUTION_QUEUE_CTM_COUNT_OFFSET, 1);
+        write_u32(&mut data, EXECUTION_QUEUE_LIQUIDITY_COUNT_OFFSET, 1);
+        write_u32(&mut data, EXECUTION_QUEUE_HEAD_OFFSET, 0);
+
+        let ctm_offset = queue_item_offset(10);
+        write_u64(
+            &mut data,
+            ctm_offset + EXECUTION_QUEUE_ITEM_SEQUENCE_OFFSET,
+            11,
+        );
+        data[ctm_offset + EXECUTION_QUEUE_ITEM_KIND_OFFSET] = 0;
+        data[ctm_offset + EXECUTION_QUEUE_ITEM_STATUS_OFFSET] = 1;
+
+        let liq_offset = liquidity_item_offset(0);
+        write_u64(
+            &mut data,
+            liq_offset + EXECUTION_QUEUE_ITEM_SEQUENCE_OFFSET,
+            77,
+        );
+        data[liq_offset + EXECUTION_QUEUE_ITEM_KIND_OFFSET] = 1;
+        data[liq_offset + EXECUTION_QUEUE_ITEM_STATUS_OFFSET] = 1;
+        data[liq_offset + EXECUTION_QUEUE_ITEM_ACCOUNTS_HASH_OFFSET
+            ..liq_offset + EXECUTION_QUEUE_ITEM_ACCOUNTS_HASH_OFFSET + 32]
+            .copy_from_slice(&[9u8; 32]);
+
+        let head = inspect_queue_head(&data);
+        assert_eq!(head.reason, "liquidity_pending");
+        assert_eq!(head.source, Some(QueueHeadSource::Liquidity));
+        assert_eq!(head.head_accounts_hash, Some([9u8; 32]));
+        assert_eq!(head.ctm_sequence, Some(11));
+        assert_eq!(head.ctm_status, Some(1));
+    }
+
+    #[test]
+    fn inspect_queue_head_reports_ctm_sequence_mismatch() {
+        let mut data = vec![0u8; EXECUTION_QUEUE_LIQUIDITY_ITEMS_OFFSET];
+        write_u32(&mut data, EXECUTION_QUEUE_COUNT_OFFSET, 1);
+        write_u64(&mut data, EXECUTION_QUEUE_NEXT_SEQUENCE_OFFSET, 10);
+        write_u64(&mut data, EXECUTION_QUEUE_MAX_SEEN_SEQUENCE_OFFSET, 10);
+        write_u32(&mut data, EXECUTION_QUEUE_CTM_COUNT_OFFSET, 1);
+
+        let item_offset = queue_item_offset(10);
+        write_u64(
+            &mut data,
+            item_offset + EXECUTION_QUEUE_ITEM_SEQUENCE_OFFSET,
+            11,
+        );
+        data[item_offset + EXECUTION_QUEUE_ITEM_KIND_OFFSET] = 0;
+        data[item_offset + EXECUTION_QUEUE_ITEM_STATUS_OFFSET] = 1;
+
+        let head = inspect_queue_head(&data);
+        assert_eq!(head.reason, "ctm_sequence_mismatch");
+        assert_eq!(head.source, None);
+        assert_eq!(head.head_accounts_hash, None);
+        assert_eq!(head.ctm_sequence, Some(11));
+    }
+
+    #[test]
     fn sequence_cursor_reuses_failed_hole() {
         let mut cursor = SequenceCursor::default();
         let first = cursor.reserve(100);
@@ -2881,6 +3077,23 @@ mod tests {
             cursor.pending.get(&0).map(|state| state.phase),
             Some(PendingSequencePhase::Submitted)
         );
+    }
+
+    #[test]
+    fn sequence_cursor_counts_only_submitted_and_reuses_recyclable_sequence() {
+        let mut cursor = SequenceCursor::default();
+        let first = cursor.reserve(100);
+        let second = cursor.reserve(101);
+        let third = cursor.reserve(102);
+        assert_eq!((first, second, third), (0, 1, 2));
+
+        cursor.commit_success(first, 110);
+        cursor.commit_success(third, 111);
+        assert_eq!(cursor.submitted_depth_from(0), 2);
+
+        cursor.reset_after_failure(third, 0);
+        assert_eq!(cursor.submitted_depth_from(0), 1);
+        assert_eq!(cursor.reserve(200), 2);
     }
 
     #[test]
