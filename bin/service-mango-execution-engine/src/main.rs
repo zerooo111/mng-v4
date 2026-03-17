@@ -3047,6 +3047,48 @@ mod tests {
     }
 
     #[test]
+    fn inspect_queue_head_reports_gap_for_empty_ctm_slot() {
+        let mut data = vec![0u8; EXECUTION_QUEUE_LIQUIDITY_ITEMS_OFFSET];
+        write_u32(&mut data, EXECUTION_QUEUE_COUNT_OFFSET, 1);
+        write_u64(&mut data, EXECUTION_QUEUE_NEXT_SEQUENCE_OFFSET, 12);
+        write_u64(&mut data, EXECUTION_QUEUE_MAX_SEEN_SEQUENCE_OFFSET, 13);
+        write_u32(&mut data, EXECUTION_QUEUE_CTM_COUNT_OFFSET, 1);
+
+        let head = inspect_queue_head(&data);
+        assert_eq!(head.reason, "ctm_gap_or_empty_slot");
+        assert_eq!(head.source, None);
+        assert_eq!(head.ctm_sequence, Some(0));
+        assert_eq!(head.ctm_kind, Some(0));
+        assert_eq!(head.ctm_status, Some(0));
+    }
+
+    #[test]
+    fn inspect_queue_head_reports_liquidity_status_mismatch() {
+        let mut data =
+            vec![0u8; EXECUTION_QUEUE_LIQUIDITY_ITEMS_OFFSET + EXECUTION_QUEUE_ITEM_SIZE];
+        write_u32(&mut data, EXECUTION_QUEUE_COUNT_OFFSET, 1);
+        write_u64(&mut data, EXECUTION_QUEUE_NEXT_SEQUENCE_OFFSET, 0);
+        write_u64(&mut data, EXECUTION_QUEUE_MAX_SEEN_SEQUENCE_OFFSET, 0);
+        write_u32(&mut data, EXECUTION_QUEUE_CTM_COUNT_OFFSET, 0);
+        write_u32(&mut data, EXECUTION_QUEUE_LIQUIDITY_COUNT_OFFSET, 1);
+        write_u32(&mut data, EXECUTION_QUEUE_HEAD_OFFSET, 0);
+
+        let liq_offset = liquidity_item_offset(0);
+        write_u64(
+            &mut data,
+            liq_offset + EXECUTION_QUEUE_ITEM_SEQUENCE_OFFSET,
+            77,
+        );
+        data[liq_offset + EXECUTION_QUEUE_ITEM_KIND_OFFSET] = 1;
+        data[liq_offset + EXECUTION_QUEUE_ITEM_STATUS_OFFSET] = 3;
+
+        let head = inspect_queue_head(&data);
+        assert_eq!(head.reason, "liquidity_status_mismatch");
+        assert_eq!(head.source, None);
+        assert_eq!(head.head_accounts_hash, None);
+    }
+
+    #[test]
     fn sequence_cursor_reuses_failed_hole() {
         let mut cursor = SequenceCursor::default();
         let first = cursor.reserve(100);
@@ -3093,6 +3135,39 @@ mod tests {
 
         cursor.reset_after_failure(third, 0);
         assert_eq!(cursor.submitted_depth_from(0), 1);
+        assert_eq!(cursor.reserve(200), 2);
+    }
+
+    #[test]
+    fn sequence_cursor_mark_submitted_promotes_reserved_without_double_counting() {
+        let mut cursor = SequenceCursor::default();
+        let first = cursor.reserve(100);
+        let second = cursor.reserve(101);
+        assert_eq!((first, second), (0, 1));
+        assert_eq!(cursor.submitted_depth_from(0), 0);
+
+        assert!(cursor.mark_submitted(first, 110));
+        assert_eq!(cursor.submitted_depth_from(0), 1);
+        assert!(!cursor.mark_submitted(first, 120));
+        assert_eq!(cursor.submitted_depth_from(0), 1);
+    }
+
+    #[test]
+    fn sequence_cursor_observe_queue_floor_drops_old_pending_and_recyclable_sequences() {
+        let mut cursor = SequenceCursor::default();
+        let first = cursor.reserve(100);
+        let second = cursor.reserve(101);
+        let third = cursor.reserve(102);
+        cursor.commit_success(first, 110);
+        cursor.commit_success(second, 111);
+        cursor.reset_after_failure(third, 0);
+        assert!(cursor.recyclable.contains(&2));
+
+        assert!(cursor.observe_queue_floor(2));
+        assert_eq!(cursor.next_sequence, 2);
+        assert!(!cursor.pending.contains_key(&0));
+        assert!(!cursor.pending.contains_key(&1));
+        assert!(cursor.recyclable.contains(&2));
         assert_eq!(cursor.reserve(200), 2);
     }
 

@@ -16,7 +16,6 @@ import {
   encodePerpCancelAllOrdersBySideQueuePayload,
   encodePerpCancelAllOrdersQueuePayload,
   encodePerpPlaceOrderV2QueuePayload,
-  hashExecutionQueueAccounts,
   hashExecutionQueuePayload,
   signExecutionQueueIntentMessage,
 } from './executionQueue';
@@ -40,7 +39,7 @@ describe('Execution Queue Helpers', () => {
     expect(payload[1]).eq(QueuePayloadVariant.PerpPlaceOrderV2);
     expect(payload[2]).eq(0);
     expect(payload[3]).eq(0);
-    expect(payload.length).eq(46);
+    expect(payload.length).eq(49);
   });
 
   it('encodes option<side> payloads deterministically', () => {
@@ -131,7 +130,14 @@ describe('Execution Queue Helpers', () => {
     expect(built.ctmEnvelopeMessage.length).eq(32);
 
     const expectedPayloadHash = await hashExecutionQueuePayload(payload);
-    const expectedAccountsHash = await hashExecutionQueueAccounts(remainingAccounts);
+    const expectedAccountsHash = buildExecutionQueueUserIntent({
+      group,
+      executionQueue,
+      mangoAccount,
+      userOwner: user.publicKey,
+      payload,
+      remainingAccounts,
+    }).accountsHash;
     expect(Buffer.compare(built.envelope.payloadHash, expectedPayloadHash)).eq(0);
     expect(Buffer.compare(built.envelope.accountsHash, expectedAccountsHash)).eq(0);
   });
@@ -170,7 +176,7 @@ describe('Execution Queue Helpers', () => {
     });
 
     expect(enqueueLiquidityIx.keys.length).eq(3);
-    expect(executeIx.keys.length).eq(4);
+    expect(executeIx.keys.length).eq(3);
     expect(executeIx.data.length).eq(10);
   });
 

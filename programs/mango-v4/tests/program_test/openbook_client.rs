@@ -360,15 +360,8 @@ impl OpenbookClientInstruction for CreateMarketInstruction {
             base_mint: self.base_mint,
             system_program: System::id(),
             collect_fee_admin: self.collect_fee_admin,
-            open_orders_admin: self.open_orders_admin,
-            consume_events_admin: self.consume_events_admin,
-            close_market_admin: self.close_market_admin,
-            oracle_a: self.oracle_a,
-            oracle_b: self.oracle_b,
-            event_authority,
             associated_token_program: AssociatedToken::id(),
             token_program: Token::id(),
-            program: openbook_v2::id(),
         };
 
         let instruction = make_instruction(program_id, &accounts, instruction);
@@ -562,14 +555,11 @@ impl OpenbookClientInstruction for PlaceTakeOrderInstruction {
         let market: Market = account_loader.load(&self.market).await.unwrap();
 
         let accounts = Self::Accounts {
-            open_orders_admin: self.open_orders_admin.map(|kp| kp.pubkey()),
             market: self.market,
             market_authority: market.market_authority,
             bids: market.bids,
             asks: market.asks,
             event_heap: market.event_heap,
-            oracle_a: market.oracle_a.into(),
-            oracle_b: market.oracle_b.into(),
             signer: self.signer.pubkey(),
             user_base_account: self.user_base_account,
             user_quote_account: self.user_quote_account,

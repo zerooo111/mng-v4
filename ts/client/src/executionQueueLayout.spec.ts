@@ -121,4 +121,47 @@ describe('executionQueueLayout', () => {
     expect(header.headerInvariantOk).eq(false);
     expect(decodeExecutionQueueHeadItem(data)).eq(null);
   });
+
+  it('returns null when the CTM head sequence mismatches and no liquidity item is pending', () => {
+    const data = Buffer.alloc(
+      EXECUTION_QUEUE_LAYOUT.liquidityItemsOffset +
+        EXECUTION_QUEUE_LAYOUT.itemSize,
+    );
+    writeU32(data, EXECUTION_QUEUE_LAYOUT.totalCountOffset, 1);
+    writeU32(data, EXECUTION_QUEUE_LAYOUT.ctmCountOffset, 1);
+    writeU32(data, EXECUTION_QUEUE_LAYOUT.liquidityCountOffset, 0);
+    writeU64(data, EXECUTION_QUEUE_LAYOUT.nextSequenceOffset, 10n);
+    writeU64(data, EXECUTION_QUEUE_LAYOUT.maxSeenSequenceOffset, 10n);
+
+    const itemOffset = ctmItemOffset(10n);
+    writeU64(data, itemOffset + EXECUTION_QUEUE_LAYOUT.itemSequenceOffset, 11n);
+    data.writeUInt8(
+      EXECUTION_QUEUE_LAYOUT.ctmWrappedKind,
+      itemOffset + EXECUTION_QUEUE_LAYOUT.itemKindOffset,
+    );
+    data.writeUInt8(
+      EXECUTION_QUEUE_LAYOUT.pendingStatus,
+      itemOffset + EXECUTION_QUEUE_LAYOUT.itemStatusOffset,
+    );
+
+    expect(decodeExecutionQueueHeadItem(data)).eq(null);
+  });
+
+  it('returns null when the liquidity head is present but not pending', () => {
+    const data = Buffer.alloc(
+      EXECUTION_QUEUE_LAYOUT.liquidityItemsOffset +
+        EXECUTION_QUEUE_LAYOUT.itemSize,
+    );
+    writeU32(data, EXECUTION_QUEUE_LAYOUT.totalCountOffset, 1);
+    writeU32(data, EXECUTION_QUEUE_LAYOUT.ctmCountOffset, 0);
+    writeU32(data, EXECUTION_QUEUE_LAYOUT.liquidityCountOffset, 1);
+    writeU32(data, EXECUTION_QUEUE_LAYOUT.liquidityHeadOffset, 0);
+
+    const itemOffset = liquidityItemOffset(0);
+    writeU64(data, itemOffset + EXECUTION_QUEUE_LAYOUT.itemSequenceOffset, 42n);
+    data.writeUInt8(1, itemOffset + EXECUTION_QUEUE_LAYOUT.itemKindOffset);
+    data.writeUInt8(3, itemOffset + EXECUTION_QUEUE_LAYOUT.itemStatusOffset);
+
+    expect(decodeExecutionQueueHeadItem(data)).eq(null);
+  });
 });

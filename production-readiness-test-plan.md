@@ -208,6 +208,65 @@ Required coverage:
 5. Devnet conservative end-to-end and PnL tests.
 6. Pre-release restart and operational drills.
 
+## Release Checklist
+
+### A. Must-pass automated suites
+- `cargo test -p mango-v4 --lib --features client,enable-gpl`
+- `cargo test -p service-mango-execution-engine`
+- TS specs for queue helpers, queue layout decode, continuum harness, and account math
+- `test-bpf` program-test cases covering queue enqueue/execute and negative flows
+
+### B. Must-pass scripted end-to-end flows
+- local bootstrap from empty state
+- local restart from persisted runtime state
+- local relayer E2E place/match/cancel
+- local PnL + settlement flow
+- devnet reuse-mode E2E with persistent keypairs
+- devnet PnL + settlement flow
+
+### C. Must-pass operational drills
+- startup scripts in clean and reuse modes
+- explicit failure when config or funding is missing
+- metrics and health endpoints reachable during runs
+- no auto-funding, no hot-generated keypairs, no unsafe cleanup of devnet runtime state
+
+### D. Must-pass performance gates
+- local single-lane benchmark above target
+- mixed-lane local verdict captured and documented
+- queue drains to zero after bounded load
+- no sustained duplicate execute sends, queue-full storms, or speculative fee-spam loops
+
+## Traceability Matrix
+
+### Queue correctness
+- duplicate sequence rejection: Rust unit tests in `state/execution_queue.rs`
+- front-gap head advance: Rust unit tests in `state/execution_queue.rs`
+- lane scan limit and matching: Rust unit tests in `state/execution_queue.rs`
+- queue header decode offsets: Rust relayer tests and TS queue-layout specs
+- gap/empty-slot reason reporting: Rust relayer tests
+
+### Relayer/executor correctness
+- dense sequence reuse: Rust relayer tests
+- submitted-depth accounting: Rust relayer tests
+- head decode fallbacks: Rust relayer tests
+- confirmed-no-advance dedupe: Rust relayer tests
+
+### Harness/client correctness
+- queue layout decoding: TS specs
+- replay determinism and divergence accounting: TS specs
+- processed-event dedupe and skipped-item accounting: TS specs
+
+### Onchain trading correctness
+- legacy perp/liquidation/oracle coverage: existing `program-test` cases
+- queue-driven place/cancel/execute: new `program-test` coverage required before certification
+- margin, stale oracle, liquidation, bankruptcy, and settle behavior: existing `program-test` plus targeted queue-path additions
+
+## Open Certification Blockers
+- queue-path `solana-program-test` coverage is still incomplete
+- localnet `100+ avg place TPS` acceptance has not been achieved
+- one canonical devnet deployment and release-validation environment must be maintained
+- independent review/audit is still required for a production-grade onchain claim
+
 ## Automation Tiers
 
 ### Required on every PR

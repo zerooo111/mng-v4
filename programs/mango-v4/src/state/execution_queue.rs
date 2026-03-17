@@ -462,4 +462,73 @@ mod tests {
         assert_eq!(second.first_failure_slot, 50);
         assert_eq!(second.min_execute_slot, 57);
     }
+
+    #[test]
+    fn push_ctm_rejects_sequence_outside_enqueue_window() {
+        let mut queue = test_queue();
+        queue.header.next_sequence_to_execute = 11;
+        queue.header.max_seen_sequence = 42;
+
+        let result = queue.push_ctm(pending_ctm_item(10, 1));
+        assert!(result.is_err());
+        assert_eq!(queue.header.ctm_count, 0);
+        assert_eq!(queue.header.total_count, 0);
+    }
+
+    #[test]
+    fn clear_current_ctm_head_and_advance_updates_counts_and_resets_gap_slot() {
+        let mut queue = test_queue();
+        queue.push_ctm(pending_ctm_item(0, 1)).unwrap();
+        queue.push_ctm(pending_ctm_item(1, 2)).unwrap();
+        queue.header.max_seen_sequence = 1;
+        queue.header.gap_observed_slot = 99;
+
+        queue.clear_current_ctm_head_and_advance();
+
+        assert_eq!(queue.header.next_sequence_to_execute, 1);
+        assert_eq!(queue.header.ctm_count, 1);
+        assert_eq!(queue.header.total_count, 1);
+        assert_eq!(queue.header.gap_observed_slot, 0);
+        assert_eq!(queue.current_ctm_head().unwrap().sequence, 1);
+    }
+
+    #[test]
+    fn clear_ctm_item_at_stops_advancing_once_real_pending_head_found() {
+        let mut queue = test_queue();
+        queue.push_ctm(pending_ctm_item(0, 1)).unwrap();
+        queue.push_ctm(pending_ctm_item(2, 2)).unwrap();
+        queue.push_ctm(pending_ctm_item(3, 3)).unwrap();
+        queue.header.max_seen_sequence = 3;
+
+        queue.clear_ctm_item_at(0);
+
+        assert_eq!(queue.header.next_sequence_to_execute, 2);
+        assert_eq!(queue.header.ctm_count, 2);
+        assert_eq!(queue.header.total_count, 2);
+        assert_eq!(queue.current_ctm_head().unwrap().sequence, 2);
+    }
+
+    #[test]
+    fn mixed_ctm_and_liquidity_operations_preserve_header_totals() {
+        let mut queue = test_queue();
+        queue.push_ctm(pending_ctm_item(0, 1)).unwrap();
+        queue.push_ctm(pending_ctm_item(1, 2)).unwrap();
+        queue.header.max_seen_sequence = 1;
+        queue
+            .push_liquidity(pending_liquidity_item(7, QueueItemKind::LiquidityDeposit))
+            .unwrap();
+
+        assert_eq!(queue.header.total_count, queue.header.ctm_count + queue.header.liquidity_count);
+
+        queue.clear_current_ctm_head_and_advance();
+        assert_eq!(queue.header.total_count, queue.header.ctm_count + queue.header.liquidity_count);
+
+        queue.pop_liquidity_head().unwrap();
+        assert_eq!(queue.header.total_count, queue.header.ctm_count + queue.header.liquidity_count);
+
+        queue.clear_current_ctm_head_and_advance();
+        assert_eq!(queue.header.total_count, 0);
+        assert_eq!(queue.header.ctm_count, 0);
+        assert_eq!(queue.header.liquidity_count, 0);
+    }
 }

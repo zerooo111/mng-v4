@@ -204,6 +204,242 @@ fn make_instruction(
     }
 }
 
+fn anchor_discriminator(ix_name: &str) -> [u8; 8] {
+    let mut preimage = b"global:".to_vec();
+    preimage.extend_from_slice(ix_name.as_bytes());
+    let digest = anchor_lang::solana_program::hash::hash(&preimage);
+    let mut discriminator = [0u8; 8];
+    discriminator.copy_from_slice(&digest.to_bytes()[..8]);
+    discriminator
+}
+
+pub fn execution_queue_pda(group: Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[b"ExecutionQueue".as_ref(), group.as_ref()], &mango_v4::id()).0
+}
+
+#[derive(Default)]
+pub struct ExecutionQueueCreateInstruction {
+    pub group: Pubkey,
+    pub payer: TestKeypair,
+    pub admin: TestKeypair,
+}
+
+#[async_trait::async_trait(?Send)]
+impl ClientInstruction for ExecutionQueueCreateInstruction {
+    type Accounts = mango_v4::accounts::ExecutionQueueCreate;
+    type Instruction = mango_v4::instruction::ExecutionQueueCreate;
+
+    async fn to_instruction(
+        &self,
+        _loader: &(impl ClientAccountLoader + 'async_trait),
+    ) -> (Self::Accounts, instruction::Instruction) {
+        let accounts = Self::Accounts {
+            group: self.group,
+            execution_queue: execution_queue_pda(self.group),
+            payer: self.payer.pubkey(),
+            admin: self.admin.pubkey(),
+            system_program: System::id(),
+        };
+        let instruction = instruction::Instruction {
+            program_id: mango_v4::id(),
+            accounts: accounts.to_account_metas(None),
+            data: anchor_discriminator("execution_queue_create").to_vec(),
+        };
+        (accounts, instruction)
+    }
+
+    fn signers(&self) -> Vec<TestKeypair> {
+        vec![self.payer, self.admin]
+    }
+}
+
+#[derive(Default)]
+pub struct ExecutionQueueResizeInstruction {
+    pub group: Pubkey,
+    pub payer: TestKeypair,
+    pub admin: TestKeypair,
+}
+
+#[async_trait::async_trait(?Send)]
+impl ClientInstruction for ExecutionQueueResizeInstruction {
+    type Accounts = mango_v4::accounts::ExecutionQueueResize;
+    type Instruction = mango_v4::instruction::ExecutionQueueResize;
+
+    async fn to_instruction(
+        &self,
+        _loader: &(impl ClientAccountLoader + 'async_trait),
+    ) -> (Self::Accounts, instruction::Instruction) {
+        let accounts = Self::Accounts {
+            group: self.group,
+            execution_queue: execution_queue_pda(self.group),
+            payer: self.payer.pubkey(),
+            admin: self.admin.pubkey(),
+            system_program: System::id(),
+        };
+        let instruction = instruction::Instruction {
+            program_id: mango_v4::id(),
+            accounts: accounts.to_account_metas(None),
+            data: anchor_discriminator("execution_queue_resize").to_vec(),
+        };
+        (accounts, instruction)
+    }
+
+    fn signers(&self) -> Vec<TestKeypair> {
+        vec![self.payer, self.admin]
+    }
+}
+
+pub struct ExecutionQueueInitInstruction {
+    pub group: Pubkey,
+    pub admin: TestKeypair,
+    pub ctm_signer: Pubkey,
+}
+
+#[async_trait::async_trait(?Send)]
+impl ClientInstruction for ExecutionQueueInitInstruction {
+    type Accounts = mango_v4::accounts::ExecutionQueueInit;
+    type Instruction = mango_v4::instruction::ExecutionQueueInit;
+
+    async fn to_instruction(
+        &self,
+        _loader: &(impl ClientAccountLoader + 'async_trait),
+    ) -> (Self::Accounts, instruction::Instruction) {
+        let accounts = Self::Accounts {
+            group: self.group,
+            execution_queue: execution_queue_pda(self.group),
+            admin: self.admin.pubkey(),
+        };
+        let mut data = anchor_discriminator("execution_queue_init").to_vec();
+        data.extend_from_slice(self.ctm_signer.as_ref());
+        let instruction = instruction::Instruction {
+            program_id: mango_v4::id(),
+            accounts: accounts.to_account_metas(None),
+            data,
+        };
+        (accounts, instruction)
+    }
+
+    fn signers(&self) -> Vec<TestKeypair> {
+        vec![self.admin]
+    }
+}
+
+pub struct ExecutionQueueConfigureInstruction {
+    pub group: Pubkey,
+    pub admin: TestKeypair,
+    pub gap_wait_slots: u64,
+    pub liquidity_delay_slots: u64,
+    pub pause_ingress: bool,
+    pub pause_execute: bool,
+}
+
+#[async_trait::async_trait(?Send)]
+impl ClientInstruction for ExecutionQueueConfigureInstruction {
+    type Accounts = mango_v4::accounts::ExecutionQueueAdmin;
+    type Instruction = mango_v4::instruction::ExecutionQueueConfigure;
+
+    async fn to_instruction(
+        &self,
+        _loader: &(impl ClientAccountLoader + 'async_trait),
+    ) -> (Self::Accounts, instruction::Instruction) {
+        let accounts = Self::Accounts {
+            group: self.group,
+            execution_queue: execution_queue_pda(self.group),
+            admin: self.admin.pubkey(),
+        };
+        let mut data = anchor_discriminator("execution_queue_configure").to_vec();
+        data.extend_from_slice(&self.gap_wait_slots.to_le_bytes());
+        data.extend_from_slice(&self.liquidity_delay_slots.to_le_bytes());
+        data.push(u8::from(self.pause_ingress));
+        data.push(u8::from(self.pause_execute));
+        let instruction = instruction::Instruction {
+            program_id: mango_v4::id(),
+            accounts: accounts.to_account_metas(None),
+            data,
+        };
+        (accounts, instruction)
+    }
+
+    fn signers(&self) -> Vec<TestKeypair> {
+        vec![self.admin]
+    }
+}
+
+pub struct ExecutionQueueEnqueueLiquidityInstruction {
+    pub group: Pubkey,
+    pub execution_queue: Pubkey,
+    pub kind: u8,
+    pub payload: Vec<u8>,
+    pub remaining_accounts: Vec<AccountMeta>,
+}
+
+#[async_trait::async_trait(?Send)]
+impl ClientInstruction for ExecutionQueueEnqueueLiquidityInstruction {
+    type Accounts = mango_v4::accounts::ExecutionQueueEnqueueLiquidity;
+    type Instruction = mango_v4::instruction::ExecutionQueueEnqueueLiquidity;
+
+    async fn to_instruction(
+        &self,
+        _loader: &(impl ClientAccountLoader + 'async_trait),
+    ) -> (Self::Accounts, instruction::Instruction) {
+        let accounts = Self::Accounts {
+            group: self.group,
+            execution_queue: self.execution_queue,
+        };
+        let mut data = anchor_discriminator("execution_queue_enqueue_liquidity").to_vec();
+        data.push(self.kind);
+        data.extend_from_slice(&(self.payload.len() as u32).to_le_bytes());
+        data.extend_from_slice(&self.payload);
+        let mut instruction = instruction::Instruction {
+            program_id: mango_v4::id(),
+            accounts: accounts.to_account_metas(None),
+            data,
+        };
+        instruction.accounts.extend(self.remaining_accounts.iter().cloned());
+        (accounts, instruction)
+    }
+
+    fn signers(&self) -> Vec<TestKeypair> {
+        vec![]
+    }
+}
+
+pub struct ExecutionQueueExecuteInstruction {
+    pub group: Pubkey,
+    pub execution_queue: Pubkey,
+    pub max_items: u16,
+    pub remaining_accounts: Vec<AccountMeta>,
+}
+
+#[async_trait::async_trait(?Send)]
+impl ClientInstruction for ExecutionQueueExecuteInstruction {
+    type Accounts = mango_v4::accounts::ExecutionQueueExecute;
+    type Instruction = mango_v4::instruction::ExecutionQueueExecute;
+
+    async fn to_instruction(
+        &self,
+        _loader: &(impl ClientAccountLoader + 'async_trait),
+    ) -> (Self::Accounts, instruction::Instruction) {
+        let accounts = Self::Accounts {
+            group: self.group,
+            execution_queue: self.execution_queue,
+        };
+        let mut data = anchor_discriminator("execution_queue_execute").to_vec();
+        data.extend_from_slice(&self.max_items.to_le_bytes());
+        let mut instruction = instruction::Instruction {
+            program_id: mango_v4::id(),
+            accounts: accounts.to_account_metas(None),
+            data,
+        };
+        instruction.accounts.extend(self.remaining_accounts.iter().cloned());
+        (accounts, instruction)
+    }
+
+    fn signers(&self) -> Vec<TestKeypair> {
+        vec![]
+    }
+}
+
 async fn get_mint_info_by_mint(
     account_loader: &impl ClientAccountLoader,
     account: &MangoAccountValue,
@@ -1122,7 +1358,6 @@ impl ClientInstruction for TokenRegisterInstruction {
             payer: self.payer.pubkey(),
             token_program: Token::id(),
             system_program: System::id(),
-            rent: sysvar::rent::Rent::id(),
         };
 
         let instruction = make_instruction(program_id, &accounts, &instruction);
@@ -1207,7 +1442,6 @@ impl ClientInstruction for TokenAddBankInstruction {
             payer: self.payer.pubkey(),
             token_program: Token::id(),
             system_program: System::id(),
-            rent: sysvar::rent::Rent::id(),
         };
 
         let instruction = make_instruction(program_id, &accounts, &instruction);
@@ -2702,22 +2936,24 @@ impl ClientInstruction for Serum3PlaceOrderInstruction {
             open_orders,
             payer_bank: payer_info.first_bank(),
             payer_vault: payer_info.first_vault(),
-            payer_oracle: payer_info.oracle,
             serum_market: self.serum_market,
             serum_program: serum_market.serum_program,
             serum_market_external: serum_market.serum_market_external,
-            market_bids: from_serum_style_pubkey(&bids),
-            market_asks: from_serum_style_pubkey(&asks),
-            market_event_queue: from_serum_style_pubkey(&event_q),
-            market_request_queue: from_serum_style_pubkey(&req_q),
-            market_base_vault: from_serum_style_pubkey(&coin_vault),
-            market_quote_vault: from_serum_style_pubkey(&pc_vault),
-            market_vault_signer: vault_signer,
             owner: self.owner.pubkey(),
-            token_program: Token::id(),
         };
 
         let mut instruction = make_instruction(program_id, &accounts, &instruction);
+        instruction.accounts.extend([
+            AccountMeta::new_readonly(payer_info.oracle, false),
+            AccountMeta::new(from_serum_style_pubkey(&bids), false),
+            AccountMeta::new(from_serum_style_pubkey(&asks), false),
+            AccountMeta::new(from_serum_style_pubkey(&event_q), false),
+            AccountMeta::new(from_serum_style_pubkey(&req_q), false),
+            AccountMeta::new(from_serum_style_pubkey(&coin_vault), false),
+            AccountMeta::new(from_serum_style_pubkey(&pc_vault), false),
+            AccountMeta::new_readonly(vault_signer, false),
+            AccountMeta::new_readonly(Token::id(), false),
+        ]);
         instruction.accounts.extend(health_check_metas.into_iter());
 
         (accounts, instruction)
@@ -3079,16 +3315,18 @@ impl ClientInstruction for Serum3LiqForceCancelOrdersInstruction {
             serum_market: self.serum_market,
             serum_program: serum_market.serum_program,
             serum_market_external: serum_market.serum_market_external,
-            market_bids: from_serum_style_pubkey(&bids),
-            market_asks: from_serum_style_pubkey(&asks),
-            market_event_queue: from_serum_style_pubkey(&event_q),
-            market_base_vault: from_serum_style_pubkey(&coin_vault),
-            market_quote_vault: from_serum_style_pubkey(&pc_vault),
-            market_vault_signer: vault_signer,
-            token_program: Token::id(),
         };
 
         let mut instruction = make_instruction(program_id, &accounts, &instruction);
+        instruction.accounts.extend([
+            AccountMeta::new(from_serum_style_pubkey(&bids), false),
+            AccountMeta::new(from_serum_style_pubkey(&asks), false),
+            AccountMeta::new(from_serum_style_pubkey(&event_q), false),
+            AccountMeta::new(from_serum_style_pubkey(&coin_vault), false),
+            AccountMeta::new(from_serum_style_pubkey(&pc_vault), false),
+            AccountMeta::new_readonly(vault_signer, false),
+            AccountMeta::new_readonly(Token::id(), false),
+        ]);
         instruction.accounts.extend(health_check_metas.into_iter());
 
         (accounts, instruction)
@@ -5482,18 +5720,20 @@ impl ClientInstruction for OpenbookV2PlaceOrderInstruction {
             openbook_v2_program: openbook_program_id,
             openbook_v2_market_external: market.openbook_v2_market_external,
             openbook_v2_market: self.openbook_v2_market,
-            bids: external_market.bids,
-            asks: external_market.asks,
-            event_heap: external_market.event_heap,
             payer_bank,
             payer_vault,
             receiver_bank,
-            market_vault,
-            market_vault_signer: external_market.market_authority,
-            token_program: Token::id(),
         };
 
         let mut instruction = make_instruction(program_id, &accounts, &instruction);
+        instruction.accounts.extend([
+            AccountMeta::new(external_market.bids, false),
+            AccountMeta::new(external_market.asks, false),
+            AccountMeta::new(external_market.event_heap, false),
+            AccountMeta::new(market_vault, false),
+            AccountMeta::new_readonly(external_market.market_authority, false),
+            AccountMeta::new_readonly(Token::id(), false),
+        ]);
         instruction.accounts.extend(health_check_metas.into_iter());
         (accounts, instruction)
     }
@@ -5678,20 +5918,22 @@ impl ClientInstruction for OpenbookV2SettleFundsInstruction {
             openbook_v2_program: openbook_program_id,
             openbook_v2_market_external: market.openbook_v2_market_external,
             openbook_v2_market: self.openbook_v2_market,
-            market_base_vault: external_market.market_base_vault,
-            market_quote_vault: external_market.market_quote_vault,
-            market_vault_signer: external_market.market_authority,
             quote_bank: quote_info.first_bank(),
             quote_vault: quote_info.first_vault(),
             base_bank: base_info.first_bank(),
             base_vault: base_info.first_vault(),
-            quote_oracle: quote_info.oracle,
-            base_oracle: base_info.oracle,
-            token_program: Token::id(),
-            system_program: System::id(),
         };
 
-        let instruction = make_instruction(program_id, &accounts, &instruction);
+        let mut instruction = make_instruction(program_id, &accounts, &instruction);
+        instruction.accounts.extend([
+            AccountMeta::new(external_market.market_base_vault, false),
+            AccountMeta::new(external_market.market_quote_vault, false),
+            AccountMeta::new_readonly(external_market.market_authority, false),
+            AccountMeta::new_readonly(quote_info.oracle, false),
+            AccountMeta::new_readonly(base_info.oracle, false),
+            AccountMeta::new_readonly(Token::id(), false),
+            AccountMeta::new_readonly(System::id(), false),
+        ]);
 
         (accounts, instruction)
     }
@@ -5837,21 +6079,23 @@ impl ClientInstruction for OpenbookV2LiqForceCancelInstruction {
             openbook_v2_program: openbook_program_id,
             openbook_v2_market_external: market.openbook_v2_market_external,
             openbook_v2_market: self.openbook_v2_market,
-            bids: external_market.bids,
-            asks: external_market.asks,
-            event_heap: external_market.event_heap,
-            market_base_vault: external_market.market_base_vault,
-            market_quote_vault: external_market.market_quote_vault,
-            market_vault_signer: external_market.market_authority,
             quote_bank: quote_info.first_bank(),
             quote_vault: quote_info.first_vault(),
             base_bank: base_info.first_bank(),
             base_vault: base_info.first_vault(),
-            system_program: System::id(),
-            token_program: Token::id(),
         };
 
         let mut instruction = make_instruction(program_id, &accounts, &instruction);
+        instruction.accounts.extend([
+            AccountMeta::new(external_market.bids, false),
+            AccountMeta::new(external_market.asks, false),
+            AccountMeta::new(external_market.event_heap, false),
+            AccountMeta::new(external_market.market_base_vault, false),
+            AccountMeta::new(external_market.market_quote_vault, false),
+            AccountMeta::new_readonly(external_market.market_authority, false),
+            AccountMeta::new_readonly(System::id(), false),
+            AccountMeta::new_readonly(Token::id(), false),
+        ]);
         instruction.accounts.extend(health_check_metas.into_iter());
         (accounts, instruction)
     }
