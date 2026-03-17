@@ -2,7 +2,7 @@
 Error while loading price impact: TypeError: fetch failed
 Error while loading price impact: TypeError: fetch failed
 Continuum state harness listening on http://127.0.0.1:9091, mode=devnet, program=7ftfLAYEtDrz8xjhaqa6wUYMrjrmbZ3tjw7J7Rb3QA37
-Onchain read context enabled: group=ETeadYXpyxEP4icqfUzwKaXdmLoh6AurpBJzsF9RbW5P, usdc_mint=C59fi4wkiEUFEUvHCrZUstTry1yopAXRqXTp211PvTpj
+Onchain read context enabled: group=6DmavriJww4giwdbRd3Ep5uZ6cfKvHCaBA5782KFRYyq, usdc_mint=AXZeaxEbBbTVbfxJLPJCD7Yk94iFfCLGGDSYWhCsB2iU
 Error while loading price impact: TypeError: fetch failed
 Error while loading price impact: TypeError: fetch failed
 Error while loading price impact: TypeError: fetch failed
@@ -27,3 +27,42 @@ Error while loading price impact: TypeError: fetch failed
 Error while loading price impact: TypeError: fetch failed
 Error while loading price impact: TypeError: fetch failed
 Error while loading price impact: TypeError: fetch failed
+Error while loading price impact: TypeError: fetch failed
+Error while loading price impact: TypeError: fetch failed
+Error while loading price impact: TypeError: fetch failed
+Error while loading price impact: TypeError: fetch failed
+Error while loading price impact: TypeError: fetch failed
+Error while loading price impact: TypeError: fetch failed
+Error while loading price impact: TypeError: fetch failed
+Error while loading price impact: TypeError: fetch failed
+Error while loading price impact: TypeError: fetch failed
+Error while loading price impact: TypeError: fetch failed
+Error while loading price impact: TypeError: fetch failed
+Error while loading price impact: TypeError: fetch failed
+Error while loading price impact: TypeError: fetch failed
+Error while loading price impact: TypeError: fetch failed
+Error while loading price impact: TypeError: fetch failed
+Error while loading price impact: TypeError: fetch failed
+Error while loading price impact: TypeError: fetch failed
+Error while loading price impact: TypeError: fetch failed
+Error while loading price impact: TypeError: fetch failed
+Error while loading price impact: TypeError: fetch failed
+Error while loading price impact: TypeError: fetch failed
+Error while loading price impact: TypeError: fetch failed
+Error while loading price impact: TypeError: fetch failed
+Error while loading price impact: TypeError: fetch failed
+Error while loading price impact: TypeError: fetch failed
+Error while loading price impact: TypeError: fetch failed
+Error while loading price impact: TypeError: fetch failed
+Error while loading price impact: TypeError: fetch failed
+Error while loading price impact: TypeError: fetch failed
+Error while loading price impact: TypeError: fetch failed
+Error while loading price impact: TypeError: fetch failed
+Error while loading price impact: TypeError: fetch failed
+Error while loading price impact: TypeError: fetch failed
+Error while loading price impact: TypeError: fetch failed
+Error while loading price impact: TypeError: fetch failed
+Error while loading price impact: TypeError: fetch failed
+{ idsSource: 'get-program-accounts' }
+Continuum state harness listening on http://127.0.0.1:9091, mode=devnet, program=7ftfLAYEtDrz8xjhaqa6wUYMrjrmbZ3tjw7J7Rb3QA37
+Onchain read context enabled: group=6DmavriJww4giwdbRd3Ep5uZ6cfKvHCaBA5782KFRYyq, usdc_mint=AXZeaxEbBbTVbfxJLPJCD7Yk94iFfCLGGDSYWhCsB2iU

@@ -5,3 +5,10 @@
   "tsdb_enabled": false,
   "tsdb_table": "fermi_trade_ticks"
 }
+{
+  "msg": "ctm-relayer-http-bridge listening",
+  "bind": "127.0.0.1:9092",
+  "relayer_grpc": "127.0.0.1:9090",
+  "tsdb_enabled": false,
+  "tsdb_table": "fermi_trade_ticks"
+}

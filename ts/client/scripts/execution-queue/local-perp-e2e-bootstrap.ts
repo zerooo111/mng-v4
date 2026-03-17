@@ -307,20 +307,39 @@ async function executionQueueCanonicalPerpRemainingAccounts(params: {
 }
 
 async function getOrCreateMangoAccount(
-  client: MangoClient,
+  ownerClient: MangoClient,
+  payerClient: MangoClient,
   groupPk: PublicKey,
-  owner: PublicKey,
+  owner: Keypair,
   accountNum: number,
   name: string,
 ) {
-  const group = await client.getGroup(groupPk);
-  let account = await client.getMangoAccountForOwner(group, owner, accountNum);
+  const group = await ownerClient.getGroup(groupPk);
+  let account = await ownerClient.getMangoAccountForOwner(
+    group,
+    owner.publicKey,
+    accountNum,
+  );
   if (!account) {
-    await client.createMangoAccount(group, accountNum, name, 8, 4, 4, 32);
-    account = await client.getMangoAccountForOwner(group, owner, accountNum);
+    const ix = await payerClient.program.methods
+      .accountCreate(accountNum, 8, 4, 4, 32, name)
+      .accounts({
+        group: group.publicKey,
+        owner: owner.publicKey,
+        payer: payerClient.walletPk,
+      })
+      .instruction();
+    await payerClient.sendAndConfirmTransactionForGroup(group, [ix], {
+      additionalSigners: [owner],
+    });
+    account = await ownerClient.getMangoAccountForOwner(
+      group,
+      owner.publicKey,
+      accountNum,
+    );
   }
   if (!account) {
-    throw new Error(`failed to create mango account for ${owner.toBase58()}`);
+    throw new Error(`failed to create mango account for ${owner.publicKey.toBase58()}`);
   }
   return account;
 }
@@ -565,15 +584,17 @@ async function main(): Promise<void> {
 
   const makerAccount = await getOrCreateMangoAccount(
     makerClient,
+    adminClient,
     group.publicKey,
-    maker.publicKey,
+    maker,
     0,
     'eq-maker',
   );
   const takerAccount = await getOrCreateMangoAccount(
     takerClient,
+    adminClient,
     group.publicKey,
-    taker.publicKey,
+    taker,
     0,
     'eq-taker',
   );

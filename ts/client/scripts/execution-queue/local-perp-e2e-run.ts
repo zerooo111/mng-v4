@@ -11,6 +11,8 @@ import {
   PerpOrderType,
   PerpSelfTradeBehavior,
 } from '../../src/accounts/perp';
+import { MangoAccount } from '../../src/accounts/mangoAccount';
+import { Group } from '../../src/accounts/group';
 import { MangoClient } from '../../src/client';
 import {
   buildExecutionQueueUserIntent,
@@ -126,6 +128,49 @@ async function waitForQueueToDrain(
   throw new Error('timed out waiting for execution queue to drain');
 }
 
+async function loadOpenOrdersCount(
+  client: MangoClient,
+  group: Group,
+  account: MangoAccount,
+  marketIndex: PerpMarketIndex,
+): Promise<number> {
+  const fresh = await client.getMangoAccount(account.publicKey);
+  const openOrders = await fresh.loadPerpOpenOrdersForMarket(client, group, marketIndex, true);
+  return openOrders.length;
+}
+
+async function snapshotAccount(params: {
+  client: MangoClient;
+  group: Group;
+  accountPk: PublicKey;
+  owner: PublicKey;
+  usdcMint: PublicKey;
+  marketIndex: PerpMarketIndex;
+}): Promise<{
+  account: MangoAccount;
+  baseLots: BN;
+  usdcBalanceUi: number;
+  openOrdersCount: number;
+}> {
+  const account = await params.client.getMangoAccount(params.accountPk);
+  await account.reload(params.client);
+  const perpPosition = account.getPerpPosition(params.marketIndex);
+  const usdcBank = params.group.getFirstBankByMint(params.usdcMint);
+  const openOrdersCount = await loadOpenOrdersCount(
+    params.client,
+    params.group,
+    account,
+    params.marketIndex,
+  );
+
+  return {
+    account,
+    baseLots: perpPosition ? perpPosition.basePositionLots : new BN(0),
+    usdcBalanceUi: account.getTokenBalanceUi(usdcBank),
+    openOrdersCount,
+  };
+}
+
 async function submitIntentViaRelayer(params: {
   relayerClient: any;
   group: PublicKey;
@@ -193,6 +238,7 @@ async function main(): Promise<void> {
   const executionQueueBufferPk = new PublicKey(
     config.executionQueueBuffer || config.executionQueue,
   );
+  const usdcMintPk = new PublicKey(config.usdcMint);
   const marketIndex = config.perpMarketIndex as PerpMarketIndex;
 
   const makerKp = readKeypair(config.maker.keypairPath);
@@ -320,21 +366,29 @@ async function main(): Promise<void> {
   await waitForQueueToDrain(connection, executionQueuePk);
 
   await makerClient.perpConsumeAllEvents(makerGroup, marketIndex);
+  await makerGroup.reloadAll(makerClient);
 
-  await makerAccount.reload(makerClient);
-  await takerAccount.reload(takerClient);
+  const makerState = await snapshotAccount({
+    client: makerClient,
+    group: makerGroup,
+    accountPk: makerAccount.publicKey,
+    owner: makerKp.publicKey,
+    usdcMint: usdcMintPk,
+    marketIndex,
+  });
+  const takerState = await snapshotAccount({
+    client: takerClient,
+    group: takerGroup,
+    accountPk: takerAccount.publicKey,
+    owner: takerKp.publicKey,
+    usdcMint: usdcMintPk,
+    marketIndex,
+  });
 
-  const makerPerpPos = makerAccount.perpActive();
-  const takerPerpPos = takerAccount.perpActive();
-  if (makerPerpPos.length === 0 || takerPerpPos.length === 0) {
-    throw new Error('expected both maker and taker to have active perp positions');
-  }
-
-  if (
-    !makerPerpPos[0].basePositionLots.gt(new BN(0)) ||
-    !takerPerpPos[0].basePositionLots.lt(new BN(0))
-  ) {
-    throw new Error('expected maker long and taker short after match');
+  if (!makerState.baseLots.gt(new BN(0)) || !takerState.baseLots.lt(new BN(0))) {
+    throw new Error(
+      `expected maker long and taker short after match, got maker=${makerState.baseLots.toString()} taker=${takerState.baseLots.toString()}`,
+    );
   }
 
   const loadMakerOpenOrders = async () => {
@@ -403,9 +457,24 @@ async function main(): Promise<void> {
   }
 
   await makerGroup.reloadAll(makerClient);
-  const usdcBank = makerGroup.getFirstBankByMint(new PublicKey(config.usdcMint));
-  const makerUsdcBalance = makerAccount.getTokenBalanceUi(usdcBank);
-  const takerUsdcBalance = takerAccount.getTokenBalanceUi(usdcBank);
+  const makerFinalState = await snapshotAccount({
+    client: makerClient,
+    group: makerGroup,
+    accountPk: makerAccount.publicKey,
+    owner: makerKp.publicKey,
+    usdcMint: usdcMintPk,
+    marketIndex,
+  });
+  const takerFinalState = await snapshotAccount({
+    client: takerClient,
+    group: takerGroup,
+    accountPk: takerAccount.publicKey,
+    owner: takerKp.publicKey,
+    usdcMint: usdcMintPk,
+    marketIndex,
+  });
+  const makerUsdcBalance = makerFinalState.usdcBalanceUi;
+  const takerUsdcBalance = takerFinalState.usdcBalanceUi;
 
   if (makerUsdcBalance <= 0 || takerUsdcBalance <= 0) {
     throw new Error('expected positive USDC deposits for maker and taker');
@@ -421,8 +490,8 @@ async function main(): Promise<void> {
           cancel: cancelResp,
         },
         positions: {
-          makerBaseLots: makerPerpPos[0].basePositionLots.toString(),
-          takerBaseLots: takerPerpPos[0].basePositionLots.toString(),
+          makerBaseLots: makerFinalState.baseLots.toString(),
+          takerBaseLots: takerFinalState.baseLots.toString(),
         },
         balances: {
           makerUsdc: makerUsdcBalance,

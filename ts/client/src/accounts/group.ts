@@ -218,7 +218,9 @@ export class Group {
         )
       ).json();
     } catch (error) {
-      console.log(`Error while loading price impact: ${error}`);
+      if (process.env.MANGO_LOG_PRICE_IMPACT_ERRORS === 'true') {
+        console.log(`Error while loading price impact: ${error}`);
+      }
     }
   }
 
