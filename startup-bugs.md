@@ -1,5 +1,30 @@
 # Startup Bugs Log
 
+## 2026-03-19
+
+### 1) Present expired CTM heads still wedge the queue unless the relayer/admin drops them
+- Symptom:
+  - The executor kept retrying the same live head sequence and the queue stopped draining even after the earlier stuck-head fixes.
+  - Live failing execute txs showed:
+    - `Instruction: ExecutionQueueExecute`
+    - `Order is already expired`
+    - `custom program error: 0x1770`
+- Root cause:
+  - This was not a missing-head gap case.
+  - The CTM head item was still present, but its `PerpPlaceOrderV2` payload had already expired by execution time.
+  - The onchain execute path intentionally bubbles health-gated dispatch errors, so the head stays pending unless an operator calls `execution_queue_drop_ctm`.
+- Fix:
+  - The Rust relayer now fetches failed executor tx logs, detects the exact `Order is already expired` failure, and submits a single admin recovery tx that:
+    1. preserves the live queue config,
+    2. pauses execute,
+    3. calls `execution_queue_drop_ctm(sequence)`,
+    4. restores the prior execute pause state.
+  - This requires the relayer admin signer to match the group admin; the relayer now supports `EXECUTION_QUEUE_ADMIN_KEYPAIR` and otherwise falls back to the payer keypair.
+- Operational note:
+  - The queue now drains past expired heads instead of wedging, but a backlog full of expired intents will still clear slowly because each expired head is dropped one sequence at a time.
+- Follow-up:
+  - The better long-term fix is still onchain: deterministic expired-order heads should be fail-cleared inside `execution_queue_execute` instead of depending on the relayer/admin path.
+
 ## 2026-03-16
 
 ### 1) Devnet frontend order submit can intermittently fail with relayer duplicate-sequence aborts

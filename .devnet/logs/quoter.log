@@ -8185,3 +8185,1031 @@
 {"ts":"2026-03-19T20:12:05.082Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
 {"ts":"2026-03-19T20:12:07.162Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
 {"ts":"2026-03-19T20:12:09.130Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:12:11.054Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:12:13.180Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:12:15.045Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:12:17.154Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:12:19.125Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:12:21.099Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:12:23.113Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:12:25.219Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:12:27.125Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:12:29.113Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:12:31.054Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:12:33.055Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:12:35.047Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:12:37.146Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:12:39.067Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:12:41.151Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:12:43.120Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:12:45.084Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:12:47.129Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:12:49.091Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:12:51.046Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:12:53.048Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:12:55.055Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:12:57.021Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:12:57.067Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:12:59.012Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:12:59.142Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:13:01.012Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:13:01.102Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:13:03.017Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:13:03.184Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:13:05.016Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:13:05.066Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:13:07.014Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:13:07.067Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:13:09.017Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:13:09.147Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:13:11.015Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:13:11.172Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:13:13.015Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:13:13.141Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:13:15.015Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:13:15.087Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:13:17.014Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:13:17.066Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:13:19.014Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:13:19.140Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:13:21.013Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:13:21.062Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:13:23.014Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:13:23.149Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:13:25.016Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:13:25.089Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:13:27.014Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:13:27.083Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:13:29.019Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:13:29.071Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:13:31.014Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:13:31.065Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:13:33.016Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:13:33.069Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:13:35.018Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:13:35.132Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:13:37.017Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:13:37.131Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:13:39.019Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:13:39.071Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:13:41.021Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:13:41.061Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:13:43.020Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:13:43.066Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:13:45.023Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:13:45.066Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:13:47.024Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:13:47.141Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:13:49.025Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:13:49.140Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:13:51.028Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:13:51.089Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:13:53.027Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:13:53.203Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:13:55.028Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:13:55.070Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:13:57.031Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:13:57.290Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:13:59.159Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:14:01.105Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:14:03.148Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:14:05.192Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:14:07.174Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:14:09.143Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:14:11.074Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:14:13.079Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:14:15.076Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:14:17.073Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:14:19.186Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:14:21.154Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:14:23.153Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:14:25.079Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:14:27.086Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:14:29.294Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:14:31.077Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:14:33.113Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:14:35.132Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:14:37.075Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:14:39.053Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:14:39.134Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:14:41.045Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:14:41.108Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:14:43.047Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:14:43.212Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:14:45.046Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:14:45.277Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:14:47.046Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:14:47.152Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:14:49.046Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:14:49.160Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:14:51.049Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:14:51.096Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:14:53.050Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:14:53.096Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:14:55.048Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:14:55.093Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:14:57.050Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:14:57.096Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:14:59.052Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:14:59.099Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:15:01.050Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:15:01.142Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:15:03.055Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:15:03.185Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:15:05.053Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:15:05.234Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:15:07.056Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:15:07.109Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:15:09.051Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:15:09.097Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:15:11.050Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:15:11.120Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:15:13.052Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:15:13.105Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:15:15.054Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:15:15.185Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:15:17.058Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:15:17.180Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:15:19.054Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:15:19.213Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:15:21.056Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:15:21.167Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:15:23.060Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:15:23.182Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:15:25.059Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:15:25.134Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:15:27.062Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:15:27.179Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:15:29.061Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:15:29.118Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:15:31.062Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:15:31.141Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:15:33.064Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:15:33.125Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:15:35.063Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:15:35.105Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:15:37.063Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:15:37.173Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:15:39.064Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:15:39.113Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:15:41.208Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:15:43.180Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:15:45.107Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:15:47.106Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:15:49.123Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:15:51.246Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:15:53.241Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:15:55.195Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:15:57.114Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:15:59.175Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:16:01.296Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:16:03.179Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:16:05.196Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:16:07.186Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:16:09.109Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:16:11.148Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:16:13.178Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:16:15.181Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:16:17.180Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:16:19.116Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:16:21.154Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:16:23.127Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:16:25.117Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:16:27.122Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:16:29.153Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:16:31.089Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:16:31.178Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:16:33.079Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:16:33.133Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:16:35.079Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:16:35.197Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:16:37.083Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:16:37.207Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:16:39.084Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:16:39.273Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:16:41.083Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:16:41.137Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:16:43.084Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:16:43.208Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:16:45.085Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:16:45.203Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:16:47.086Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:16:47.169Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:16:49.084Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:16:49.126Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:16:51.087Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:16:51.137Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:16:53.086Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:16:53.131Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:16:55.085Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:16:55.178Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:16:57.086Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:16:57.133Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:16:59.088Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:16:59.214Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:17:01.092Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:17:01.177Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:17:03.092Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:17:03.139Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:17:05.090Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:17:05.307Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:17:07.092Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:17:07.156Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:17:09.093Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:17:09.137Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:17:11.094Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:17:11.304Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:17:13.094Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:17:13.199Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:17:15.094Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:17:15.202Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:17:17.096Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:17:17.152Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:17:19.095Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:17:19.155Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:17:21.096Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:17:21.146Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:17:23.095Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:17:23.140Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:17:25.094Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:17:25.226Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:17:27.096Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:17:27.221Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:17:29.103Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:17:29.235Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:17:31.099Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:17:31.148Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:17:33.170Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:17:35.184Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:17:37.137Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:17:39.228Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:17:41.222Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:17:43.250Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:17:45.186Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:17:47.154Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:17:49.223Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:17:51.141Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:17:53.194Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:17:55.197Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:17:57.253Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:17:59.249Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:18:01.155Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:18:03.179Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:18:05.149Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:18:07.226Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:18:09.243Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:18:11.205Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:18:13.216Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:18:15.114Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:18:15.229Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:18:17.109Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:18:17.231Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:18:19.111Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:18:19.254Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:18:21.107Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:18:21.226Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:18:23.110Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:18:23.242Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:18:25.109Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:18:25.238Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:18:27.111Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:18:27.256Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:18:29.112Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:18:29.288Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:18:31.112Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:18:31.172Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:18:33.113Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:18:33.175Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:18:35.113Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:18:35.209Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:18:37.116Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:18:37.201Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:18:39.114Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:18:39.157Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:18:41.118Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:18:41.159Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:18:43.118Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:18:43.199Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:18:45.119Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:18:45.161Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:18:47.119Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:18:47.166Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:18:49.120Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:18:49.163Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:18:51.119Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:18:51.247Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:18:53.123Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:18:53.236Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:18:55.119Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:18:55.163Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:18:57.121Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:18:57.180Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:18:59.121Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:18:59.236Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:19:01.125Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:19:01.231Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:19:03.123Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:19:03.175Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:19:05.124Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:19:05.184Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:19:07.125Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:19:07.197Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:19:09.126Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:19:09.187Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:19:11.128Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:19:11.262Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:19:13.130Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:19:13.242Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:19:15.130Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:19:15.253Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:19:17.187Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:19:19.177Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:19:21.190Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:19:23.169Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:19:25.176Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:19:27.188Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:19:29.184Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:19:31.182Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:19:33.214Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:19:35.261Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:19:37.250Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:19:39.173Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:19:41.232Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:19:43.242Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:19:45.178Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:19:47.141Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:19:47.192Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:19:49.134Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:19:49.266Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:19:51.134Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:19:51.182Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:19:53.133Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:19:53.187Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:19:55.137Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:19:55.204Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:19:57.138Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:19:57.262Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:19:59.136Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:19:59.244Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:20:01.139Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:20:01.381Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:20:03.138Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:20:03.305Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:20:05.136Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:20:05.303Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:20:07.137Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:20:07.269Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:20:09.138Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:20:09.280Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:20:11.138Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:20:11.201Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:20:13.139Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:20:13.184Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:20:15.143Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:20:15.204Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:20:17.141Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:20:17.231Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:20:19.142Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:20:19.198Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:20:21.144Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:20:21.199Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:20:23.145Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:20:23.282Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:20:25.147Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:20:25.407Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:20:27.147Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:20:27.242Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:20:29.146Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:20:29.196Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:20:31.147Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:20:31.204Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:20:33.148Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:20:33.204Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:20:35.146Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:20:35.244Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:20:37.146Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:20:37.200Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:20:39.148Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:20:39.212Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:20:41.149Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:20:41.240Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:20:43.151Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:20:43.197Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:20:45.149Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:20:45.197Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:20:47.151Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:20:47.235Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:20:49.215Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:20:51.202Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:20:53.264Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:20:55.254Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:20:57.317Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:20:59.236Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:21:01.203Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:21:03.290Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:21:05.268Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:21:07.292Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:21:09.312Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:21:11.208Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:21:13.291Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:21:15.290Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:21:17.280Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:21:19.237Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:21:21.229Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:21:23.278Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:21:25.708Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:21:27.379Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:21:29.172Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:21:29.228Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:21:31.163Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:21:31.215Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:21:33.168Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:21:33.219Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:21:35.166Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:21:35.219Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:21:37.165Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:21:37.209Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:21:39.173Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:21:39.282Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:21:41.169Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:21:41.210Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:21:43.170Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:21:43.232Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:21:45.172Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:21:45.217Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:21:47.173Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:21:47.220Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:21:49.172Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:21:49.347Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:21:51.172Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:21:51.211Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:21:53.174Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:21:53.221Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:21:55.174Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:21:55.226Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:21:57.176Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:21:57.221Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:21:59.183Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:21:59.266Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:22:01.178Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:22:01.275Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:22:03.180Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:22:03.268Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:22:05.178Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:22:05.234Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:22:07.181Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:22:07.305Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:22:09.182Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:22:09.224Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:22:11.188Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:22:11.236Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:22:13.181Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:22:13.231Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:22:15.185Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:22:15.271Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:22:17.182Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:22:17.259Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:22:19.182Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:22:19.223Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:22:21.185Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:22:21.246Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:22:23.186Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:22:23.381Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:22:25.187Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:22:25.282Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:22:27.186Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:22:27.311Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:22:29.188Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:22:29.240Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:22:31.293Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:22:33.232Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:22:35.312Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:22:37.396Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:22:39.303Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:22:41.438Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:22:43.302Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:22:45.240Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:22:47.303Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:22:49.243Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:22:51.286Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:22:53.241Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:22:55.336Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:22:57.309Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:22:59.314Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:23:01.373Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:23:03.253Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:23:05.236Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:23:07.252Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:23:09.320Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:23:11.210Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:23:11.273Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:23:13.201Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:23:13.262Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:23:15.202Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:23:15.266Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:23:17.202Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:23:17.250Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:23:19.207Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:23:19.254Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:23:21.207Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:23:21.263Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:23:23.211Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:23:23.347Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:23:25.208Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:23:25.357Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:23:27.207Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:23:27.406Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:23:29.208Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:23:29.266Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:23:31.207Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:23:31.272Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:23:33.208Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:23:33.368Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:23:35.209Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:23:35.292Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:23:37.209Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:23:37.332Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:23:39.207Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:23:39.510Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:23:41.211Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:23:41.313Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:23:43.214Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:23:43.290Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:23:45.211Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:23:45.320Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:23:47.211Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:23:47.336Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:23:49.214Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:23:49.266Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:23:51.212Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:23:51.263Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:23:53.218Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:23:53.270Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:23:55.214Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:23:55.314Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:23:57.221Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:23:57.513Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:23:59.217Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:23:59.350Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:24:01.216Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:24:01.367Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:24:03.218Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:24:03.544Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:24:05.216Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:24:05.334Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:24:07.222Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:24:07.349Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:24:09.220Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:24:09.367Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:24:11.222Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:24:11.348Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:24:13.364Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:24:15.272Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:24:17.272Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:24:19.278Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:24:21.267Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:24:23.329Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:24:25.326Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:24:27.340Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:24:29.279Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:24:31.349Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:24:33.371Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:24:35.298Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:24:37.266Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:24:39.341Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:24:41.460Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:24:43.242Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:24:43.381Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:24:45.234Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:24:45.294Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:24:47.234Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:24:47.300Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:24:49.234Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:24:49.301Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:24:51.237Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:24:51.498Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:24:53.236Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:24:53.280Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:24:55.239Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:24:55.339Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:24:57.237Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:24:57.303Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:24:59.237Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:24:59.288Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:25:01.240Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:25:01.309Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:25:03.247Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:25:03.366Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:25:05.242Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:25:05.288Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:25:07.240Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:25:07.318Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:25:09.423Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:25:09.573Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:25:11.240Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:25:11.371Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:25:13.242Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:25:13.290Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:25:15.251Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:25:15.356Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:25:17.254Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:25:17.299Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:25:19.246Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:25:19.301Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:25:21.247Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:25:21.374Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:25:23.253Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:25:23.307Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:25:25.252Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:25:25.378Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:25:27.247Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:25:27.317Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:25:29.247Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:25:29.305Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:25:31.250Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:25:31.410Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:25:33.252Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:25:33.382Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:25:35.254Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:25:35.301Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:25:37.273Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:25:37.353Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:25:39.250Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:25:39.461Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:25:41.248Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:25:41.307Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:25:43.247Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:25:43.294Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:25:45.307Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:25:47.396Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:25:49.302Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:25:51.384Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:25:53.384Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:25:55.319Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:25:57.339Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:25:59.371Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:26:01.337Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:26:03.340Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:26:05.330Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:26:07.316Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:26:09.308Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:26:11.330Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:26:13.354Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:26:15.393Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:26:17.303Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:26:19.298Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:26:21.314Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:26:23.367Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:26:25.263Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:26:25.311Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:26:27.254Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:26:27.317Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:26:29.253Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:26:29.298Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:26:31.257Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:26:31.310Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:26:33.258Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:26:33.299Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:26:35.257Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:26:35.322Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:26:37.259Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:26:37.470Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:26:39.256Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:26:39.305Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:26:41.258Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:26:41.318Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:26:43.261Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:26:43.338Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:26:45.261Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:26:45.323Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:26:47.259Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:26:47.321Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:26:49.264Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:26:49.333Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:26:51.260Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:26:51.381Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:26:53.269Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:26:53.366Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:26:55.263Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:26:55.408Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:26:57.263Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:26:57.329Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:26:59.264Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:26:59.523Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:27:01.266Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:27:01.409Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:27:03.266Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:27:03.481Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:27:05.273Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:27:05.544Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:27:07.271Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:27:07.336Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:27:09.269Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:27:09.318Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:27:11.268Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:27:11.319Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:27:13.270Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:27:13.394Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:27:15.270Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:27:15.381Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:27:17.267Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:27:17.370Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:27:19.271Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:27:19.318Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:27:21.268Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:27:21.313Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:27:23.270Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:27:23.392Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:27:25.268Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:27:25.365Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:27:27.386Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:27:29.329Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:27:31.312Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:27:33.386Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:27:35.310Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:27:37.358Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:27:39.415Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:27:41.387Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:27:43.360Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:27:45.393Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:27:47.372Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:27:49.377Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:27:51.466Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:27:53.418Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:27:55.405Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:27:57.299Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:27:57.431Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:27:59.278Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:27:59.389Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:28:01.281Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:28:01.592Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:28:03.278Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:28:03.346Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:28:05.282Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:28:05.401Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:28:07.281Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:28:07.431Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:28:09.280Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:28:09.403Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:28:11.281Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:28:11.406Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:28:13.283Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:28:13.351Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:28:15.278Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:28:15.341Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:28:17.280Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:28:17.323Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:28:19.279Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:28:19.401Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:28:21.282Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:28:21.405Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:28:23.282Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:28:23.342Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:28:25.283Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:28:25.481Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:28:27.286Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:28:27.346Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:28:29.282Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:28:29.334Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:28:31.287Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:28:31.342Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:28:33.283Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:28:33.397Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:28:35.283Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:28:35.436Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:28:37.287Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:28:37.385Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:28:39.286Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:28:39.347Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:28:41.286Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:28:41.407Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:28:43.286Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:28:43.341Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:28:45.288Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:28:45.337Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:28:47.288Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:28:47.334Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:28:49.290Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:28:49.344Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:28:51.292Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:28:51.377Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:28:53.292Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:28:53.373Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:28:55.292Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:28:55.389Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:28:57.293Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:28:57.348Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:28:59.356Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:29:01.362Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:29:03.416Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:29:05.358Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:29:07.338Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:29:09.392Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:29:11.340Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:29:13.409Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:29:15.407Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:29:17.434Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:29:19.389Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:29:21.336Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:29:23.416Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:29:25.341Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:29:27.479Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:29:29.369Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:29:31.385Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:29:33.336Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:29:35.344Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:29:37.335Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:29:39.310Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:29:39.426Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:29:41.302Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:29:41.431Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:29:43.302Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:29:43.425Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:29:45.303Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:29:45.373Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:29:47.305Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:29:47.353Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:29:49.303Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:29:49.426Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:29:51.308Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:29:51.424Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:29:53.304Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:29:53.454Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:29:55.308Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:29:55.426Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:29:57.306Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:29:57.465Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:29:59.304Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:29:59.433Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:30:01.307Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:30:01.458Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:30:03.307Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:30:03.579Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:30:05.314Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:30:05.379Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:30:07.309Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:30:07.450Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:30:09.316Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:30:09.389Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:30:11.309Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:30:11.421Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:30:13.308Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:30:13.375Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:30:15.310Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:30:15.507Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:30:17.312Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:30:17.364Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:30:19.328Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:30:19.412Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:30:21.308Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:30:21.406Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:30:23.306Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:30:23.374Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:30:25.318Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:30:25.453Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:30:27.319Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:30:27.450Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:30:29.319Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:30:29.444Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:30:31.313Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:30:31.377Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:30:33.316Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:30:33.458Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:30:35.310Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:30:35.467Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:30:37.315Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:30:37.380Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:30:39.321Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T20:30:39.377Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:30:41.441Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:30:43.444Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:30:45.421Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:30:47.348Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:30:49.375Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:30:51.400Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:30:53.451Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:30:55.368Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:30:57.433Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:30:59.410Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:31:01.373Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:31:03.445Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:31:05.445Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:31:07.434Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:31:09.438Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:31:11.435Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:31:13.492Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:31:15.457Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:31:17.377Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:31:19.353Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+{"ts":"2026-03-19T20:31:21.447Z","msg":"quote tick failed","error":"8 RESOURCE_EXHAUSTED: execution queue backpressure count=1024 soft_limit=1024"}
+[2026-03-19T23:27:08Z] supervisor starting quoter
+{ idsSource: 'get-program-accounts' }
+{ idsSource: 'get-program-accounts' }
+{"msg":"random-sol-usdc-quoter-bot started","clusterUrl":"https://devnet.helius-rpc.com/?api-key=6475b77b-7c5f-48b4-88f0-4879d4af73cb","relayerAddr":"127.0.0.1:9090","intervalMs":2000,"priceRangeBps":200,"orderExpirySecs":30,"closePositionProbabilityBps":1000,"sizeMinSol":1,"sizeMaxSol":3,"referencePrice":{"provider":"coingecko","assetId":"solana","vsCurrency":"usd","apiBase":"https://api.coingecko.com/api/v3","refreshMs":10000},"parallelBotExecution":true,"botDispatchMode":"round-robin","logEachOrder":true,"nonblockingSubmit":false,"maxInFlight":200,"groupReloadEveryTicks":0,"accountReloadEveryTicks":0,"bots":[{"name":"quoter-bot-0","owner":"5broL7zGKzYWup5CoVZKKmuA7PC17gM5Jup2qCPGiH2L","mangoAccount":"ETDC5DfRHQwDa4xqwLyu7EbyfCJpYok6c6f1cK2e5HC4","side":"bid"},{"name":"quoter-bot-1","owner":"7g6MyKXgG1wCzNCPSSBVHd1wKApZMyDdsNdNobDVAeAg","mangoAccount":"A6jVDhxjZbJhnEBKfonMUaonrfuudbPcx4Nea5U7C65y","side":"ask"}]}
+{"ts":"2026-03-19T23:27:20.299Z","bot":"quoter-bot-0","action":"quote","side":"bid","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":87.2586,"sizeSol":2.68,"maxQuoteQty":292.31631,"sequence":"1113","txSignature":"kCVgB9K9hyEj1JgwS2Tr4RcPdjBCB1p8eVZ695tXEiZNuBvK8rDMvR2PTqzMbZHdkJAo61iUwspZKkduvGVgWeS"}
+{"ts":"2026-03-19T23:27:22.014Z","bot":"quoter-bot-1","action":"quote","side":"ask","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":89.287,"sizeSol":1.601,"maxQuoteQty":178.685609,"sequence":"1114","txSignature":"2w9t8kpHCm2TEQUd9JCSZsDk4dRxhaG7wTVNvjYvRYcXoiy5Y4n2rL6VoigkBXpTKF1HyEyJkeXmfoVYCe7JStdv"}
+{"ts":"2026-03-19T23:27:24.011Z","bot":"quoter-bot-0","action":"quote","side":"bid","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":88.7498,"sizeSol":1.343,"maxQuoteQty":148.988727,"sequence":"1115","txSignature":"4GCRMsXi1wpdJVQb7FkBaTyN4GuTyX1kPh45Ny4cgcAVGXmowstwHLAPJxQttC2QMaFGSnsce3rKAtcRNfPCT22p"}
+{"ts":"2026-03-19T23:27:26.080Z","bot":"quoter-bot-1","action":"quote","side":"ask","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":89.2991,"sizeSol":1.997,"maxQuoteQty":222.912878,"sequence":"1116","txSignature":"XbaZ3TqqqUFsBy6ziSCWdfLUzoC51GU8UuMSqb9paUMBK4xDvwjeEkCJv6BaGU9hJERq1qSVhhq9BBjRTyh4VaY"}
+{"ts":"2026-03-19T23:27:28.081Z","bot":"quoter-bot-0","action":"quote","side":"bid","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":87.5791,"sizeSol":2.984,"maxQuoteQty":326.670043,"sequence":"1117","txSignature":"JPEVD2i5csuMQdURFBE68MAnXGFxuQfuZf7HUk3n7FWy4c37YU8v76cuWH1sspU8H8hcwozvQVFMZaNzaRi4Ybn"}
+{"ts":"2026-03-19T23:27:28.081Z","msg":"quoter-stats","ticks":5,"bots":2,"totalPlaceIntents":5,"totalCancelIntents":0,"avgPlaceTps":0.6074596039363382,"avgIntentTps":0.6074596039363382,"windowPlaceTps":0.6074596039363382,"windowIntentTps":0.6074596039363382,"peakAvgPlaceTps":0.6074596039363382,"peakAvgIntentTps":0.6074596039363382,"peakWindowPlaceTps":0.6074596039363382,"peakWindowIntentTps":0.6074596039363382,"cancelBeforePlace":false,"cancelEveryTicks":1,"inFlight":0}
+{"ts":"2026-03-19T23:27:30.089Z","bot":"quoter-bot-1","action":"quote","side":"ask","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":89.8447,"sizeSol":2.162,"maxQuoteQty":242.805302,"sequence":"1118","txSignature":"4ZCoWUxYd1CbqUz76cVL2caEmMy6XUmHpKoBXyBPc2Dk4vb1gSycfJQ617MLTegpSJGmbFYcWt1ZU7p6VSPcnLPe"}
+{"ts":"2026-03-19T23:27:32.085Z","bot":"quoter-bot-0","action":"quote","side":"bid","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":87.2687,"sizeSol":1.929,"maxQuoteQty":210.426653,"sequence":"1119","txSignature":"2UpEAqDCKc2nvG9c8JGn7i3eorPpFjtyhg52DH6eQedNtH145Npa5DZVhhKeAeJbb2XGYggFn3NuZngEyKGyDLhK"}
+{"ts":"2026-03-19T23:27:34.009Z","bot":"quoter-bot-1","action":"quote","side":"ask","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":90.3898,"sizeSol":1.443,"maxQuoteQty":163.040602,"sequence":"1120","txSignature":"5snQtsL8Ed7xJCDLraioQGUPrYkEaaBZY5QUsVFwHoDPbHwajxuZAZbYJomMzEjR53L3V1Ux7no8tMz6HsHQ8Y8H"}
+{"ts":"2026-03-19T23:27:36.057Z","bot":"quoter-bot-0","action":"quote","side":"bid","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":88.0037,"sizeSol":2.62,"maxQuoteQty":288.212117,"sequence":"1121","txSignature":"3ZNchhA1ezxwSFvVpmykvc8fCVQGvmJ4HqJiCUABt7SXEEGpL4JniKWbrH4BRcYnVqVdwWniZ2AVxpccWitmHEZM"}
+{"ts":"2026-03-19T23:27:37.987Z","bot":"quoter-bot-1","action":"quote","side":"ask","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":89.4864,"sizeSol":1.653,"maxQuoteQty":184.901274,"sequence":"1122","txSignature":"3wC26Utz4YfmnANLmtHqNuHsj3vYhWyHrC9PWoSca8uL9HXF1ZxbvdxCYWyKfrvxUxvUYUAXxbW783nYmeyD1jPc"}
+{"ts":"2026-03-19T23:27:37.987Z","msg":"quoter-stats","ticks":10,"bots":2,"totalPlaceIntents":10,"totalCancelIntents":0,"avgPlaceTps":0.5513591001819484,"avgIntentTps":0.5513591001819484,"windowPlaceTps":0.5047445992327881,"windowIntentTps":0.5047445992327881,"peakAvgPlaceTps":0.6074596039363382,"peakAvgIntentTps":0.6074596039363382,"peakWindowPlaceTps":0.6074596039363382,"peakWindowIntentTps":0.6074596039363382,"cancelBeforePlace":false,"cancelEveryTicks":1,"inFlight":0}
+{"ts":"2026-03-19T23:27:39.981Z","bot":"quoter-bot-0","action":"quote","side":"bid","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":88.9467,"sizeSol":2.841,"maxQuoteQty":315.871968,"sequence":"1123","txSignature":"2yFye46oYU97Eha3PBcdTm5c91H7vYXiqxNzFwKwydPVsnYWr8v8VmzF9EJXtxYr4oV1KJmMDipVnaDa8ERUoLWe"}
+{"ts":"2026-03-19T23:27:42.046Z","bot":"quoter-bot-1","action":"quote","side":"ask","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":90.2057,"sizeSol":1.761,"maxQuoteQty":198.565297,"sequence":"1124","txSignature":"2omqnQfHK9woPB6wHnTqFXAjgYP9Wdn1yX1Q15VMz5JN9bVp4qTWTV2BVZYMu4osTYD1DZf5KC59HPf8s9idMX8x"}
+{"ts":"2026-03-19T23:27:44.066Z","bot":"quoter-bot-0","action":"quote","side":"bid","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":88.3118,"sizeSol":2.04,"maxQuoteQty":225.19509,"sequence":"1125","txSignature":"52LiRadUm8eBFgkd9NeHckgPhwng3TUw4erjhsLR2LedQQqpv1YqgXx9Ya29DKnYv2sWXCcqov6pMik6fpxP8VZy"}
+{"ts":"2026-03-19T23:27:46.078Z","bot":"quoter-bot-1","action":"quote","side":"ask","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":89.3218,"sizeSol":1.523,"maxQuoteQty":170.046377,"sequence":"1126","txSignature":"4Ta7NrXrqtjtrDnXnZTj2Chk3GwJVoaDC7NQFSvZsJYo11VGVVppTosDXnx9ZYD9NyWixAYaWpoZJQ7jSYhn8UvK"}
+{"ts":"2026-03-19T23:27:48.192Z","bot":"quoter-bot-0","action":"quote","side":"bid","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":87.4112,"sizeSol":2.102,"maxQuoteQty":229.672928,"sequence":"1127","txSignature":"5TATMNzi4DEWkhuY3YjT8cK4hH6Za56umkTDgx13e7VXYoUfNrY9XnUAnXd8hTZKXXpStT3Xxbi6DEJDLg1icRLS"}
+{"ts":"2026-03-19T23:27:48.192Z","msg":"quoter-stats","ticks":15,"bots":2,"totalPlaceIntents":15,"totalCancelIntents":0,"avgPlaceTps":0.5292498765083622,"avgIntentTps":0.5292498765083622,"windowPlaceTps":0.4899559039686428,"windowIntentTps":0.4899559039686428,"peakAvgPlaceTps":0.6074596039363382,"peakAvgIntentTps":0.6074596039363382,"peakWindowPlaceTps":0.6074596039363382,"peakWindowIntentTps":0.6074596039363382,"cancelBeforePlace":false,"cancelEveryTicks":1,"inFlight":0}
+{"ts":"2026-03-19T23:27:49.873Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T23:27:50.125Z","bot":"quoter-bot-1","action":"quote","side":"ask","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":89.2577,"sizeSol":2.3,"maxQuoteQty":256.615887,"sequence":"1128","txSignature":"LY42fBGcxQhnjTd8Q9NhfzqexH8sZsCcij3mta1BPM1vjN8TG3LweqEXFbDSSQN3PyCAqGGN2x1FfEw7uEE7FPv"}
+{"ts":"2026-03-19T23:27:51.863Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T23:27:52.116Z","bot":"quoter-bot-0","action":"quote","side":"bid","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":88.0067,"sizeSol":1.712,"maxQuoteQty":188.334338,"sequence":"1129","txSignature":"3NGWpYcMdukhRAu6sXYD52MpVV9ToU9QjzAcLBaihKmpNHjUxv1rf11sieYq2FKY79xyVXf8QNasVisCnAzJjQ94"}
+{"ts":"2026-03-19T23:27:53.862Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T23:27:54.051Z","bot":"quoter-bot-1","action":"quote","side":"ask","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":89.1011,"sizeSol":2.911,"maxQuoteQty":324.216628,"sequence":"1130","txSignature":"s9KCfVr2R8Dg7Swera5PNr1MGxWfb1XcoBMANgTtAB9JTJaTNWHkQnYFMvbahERfs8j57737xrF4xXLpLjFjnpS"}
+{"ts":"2026-03-19T23:27:55.864Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T23:27:55.966Z","bot":"quoter-bot-0","action":"quote","side":"bid","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":88.5887,"sizeSol":2.238,"maxQuoteQty":247.826888,"sequence":"1131","txSignature":"rTTa5AVNkhxMzrn9xEKjwoYDVgqy9UttRFFVFCDgxSokbjSFbbWK19oYsTZ5Mtf3Nnw5dpSrDXNC8SBDinkiwTU"}
+{"ts":"2026-03-19T23:27:57.865Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T23:27:58.008Z","bot":"quoter-bot-1","action":"quote","side":"ask","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":90.4973,"sizeSol":1.71,"maxQuoteQty":193.437979,"sequence":"1132","txSignature":"3nHdoBxJt4g77kxQPCphiuhs4W5cGtSYycpMktoi6WfjfvCq3oj5cdEcSXxfTh8ctKyYRwETgL5wmMPsVYYns4J5"}
+{"ts":"2026-03-19T23:27:58.008Z","msg":"quoter-stats","ticks":20,"bots":2,"totalPlaceIntents":20,"totalCancelIntents":0,"avgPlaceTps":0.5241364851407306,"avgIntentTps":0.5241364851407306,"windowPlaceTps":0.5093724531377343,"windowIntentTps":0.5093724531377343,"peakAvgPlaceTps":0.6074596039363382,"peakAvgIntentTps":0.6074596039363382,"peakWindowPlaceTps":0.6074596039363382,"peakWindowIntentTps":0.6074596039363382,"cancelBeforePlace":false,"cancelEveryTicks":1,"inFlight":0}
+{"ts":"2026-03-19T23:27:59.865Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T23:28:00.026Z","bot":"quoter-bot-0","action":"quote","side":"bid","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":88.0965,"sizeSol":1.63,"maxQuoteQty":179.496619,"sequence":"1133","txSignature":"yhX7shGh6GkXwgn3oWCniikFvHfUXFSkLpzdFGaJKzJD3d4asV84boBiAtqNkYpayBvLr8TCjKY7CeBpxYBLNNL"}
+{"ts":"2026-03-19T23:28:01.866Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T23:28:02.067Z","bot":"quoter-bot-1","action":"quote","side":"ask","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":90.4907,"sizeSol":2.124,"maxQuoteQty":240.252809,"sequence":"1134","txSignature":"5Z6FFQhfQGz9meFNro1bMWkgRoVi2YXndBD2PzvGmXSvaRVSeUMBh5PoWY6Z8VpssVTK1oj1EPyHF3NL3VkjH4xb"}
+{"ts":"2026-03-19T23:28:03.866Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T23:28:04.164Z","bot":"quoter-bot-0","action":"quote","side":"bid","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":88.7381,"sizeSol":2.414,"maxQuoteQty":267.767217,"sequence":"1135","txSignature":"4ZQ7RdyUDfoWR8fWhu9beMP9w7HZWciVhBej9dan6MhyvXDeDGfjbEEnwYUPAyXkuFB7VhrEPSPvzn14DQpSrLza"}
+{"ts":"2026-03-19T23:28:05.868Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T23:28:05.973Z","bot":"quoter-bot-1","action":"quote","side":"ask","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":90.1196,"sizeSol":1.461,"maxQuoteQty":164.58092,"sequence":"1136","txSignature":"3jXHpJQsz5FdttyjoEkKheVjYrB13fHcZFnNhWDHHcsX7cHGUtsHX3uRXCTSujLtUrc5ZguZ8gzWTGWE29d484L5"}
+{"ts":"2026-03-19T23:28:07.866Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T23:28:07.953Z","bot":"quoter-bot-0","action":"quote","side":"bid","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":88.5105,"sizeSol":2.055,"maxQuoteQty":227.361347,"sequence":"1137","txSignature":"xE1Q6LVrtDB136b7zVsggZdJrvzc91tuZDNcPE37LPSQ5nkvga7se6aJGWeqhcDz9a1yP2teUWYqtWSWSCRuR7J"}
+{"ts":"2026-03-19T23:28:07.953Z","msg":"quoter-stats","ticks":25,"bots":2,"totalPlaceIntents":25,"totalCancelIntents":0,"avgPlaceTps":0.5197181048999022,"avgIntentTps":0.5197181048999022,"windowPlaceTps":0.5027652086475616,"windowIntentTps":0.5027652086475616,"peakAvgPlaceTps":0.6074596039363382,"peakAvgIntentTps":0.6074596039363382,"peakWindowPlaceTps":0.6074596039363382,"peakWindowIntentTps":0.6074596039363382,"cancelBeforePlace":false,"cancelEveryTicks":1,"inFlight":0}
+{"ts":"2026-03-19T23:28:09.870Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T23:28:10.053Z","bot":"quoter-bot-1","action":"quote","side":"ask","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":90.4607,"sizeSol":1.249,"maxQuoteQty":141.231768,"sequence":"1138","txSignature":"EX5osTyWpDs6KZqrYwzaCjYZHhb31VPgCjbJwqUNBv2cMhfjtepauYmpQ5oCL5KVQoMn3GGJK8wPFr4uXT4uu3s"}
+{"ts":"2026-03-19T23:28:11.867Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T23:28:12.025Z","bot":"quoter-bot-0","action":"quote","side":"bid","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":88.5239,"sizeSol":2.677,"maxQuoteQty":296.2231,"sequence":"1139","txSignature":"2E2Ti9cjkaMmpZ3U1WRggsGLEsYs3ycEnhkHrphWY8GCC5wrk2orjpYfhFdWdd3XG7qzur6YdzaBjo3Dj7VXTzhA"}
+{"ts":"2026-03-19T23:28:13.867Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T23:28:14.085Z","bot":"quoter-bot-1","action":"quote","side":"ask","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":89.9864,"sizeSol":1.41,"maxQuoteQty":158.60103,"sequence":"1140","txSignature":"3ayVBpWKmSBahAPgs9Nrep2Bn3A7N1mZyDYXV2cP9E88xFx3tYHybkGZgdQiV58SMemn2Lmd8GoFJW8Js4j4UxSy"}
+{"ts":"2026-03-19T23:28:15.869Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T23:28:16.117Z","bot":"quoter-bot-0","action":"quote","side":"bid","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":87.3154,"sizeSol":1.654,"maxQuoteQty":180.524589,"sequence":"1141","txSignature":"GfCg6PuevqoZyz6NEaPn2TLXYCx6iFiuhM4QddGkNzLHpZ8EA8h1RaNARiTsqFPk719bA6HYE9xbXUPzbm6ZvbN"}
+{"ts":"2026-03-19T23:28:17.870Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T23:28:18.130Z","bot":"quoter-bot-1","action":"quote","side":"ask","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":90.5901,"sizeSol":2.231,"maxQuoteQty":252.633141,"sequence":"1142","txSignature":"4JScd3ajiHPk1D3FnBd7FXXvVJgwngo9Xewk4AQCWVvcWEwZKK2gMcCDSFVwBpyuQpo4NXaiydUVkwmGC7bJt5FC"}
+{"ts":"2026-03-19T23:28:18.130Z","msg":"quoter-stats","ticks":30,"bots":2,"totalPlaceIntents":30,"totalCancelIntents":0,"avgPlaceTps":0.5147563486616334,"avgIntentTps":0.5147563486616334,"windowPlaceTps":0.49130392060528644,"windowIntentTps":0.49130392060528644,"peakAvgPlaceTps":0.6074596039363382,"peakAvgIntentTps":0.6074596039363382,"peakWindowPlaceTps":0.6074596039363382,"peakWindowIntentTps":0.6074596039363382,"cancelBeforePlace":false,"cancelEveryTicks":1,"inFlight":0}
+{"ts":"2026-03-19T23:28:19.868Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T23:28:20.016Z","bot":"quoter-bot-0","action":"quote","side":"bid","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":87.6906,"sizeSol":2.783,"maxQuoteQty":305.053675,"sequence":"1143","txSignature":"587RPhgPhQuxnbfrSquRUyp6MHPgVVreevtm1Ji6Ksw58gnT3unB7MZNUu2qL2rVZCnN1cxTxmRmD2e19Db19bSJ"}
+{"ts":"2026-03-19T23:28:21.870Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T23:28:22.013Z","bot":"quoter-bot-1","action":"quote","side":"ask","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":89.3659,"sizeSol":2.11,"maxQuoteQty":235.702561,"sequence":"1144","txSignature":"5e4WhckiDb96fqTfULHD49akMgG6YrHQ5iwgJcPnrjMdottowsA4xyMDjWjVuwYpXNjpSSbzebxhbDxZPnJacCYM"}
+{"ts":"2026-03-19T23:28:23.868Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T23:28:24.014Z","bot":"quoter-bot-0","action":"quote","side":"bid","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":87.6678,"sizeSol":2.254,"maxQuoteQty":247.004027,"sequence":"1145","txSignature":"3Lw5ZrPGkNL4KeWTqv2jsXTPPNywVUuwJTC1uxfP4H2FiNev1SG72r5HymQat2C7rV5ofdVUCDbvuBPmY9qEZChU"}
+{"ts":"2026-03-19T23:28:25.870Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T23:28:26.050Z","bot":"quoter-bot-1","action":"quote","side":"ask","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":89.2459,"sizeSol":1.591,"maxQuoteQty":177.487784,"sequence":"1146","txSignature":"TBsF7hbJePMrj8fxmG4GiE1KjK5HGrQqrJZaF26X4CnBMJSTPSgWKFXes8ubge9GxfLazaJkpgNygLkADGfg7NQ"}
+{"ts":"2026-03-19T23:28:27.870Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T23:28:27.965Z","bot":"quoter-bot-0","action":"quote","side":"bid","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":87.6529,"sizeSol":2.347,"maxQuoteQty":257.151695,"sequence":"1147","txSignature":"5GPxtBocxZTmTuge4SAD9cSos6eiGAfdEaZQRGFocMyc2mgjeQRiQoLRPEFsQmrofx7Q1NVtAcq9J4WZF2NroEev"}
+{"ts":"2026-03-19T23:28:27.965Z","msg":"quoter-stats","ticks":35,"bots":2,"totalPlaceIntents":35,"totalCancelIntents":0,"avgPlaceTps":0.5138368934889526,"avgIntentTps":0.5138368934889526,"windowPlaceTps":0.5083884087442806,"windowIntentTps":0.5083884087442806,"peakAvgPlaceTps":0.6074596039363382,"peakAvgIntentTps":0.6074596039363382,"peakWindowPlaceTps":0.6074596039363382,"peakWindowIntentTps":0.6074596039363382,"cancelBeforePlace":false,"cancelEveryTicks":1,"inFlight":0}
+{"ts":"2026-03-19T23:28:29.873Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T23:28:31.065Z","bot":"quoter-bot-1","action":"quote","side":"ask","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":89.7746,"sizeSol":1.215,"maxQuoteQty":136.345174,"sequence":"1148","txSignature":"29Z8DJh6zf7K4QkLGRE3nzf6Paajk7jKfWYbDSfg4FJCpF9zS4w6ECoyLQJShsucM5fcA1ms822FsRNm3DrJVxdN"}
+{"ts":"2026-03-19T23:28:31.870Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T23:28:32.170Z","bot":"quoter-bot-0","action":"quote","side":"bid","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":87.6075,"sizeSol":1.339,"maxQuoteQty":146.633053,"sequence":"1149","txSignature":"4hJ3jLLuK9DpjH6YZqpxWFeEvSwVsLxRhGRdfXiWnsmWkZy9RPfhPkWE7kQBznin2N3rpq4qaPoKu99N5Dprxtfs"}
+{"ts":"2026-03-19T23:28:33.867Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T23:28:34.102Z","bot":"quoter-bot-1","action":"quote","side":"ask","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":89.7006,"sizeSol":2.169,"maxQuoteQty":243.200752,"sequence":"1150","txSignature":"55vXUVLgJBp2q8nL3f51JC7arwZH2UgpMvUSFGz6jRLziCqvPz7eeZokjiiuw4f5i4dtfErkJuSewkzDgsqgWsPG"}
+{"ts":"2026-03-19T23:28:35.869Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T23:28:36.235Z","bot":"quoter-bot-0","action":"quote","side":"bid","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":88.0599,"sizeSol":1.382,"maxQuoteQty":152.123477,"sequence":"1151","txSignature":"hR3heA1ToaJrckbTmwqW5ZfeYdydFDrdDC9Q9XGHJFp2quLV534R1wNrRAYvvSPmg8vicFxkWHPQavWrL7uzBoE"}
+{"ts":"2026-03-19T23:28:37.868Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T23:28:38.035Z","bot":"quoter-bot-1","action":"quote","side":"ask","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":90.63,"sizeSol":1.7,"maxQuoteQty":192.58875,"sequence":"1152","txSignature":"3yksYH1Ap5DKFFQkPHgSs5Fhp6wAjSnfSMTXibNY6rY6kt3sUVoC8wTcn18Nvd2V6T22KHDGEyBcyEL2mjVNANwZ"}
+{"ts":"2026-03-19T23:28:38.035Z","msg":"quoter-stats","ticks":40,"bots":2,"totalPlaceIntents":40,"totalCancelIntents":0,"avgPlaceTps":0.5116070857581377,"avgIntentTps":0.5116070857581377,"windowPlaceTps":0.4965243296921549,"windowIntentTps":0.4965243296921549,"peakAvgPlaceTps":0.6074596039363382,"peakAvgIntentTps":0.6074596039363382,"peakWindowPlaceTps":0.6074596039363382,"peakWindowIntentTps":0.6074596039363382,"cancelBeforePlace":false,"cancelEveryTicks":1,"inFlight":0}
+{"ts":"2026-03-19T23:28:39.872Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T23:28:40.013Z","bot":"quoter-bot-0","action":"quote","side":"bid","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":87.2773,"sizeSol":1.412,"maxQuoteQty":154.044434,"sequence":"1153","txSignature":"4ZsL5fQAcLsrwey7zU6MtJYqrtsTRaL7TSYfhrefKNjdenRJGQvfkfAGyzKnUe9gGqoJ6pmr4jXQzaeW2NxrStfi"}
+{"ts":"2026-03-19T23:28:41.869Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T23:28:42.045Z","bot":"quoter-bot-1","action":"quote","side":"ask","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":90.4213,"sizeSol":2.802,"maxQuoteQty":316.700603,"sequence":"1154","txSignature":"2tpAi3TkiQvjqgwD9ns82qhP4MaXyFk6G6sck34Y9pBoqpmkh5aoqbXA2MFSioWsLs8yWpRxR3UwrDDPxMn1LREV"}
+{"ts":"2026-03-19T23:28:43.869Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T23:28:44.013Z","bot":"quoter-bot-0","action":"quote","side":"bid","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":88.1545,"sizeSol":1.828,"maxQuoteQty":201.433032,"sequence":"1155","txSignature":"4VA6m5ro8CfwN2eXpjvqzzJEsGZKQfzBoYhcixJtY5km7toFYcxXDtxnRrDyuaCXRDLtcNLDnLecs8ve6xUTUhe7"}
+{"ts":"2026-03-19T23:28:45.869Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T23:28:46.045Z","bot":"quoter-bot-1","action":"quote","side":"ask","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":89.9758,"sizeSol":2.191,"maxQuoteQty":246.421222,"sequence":"1156","txSignature":"CwmCfq3fh643X9LRZ7cfwLCgNagu3cFp44z9xBs96QwTgqZyYJ8zytU4LGdcYxB9AMCBTZTNEcpVYwyGpC2PuTw"}
+{"ts":"2026-03-19T23:28:47.869Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T23:28:48.242Z","bot":"quoter-bot-0","action":"quote","side":"bid","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":87.5812,"sizeSol":2.099,"maxQuoteQty":229.791174,"sequence":"1157","txSignature":"63HvYdkFj8gKPbhjjEnGVFjpBBm8nUaKizpsnDzUBGEvFSzZdFoFELixyCg9urD1daejPa7BKJQVij3rXdxikYXx"}
+{"ts":"2026-03-19T23:28:48.242Z","msg":"quoter-stats","ticks":45,"bots":2,"totalPlaceIntents":45,"totalCancelIntents":0,"avgPlaceTps":0.5090958457778985,"avgIntentTps":0.5090958457778985,"windowPlaceTps":0.4898599000685803,"windowIntentTps":0.4898599000685803,"peakAvgPlaceTps":0.6074596039363382,"peakAvgIntentTps":0.6074596039363382,"peakWindowPlaceTps":0.6074596039363382,"peakWindowIntentTps":0.6074596039363382,"cancelBeforePlace":false,"cancelEveryTicks":1,"inFlight":0}
+{"ts":"2026-03-19T23:28:49.867Z","msg":"coingecko price fetch failed; using cached coingecko price","error":"coingecko non-200 status 429"}
+{"ts":"2026-03-19T23:28:50.034Z","bot":"quoter-bot-1","action":"quote","side":"ask","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":89.0904,"sizeSol":2.712,"maxQuoteQty":302.016456,"sequence":"1158","txSignature":"4635TxA7VdJEwrjFNTGg94nmuMomSwFNnaD6LhmprhzdHTLpzFk8ZSjcFsVxeMC7Aqjy5AffKM1ZT1k28DtBiJFQ"}
+{"ts":"2026-03-19T23:28:52.111Z","bot":"quoter-bot-0","action":"quote","side":"bid","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":88.6244,"sizeSol":2.839,"maxQuoteQty":314.505839,"sequence":"1159","txSignature":"2qDeptD6BJqm2Nq5JFYiLZpGnWjSPBxoWingTFbn9G67oYrvN1jmw7WWqNsgi9uCMC2wHzkhP4yzr5JCJEUWoXhX"}
+{"ts":"2026-03-19T23:28:54.034Z","bot":"quoter-bot-1","action":"quote","side":"ask","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":90.2979,"sizeSol":2.05,"maxQuoteQty":231.388369,"sequence":"1160","txSignature":"1HXU6peAa5UFUf8JT2LhHaPc4E5FkSMPiqP3rherTu4tHkke2yCFL9yK7JJPf99aL4Gm2h42HFy7uFSeTUwUEWk"}
+{"ts":"2026-03-19T23:28:56.028Z","bot":"quoter-bot-0","action":"quote","side":"bid","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":88.0917,"sizeSol":2.408,"maxQuoteQty":265.156017,"sequence":"1161","txSignature":"KBSJkh7mUpHmrgWdxLeHUsijbX6CDYe7vtVDx3cDfcRVT174eoLnGwj8oKpZP8ytTXp63858Raa568yNAyjHLa1"}
+{"ts":"2026-03-19T23:28:58.062Z","bot":"quoter-bot-1","action":"quote","side":"ask","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":90.3493,"sizeSol":2.709,"maxQuoteQty":305.945317,"sequence":"1162","txSignature":"3WUCJFAjYRgkL45HjvDsCcdkstZKyMd7GHL4Qj5YtN2jJbrWH4EWF8Cfqa4MEJNA1JVjUnHgdeKVjDQMCnCkTRQC"}
+{"ts":"2026-03-19T23:28:58.062Z","msg":"quoter-stats","ticks":50,"bots":2,"totalPlaceIntents":50,"totalCancelIntents":0,"avgPlaceTps":0.5091027573005336,"avgIntentTps":0.5091027573005336,"windowPlaceTps":0.5091649694501018,"windowIntentTps":0.5091649694501018,"peakAvgPlaceTps":0.6074596039363382,"peakAvgIntentTps":0.6074596039363382,"peakWindowPlaceTps":0.6074596039363382,"peakWindowIntentTps":0.6074596039363382,"cancelBeforePlace":false,"cancelEveryTicks":1,"inFlight":0}
+{"ts":"2026-03-19T23:28:59.965Z","bot":"quoter-bot-0","action":"quote","side":"bid","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":87.735,"sizeSol":1.872,"maxQuoteQty":205.2999,"sequence":"1163","txSignature":"gijg2Fs7oNcgYvGo5RRZkrGKQh5KR2Mmt1vwBZAJvCcTFrZnwaaVUb1dkRUfhRLGgeNzvabjhvNHy9cp7Yw1zQL"}
+{"ts":"2026-03-19T23:29:02.042Z","bot":"quoter-bot-1","action":"quote","side":"ask","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":89.645,"sizeSol":2.272,"maxQuoteQty":254.5918,"sequence":"1164","txSignature":"2sGUzo8EWt7DeHEP1wRLv7oPQqaSrDxkuzN1ZavQQdjcscQ1N67oDNd3nPenRqz2x4gPtCiapuDu34Jy5BeYdEgi"}
+{"ts":"2026-03-19T23:29:03.955Z","bot":"quoter-bot-0","action":"quote","side":"bid","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":87.7175,"sizeSol":2.584,"maxQuoteQty":283.327525,"sequence":"1165","txSignature":"3bWFXP4N8KLWQcAT9fmtHsa9ybVGT2bHscDX8wLgoHXCvCSq3BCnKFN2ypsRDEjK1kURoHgekCV8dQB3GM6S5fyr"}
+{"ts":"2026-03-19T23:29:05.955Z","bot":"quoter-bot-1","action":"quote","side":"ask","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":90.5405,"sizeSol":2.847,"maxQuoteQty":322.211004,"sequence":"1166","txSignature":"gm9qxrvUew5Pd7D5KTdhKTMfpxBXQiMF57arj3jKkuEnQD7YewfsjH549hJrgaS8uYeeDJmpRn4F6jETwVZ5b8G"}
+{"ts":"2026-03-19T23:29:07.954Z","bot":"quoter-bot-0","action":"quote","side":"bid","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":87.6392,"sizeSol":1.394,"maxQuoteQty":152.711306,"sequence":"1167","txSignature":"2zd2kjADNVBKdmTY6izzhyzLUGkNnKvimBsgK5dNyhRz5YCS9rkEGnyMNiY2rMq13rZyHnNV4z3bnmo3XHci2Zc3"}
+{"ts":"2026-03-19T23:29:07.955Z","msg":"quoter-stats","ticks":55,"bots":2,"totalPlaceIntents":55,"totalCancelIntents":0,"avgPlaceTps":0.5087646269830257,"avgIntentTps":0.5087646269830257,"windowPlaceTps":0.5054078641463661,"windowIntentTps":0.5054078641463661,"peakAvgPlaceTps":0.6074596039363382,"peakAvgIntentTps":0.6074596039363382,"peakWindowPlaceTps":0.6074596039363382,"peakWindowIntentTps":0.6074596039363382,"cancelBeforePlace":false,"cancelEveryTicks":1,"inFlight":0}
+{"ts":"2026-03-19T23:29:10.013Z","bot":"quoter-bot-1","action":"quote","side":"ask","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":90.5989,"sizeSol":1.646,"maxQuoteQty":186.407237,"sequence":"1168","txSignature":"ebLeksCMTfpsEHWVRhLV2C5kWWtq3weXqzbsc5AhCst48x3St71T6tamXeu2UoR3V6C4wwGNu6hA6F4nVhkcSJ3"}
+{"ts":"2026-03-19T23:29:11.946Z","bot":"quoter-bot-0","action":"quote","side":"bid","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":88.5917,"sizeSol":2.327,"maxQuoteQty":257.691107,"sequence":"1169","txSignature":"2jJWgJ5QvEME1XBKzb9yv7WgbHWPwzjtqQQZb9s1q1fVQo28XzYVVPrsCViK9gQJtA7435gDSk9DZf9LFgzfVooC"}
+{"ts":"2026-03-19T23:29:13.974Z","bot":"quoter-bot-1","action":"quote","side":"ask","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":89.3556,"sizeSol":2.864,"maxQuoteQty":319.893048,"sequence":"1170","txSignature":"3DdWhuGT9kT4g4UhRGWocESCXeJ5KBxgKmKbbfd4ENSK7f9WRqX7VqoHYFxWHx5gCjFxmw1BXNqSDJRKTfmVxDuw"}
+{"ts":"2026-03-19T23:29:16.083Z","bot":"quoter-bot-0","action":"quote","side":"bid","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":88.3018,"sizeSol":2.987,"maxQuoteQty":329.696846,"sequence":"1171","txSignature":"e5kfvDtvRnWLfCdr7nX5NuEaVhK9d3aTB7JPayw9armJtHhKnkfFMJcFLkFKgUEkr5A7hRu6BoE2aaA7p7BtepL"}
+{"ts":"2026-03-19T23:29:18.118Z","bot":"quoter-bot-1","action":"quote","side":"ask","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":89.6443,"sizeSol":1.538,"maxQuoteQty":172.341167,"sequence":"1172","txSignature":"3cUyRskmSscKkkSitfetxtZi8GiAvD6GZJFB9B6wGxadYwLzaat8t4HG9tfFdsavVTgRXmUfEnVE2mmzPEEtcNEa"}
+{"ts":"2026-03-19T23:29:18.118Z","msg":"quoter-stats","ticks":60,"bots":2,"totalPlaceIntents":60,"totalCancelIntents":0,"avgPlaceTps":0.5073223526228565,"avgIntentTps":0.5073223526228565,"windowPlaceTps":0.4919807143559972,"windowIntentTps":0.4919807143559972,"peakAvgPlaceTps":0.6074596039363382,"peakAvgIntentTps":0.6074596039363382,"peakWindowPlaceTps":0.6074596039363382,"peakWindowIntentTps":0.6074596039363382,"cancelBeforePlace":false,"cancelEveryTicks":1,"inFlight":0}
+{"ts":"2026-03-19T23:29:20.028Z","bot":"quoter-bot-0","action":"quote","side":"bid","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":87.3824,"sizeSol":2.54,"maxQuoteQty":277.43912,"sequence":"1173","txSignature":"5ufAa5waUN3NwZYWNU3pTkjgTAbQmT6MAyk5NY4kr4EkHhv5FJ89tdFqeqVhoeD9ar683hZ3od4DRSUavkAP6kuk"}
+{"ts":"2026-03-19T23:29:21.984Z","bot":"quoter-bot-1","action":"quote","side":"ask","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":90.4271,"sizeSol":2.372,"maxQuoteQty":268.116351,"sequence":"1174","txSignature":"2rzj1stP9uuWwp3K2RTY9thSQvPm9h7FqBW6dtJy9JS7s8TQ6BdYHWAWopWSm8VMihj2QtaLiTYYKTmisEPEbUzo"}
+{"ts":"2026-03-19T23:29:24.029Z","bot":"quoter-bot-0","action":"quote","side":"bid","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":88.7239,"sizeSol":1.6,"maxQuoteQty":177.4478,"sequence":"1175","txSignature":"2oAGkbeyPo7ieGBycvm55cecj7sbfXhu2J5Fo9FMNHBB21ukPpXatzs4QRchXnF8tL757XscKNZyxnwpyFzdG9dC"}
+{"ts":"2026-03-19T23:29:26.078Z","bot":"quoter-bot-1","action":"quote","side":"ask","referencePrice":88.99,"referenceSource":"coingecko","quotePrice":89.7662,"sizeSol":1.338,"maxQuoteQty":150.13397,"sequence":"1176","txSignature":"5xFgjC3VQVuy2iAc2HAHmgVjPjAyw6Fnue1mHMjvABtzHm5oCSAXqZkjbBUN2n2Ff2mLh45ESFgzcWnW6KAcdRvs"}

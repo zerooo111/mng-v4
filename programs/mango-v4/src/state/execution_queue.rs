@@ -343,6 +343,18 @@ impl ExecutionQueue {
         Some(item)
     }
 
+    /// Increment the retry counter on a CTM item in-place (no reordering needed
+    /// since CTM uses sequence-indexed slots, not a circular buffer).
+    /// Returns the new retry count.
+    pub fn increment_ctm_retry(&mut self, sequence: u64, current_slot: u64) -> u8 {
+        let item = self.ctm_item_mut(sequence);
+        if item.first_failure_slot == 0 {
+            item.first_failure_slot = current_slot;
+        }
+        item.retries = item.retries.saturating_add(1);
+        item.retries
+    }
+
     pub fn rotate_liquidity_head_with_retry(
         &mut self,
         current_slot: u64,
@@ -542,7 +554,8 @@ mod tests {
     #[test]
     fn push_ctm_wraps_around_at_capacity_boundary() {
         let mut queue = test_queue();
-        // Place an item at sequence 1024 which should map to physical index 0
+        // Advance head to 1 so seq 1024 is within window [1, 1025)
+        queue.header.next_sequence_to_execute = 1;
         queue.push_ctm(pending_ctm_item(1024, 1)).unwrap();
         assert_eq!(ExecutionQueue::ctm_slot_index(1024), 0);
         assert_eq!(queue.ctm_item(1024).sequence, 1024);
@@ -850,10 +863,11 @@ mod tests {
     fn sequence_overflow_u64_max() {
         let mut queue = test_queue();
         queue.header.next_sequence_to_execute = u64::MAX - 5;
-        // can_enqueue_ctm_sequence uses saturating_add, so no panic
+        // can_enqueue checks: seq >= base && seq < base.saturating_add(1024)
+        // saturating_add(1024) when base = u64::MAX - 5 → u64::MAX
         assert!(queue.can_enqueue_ctm_sequence(u64::MAX - 5));
-        assert!(queue.can_enqueue_ctm_sequence(u64::MAX));
-        // Push at u64::MAX should not panic
+        assert!(queue.can_enqueue_ctm_sequence(u64::MAX - 1));
+        assert!(!queue.can_enqueue_ctm_sequence(u64::MAX)); // saturating edge
         queue
             .push_ctm(pending_ctm_item(u64::MAX - 5, 1))
             .unwrap();

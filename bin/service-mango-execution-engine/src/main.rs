@@ -7,18 +7,19 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use anchor_lang::InstructionData;
+use anchor_lang::{AnchorDeserialize, InstructionData};
 use anyhow::{anyhow, Context, Result};
 use mango_v4::{
     error::MangoError,
-    instructions::CtmEnvelope,
+    instructions::{CtmEnvelope, ExecutionQueueConfigParams, PerpPlaceOrderV2Payload},
     state::{
         EXECUTION_QUEUE_COUNT_OFFSET, EXECUTION_QUEUE_CTM_CAPACITY,
         EXECUTION_QUEUE_CTM_ITEMS_OFFSET, EXECUTION_QUEUE_HEAD_OFFSET,
         EXECUTION_QUEUE_ITEM_ACCOUNTS_HASH_OFFSET, EXECUTION_QUEUE_ITEM_KIND_OFFSET,
+        EXECUTION_QUEUE_ITEM_PAYLOAD_LEN_OFFSET, EXECUTION_QUEUE_ITEM_PAYLOAD_OFFSET,
         EXECUTION_QUEUE_ITEM_SEQUENCE_OFFSET, EXECUTION_QUEUE_ITEM_SIZE,
         EXECUTION_QUEUE_ITEM_STATUS_OFFSET, EXECUTION_QUEUE_LIQUIDITY_CAPACITY,
         EXECUTION_QUEUE_LIQUIDITY_ITEMS_OFFSET, EXECUTION_QUEUE_MAX_SEEN_SEQUENCE_OFFSET,
@@ -49,7 +50,7 @@ use tokio::{
     fs,
     sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore},
     task::JoinHandle,
-    time::timeout,
+    time::{sleep, timeout},
 };
 use tonic::{transport::Server, Request, Response, Status};
 use tracing::{debug, info, warn};
@@ -72,6 +73,7 @@ struct Config {
     bind_addr: SocketAddr,
     http_bind_addr: Option<SocketAddr>,
     payer: Arc<Keypair>,
+    executor_admin: Arc<Keypair>,
     ctm: Arc<Keypair>,
     program_id: Pubkey,
     executor_group: Option<Pubkey>,
@@ -111,6 +113,10 @@ struct Config {
     executor_include_legacy_fixed_hash: bool,
     executor_dynamic_lanes_refresh_ms: u64,
     executor_dynamic_lanes_max_events: usize,
+    executor_auto_drop_expired_heads: bool,
+    executor_admin_tx_timeout_ms: u64,
+    executor_expired_head_drop_batch_max: usize,
+    executor_expired_head_drop_grace_secs: u64,
 }
 
 impl Config {
@@ -129,6 +135,10 @@ impl Config {
             "CTM_RELAYER_PAYER_KEYPAIR",
             "MB_PAYER_KEYPAIR",
         )?);
+        let executor_admin = Arc::new(
+            read_keypair_env("EXECUTION_QUEUE_ADMIN_KEYPAIR", "CTM_RELAYER_PAYER_KEYPAIR")
+                .or_else(|_| read_keypair_env("CTM_RELAYER_PAYER_KEYPAIR", "MB_PAYER_KEYPAIR"))?,
+        );
         let ctm = Arc::new(
             read_keypair_env("CTM_RELAYER_CTM_KEYPAIR", "CTM_RELAYER_PAYER_KEYPAIR")
                 .or_else(|_| read_keypair_env("CTM_RELAYER_PAYER_KEYPAIR", "MB_PAYER_KEYPAIR"))?,
@@ -215,12 +225,21 @@ impl Config {
             parse_u64_env("EXECUTION_QUEUE_CRANK_DYNAMIC_LANES_REFRESH_MS", 500)?;
         let executor_dynamic_lanes_max_events =
             parse_u64_env("EXECUTION_QUEUE_CRANK_DYNAMIC_LANES_MAX_EVENTS", 4096)? as usize;
+        let executor_auto_drop_expired_heads =
+            parse_bool_env("EXECUTION_QUEUE_CRANK_AUTO_DROP_EXPIRED_HEADS", true);
+        let executor_admin_tx_timeout_ms =
+            parse_u64_env("EXECUTION_QUEUE_CRANK_ADMIN_TX_TIMEOUT_MS", 5_000)?;
+        let executor_expired_head_drop_batch_max =
+            parse_u64_env("EXECUTION_QUEUE_CRANK_EXPIRED_HEAD_DROP_BATCH_MAX", 8)? as usize;
+        let executor_expired_head_drop_grace_secs =
+            parse_u64_env("EXECUTION_QUEUE_CRANK_EXPIRED_HEAD_DROP_GRACE_SECS", 5)?;
 
         Ok(Self {
             cluster_url,
             bind_addr,
             http_bind_addr,
             payer,
+            executor_admin,
             ctm,
             program_id,
             executor_group,
@@ -260,6 +279,10 @@ impl Config {
             executor_include_legacy_fixed_hash,
             executor_dynamic_lanes_refresh_ms,
             executor_dynamic_lanes_max_events,
+            executor_auto_drop_expired_heads,
+            executor_admin_tx_timeout_ms,
+            executor_expired_head_drop_batch_max,
+            executor_expired_head_drop_grace_secs,
         })
     }
 }
@@ -923,6 +946,20 @@ struct PendingHeadDispatch {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QueueAdminState {
+    pause_ingress: bool,
+    pause_execute: bool,
+    gap_wait_slots: u64,
+    liquidity_delay_slots: u64,
+    head: QueueHead,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct QueueExpiredHeadBatch {
+    sequences: Vec<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExecuteLoopOutcome {
     Idle,
     Busy,
@@ -969,6 +1006,282 @@ fn classify_lane_failure(err: &anyhow::Error) -> LaneFailureClass {
 }
 
 impl Engine {
+    fn current_unix_timestamp_secs(&self) -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    fn inspect_expired_head_batch(&self, queue_data: &[u8], expected_sequence: u64) -> QueueExpiredHeadBatch {
+        let queue_state = inspect_queue_admin_state(queue_data);
+        if queue_state.head.reason != "ctm_pending" || queue_state.head.next_sequence != expected_sequence {
+            return QueueExpiredHeadBatch {
+                sequences: Vec::new(),
+            };
+        }
+        let now_ts = self.current_unix_timestamp_secs();
+        let expiry_cutoff = now_ts.saturating_sub(self.config.executor_expired_head_drop_grace_secs);
+        let mut sequences = Vec::new();
+        let start = queue_state.head.next_sequence;
+        let end = queue_state
+            .head
+            .max_seen_sequence
+            .saturating_add(1)
+            .min(start.saturating_add(self.config.executor_expired_head_drop_batch_max as u64));
+        let mut sequence = start;
+        while sequence < end {
+            let item_offset = EXECUTION_QUEUE_CTM_ITEMS_OFFSET
+                + (sequence as usize % EXECUTION_QUEUE_CTM_CAPACITY) * EXECUTION_QUEUE_ITEM_SIZE;
+            if item_offset + EXECUTION_QUEUE_ITEM_SIZE > queue_data.len() {
+                break;
+            }
+            let slot_sequence = u64::from_le_bytes(
+                queue_data[item_offset + EXECUTION_QUEUE_ITEM_SEQUENCE_OFFSET
+                    ..item_offset + EXECUTION_QUEUE_ITEM_SEQUENCE_OFFSET + 8]
+                    .try_into()
+                    .unwrap_or([0; 8]),
+            );
+            let slot_kind = queue_data[item_offset + EXECUTION_QUEUE_ITEM_KIND_OFFSET];
+            let slot_status = queue_data[item_offset + EXECUTION_QUEUE_ITEM_STATUS_OFFSET];
+            if slot_status != 1 || slot_kind != 0 || slot_sequence != sequence {
+                break;
+            }
+            let payload_len = u16::from_le_bytes(
+                queue_data[item_offset + EXECUTION_QUEUE_ITEM_PAYLOAD_LEN_OFFSET
+                    ..item_offset + EXECUTION_QUEUE_ITEM_PAYLOAD_LEN_OFFSET + 2]
+                    .try_into()
+                    .unwrap_or([0; 2]),
+            ) as usize;
+            if payload_len < 4 || payload_len > (EXECUTION_QUEUE_ITEM_SIZE - EXECUTION_QUEUE_ITEM_PAYLOAD_OFFSET) {
+                break;
+            }
+            let payload_offset = item_offset + EXECUTION_QUEUE_ITEM_PAYLOAD_OFFSET;
+            let payload_end = payload_offset + payload_len;
+            if payload_end > queue_data.len() {
+                break;
+            }
+            let payload = &queue_data[payload_offset..payload_end];
+            if payload[0] != 1 || payload[1] != 0 || payload[2] != 0 || payload[3] != 0 {
+                break;
+            }
+            let decoded =
+                match PerpPlaceOrderV2Payload::try_from_slice(&payload[4..]) {
+                    Ok(decoded) => decoded,
+                    Err(_) => break,
+                };
+            if decoded.expiry_timestamp == 0 || decoded.expiry_timestamp > expiry_cutoff {
+                break;
+            }
+            sequences.push(sequence);
+            sequence = sequence.saturating_add(1);
+        }
+        QueueExpiredHeadBatch { sequences }
+    }
+
+    async fn fetch_transaction_logs(&self, signature: Signature) -> Result<Vec<String>> {
+        for attempt in 0..3u8 {
+            let response = self
+                .http_client
+                .post(&self.config.cluster_url)
+                .json(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": format!("get-transaction-{signature}-{attempt}"),
+                    "method": "getTransaction",
+                    "params": [
+                        signature.to_string(),
+                        {
+                            "commitment": "confirmed",
+                            "encoding": "json",
+                            "maxSupportedTransactionVersion": 0
+                        }
+                    ]
+                }))
+                .send()
+                .await?
+                .error_for_status()?;
+            let body: serde_json::Value = response.json().await?;
+            if let Some(error) = body.get("error") {
+                return Err(anyhow!("getTransaction rpc error for {signature}: {error}"));
+            }
+            if let Some(result) = body.get("result") {
+                if result.is_null() {
+                    sleep(Duration::from_millis(200)).await;
+                    continue;
+                }
+                if let Some(logs) = result
+                    .pointer("/meta/logMessages")
+                    .and_then(|value| value.as_array())
+                {
+                    return Ok(logs
+                        .iter()
+                        .filter_map(|value| value.as_str().map(str::to_owned))
+                        .collect());
+                }
+                return Ok(Vec::new());
+            }
+        }
+        Err(anyhow!(
+            "transaction details unavailable for failed executor tx {}",
+            signature
+        ))
+    }
+
+    async fn await_signature_result(&self, signature: Signature, timeout_ms: u64) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        loop {
+            let response = self.rpc.get_signature_statuses(&[signature]).await?;
+            match response.value.into_iter().next().flatten() {
+                Some(status) if status.err.is_none() => return Ok(()),
+                Some(status) => {
+                    return Err(anyhow!(
+                        "transaction {} failed while awaiting confirmation: {:?}",
+                        signature,
+                        status.err
+                    ))
+                }
+                None if Instant::now() >= deadline => {
+                    return Err(anyhow!(
+                        "timed out awaiting transaction confirmation for {}",
+                        signature
+                    ))
+                }
+                None => sleep(Duration::from_millis(200)).await,
+            }
+        }
+    }
+
+    async fn maybe_auto_drop_expired_head(
+        &self,
+        executor: &Arc<ExecutorState>,
+        pending: &PendingHeadDispatch,
+    ) -> bool {
+        if !self.config.executor_auto_drop_expired_heads {
+            return false;
+        }
+        let logs = match self.fetch_transaction_logs(pending.signature).await {
+            Ok(logs) => logs,
+            Err(err) => {
+                debug!(
+                    "executor failed tx log fetch skipped sequence={} sig={} err={err:?}",
+                    pending.sequence, pending.signature
+                );
+                return false;
+            }
+        };
+        if !logs.iter().any(|line| line.contains("Order is already expired")) {
+            return false;
+        }
+        match self
+            .drop_ctm_head_with_admin_tx(executor, pending.sequence, "expired_order")
+            .await
+        {
+            Ok(signature) => {
+                info!(
+                    "executor auto-dropped expired head sequence={} recovery_tx={}",
+                    pending.sequence, signature
+                );
+                true
+            }
+            Err(err) => {
+                warn!(
+                    "executor failed to auto-drop expired head sequence={} err={err:?}",
+                    pending.sequence
+                );
+                false
+            }
+        }
+    }
+
+    async fn drop_ctm_head_with_admin_tx(
+        &self,
+        executor: &Arc<ExecutorState>,
+        sequence: u64,
+        reason: &str,
+    ) -> Result<Signature> {
+        let queue_account = self.rpc.get_account(&executor.execution_queue).await?;
+        let queue_state = inspect_queue_admin_state(&queue_account.data);
+        if queue_state.head.reason != "ctm_pending" || queue_state.head.next_sequence != sequence {
+            return Err(anyhow!(
+                "queue head moved before admin drop: expected_sequence={} current_sequence={} reason={}",
+                sequence,
+                queue_state.head.next_sequence,
+                queue_state.head.reason
+            ));
+        }
+        let expired_batch = self.inspect_expired_head_batch(&queue_account.data, sequence);
+        let sequences_to_drop = if expired_batch.sequences.is_empty() {
+            vec![sequence]
+        } else {
+            expired_batch.sequences
+        };
+
+        let mut instructions = vec![build_execution_queue_configure_instruction(
+            self.config.program_id,
+            executor.group,
+            executor.execution_queue,
+            self.config.executor_admin.pubkey(),
+            &queue_state,
+            true,
+        )];
+        for sequence in &sequences_to_drop {
+            instructions.push(build_execution_queue_drop_ctm_instruction(
+                self.config.program_id,
+                executor.group,
+                executor.execution_queue,
+                self.config.executor_admin.pubkey(),
+                *sequence,
+            ));
+        }
+        instructions.push(build_execution_queue_configure_instruction(
+            self.config.program_id,
+            executor.group,
+            executor.execution_queue,
+            self.config.executor_admin.pubkey(),
+            &queue_state,
+            queue_state.pause_execute,
+        ));
+
+        let chain = self.blockhashes.snapshot().await;
+        let message = MessageV0::try_compile(
+            &self.config.payer.pubkey(),
+            &instructions,
+            &[],
+            chain.blockhash,
+        )?;
+        let tx = if self.config.executor_admin.pubkey() == self.config.payer.pubkey() {
+            VersionedTransaction::try_new(
+                solana_sdk::message::VersionedMessage::V0(message),
+                &[self.config.payer.as_ref()],
+            )?
+        } else {
+            VersionedTransaction::try_new(
+                solana_sdk::message::VersionedMessage::V0(message),
+                &[self.config.payer.as_ref(), self.config.executor_admin.as_ref()],
+            )?
+        };
+        let send_cfg = RpcSendTransactionConfig {
+            skip_preflight: false,
+            preflight_commitment: Some(CommitmentConfig::processed().commitment),
+            max_retries: Some(0),
+            ..RpcSendTransactionConfig::default()
+        };
+        let signature = self.rpc.send_transaction_with_config(&tx, send_cfg).await?;
+        self.await_signature_result(signature, self.config.executor_admin_tx_timeout_ms)
+            .await?;
+        executor.pending_dispatches.lock().await.clear();
+        executor.last_inspect_ms.store(0, Ordering::Relaxed);
+        *executor.cached_head.lock().await = None;
+        info!(
+            "executor admin recovery completed start_sequence={} dropped={} reason={} tx={}",
+            sequence,
+            sequences_to_drop.len(),
+            reason,
+            signature
+        );
+        Ok(signature)
+    }
+
     fn current_queue_state_for(
         &self,
         group: Pubkey,
@@ -1580,16 +1893,21 @@ impl Engine {
                             }
                         }
                         Some(status) => {
+                            let auto_recovered =
+                                self.maybe_auto_drop_expired_head(executor, &retained[index])
+                                    .await;
                             warn!(
                                 "executor tx failed sequence={} sig={} err={:?}",
                                 retained[index].sequence, signature, status.err
                             );
-                            self.apply_executor_lane_failure(
-                                executor,
-                                retained[index].lane_hash,
-                                "signature_status_failed",
-                            )
-                            .await;
+                            if !auto_recovered {
+                                self.apply_executor_lane_failure(
+                                    executor,
+                                    retained[index].lane_hash,
+                                    "signature_status_failed",
+                                )
+                                .await;
+                            }
                             failed_indices.insert(index);
                         }
                         None => {}
@@ -2460,7 +2778,54 @@ fn build_execute_head_memo_instruction(head_sequence: u64, nonce: u64) -> Instru
     }
 }
 
-#[cfg(test)]
+fn build_execution_queue_configure_instruction(
+    program_id: Pubkey,
+    group: Pubkey,
+    execution_queue: Pubkey,
+    admin: Pubkey,
+    queue_state: &QueueAdminState,
+    pause_execute: bool,
+) -> Instruction {
+    Instruction {
+        program_id,
+        accounts: vec![
+            AccountMeta::new_readonly(group, false),
+            AccountMeta::new(execution_queue, false),
+            AccountMeta::new_readonly(admin, true),
+        ],
+        data: mango_v4::instruction::ExecutionQueueConfigure {
+            params: ExecutionQueueConfigParams {
+                gap_wait_slots: queue_state.gap_wait_slots,
+                liquidity_delay_slots: queue_state.liquidity_delay_slots,
+                pause_ingress: queue_state.pause_ingress,
+                pause_execute,
+            },
+        }
+        .data(),
+    }
+}
+
+fn build_execution_queue_drop_ctm_instruction(
+    program_id: Pubkey,
+    group: Pubkey,
+    execution_queue: Pubkey,
+    admin: Pubkey,
+    sequence: u64,
+) -> Instruction {
+    Instruction {
+        program_id,
+        accounts: vec![
+            AccountMeta::new_readonly(group, false),
+            AccountMeta::new(execution_queue, false),
+            AccountMeta::new_readonly(admin, true),
+        ],
+        data: mango_v4::instruction::ExecutionQueueDropCtm { sequence }.data(),
+    }
+}
+
+const EXECUTION_QUEUE_GAP_WAIT_SLOTS_OFFSET: usize = 184;
+const EXECUTION_QUEUE_PAUSED_INGRESS_OFFSET: usize = 146;
+const EXECUTION_QUEUE_PAUSED_EXECUTE_OFFSET: usize = 147;
 const EXECUTION_QUEUE_LIQUIDITY_DELAY_SLOTS_OFFSET: usize = 192;
 const EXECUTION_QUEUE_CTM_COUNT_OFFSET: usize = 200;
 const EXECUTION_QUEUE_LIQUIDITY_COUNT_OFFSET: usize = 204;
@@ -2708,6 +3073,47 @@ fn inspect_queue_head(queue_data: &[u8]) -> QueueHead {
         ctm_sequence,
         ctm_kind,
         ctm_status,
+    }
+}
+
+fn inspect_queue_admin_state(queue_data: &[u8]) -> QueueAdminState {
+    let gap_wait_slots = if queue_data.len() >= EXECUTION_QUEUE_GAP_WAIT_SLOTS_OFFSET + 8 {
+        u64::from_le_bytes(
+            queue_data
+                [EXECUTION_QUEUE_GAP_WAIT_SLOTS_OFFSET..EXECUTION_QUEUE_GAP_WAIT_SLOTS_OFFSET + 8]
+                .try_into()
+                .unwrap_or([0; 8]),
+        )
+    } else {
+        0
+    };
+    let liquidity_delay_slots =
+        if queue_data.len() >= EXECUTION_QUEUE_LIQUIDITY_DELAY_SLOTS_OFFSET + 8 {
+            u64::from_le_bytes(
+                queue_data[EXECUTION_QUEUE_LIQUIDITY_DELAY_SLOTS_OFFSET
+                    ..EXECUTION_QUEUE_LIQUIDITY_DELAY_SLOTS_OFFSET + 8]
+                    .try_into()
+                    .unwrap_or([0; 8]),
+            )
+        } else {
+            0
+        };
+    let pause_ingress = queue_data
+        .get(EXECUTION_QUEUE_PAUSED_INGRESS_OFFSET)
+        .copied()
+        .unwrap_or_default()
+        != 0;
+    let pause_execute = queue_data
+        .get(EXECUTION_QUEUE_PAUSED_EXECUTE_OFFSET)
+        .copied()
+        .unwrap_or_default()
+        != 0;
+    QueueAdminState {
+        pause_ingress,
+        pause_execute,
+        gap_wait_slots,
+        liquidity_delay_slots,
+        head: inspect_queue_head(queue_data),
     }
 }
 

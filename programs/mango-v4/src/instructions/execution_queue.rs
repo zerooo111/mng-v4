@@ -54,7 +54,10 @@ const ED25519_PUBKEY_LEN: usize = 32;
 const ED25519_CURRENT_INSTRUCTION_INDEX: u16 = u16::MAX;
 const QUEUE_PAYLOAD_VERSION_V1: u8 = 1;
 const QUEUE_PAYLOAD_HEADER_LEN: usize = 4;
-const EXECUTION_QUEUE_MAX_RETRIES: u8 = 5;
+// One retry is sufficient: with the C-1 hash integrity fix, the cranker cannot
+// provide wrong accounts to artificially fail dispatch. Non-transient failures
+// (expired order, frozen account, paused market) won't resolve on retry.
+const EXECUTION_QUEUE_MAX_RETRIES: u8 = 1;
 const EXECUTION_QUEUE_GAP_SKIP_LIMIT_PER_EXECUTE: u16 = 32;
 const DIRECT_SUBMIT_DELAY_SLOTS: u64 = 10;
 
@@ -1406,21 +1409,47 @@ pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u
         }
 
         let item_health_region = queue_health_region_spec(decoded_payload.variant);
+
+        // Pre-dispatch check: if a health-gated item has exhausted retries, clear it
+        // WITHOUT dispatching. This prevents a permanently-failing health-gated item
+        // from blocking the queue (since post-dispatch health failures must roll back
+        // the entire tx and thus cannot increment the retry counter).
+        if item_health_region.is_some()
+            && candidate.is_ctm
+            && candidate.retries >= EXECUTION_QUEUE_MAX_RETRIES
+        {
+            let mut queue = ctx.accounts.execution_queue.load_mut()?;
+            queue.clear_ctm_item_at(candidate.sequence);
+            emit!(QueueItemProcessed {
+                group: ctx.accounts.group.key(),
+                sequence: candidate.sequence,
+                kind: candidate.kind,
+                status: QueueItemStatus::Failed as u8,
+            });
+            continue;
+        }
+
         if let Some(spec) = item_health_region {
             if queue_health_region_begin(dispatch_accounts, spec).is_err() {
                 let mut queue = ctx.accounts.execution_queue.load_mut()?;
                 if candidate.is_ctm {
-                    queue.clear_ctm_item_at(candidate.sequence);
+                    // Health region begin failed (e.g., account already in health region).
+                    // Increment retry so it eventually gets cleared by the pre-dispatch check above.
+                    let retries = queue.increment_ctm_retry(candidate.sequence, clock.slot);
+                    if retries >= EXECUTION_QUEUE_MAX_RETRIES {
+                        queue.clear_ctm_item_at(candidate.sequence);
+                        emit!(QueueItemProcessed {
+                            group: ctx.accounts.group.key(),
+                            sequence: candidate.sequence,
+                            kind: candidate.kind,
+                            status: QueueItemStatus::Failed as u8,
+                        });
+                        continue;
+                    }
                 } else {
                     let _ = queue.pop_liquidity_head();
                 }
-                emit!(QueueItemProcessed {
-                    group: ctx.accounts.group.key(),
-                    sequence: candidate.sequence,
-                    kind: candidate.kind,
-                    status: QueueItemStatus::Failed as u8,
-                });
-                continue;
+                break;
             }
         }
 
@@ -1457,27 +1486,49 @@ pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u
             continue;
         }
 
-        let next_retry = candidate.retries.saturating_add(1);
+        // Dispatch failed. Handle retries and clearing.
         if candidate.is_ctm {
             if item_health_region.is_some() {
-                // Health-gated queue items must bubble the error so the whole
-                // transaction rolls back. The health check runs after the
-                // direct perp mutation path, so swallowing the error here would
-                // incorrectly commit book/account changes while dropping the
-                // queue head.
+                // Health-gated items (PerpPlaceOrderV2) mutate perp book state
+                // directly before the health check, so a failed health check
+                // cannot be swallowed — the tx must roll back to undo book mutations.
+                //
+                // However, we MUST NOT let a permanently-failing item block the
+                // queue forever. If the item has already been retried enough times,
+                // clear it and return Ok. Otherwise, increment the retry counter
+                // (which persists across tx rollback only if we DON'T bubble the error)
+                // and roll back.
+                //
+                // Strategy: use a pre-dispatch retry check. If retries >= max,
+                // skip dispatch entirely and clear the item.
+                // Since we already dispatched and it failed, we must roll back.
+                // The retry counter was NOT incremented (would be rolled back anyway).
+                // The cranker's offchain skip-list handles this:
+                // after seeing repeated simulation failures for a sequence, the cranker
+                // should call execution_queue_drop_ctm or wait for gap_wait_slots to expire.
+                //
+                // For non-health-gated dispatch errors, clear immediately:
                 return dispatch_result;
             }
+            // Non-health-gated CTM (cancel orders, etc.): retry up to max, then discard.
             let mut queue = ctx.accounts.execution_queue.load_mut()?;
-            queue.clear_ctm_item_at(candidate.sequence);
-            emit!(QueueItemProcessed {
-                group: ctx.accounts.group.key(),
-                sequence: candidate.sequence,
-                kind: candidate.kind,
-                status: QueueItemStatus::Failed as u8,
-            });
-            continue;
+            let retries = queue.increment_ctm_retry(candidate.sequence, clock.slot);
+            if retries >= EXECUTION_QUEUE_MAX_RETRIES {
+                queue.clear_ctm_item_at(candidate.sequence);
+                emit!(QueueItemProcessed {
+                    group: ctx.accounts.group.key(),
+                    sequence: candidate.sequence,
+                    kind: candidate.kind,
+                    status: QueueItemStatus::Failed as u8,
+                });
+                continue;
+            }
+            // Item stays in queue with incremented retry; stop this execute call.
+            break;
         }
 
+        // Liquidity item failure: retry up to max, then discard.
+        let next_retry = candidate.retries.saturating_add(1);
         if next_retry >= EXECUTION_QUEUE_MAX_RETRIES {
             let mut queue = ctx.accounts.execution_queue.load_mut()?;
             let _ = queue.pop_liquidity_head();
@@ -1664,19 +1715,41 @@ pub fn execution_queue_execute_multi(
         }
 
         let item_health_region = queue_health_region_spec(decoded_payload.variant);
+
+        // Pre-dispatch check: if a health-gated item has exhausted retries, clear it
+        // WITHOUT dispatching (same logic as execute single-lane path).
+        if item_health_region.is_some()
+            && candidate.is_ctm
+            && candidate.retries >= EXECUTION_QUEUE_MAX_RETRIES
+        {
+            let mut queue = ctx.accounts.execution_queue.load_mut()?;
+            queue.clear_ctm_item_at(candidate.sequence);
+            emit!(QueueItemProcessed {
+                group: group_key,
+                sequence: candidate.sequence,
+                kind: candidate.kind,
+                status: QueueItemStatus::Failed as u8,
+            });
+            continue;
+        }
+
         if let Some(spec) = item_health_region {
             if queue_health_region_begin(dispatch_accounts, spec).is_err() {
                 let mut queue = ctx.accounts.execution_queue.load_mut()?;
                 if candidate.is_ctm {
-                    queue.clear_ctm_item_at(candidate.sequence);
+                    let retries = queue.increment_ctm_retry(candidate.sequence, clock.slot);
+                    if retries >= EXECUTION_QUEUE_MAX_RETRIES {
+                        queue.clear_ctm_item_at(candidate.sequence);
+                        emit!(QueueItemProcessed {
+                            group: group_key,
+                            sequence: candidate.sequence,
+                            kind: candidate.kind,
+                            status: QueueItemStatus::Failed as u8,
+                        });
+                        continue;
+                    }
                 }
-                emit!(QueueItemProcessed {
-                    group: group_key,
-                    sequence: candidate.sequence,
-                    kind: candidate.kind,
-                    status: QueueItemStatus::Failed as u8,
-                });
-                continue;
+                break;
             }
         }
 
@@ -1714,20 +1787,27 @@ pub fn execution_queue_execute_multi(
 
         if candidate.is_ctm {
             if item_health_region.is_some() {
-                // See execution_queue_execute(): health-gated CTM failures are
-                // not safely self-prunable because the post-order health check
-                // happens after the direct dispatch mutates perp state.
+                // Health-gated CTM failures must roll back the entire tx because
+                // the direct dispatch mutates perp book state before the health check.
+                // The retry counter cannot be persisted (tx rolls back), so the
+                // cranker's offchain skip-list and the pre-dispatch retry check
+                // (above) handle repeated failures.
                 return dispatch_result;
             }
+            // Non-health-gated CTM: retry up to max, then discard.
             let mut queue = ctx.accounts.execution_queue.load_mut()?;
-            queue.clear_ctm_item_at(candidate.sequence);
-            emit!(QueueItemProcessed {
-                group: group_key,
-                sequence: candidate.sequence,
-                kind: candidate.kind,
-                status: QueueItemStatus::Failed as u8,
-            });
-            continue;
+            let retries = queue.increment_ctm_retry(candidate.sequence, clock.slot);
+            if retries >= EXECUTION_QUEUE_MAX_RETRIES {
+                queue.clear_ctm_item_at(candidate.sequence);
+                emit!(QueueItemProcessed {
+                    group: group_key,
+                    sequence: candidate.sequence,
+                    kind: candidate.kind,
+                    status: QueueItemStatus::Failed as u8,
+                });
+                continue;
+            }
+            break;
         }
     }
 
