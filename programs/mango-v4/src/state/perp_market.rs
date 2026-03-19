@@ -198,8 +198,11 @@ pub struct PerpMarket {
     /// liquidation fees that happened. So never decreases (different to fees_accrued).
     pub accrued_liquidation_fees: I80F48,
 
+    /// Tracks losses that could not be socialized because open_interest was zero.
+    /// These losses represent an accounting shortfall in the settle token vault.
+    pub unsocialized_loss: I80F48,
     #[derivative(Debug = "ignore")]
-    pub reserved: [u8; 1848],
+    pub reserved: [u8; 1832],
 }
 
 const_assert_eq!(
@@ -237,7 +240,8 @@ const_assert_eq!(
         + 3 * 16
         + 8
         + 2 * 16
-        + 1848
+        + 16
+        + 1832
 );
 const_assert_eq!(size_of::<PerpMarket>(), 2808);
 const_assert_eq!(size_of::<PerpMarket>() % 8, 0);
@@ -409,10 +413,10 @@ impl PerpMarket {
         // TODO convert into only socializing on one side
         // native settle token per contract open interest
         let socialized_loss = if self.open_interest == 0 {
-            // AUDIT: think about the following:
-            // This is kind of an unfortunate situation. This means socialized loss occurs on the
-            // last person to call settle_pnl on their profits. Any advice on better mechanism
-            // would be appreciated. Luckily, this will be an extremely rare situation.
+            // C-5 fix: Track unsocialized loss instead of silently discarding it.
+            // This loss represents a shortfall that should be covered by the insurance fund
+            // or governance action.
+            self.unsocialized_loss += loss; // loss is negative, so this accumulates
             I80F48::ZERO
         } else {
             loss / I80F48::from(self.open_interest)
@@ -537,7 +541,8 @@ impl PerpMarket {
             fees_withdrawn: 0,
             platform_liquidation_fee: I80F48::ZERO,
             accrued_liquidation_fees: I80F48::ZERO,
-            reserved: [0; 1848],
+            unsocialized_loss: I80F48::ZERO,
+            reserved: [0; 1832],
         }
     }
 }

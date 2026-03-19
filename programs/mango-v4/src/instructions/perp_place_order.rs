@@ -184,6 +184,10 @@ pub(crate) fn perp_place_order_from_account_infos<'info>(
     let account = AccountLoader::try_from(&dispatch_accounts[1])
         .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?;
     let owner = *dispatch_accounts[2].key;
+    // NOTE: owner is validated against account.fixed.is_owner_or_delegate(owner)
+    // inside perp_place_order_inner. Combined with the accounts_hash integrity check
+    // at enqueue time (and the C-1 fix computing hashes from actual accounts in
+    // execute_multi), this prevents account impersonation.
     let perp_market = AccountLoader::try_from(&dispatch_accounts[3])
         .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?;
     let bids = AccountLoader::try_from(&dispatch_accounts[4])

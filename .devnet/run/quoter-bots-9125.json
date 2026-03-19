@@ -1,0 +1,16 @@
+[
+  {
+    "name": "quoter-bot-0",
+    "keypairPath": "/home/ec2-user/stagin4/mng-v4/keypairs/quoter-bots/quoter-bot-0.json",
+    "owner": "5broL7zGKzYWup5CoVZKKmuA7PC17gM5Jup2qCPGiH2L",
+    "mangoAccount": "ETDC5DfRHQwDa4xqwLyu7EbyfCJpYok6c6f1cK2e5HC4",
+    "side": "bid"
+  },
+  {
+    "name": "quoter-bot-1",
+    "keypairPath": "/home/ec2-user/stagin4/mng-v4/keypairs/quoter-bots/quoter-bot-1.json",
+    "owner": "7g6MyKXgG1wCzNCPSSBVHd1wKApZMyDdsNdNobDVAeAg",
+    "mangoAccount": "A6jVDhxjZbJhnEBKfonMUaonrfuudbPcx4Nea5U7C65y",
+    "side": "ask"
+  }
+]

@@ -30,6 +30,7 @@ import {
 } from '../../src/continuumHarness';
 import { MangoClient } from '../../src/client';
 import { HealthType } from '../../src/accounts/mangoAccount';
+import { HealthCache } from '../../src/accounts/healthCache';
 import { ZERO_I80F48 } from '../../src/numbers/I80F48';
 
 dotenv.config();
@@ -679,10 +680,14 @@ async function enrichOwnerStateWithOnchain(
       maintHealth: ZERO_I80F48(),
     };
     const marginAccounts = ownerAccounts.map((account) => {
+      const healthCache = HealthCache.fromMangoAccount(group, account);
+      const initAssetsAndLiabs = healthCache.healthAssetsAndLiabsStableLiabs(
+        HealthType.init,
+      );
       const equity = account.getEquity(group);
       const pnl = account.getPnl(group);
-      const assets = account.getAssetsValue(group, HealthType.init);
-      const liabs = account.getLiabsValue(group);
+      const assets = initAssetsAndLiabs.assets;
+      const liabs = initAssetsAndLiabs.liabs;
       const initHealth = account.getHealth(group, HealthType.init);
       const maintHealth = account.getHealth(group, HealthType.maint);
       const initHealthRatio = account.getHealthRatio(group, HealthType.init);

@@ -56,6 +56,7 @@ const QUEUE_PAYLOAD_VERSION_V1: u8 = 1;
 const QUEUE_PAYLOAD_HEADER_LEN: usize = 4;
 const EXECUTION_QUEUE_MAX_RETRIES: u8 = 5;
 const EXECUTION_QUEUE_GAP_SKIP_LIMIT_PER_EXECUTE: u16 = 32;
+const DIRECT_SUBMIT_DELAY_SLOTS: u64 = 10;
 
 #[repr(u8)]
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -917,6 +918,31 @@ pub fn execution_queue_set_ctm_pending(
     Ok(())
 }
 
+pub fn execution_queue_drop_ctm(ctx: Context<ExecutionQueueAdmin>, sequence: u64) -> Result<()> {
+    let clock = Clock::get()?;
+    let mut queue = ctx.accounts.execution_queue.load_mut()?;
+    queue.maybe_activate_pending_ctm(clock.slot);
+    require!(
+        queue.paused_execute != 0,
+        MangoError::ExecutionQueueAdminActionRequiresPause
+    );
+
+    let item = *queue.ctm_item(sequence);
+    require!(
+        item.status == QueueItemStatus::Pending as u8 && item.sequence == sequence,
+        MangoError::ExecutionQueueSequenceNotPending
+    );
+
+    queue.clear_ctm_item_at(sequence);
+    emit!(QueueItemProcessed {
+        group: ctx.accounts.group.key(),
+        sequence,
+        kind: item.kind,
+        status: QueueItemStatus::Failed as u8,
+    });
+    Ok(())
+}
+
 pub fn execution_queue_enqueue_ctm(
     ctx: Context<ExecutionQueueEnqueueCtm>,
     envelope: CtmEnvelope,
@@ -1044,6 +1070,131 @@ pub fn execution_queue_enqueue_ctm(
     Ok(())
 }
 
+/// C-4 fix: Direct-submit fallback for liveness.
+/// Allows users to enqueue intents without the CTM co-signature, but with a
+/// mandatory 10-slot delayed execution to prevent race conditions with properly
+/// sequenced relayer transactions.
+pub fn execution_queue_enqueue_direct(
+    ctx: Context<ExecutionQueueEnqueueCtm>,
+    envelope: CtmEnvelope,
+    payload: Vec<u8>,
+) -> Result<()> {
+    require!(
+        envelope.kind == QueueItemKind::CtmWrapped as u8,
+        MangoError::ExecutionQueueInvalidItemKind
+    );
+    require!(
+        payload.len() <= EXECUTION_QUEUE_PAYLOAD_MAX,
+        MangoError::ExecutionQueuePayloadTooLarge
+    );
+
+    require!(
+        !ctx.remaining_accounts.is_empty(),
+        MangoError::ExecutionQueueDispatchAccountLayoutInvalid
+    );
+    let (dispatch_accounts, _) =
+        split_dispatch_accounts(ctx.remaining_accounts, ctx.accounts.execution_queue.key())?;
+
+    let clock = Clock::get()?;
+    let mut queue = ctx.accounts.execution_queue.load_mut()?;
+    queue.maybe_activate_pending_ctm(clock.slot);
+
+    require!(
+        queue.paused_ingress == 0,
+        MangoError::ExecutionQueueIngressPaused
+    );
+
+    let payload_hash = hashv(&[&payload]).to_bytes();
+    require!(
+        payload_hash == envelope.payload_hash,
+        MangoError::ExecutionQueuePayloadHashMismatch
+    );
+    let decoded_payload = decode_queue_payload(&payload)?;
+    require!(
+        decoded_payload.flags == 0,
+        MangoError::ExecutionQueuePayloadDecodeFailed
+    );
+    require!(
+        queue_item_kind_for_payload_variant(decoded_payload.variant)
+            == QueueItemKind::CtmWrapped as u8,
+        MangoError::ExecutionQueuePayloadKindMismatch
+    );
+
+    let account_hash = hash_accounts(
+        &dispatch_accounts
+            .iter()
+            .map(|ai| AccountMeta {
+                pubkey: *ai.key,
+                is_signer: ai.is_signer,
+                is_writable: ai.is_writable,
+            })
+            .collect::<Vec<_>>(),
+    );
+    require!(
+        account_hash == envelope.accounts_hash,
+        MangoError::ExecutionQueueAccountsHashMismatch
+    );
+
+    require!(
+        envelope.expires_at_slot == 0 || clock.slot <= envelope.expires_at_slot,
+        MangoError::ExecutionQueueEnvelopeExpired
+    );
+
+    // Direct-submit: NO CTM signer verification required.
+    // Instead, verify only the user's Ed25519 intent signature.
+    if variant_uses_user_signature(decoded_payload.variant) {
+        let (mango_account_key, user_owner) =
+            extract_user_owner_for_ctm_payload(ctx.accounts.group.key(), dispatch_accounts)?;
+        let user_intent_hash = canonical_user_intent_message(
+            ctx.accounts.group.key(),
+            mango_account_key,
+            user_owner,
+            &envelope,
+        );
+        verify_user_ed25519_preinstruction(
+            ctx.accounts.instructions.as_ref(),
+            user_owner,
+            user_intent_hash,
+        )?;
+    }
+
+    // Assign sequence: use max_seen_sequence + 1 to avoid collisions with relayer sequences
+    let sequence = queue.header.max_seen_sequence.saturating_add(1);
+    require!(
+        queue.can_enqueue_ctm_sequence(sequence),
+        MangoError::ExecutionQueueFull
+    );
+
+    // Force minimum execution delay of DIRECT_SUBMIT_DELAY_SLOTS
+    let forced_min_execute_slot = clock.slot.saturating_add(DIRECT_SUBMIT_DELAY_SLOTS);
+    let min_execute_slot = envelope.min_execute_slot.max(forced_min_execute_slot);
+
+    let mut item = QueueItem::default();
+    item.sequence = sequence;
+    item.min_execute_slot = min_execute_slot;
+    item.ingress_slot = clock.slot;
+    item.kind = envelope.kind;
+    item.status = QueueItemStatus::Pending as u8;
+    item.payload_len = payload.len() as u16;
+    item.payload_hash = payload_hash;
+    item.accounts_hash = account_hash;
+    item.payload[..payload.len()].copy_from_slice(&payload);
+
+    queue.push_ctm(item)?;
+    if sequence > queue.header.max_seen_sequence {
+        queue.header.max_seen_sequence = sequence;
+    }
+
+    emit!(QueueItemEnqueued {
+        group: ctx.accounts.group.key(),
+        sequence,
+        kind: envelope.kind,
+        min_execute_slot,
+    });
+
+    Ok(())
+}
+
 pub fn execution_queue_enqueue_liquidity(
     ctx: Context<ExecutionQueueEnqueueLiquidity>,
     kind: u8,
@@ -1131,8 +1282,6 @@ pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u
     }
 
     let provided_accounts_hash = hash_accounts(&account_metas_from_infos(dispatch_accounts));
-    let mut active_health_region: Option<QueueHealthRegionSpec> = None;
-
     for _ in 0..max_items {
         let mut candidate: Option<ExecutableCandidate> = None;
         let mut blocked = false;
@@ -1210,35 +1359,13 @@ pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u
             break;
         }
 
-        let Some(mut candidate) = candidate else {
+        let Some(candidate) = candidate else {
             break;
         };
 
-        // Lane check: if head lane doesn't match, scan forward for a matching item.
+        // H-8 fix: Strict head-only FIFO — if hash doesn't match, stop.
         if candidate.accounts_hash != [0; 32] && provided_accounts_hash != candidate.accounts_hash {
-            if candidate.is_ctm {
-                let queue = ctx.accounts.execution_queue.load_mut()?;
-                if let Some((match_seq, match_item)) = queue.find_matching_ctm_item(
-                    &provided_accounts_hash,
-                    EXECUTION_QUEUE_GAP_SKIP_LIMIT_PER_EXECUTE * 4,
-                ) {
-                    let payload_len = match_item.payload_len as usize;
-                    candidate = ExecutableCandidate {
-                        sequence: match_seq,
-                        kind: match_item.kind,
-                        payload: match_item.payload[..payload_len].to_vec(),
-                        accounts_hash: match_item.accounts_hash,
-                        retries: match_item.retries,
-                        is_ctm: true,
-                    };
-                    drop(queue);
-                } else {
-                    drop(queue);
-                    break;
-                }
-            } else {
-                break;
-            }
+            break;
         }
 
         // Payload hash was verified at enqueue time; skip redundant re-hash.
@@ -1278,24 +1405,22 @@ pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u
             continue;
         }
 
-        if active_health_region.is_none() {
-            if let Some(spec) = queue_health_region_spec(decoded_payload.variant) {
-                if queue_health_region_begin(dispatch_accounts, spec).is_err() {
-                    let mut queue = ctx.accounts.execution_queue.load_mut()?;
-                    if candidate.is_ctm {
-                        queue.clear_ctm_item_at(candidate.sequence);
-                    } else {
-                        let _ = queue.pop_liquidity_head();
-                    }
-                    emit!(QueueItemProcessed {
-                        group: ctx.accounts.group.key(),
-                        sequence: candidate.sequence,
-                        kind: candidate.kind,
-                        status: QueueItemStatus::Failed as u8,
-                    });
-                    continue;
+        let item_health_region = queue_health_region_spec(decoded_payload.variant);
+        if let Some(spec) = item_health_region {
+            if queue_health_region_begin(dispatch_accounts, spec).is_err() {
+                let mut queue = ctx.accounts.execution_queue.load_mut()?;
+                if candidate.is_ctm {
+                    queue.clear_ctm_item_at(candidate.sequence);
+                } else {
+                    let _ = queue.pop_liquidity_head();
                 }
-                active_health_region = Some(spec);
+                emit!(QueueItemProcessed {
+                    group: ctx.accounts.group.key(),
+                    sequence: candidate.sequence,
+                    kind: candidate.kind,
+                    status: QueueItemStatus::Failed as u8,
+                });
+                continue;
             }
         }
 
@@ -1307,6 +1432,15 @@ pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u
             execution_queue_key,
             execution_queue_bump,
         );
+        let dispatch_result = if let Some(spec) = item_health_region {
+            match dispatch_result {
+                Ok(()) => queue_health_region_end(dispatch_accounts, spec),
+                Err(err) => Err(err),
+            }
+        } else {
+            dispatch_result
+        };
+
         if dispatch_result.is_ok() {
             let mut queue = ctx.accounts.execution_queue.load_mut()?;
             if candidate.is_ctm {
@@ -1324,13 +1458,29 @@ pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u
         }
 
         let next_retry = candidate.retries.saturating_add(1);
-        if candidate.is_ctm || next_retry >= EXECUTION_QUEUE_MAX_RETRIES {
-            let mut queue = ctx.accounts.execution_queue.load_mut()?;
-            if candidate.is_ctm {
-                queue.clear_ctm_item_at(candidate.sequence);
-            } else {
-                let _ = queue.pop_liquidity_head();
+        if candidate.is_ctm {
+            if item_health_region.is_some() {
+                // Health-gated queue items must bubble the error so the whole
+                // transaction rolls back. The health check runs after the
+                // direct perp mutation path, so swallowing the error here would
+                // incorrectly commit book/account changes while dropping the
+                // queue head.
+                return dispatch_result;
             }
+            let mut queue = ctx.accounts.execution_queue.load_mut()?;
+            queue.clear_ctm_item_at(candidate.sequence);
+            emit!(QueueItemProcessed {
+                group: ctx.accounts.group.key(),
+                sequence: candidate.sequence,
+                kind: candidate.kind,
+                status: QueueItemStatus::Failed as u8,
+            });
+            continue;
+        }
+
+        if next_retry >= EXECUTION_QUEUE_MAX_RETRIES {
+            let mut queue = ctx.accounts.execution_queue.load_mut()?;
+            let _ = queue.pop_liquidity_head();
             emit!(QueueItemProcessed {
                 group: ctx.accounts.group.key(),
                 sequence: candidate.sequence,
@@ -1343,10 +1493,6 @@ pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u
         let mut queue = ctx.accounts.execution_queue.load_mut()?;
         queue.rotate_liquidity_head_with_retry(clock.slot, next_retry, 1)?;
         break;
-    }
-
-    if let Some(spec) = active_health_region {
-        queue_health_region_end(dispatch_accounts, spec)?;
     }
 
     Ok(())
@@ -1390,6 +1536,8 @@ pub fn execution_queue_execute_multi(
         lane_hashes.len() == lane_count,
         MangoError::ExecutionQueueDispatchAccountLayoutInvalid
     );
+    // Note: lane_hashes parameter is deprecated and ignored. Hashes are now
+    // computed from actual remaining_accounts to prevent account substitution (C-1 fix).
     let execution_queue_bump: u8;
     {
         let mut queue = ctx.accounts.execution_queue.load_mut()?;
@@ -1400,8 +1548,6 @@ pub fn execution_queue_execute_multi(
             MangoError::ExecutionQueueExecutePaused
         );
     }
-
-    let mut active_health_region: Option<(usize, QueueHealthRegionSpec)> = None;
 
     for _ in 0..max_items {
         let mut candidate: Option<ExecutableCandidate> = None;
@@ -1466,45 +1612,20 @@ pub fn execution_queue_execute_multi(
             break;
         };
 
-        // Find which lane matches this item using executor-provided hashes
+        // C-1 fix: Compute lane hashes from actual accounts instead of trusting instruction data.
+        // H-8 fix: Strict head-only FIFO — no scan-ahead for non-head items.
         let matched_lane = if candidate.accounts_hash == [0; 32] {
             Some(0)
         } else {
-            lane_hashes
-                .iter()
-                .position(|h| *h == candidate.accounts_hash)
+            lane_slices.iter().position(|lane| {
+                let computed_hash = hash_accounts(&account_metas_from_infos(lane));
+                computed_hash == candidate.accounts_hash
+            })
         };
 
-        let (lane_idx, candidate) = if let Some(li) = matched_lane {
-            (li, candidate)
-        } else {
-            // Head doesn't match any lane — scan for a non-head matching item
-            let queue = ctx.accounts.execution_queue.load_mut()?;
-            let mut found_candidate: Option<(usize, ExecutableCandidate)> = None;
-            for (li, lh) in lane_hashes.iter().enumerate() {
-                if let Some((match_seq, match_item)) =
-                    queue.find_matching_ctm_item(lh, EXECUTION_QUEUE_GAP_SKIP_LIMIT_PER_EXECUTE * 4)
-                {
-                    let payload_len = match_item.payload_len as usize;
-                    found_candidate = Some((
-                        li,
-                        ExecutableCandidate {
-                            sequence: match_seq,
-                            kind: match_item.kind,
-                            payload: match_item.payload[..payload_len].to_vec(),
-                            accounts_hash: match_item.accounts_hash,
-                            retries: match_item.retries,
-                            is_ctm: true,
-                        },
-                    ));
-                    break;
-                }
-            }
-            drop(queue);
-            match found_candidate {
-                Some((li, c)) => (li, c),
-                None => break,
-            }
+        let lane_idx = match matched_lane {
+            Some(li) => li,
+            None => break, // Head doesn't match any lane — stop (strict FIFO)
         };
 
         let dispatch_accounts = lane_slices[lane_idx];
@@ -1542,50 +1663,21 @@ pub fn execution_queue_execute_multi(
             continue;
         }
 
-        // Health region management: switch if lane changed
-        if let Some(spec) = queue_health_region_spec(decoded_payload.variant) {
-            match active_health_region {
-                Some((active_lane, active_spec)) if active_lane != lane_idx => {
-                    // End current health region and start new one for this lane
-                    queue_health_region_end(lane_slices[active_lane], active_spec)?;
-                    if queue_health_region_begin(dispatch_accounts, spec).is_err() {
-                        let mut queue = ctx.accounts.execution_queue.load_mut()?;
-                        if candidate.is_ctm {
-                            queue.clear_ctm_item_at(candidate.sequence);
-                        }
-                        emit!(QueueItemProcessed {
-                            group: group_key,
-                            sequence: candidate.sequence,
-                            kind: candidate.kind,
-                            status: QueueItemStatus::Failed as u8,
-                        });
-                        active_health_region = None;
-                        continue;
-                    }
-                    active_health_region = Some((lane_idx, spec));
+        let item_health_region = queue_health_region_spec(decoded_payload.variant);
+        if let Some(spec) = item_health_region {
+            if queue_health_region_begin(dispatch_accounts, spec).is_err() {
+                let mut queue = ctx.accounts.execution_queue.load_mut()?;
+                if candidate.is_ctm {
+                    queue.clear_ctm_item_at(candidate.sequence);
                 }
-                None => {
-                    if queue_health_region_begin(dispatch_accounts, spec).is_err() {
-                        let mut queue = ctx.accounts.execution_queue.load_mut()?;
-                        if candidate.is_ctm {
-                            queue.clear_ctm_item_at(candidate.sequence);
-                        }
-                        emit!(QueueItemProcessed {
-                            group: group_key,
-                            sequence: candidate.sequence,
-                            kind: candidate.kind,
-                            status: QueueItemStatus::Failed as u8,
-                        });
-                        continue;
-                    }
-                    active_health_region = Some((lane_idx, spec));
-                }
-                _ => {} // Same lane, keep existing health region
+                emit!(QueueItemProcessed {
+                    group: group_key,
+                    sequence: candidate.sequence,
+                    kind: candidate.kind,
+                    status: QueueItemStatus::Failed as u8,
+                });
+                continue;
             }
-        } else if let Some((active_lane, active_spec)) = active_health_region {
-            // Current item doesn't need health region but one is active — end it
-            queue_health_region_end(lane_slices[active_lane], active_spec)?;
-            active_health_region = None;
         }
 
         // Dispatch
@@ -1597,6 +1689,15 @@ pub fn execution_queue_execute_multi(
             execution_queue_key,
             execution_queue_bump,
         );
+        let dispatch_result = if let Some(spec) = item_health_region {
+            match dispatch_result {
+                Ok(()) => queue_health_region_end(dispatch_accounts, spec),
+                Err(err) => Err(err),
+            }
+        } else {
+            dispatch_result
+        };
+
         if dispatch_result.is_ok() {
             let mut queue = ctx.accounts.execution_queue.load_mut()?;
             if candidate.is_ctm {
@@ -1611,8 +1712,13 @@ pub fn execution_queue_execute_multi(
             continue;
         }
 
-        // Failed — clear CTM items, no retries for CTM
         if candidate.is_ctm {
+            if item_health_region.is_some() {
+                // See execution_queue_execute(): health-gated CTM failures are
+                // not safely self-prunable because the post-order health check
+                // happens after the direct dispatch mutates perp state.
+                return dispatch_result;
+            }
             let mut queue = ctx.accounts.execution_queue.load_mut()?;
             queue.clear_ctm_item_at(candidate.sequence);
             emit!(QueueItemProcessed {
@@ -1623,10 +1729,6 @@ pub fn execution_queue_execute_multi(
             });
             continue;
         }
-    }
-
-    if let Some((active_lane, spec)) = active_health_region {
-        queue_health_region_end(lane_slices[active_lane], spec)?;
     }
 
     Ok(())

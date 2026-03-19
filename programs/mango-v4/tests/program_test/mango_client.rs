@@ -404,6 +404,41 @@ impl ClientInstruction for ExecutionQueueEnqueueLiquidityInstruction {
     }
 }
 
+pub struct ExecutionQueueDropCtmInstruction {
+    pub group: Pubkey,
+    pub admin: TestKeypair,
+    pub sequence: u64,
+}
+
+#[async_trait::async_trait(?Send)]
+impl ClientInstruction for ExecutionQueueDropCtmInstruction {
+    type Accounts = mango_v4::accounts::ExecutionQueueAdmin;
+    type Instruction = mango_v4::instruction::ExecutionQueueDropCtm;
+
+    async fn to_instruction(
+        &self,
+        _loader: &(impl ClientAccountLoader + 'async_trait),
+    ) -> (Self::Accounts, instruction::Instruction) {
+        let accounts = Self::Accounts {
+            group: self.group,
+            execution_queue: execution_queue_pda(self.group),
+            admin: self.admin.pubkey(),
+        };
+        let mut data = anchor_discriminator("execution_queue_drop_ctm").to_vec();
+        data.extend_from_slice(&self.sequence.to_le_bytes());
+        let instruction = instruction::Instruction {
+            program_id: mango_v4::id(),
+            accounts: accounts.to_account_metas(None),
+            data,
+        };
+        (accounts, instruction)
+    }
+
+    fn signers(&self) -> Vec<TestKeypair> {
+        vec![self.admin]
+    }
+}
+
 pub struct ExecutionQueueExecuteInstruction {
     pub group: Pubkey,
     pub execution_queue: Pubkey,

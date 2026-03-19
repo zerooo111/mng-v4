@@ -195,6 +195,10 @@ pub enum MangoError {
     ExecutionQueueUserSignatureMissing,
     #[msg("execution queue invalid user account for intent verification")]
     ExecutionQueueInvalidUserAccount,
+    #[msg("execution queue admin action requires execution to be paused")]
+    ExecutionQueueAdminActionRequiresPause,
+    #[msg("execution queue sequence is not currently pending")]
+    ExecutionQueueSequenceNotPending,
 }
 
 impl MangoError {

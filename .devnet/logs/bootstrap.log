@@ -1,49 +1,42 @@
 { idsSource: 'get-program-accounts' }
-Error while loading price impact: TypeError: fetch failed
-Error while loading price impact: TypeError: fetch failed
-Error while loading price impact: TypeError: fetch failed
 { idsSource: 'get-program-accounts' }
 { idsSource: 'get-program-accounts' }
-Error while loading price impact: TypeError: fetch failed
-Error while loading price impact: TypeError: fetch failed
-Error while loading price impact: TypeError: fetch failed
-Error while loading price impact: TypeError: fetch failed
 {
-  "configPath": "/home/ec2-user/stagin4/mng-v4/.devnet/run/execution-queue-e2e-9122.json",
+  "configPath": "/home/ec2-user/stagin4/mng-v4/.devnet/run/execution-queue-e2e-9125.json",
   "cluster": "devnet",
   "clusterUrl": "https://devnet.helius-rpc.com/?api-key=6475b77b-7c5f-48b4-88f0-4879d4af73cb",
   "programId": "7ftfLAYEtDrz8xjhaqa6wUYMrjrmbZ3tjw7J7Rb3QA37",
-  "groupNum": 9122,
-  "group": "6DmavriJww4giwdbRd3Ep5uZ6cfKvHCaBA5782KFRYyq",
-  "executionQueue": "4zTgsM42RbZeHV99wAFJ6hP7dV92yLB1pnujabzGsoFp",
-  "executionQueueBuffer": "4zTgsM42RbZeHV99wAFJ6hP7dV92yLB1pnujabzGsoFp",
+  "groupNum": 9125,
+  "group": "42ZYDpNAUM8NZgmuQHwrUXsEWb98AkjJfJHYFFoCZpCi",
+  "executionQueue": "2Bs3tGdMs4PQV98qFLXaafSi8AJWH55eT2WwN8ZKJMkn",
+  "executionQueueBuffer": "2Bs3tGdMs4PQV98qFLXaafSi8AJWH55eT2WwN8ZKJMkn",
   "ctmSigner": "4zDJ8FiJu7A3ZHjCwdKF2JPyLYheFRpGVvCvHS32XnhM",
-  "usdcMint": "AXZeaxEbBbTVbfxJLPJCD7Yk94iFfCLGGDSYWhCsB2iU",
-  "solMint": null,
-  "usdcOracle": "Gh2A3a4XDkLxa2T3jzhzEiA1jG1djktS1AWcfEKM52zi",
-  "solOracle": "2jMwc5BvEcBkFp9NqAHXFkqz6VAShiKaiho457dbsogJ",
+  "usdcMint": "CkEufKyF6WX88vMEeBsxdn8urvLcQuz95TRWjCqdVpdx",
+  "solMint": "C7vwVVCrnM3vwsExpuXrqojussRvsjx4vPPP52v5ELwu",
+  "usdcOracle": "3gy39r7169YysBsuG3j9LbkqK3PxZd8U4atjYXwprifq",
+  "solOracle": "DPouKAuCDXoZ1eKmCTZtyhtHGdqWd7p6MjBenFd6kcXU",
   "perpMarketIndex": 0,
   "maker": {
     "keypairPath": "/home/ec2-user/stagin4/mng-v4/keypairs/execution-queue-maker.json",
     "owner": "9p74BNtmhvNiJuat8QLTPXbjMjcxaTZAaGPu3FNx26yg",
-    "mangoAccount": "5cfAMw9itxesn11tegjdwn3kjc4VqEj5FaKxzPBQKyio",
-    "usdcAta": "8MqPHNyeQiHj6jQKz4fsQ1toLY5CHQHa3zL9b1ZQU9Lg"
+    "mangoAccount": "ePaFExiRQsj7z5CrXCBJMKbu8KwkmwYg5uv4gXbGPey",
+    "usdcAta": "3nbTLGMEP7DTPj8nkzLqQBVoyb37MfMUmDof5kgDs4XN"
   },
   "taker": {
     "keypairPath": "/home/ec2-user/stagin4/mng-v4/keypairs/execution-queue-taker.json",
     "owner": "H5VJ8yV3hsEZBfrzZcHVsUEic64rpZhUnVze8VakkrdK",
-    "mangoAccount": "4TDJTQWxaZyWCfA3wmL4x4uFzH4GDmxgSX7HeV3Xv8AE",
-    "usdcAta": "9cguHEfFxSLKLWgdHB1TEKCA6SPNHhDWmZQyjSzgrL6T"
+    "mangoAccount": "Gewgt67b78DRtkWyjvYW4gNn1ZaoRBkSyhtZgan9Psgm",
+    "usdcAta": "6appWY3sJJfXiv2dsmBqkWfyXfKs6Jn5pvA4uiEKEhaj"
   },
   "relayer": {
     "bindAddr": "127.0.0.1:9090",
     "payerKeypairPath": "/home/ec2-user/.config/solana/id.json",
     "ctmKeypairPath": "/home/ec2-user/.config/solana/id.json",
-    "sequenceStatePath": "/tmp/ctm-sequences-9122.json"
+    "sequenceStatePath": "/tmp/ctm-sequences-9125.json"
   },
   "cranker": {
     "keypairPath": "/home/ec2-user/.config/solana/id.json",
-    "laneConfigPath": "/home/ec2-user/stagin4/mng-v4/.devnet/run/execution-queue-lanes-9122.json",
+    "laneConfigPath": "/home/ec2-user/stagin4/mng-v4/.devnet/run/execution-queue-lanes-9125.json",
     "maxItems": 8,
     "intervalMs": 1000
   }

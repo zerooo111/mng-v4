@@ -594,6 +594,15 @@ pub mod mango_v4 {
         Ok(())
     }
 
+    pub fn execution_queue_drop_ctm(
+        ctx: Context<ExecutionQueueAdmin>,
+        sequence: u64,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_drop_ctm(ctx, sequence)?;
+        Ok(())
+    }
+
     pub fn execution_queue_enqueue_ctm(
         ctx: Context<ExecutionQueueEnqueueCtm>,
         envelope: CtmEnvelope,
@@ -601,6 +610,18 @@ pub mod mango_v4 {
     ) -> Result<()> {
         #[cfg(feature = "enable-gpl")]
         instructions::execution_queue_enqueue_ctm(ctx, envelope, payload)?;
+        Ok(())
+    }
+
+    /// C-4 fix: Direct-submit fallback for enqueuing intents without the CTM co-signature.
+    /// Enforces a 10-slot delayed execution to prevent race conditions with relayer sequences.
+    pub fn execution_queue_enqueue_direct(
+        ctx: Context<ExecutionQueueEnqueueCtm>,
+        envelope: CtmEnvelope,
+        payload: Vec<u8>,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_enqueue_direct(ctx, envelope, payload)?;
         Ok(())
     }
 

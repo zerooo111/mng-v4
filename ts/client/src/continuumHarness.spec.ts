@@ -464,6 +464,71 @@ describe('Continuum State Harness', () => {
     expect(confirmed.open_orders.length).eq(0);
   });
 
+  it('removes optimistic queued place orders after a failed processed status', () => {
+    const engine = new ContinuumStateEngine();
+    const group = key();
+    const executionQueue = key();
+    const owner = key();
+    const mangoAccount = key();
+    const market = '14';
+
+    const placePayload = encodePerpPlaceOrderV2QueuePayload({
+      side: QueueSide.Bid,
+      priceLots: 101,
+      maxBaseLots: 4,
+      maxQuoteLots: 1000,
+      clientOrderId: 9,
+      orderType: QueuePlaceOrderType.Limit,
+      selfTradeBehavior: QueueSelfTradeBehavior.DecrementTake,
+      reduceOnly: false,
+      expiryTimestamp: 0,
+      limit: 10,
+    });
+
+    engine.ingestRelayIntent({
+      event_type: 'relay_intent_accepted',
+      ts_ms: 1,
+      group,
+      execution_queue: executionQueue,
+      market,
+      sequence: '9',
+      kind: 0,
+      payload_b64: placePayload.toString('base64'),
+      remaining_accounts: [],
+      min_execute_slot: '5',
+      expires_at_slot: '0',
+      user_owner: owner,
+      mango_account: mangoAccount,
+      enqueue_tx_signature: 'enqueue-9',
+    });
+
+    const optimisticBefore = engine.getMarketState(market, 'optimistic');
+    expect(optimisticBefore.open_orders.length).eq(1);
+    expect(optimisticBefore.open_orders[0].client_order_id).eq('9');
+
+    engine.ingestQueueProcessed({
+      event_type: 'queue_item_processed',
+      ts_ms: 2,
+      group,
+      sequence: '9',
+      kind: 0,
+      status: QueueProcessStatus.Failed,
+      slot: '55',
+      tx_signature: 'failed-9',
+    });
+
+    const optimisticAfter = engine.getMarketState(market, 'optimistic');
+    const confirmedAfter = engine.getMarketState(market, 'confirmed');
+    const queue = engine.getQueueState(market);
+
+    expect(optimisticAfter.open_orders.length).eq(0);
+    expect(confirmedAfter.open_orders.length).eq(0);
+    expect(queue.pending_count).eq(0);
+    expect(queue.processed_count).eq(1);
+    expect(queue.failed_count).eq(1);
+    expect(queue.skipped_count).eq(0);
+  });
+
   it('emits a divergence when processed status changes for the same queue item', () => {
     const engine = new ContinuumStateEngine();
     const group = key();
@@ -519,5 +584,94 @@ describe('Continuum State Harness', () => {
       .filter((d) => d.reason === 'processed_status_changed');
     expect(divergences.length).eq(1);
     expect(divergences[0].key).eq(`${group}:8:0`);
+  });
+
+  it('state_projection_after_enqueue', () => {
+    const engine = new ContinuumStateEngine();
+    const group = key();
+    const executionQueue = key();
+    const owner = key();
+    const mangoAccount = key();
+    const market = '20';
+
+    const placePayload = encodePerpPlaceOrderV2QueuePayload({
+      side: QueueSide.Ask,
+      priceLots: 55,
+      maxBaseLots: 10,
+      maxQuoteLots: 1000,
+      clientOrderId: 42,
+      orderType: QueuePlaceOrderType.Limit,
+      selfTradeBehavior: QueueSelfTradeBehavior.DecrementTake,
+      reduceOnly: false,
+      expiryTimestamp: 0,
+      limit: 10,
+    });
+
+    engine.ingestRelayIntent({
+      event_type: 'relay_intent_accepted',
+      ts_ms: 1,
+      group,
+      execution_queue: executionQueue,
+      market,
+      sequence: '1',
+      kind: 0,
+      payload_b64: placePayload.toString('base64'),
+      remaining_accounts: [],
+      min_execute_slot: '10',
+      expires_at_slot: '0',
+      user_owner: owner,
+      mango_account: mangoAccount,
+      enqueue_tx_signature: 'tx-enqueue-state-1',
+    });
+
+    const optimistic = engine.getMarketState(market, 'optimistic');
+    expect(optimistic.open_orders.length).eq(1);
+    expect(optimistic.open_orders[0].side).eq('ask');
+    expect(optimistic.open_orders[0].price_lots).eq('55');
+    expect(optimistic.open_orders[0].base_lots).eq('10');
+    expect(optimistic.open_orders[0].client_order_id).eq('42');
+
+    const confirmed = engine.getMarketState(market, 'confirmed');
+    expect(confirmed.open_orders.length).eq(0);
+  });
+
+  it('malformed_payload_graceful_error', () => {
+    const engine = new ContinuumStateEngine();
+    const group = key();
+    const executionQueue = key();
+    const owner = key();
+    const mangoAccount = key();
+    const market = '21';
+
+    // Use invalid base64 that decodes to bytes too short / invalid for any variant
+    const badPayload = Buffer.from([0xff, 0xff]);
+    const badB64 = badPayload.toString('base64');
+
+    // Should not throw
+    engine.ingestRelayIntent({
+      event_type: 'relay_intent_accepted',
+      ts_ms: 1,
+      group,
+      execution_queue: executionQueue,
+      market,
+      sequence: '1',
+      kind: 0,
+      payload_b64: badB64,
+      remaining_accounts: [],
+      min_execute_slot: '10',
+      expires_at_slot: '0',
+      user_owner: owner,
+      mango_account: mangoAccount,
+      enqueue_tx_signature: 'tx-malformed-1',
+    });
+
+    // The intent should be tracked (decoded_payload will be null due to decode failure)
+    const intents = engine.listIntents();
+    expect(intents.length).eq(1);
+    expect(intents[0].decoded_payload).eq(null);
+
+    // Optimistic state should have no orders since the payload couldn't be decoded
+    const optimistic = engine.getMarketState(market, 'optimistic');
+    expect(optimistic.open_orders.length).eq(0);
   });
 });

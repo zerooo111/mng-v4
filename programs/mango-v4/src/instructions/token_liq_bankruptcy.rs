@@ -245,11 +245,17 @@ pub fn token_liq_bankruptcy(
 
         // This is the solution to:
         //   total_indexed_deposits * (deposit_index - new_deposit_index) = remaining_liab_loss
-        // AUDIT: Could it happen that remaining_liab_loss > total_indexed_deposits * deposit_index?
-        //        Probably not.
-        let new_deposit_index = liab_deposit_index - remaining_liab_loss / indexed_total_deposits;
+        // H-4 fix: Cap the socializable loss to prevent the deposit index from going negative.
+        // If loss exceeds total deposits, cap at total deposits (index goes to zero).
+        let max_socializable_loss = indexed_total_deposits * liab_deposit_index;
+        let capped_remaining_loss = if remaining_liab_loss > max_socializable_loss {
+            max_socializable_loss
+        } else {
+            remaining_liab_loss
+        };
+        let new_deposit_index = liab_deposit_index - capped_remaining_loss / indexed_total_deposits;
         liab_deposit_index = new_deposit_index;
-        socialized_loss = remaining_liab_loss;
+        socialized_loss = capped_remaining_loss;
 
         let mut amount_to_credit = remaining_liab_loss;
         for bank_ai in bank_ais.iter() {

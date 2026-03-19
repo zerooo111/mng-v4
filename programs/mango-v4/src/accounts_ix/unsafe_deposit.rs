@@ -5,6 +5,7 @@ use anchor_lang::prelude::*;
 #[derive(Accounts)]
 pub struct UnsafeDeposit<'info> {
     #[account(
+        constraint = group.load()?.is_testing() @ MangoError::SomeError,
         constraint = group.load()?.admin == admin.key() @ MangoError::SomeError,
         constraint = group.load()?.is_ix_enabled(IxGate::TokenDeposit) @ MangoError::IxIsDisabled,
     )]

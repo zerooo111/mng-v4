@@ -3201,4 +3201,259 @@ mod tests {
             QueueSequencePresence::Absent
         );
     }
+
+    // ── 4A. Queue Inspection ────────────────────────────────────────────
+
+    #[test]
+    fn inspect_queue_head_empty_queue() {
+        let mut data = vec![0u8; EXECUTION_QUEUE_LIQUIDITY_ITEMS_OFFSET];
+        write_u32(&mut data, EXECUTION_QUEUE_COUNT_OFFSET, 0);
+        write_u64(&mut data, EXECUTION_QUEUE_NEXT_SEQUENCE_OFFSET, 5);
+        write_u64(&mut data, EXECUTION_QUEUE_MAX_SEEN_SEQUENCE_OFFSET, 5);
+        write_u32(&mut data, EXECUTION_QUEUE_CTM_COUNT_OFFSET, 0);
+        write_u32(&mut data, EXECUTION_QUEUE_LIQUIDITY_COUNT_OFFSET, 0);
+
+        let head = inspect_queue_head(&data);
+        assert_eq!(head.count, 0);
+        assert_eq!(head.reason, "empty");
+        assert_eq!(head.source, None);
+        assert_eq!(head.head_accounts_hash, None);
+    }
+
+    #[test]
+    fn inspect_queue_head_wraparound_boundary() {
+        let mut data = vec![0u8; EXECUTION_QUEUE_LIQUIDITY_ITEMS_OFFSET];
+        let boundary_seq: u64 = (EXECUTION_QUEUE_CTM_CAPACITY as u64) - 1; // 1023 typically
+        write_u32(&mut data, EXECUTION_QUEUE_COUNT_OFFSET, 1);
+        write_u64(&mut data, EXECUTION_QUEUE_NEXT_SEQUENCE_OFFSET, boundary_seq);
+        write_u64(
+            &mut data,
+            EXECUTION_QUEUE_MAX_SEEN_SEQUENCE_OFFSET,
+            boundary_seq,
+        );
+        write_u32(&mut data, EXECUTION_QUEUE_CTM_COUNT_OFFSET, 1);
+        write_u32(&mut data, EXECUTION_QUEUE_LIQUIDITY_COUNT_OFFSET, 0);
+
+        let item_offset = queue_item_offset(boundary_seq);
+        write_u64(
+            &mut data,
+            item_offset + EXECUTION_QUEUE_ITEM_SEQUENCE_OFFSET,
+            boundary_seq,
+        );
+        data[item_offset + EXECUTION_QUEUE_ITEM_KIND_OFFSET] = 0;
+        data[item_offset + EXECUTION_QUEUE_ITEM_STATUS_OFFSET] = 1;
+        data[item_offset + EXECUTION_QUEUE_ITEM_ACCOUNTS_HASH_OFFSET
+            ..item_offset + EXECUTION_QUEUE_ITEM_ACCOUNTS_HASH_OFFSET + 32]
+            .copy_from_slice(&[0xAB; 32]);
+
+        let head = inspect_queue_head(&data);
+        assert_eq!(head.reason, "ctm_pending");
+        assert_eq!(head.source, Some(QueueHeadSource::Ctm));
+        assert_eq!(head.head_accounts_hash, Some([0xAB; 32]));
+        assert_eq!(head.next_sequence, boundary_seq);
+    }
+
+    #[test]
+    fn inspect_queue_head_both_ctm_and_liquidity_pending_ctm_wins() {
+        let mut data =
+            vec![0u8; EXECUTION_QUEUE_LIQUIDITY_ITEMS_OFFSET + EXECUTION_QUEUE_ITEM_SIZE];
+        write_u32(&mut data, EXECUTION_QUEUE_COUNT_OFFSET, 2);
+        write_u64(&mut data, EXECUTION_QUEUE_NEXT_SEQUENCE_OFFSET, 10);
+        write_u64(&mut data, EXECUTION_QUEUE_MAX_SEEN_SEQUENCE_OFFSET, 10);
+        write_u32(&mut data, EXECUTION_QUEUE_CTM_COUNT_OFFSET, 1);
+        write_u32(&mut data, EXECUTION_QUEUE_LIQUIDITY_COUNT_OFFSET, 1);
+        write_u32(&mut data, EXECUTION_QUEUE_HEAD_OFFSET, 0);
+
+        // CTM item at sequence 10
+        let ctm_offset = queue_item_offset(10);
+        write_u64(
+            &mut data,
+            ctm_offset + EXECUTION_QUEUE_ITEM_SEQUENCE_OFFSET,
+            10,
+        );
+        data[ctm_offset + EXECUTION_QUEUE_ITEM_KIND_OFFSET] = 0;
+        data[ctm_offset + EXECUTION_QUEUE_ITEM_STATUS_OFFSET] = 1;
+        data[ctm_offset + EXECUTION_QUEUE_ITEM_ACCOUNTS_HASH_OFFSET
+            ..ctm_offset + EXECUTION_QUEUE_ITEM_ACCOUNTS_HASH_OFFSET + 32]
+            .copy_from_slice(&[0xCC; 32]);
+
+        // Liquidity item at head 0
+        let liq_offset = liquidity_item_offset(0);
+        write_u64(
+            &mut data,
+            liq_offset + EXECUTION_QUEUE_ITEM_SEQUENCE_OFFSET,
+            50,
+        );
+        data[liq_offset + EXECUTION_QUEUE_ITEM_KIND_OFFSET] = 1;
+        data[liq_offset + EXECUTION_QUEUE_ITEM_STATUS_OFFSET] = 1;
+        data[liq_offset + EXECUTION_QUEUE_ITEM_ACCOUNTS_HASH_OFFSET
+            ..liq_offset + EXECUTION_QUEUE_ITEM_ACCOUNTS_HASH_OFFSET + 32]
+            .copy_from_slice(&[0xDD; 32]);
+
+        let head = inspect_queue_head(&data);
+        assert_eq!(head.source, Some(QueueHeadSource::Ctm));
+        assert_eq!(head.reason, "ctm_pending");
+        assert_eq!(head.head_accounts_hash, Some([0xCC; 32]));
+    }
+
+    #[test]
+    fn inspect_next_enqueue_sequence_no_gaps_returns_max_plus_1() {
+        let mut data = vec![0u8; EXECUTION_QUEUE_LIQUIDITY_ITEMS_OFFSET];
+        write_u32(&mut data, EXECUTION_QUEUE_COUNT_OFFSET, 3);
+        write_u64(&mut data, EXECUTION_QUEUE_NEXT_SEQUENCE_OFFSET, 10);
+        write_u64(&mut data, EXECUTION_QUEUE_MAX_SEEN_SEQUENCE_OFFSET, 12);
+        write_u32(&mut data, EXECUTION_QUEUE_CTM_COUNT_OFFSET, 3);
+        write_u32(&mut data, EXECUTION_QUEUE_LIQUIDITY_COUNT_OFFSET, 0);
+
+        // Fill all slots 10, 11, 12 as pending
+        for sequence in 10_u64..=12 {
+            let item_offset = queue_item_offset(sequence);
+            write_u64(
+                &mut data,
+                item_offset + EXECUTION_QUEUE_ITEM_SEQUENCE_OFFSET,
+                sequence,
+            );
+            data[item_offset + EXECUTION_QUEUE_ITEM_KIND_OFFSET] = 0;
+            data[item_offset + EXECUTION_QUEUE_ITEM_STATUS_OFFSET] = 1;
+        }
+
+        assert_eq!(inspect_next_enqueue_sequence(&data), 13);
+    }
+
+    #[test]
+    fn inspect_next_enqueue_sequence_all_gaps_returns_first_hole() {
+        let mut data = vec![0u8; EXECUTION_QUEUE_LIQUIDITY_ITEMS_OFFSET];
+        write_u32(&mut data, EXECUTION_QUEUE_COUNT_OFFSET, 1);
+        write_u64(&mut data, EXECUTION_QUEUE_NEXT_SEQUENCE_OFFSET, 5);
+        write_u64(&mut data, EXECUTION_QUEUE_MAX_SEEN_SEQUENCE_OFFSET, 10);
+        write_u32(&mut data, EXECUTION_QUEUE_CTM_COUNT_OFFSET, 1);
+        write_u32(&mut data, EXECUTION_QUEUE_LIQUIDITY_COUNT_OFFSET, 0);
+
+        // No items are actually pending (all slots empty / status=0)
+        // So the first hole is at sequence 5 itself
+        assert_eq!(inspect_next_enqueue_sequence(&data), 5);
+    }
+
+    // ── 4B. Sequence Cursor ─────────────────────────────────────────────
+
+    #[test]
+    fn sequence_cursor_recycled_before_increment() {
+        let mut cursor = SequenceCursor::default();
+        let first = cursor.reserve(100);
+        assert_eq!(first, 0);
+
+        // Fail the first sequence so it becomes recyclable
+        cursor.reset_after_failure(first, 0);
+        assert!(cursor.recyclable.contains(&0));
+
+        // Next reserve should reuse the recycled sequence, not allocate a new one
+        let reused = cursor.reserve(200);
+        assert_eq!(reused, 0);
+        assert!(cursor.recyclable.is_empty());
+    }
+
+    #[test]
+    fn sequence_cursor_floor_above_all_pending() {
+        let mut cursor = SequenceCursor::default();
+        let _a = cursor.reserve(100);
+        let _b = cursor.reserve(101);
+        let _c = cursor.reserve(102);
+        cursor.commit_success(_a, 110);
+        cursor.commit_success(_b, 111);
+        cursor.commit_success(_c, 112);
+
+        // Floor above all pending sequences drops them all
+        assert!(cursor.observe_queue_floor(10));
+        assert_eq!(cursor.next_sequence, 10);
+        assert!(cursor.pending.is_empty());
+    }
+
+    #[test]
+    fn sequence_cursor_submitted_depth_excludes_reserved() {
+        let mut cursor = SequenceCursor::default();
+        let first = cursor.reserve(100);
+        let second = cursor.reserve(101);
+        let third = cursor.reserve(102);
+
+        // Only submit first and third
+        cursor.commit_success(first, 110);
+        cursor.commit_success(third, 112);
+        // second remains Reserved
+
+        // submitted_depth should count only Submitted entries (first and third)
+        assert_eq!(cursor.submitted_depth_from(0), 2);
+
+        // Verify that second is still Reserved and not counted
+        assert_eq!(
+            cursor.pending.get(&second).map(|s| s.phase),
+            Some(PendingSequencePhase::Reserved)
+        );
+    }
+
+    #[test]
+    fn sequence_cursor_multiple_failures_recyclable() {
+        let mut cursor = SequenceCursor::default();
+        let a = cursor.reserve(100);
+        let b = cursor.reserve(101);
+        let c = cursor.reserve(102);
+        assert_eq!((a, b, c), (0, 1, 2));
+
+        // Fail all three
+        cursor.reset_after_failure(a, 0);
+        cursor.reset_after_failure(b, 0);
+        cursor.reset_after_failure(c, 0);
+        assert_eq!(cursor.recyclable.len(), 3);
+
+        // All three should be reused in order (BTreeSet is sorted)
+        let r1 = cursor.reserve(200);
+        let r2 = cursor.reserve(201);
+        let r3 = cursor.reserve(202);
+        assert_eq!((r1, r2, r3), (0, 1, 2));
+        assert!(cursor.recyclable.is_empty());
+    }
+
+    #[test]
+    fn sequence_cursor_mark_submitted_idempotent() {
+        let mut cursor = SequenceCursor::default();
+        let first = cursor.reserve(100);
+
+        // First mark_submitted should succeed
+        assert!(cursor.mark_submitted(first, 110));
+        assert_eq!(
+            cursor.pending.get(&first).map(|s| s.phase),
+            Some(PendingSequencePhase::Submitted)
+        );
+
+        // Second mark_submitted on same sequence should return false
+        assert!(!cursor.mark_submitted(first, 120));
+    }
+
+    // ── 4C. Lane Matching ───────────────────────────────────────────────
+
+    #[test]
+    fn inspect_queue_sequence_presence_absent_beyond_max_seen() {
+        let mut data = vec![0u8; EXECUTION_QUEUE_LIQUIDITY_ITEMS_OFFSET];
+        write_u32(&mut data, EXECUTION_QUEUE_COUNT_OFFSET, 1);
+        write_u64(&mut data, EXECUTION_QUEUE_NEXT_SEQUENCE_OFFSET, 10);
+        write_u64(&mut data, EXECUTION_QUEUE_MAX_SEEN_SEQUENCE_OFFSET, 15);
+        write_u32(&mut data, EXECUTION_QUEUE_CTM_COUNT_OFFSET, 1);
+        write_u32(&mut data, EXECUTION_QUEUE_LIQUIDITY_COUNT_OFFSET, 0);
+
+        // Place item at sequence 10 to satisfy ctm_count > 0
+        let item_offset = queue_item_offset(10);
+        write_u64(
+            &mut data,
+            item_offset + EXECUTION_QUEUE_ITEM_SEQUENCE_OFFSET,
+            10,
+        );
+        data[item_offset + EXECUTION_QUEUE_ITEM_KIND_OFFSET] = 0;
+        data[item_offset + EXECUTION_QUEUE_ITEM_STATUS_OFFSET] = 1;
+
+        // Sequence well beyond max_seen + CTM_CAPACITY should be Absent
+        let far_sequence = 10 + EXECUTION_QUEUE_CTM_CAPACITY as u64 + 100;
+        assert_eq!(
+            inspect_queue_sequence_presence(&data, far_sequence),
+            QueueSequencePresence::Absent
+        );
+    }
 }

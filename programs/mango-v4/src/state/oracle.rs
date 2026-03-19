@@ -11,6 +11,11 @@ use static_assertions::const_assert_eq;
 
 use super::{load_raydium_pool_state, orca_mainnet_whirlpool, raydium_mainnet};
 
+/// Maximum allowed deviation between a CLMM oracle price and its fallback reference oracle.
+/// 500 basis points = 5%. If the CLMM price diverges more than this from the fallback,
+/// the oracle read fails with OracleConfidence error.
+const CLMM_MAX_DEVIATION_FROM_REFERENCE_BPS: u64 = 500;
+
 const DECIMAL_CONSTANT_ZERO_INDEX: i8 = 12;
 const DECIMAL_CONSTANTS: [I80F48; 25] = [
     I80F48::from_bits((1 << 48) / 10i128.pow(12u32)),
@@ -292,6 +297,50 @@ pub fn fallback_oracle_state_unchecked<T: KeyedAccountReader>(
     oracle_state_unchecked_inner(acc_infos, base_decimals, true)
 }
 
+/// H-7 fix: Cross-validate a CLMM-derived price against a fallback reference oracle.
+/// Returns the effective deviation (max of quote deviation and actual divergence).
+/// Fails with OracleConfidence if the CLMM price diverges beyond the allowed band.
+fn validate_clmm_against_fallback<T: KeyedAccountReader>(
+    clmm_price: I80F48,
+    quote_deviation: I80F48,
+    acc_infos: &OracleAccountInfos<T>,
+    base_decimals: u8,
+) -> Result<I80F48> {
+    let Some(fallback) = acc_infos.fallback_opt else {
+        return Ok(quote_deviation);
+    };
+    if fallback.key() == &Pubkey::default() {
+        return Ok(quote_deviation);
+    }
+
+    let fallback_type = determine_oracle_type(fallback)?;
+    // Only cross-validate against Pyth or Stub oracles (not other CLMMs)
+    let ref_state = match fallback_type {
+        OracleType::Pyth => get_pyth_state(fallback, base_decimals)?,
+        OracleType::Stub => {
+            let stub = fallback.load::<StubOracle>()?;
+            OracleState {
+                price: stub.price,
+                last_update_slot: if stub.last_update_slot == 0 { u64::MAX } else { stub.last_update_slot },
+                deviation: if stub.deviation == 0 { I80F48::MIN } else { stub.deviation },
+                oracle_type: OracleType::Stub,
+            }
+        }
+        _ => return Ok(quote_deviation), // Fallback is also CLMM — skip cross-validation
+    };
+
+    if ref_state.price <= I80F48::ZERO {
+        return Ok(quote_deviation);
+    }
+
+    let price_diff = (clmm_price - ref_state.price).abs();
+    let max_dev = ref_state.price * I80F48::from_num(CLMM_MAX_DEVIATION_FROM_REFERENCE_BPS)
+        / I80F48::from_num(10_000u64);
+    require!(price_diff <= max_dev, MangoError::OracleConfidence);
+
+    Ok(price_diff.max(quote_deviation))
+}
+
 fn oracle_state_unchecked_inner<T: KeyedAccountReader>(
     acc_infos: &OracleAccountInfos<T>,
     base_decimals: u8,
@@ -335,10 +384,12 @@ fn oracle_state_unchecked_inner<T: KeyedAccountReader>(
             let clmm_price = whirlpool.get_clmm_price();
             let quote_oracle_state = whirlpool.quote_state_unchecked(acc_infos)?;
             let price = clmm_price * quote_oracle_state.price;
+            // H-7 fix: Cross-validate CLMM price against fallback to prevent manipulation
+            let deviation = validate_clmm_against_fallback(price, quote_oracle_state.deviation, acc_infos, base_decimals)?;
             OracleState {
                 price,
                 last_update_slot: quote_oracle_state.last_update_slot,
-                deviation: quote_oracle_state.deviation,
+                deviation,
                 oracle_type: OracleType::OrcaCLMM,
             }
         }
@@ -347,10 +398,12 @@ fn oracle_state_unchecked_inner<T: KeyedAccountReader>(
             let clmm_price = whirlpool.get_clmm_price();
             let quote_oracle_state = whirlpool.quote_state_unchecked(acc_infos)?;
             let price = clmm_price * quote_oracle_state.price;
+            // H-7 fix: Cross-validate CLMM price against fallback to prevent manipulation
+            let deviation = validate_clmm_against_fallback(price, quote_oracle_state.deviation, acc_infos, base_decimals)?;
             OracleState {
                 price,
                 last_update_slot: quote_oracle_state.last_update_slot,
-                deviation: quote_oracle_state.deviation,
+                deviation,
                 oracle_type: OracleType::RaydiumCLMM,
             }
         }

@@ -13,8 +13,10 @@ import {
   buildExecutionQueueExecuteIx,
   buildUserIntentMessage,
   encodeLiquidityDepositQueuePayload,
+  encodeLiquidityWithdrawQueuePayload,
   encodePerpCancelAllOrdersBySideQueuePayload,
   encodePerpCancelAllOrdersQueuePayload,
+  encodePerpCancelOrderQueuePayload,
   encodePerpPlaceOrderV2QueuePayload,
   hashExecutionQueuePayload,
   signExecutionQueueIntentMessage,
@@ -209,5 +211,112 @@ describe('Execution Queue Helpers', () => {
         user.publicKey.toBytes(),
       ),
     ).to.be.true;
+  });
+
+  it('encodes_u128_order_id_for_cancel', () => {
+    const largeOrderId = (1n << 127n) - 1n;
+    const payload = encodePerpCancelOrderQueuePayload({
+      orderId: largeOrderId,
+    });
+    // header (4 bytes) + u128 body (16 bytes) = 20 bytes
+    expect(payload.length).eq(20);
+    // version=1, variant=PerpCancelOrder(1)
+    expect(payload[0]).eq(1);
+    expect(payload[1]).eq(1);
+    // flags = 0
+    expect(payload.readUInt16LE(2)).eq(0);
+    // read back u128 LE from body
+    const lo = payload.readBigUInt64LE(4);
+    const hi = payload.readBigUInt64LE(12);
+    const decoded = (hi << 64n) + lo;
+    expect(decoded).eq(largeOrderId);
+  });
+
+  it('client_order_id_near_2_pow_53', () => {
+    const clientOrderId = Number.MAX_SAFE_INTEGER; // 2^53 - 1
+    const payload = encodePerpPlaceOrderV2QueuePayload({
+      side: QueueSide.Ask,
+      priceLots: 50,
+      maxBaseLots: 1,
+      maxQuoteLots: 100,
+      clientOrderId,
+      orderType: QueuePlaceOrderType.Limit,
+      selfTradeBehavior: QueueSelfTradeBehavior.DecrementTake,
+      reduceOnly: false,
+      expiryTimestamp: 0,
+      limit: 5,
+    });
+    expect(payload.length).eq(49);
+    // Read back clientOrderId from body offset: header(4) + side(1) + i64*3(24) = offset 29
+    const readBack = payload.readBigUInt64LE(29);
+    expect(readBack).eq(BigInt(clientOrderId));
+  });
+
+  it('zero_amount_deposit', () => {
+    const payload = encodeLiquidityDepositQueuePayload({
+      amount: 0,
+      reduceOnly: false,
+    });
+    // header (4 bytes) + u64 amount (8) + u8 reduceOnly (1) = 13 bytes
+    expect(payload.length).eq(13);
+    expect(payload[0]).eq(1);
+    expect(payload[1]).eq(5); // LiquidityDeposit variant
+    const amount = payload.readBigUInt64LE(4);
+    expect(amount).eq(0n);
+    expect(payload[12]).eq(0); // reduceOnly false
+  });
+
+  it('max_amount_withdraw', () => {
+    const maxU64 = (1n << 64n) - 1n;
+    const payload = encodeLiquidityWithdrawQueuePayload({
+      amount: maxU64,
+      allowBorrow: true,
+    });
+    // header (4 bytes) + u64 amount (8) + u8 allowBorrow (1) = 13 bytes
+    expect(payload.length).eq(13);
+    expect(payload[0]).eq(1);
+    expect(payload[1]).eq(6); // LiquidityWithdraw variant
+    const amount = payload.readBigUInt64LE(4);
+    expect(amount).eq(maxU64);
+    expect(payload[12]).eq(1); // allowBorrow true
+  });
+
+  it('message_changes_with_mango_account', () => {
+    const group = Keypair.generate().publicKey;
+    const mangoAccountA = Keypair.generate().publicKey;
+    const mangoAccountB = Keypair.generate().publicKey;
+    const owner = Keypair.generate().publicKey;
+    const envelope = {
+      sequence: 1n,
+      minExecuteSlot: 2n,
+      kind: QueueItemKind.CtmWrapped,
+      payloadHash: Buffer.alloc(32, 7),
+      accountsHash: Buffer.alloc(32, 9),
+      expiresAtSlot: 0n,
+    };
+
+    const msgA = buildUserIntentMessage(group, mangoAccountA, owner, envelope);
+    const msgB = buildUserIntentMessage(group, mangoAccountB, owner, envelope);
+    expect(Buffer.compare(msgA, msgB)).not.eq(0);
+  });
+
+  it('message_changes_with_sequence', () => {
+    const group = Keypair.generate().publicKey;
+    const envelopeA = {
+      sequence: 1n,
+      minExecuteSlot: 2n,
+      kind: QueueItemKind.CtmWrapped,
+      payloadHash: Buffer.alloc(32, 7),
+      accountsHash: Buffer.alloc(32, 9),
+      expiresAtSlot: 0n,
+    };
+    const envelopeB = {
+      ...envelopeA,
+      sequence: 2n,
+    };
+
+    const msgA = buildCtmEnvelopeMessage(group, envelopeA);
+    const msgB = buildCtmEnvelopeMessage(group, envelopeB);
+    expect(Buffer.compare(msgA, msgB)).not.eq(0);
   });
 });

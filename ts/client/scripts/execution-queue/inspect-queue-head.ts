@@ -1,4 +1,5 @@
 import { Connection, PublicKey } from '@solana/web3.js';
+import fs from 'fs';
 import { decodeQueuePayload } from '../../src/continuumHarness';
 import {
   decodeExecutionQueueHeadItem,
@@ -6,17 +7,37 @@ import {
 } from '../../src/executionQueueLayout';
 import { defaultClusterUrl } from './scriptEnv';
 
-const RPC_URL = process.env.CLUSTER_URL_OVERRIDE || defaultClusterUrl();
-const QUEUE_PK =
-  process.env.EXECUTION_QUEUE_PK || 'HfaFVCt5FnLQfLETidHYopgQ2RqpW5JhR66yfQdtYrFP';
+type BootstrapConfig = {
+  clusterUrl?: string;
+  executionQueue?: string;
+};
+
+function resolveConfig(pathArg?: string): BootstrapConfig | null {
+  if (!pathArg) {
+    return null;
+  }
+  try {
+    return JSON.parse(fs.readFileSync(pathArg, 'utf-8')) as BootstrapConfig;
+  } catch {
+    return null;
+  }
+}
 
 function json(value: unknown): string {
   return JSON.stringify(value, (_k, v) => (typeof v === 'bigint' ? v.toString() : v));
 }
 
 async function main(): Promise<void> {
-  const conn = new Connection(RPC_URL, 'confirmed');
-  const qPk = new PublicKey(QUEUE_PK);
+  const config = resolveConfig(process.argv[2]);
+  const rpcUrl =
+    process.env.CLUSTER_URL_OVERRIDE || config?.clusterUrl || defaultClusterUrl();
+  const queuePk =
+    process.env.EXECUTION_QUEUE_PK ||
+    config?.executionQueue ||
+    'HfaFVCt5FnLQfLETidHYopgQ2RqpW5JhR66yfQdtYrFP';
+
+  const conn = new Connection(rpcUrl, 'confirmed');
+  const qPk = new PublicKey(queuePk);
   const qi = await conn.getAccountInfo(qPk, 'confirmed');
   if (!qi) {
     throw new Error('missing queue account');

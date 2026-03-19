@@ -150,7 +150,7 @@ impl ExecutionQueue {
             next_sequence_to_execute: 0,
             max_seen_sequence: 0,
             gap_observed_slot: 0,
-            gap_wait_slots: 2,
+            gap_wait_slots: 4, // M-3 fix: 4 slots covers p80-p85 SWQoS inclusion
             liquidity_delay_slots: 25,
             ctm_count: 0,
             liquidity_count: 0,
@@ -365,14 +365,19 @@ impl ExecutionQueue {
 mod tests {
     use super::*;
 
-    fn test_queue() -> ExecutionQueue {
-        let mut queue: ExecutionQueue = unsafe { std::mem::zeroed() };
-        queue.init(
-            Pubkey::new_unique(),
-            Pubkey::new_unique(),
-            Pubkey::new_unique(),
-            1,
-        );
+    fn test_queue() -> Box<ExecutionQueue> {
+        let layout = std::alloc::Layout::new::<ExecutionQueue>();
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) as *mut ExecutionQueue };
+        assert!(!ptr.is_null());
+        let mut queue = unsafe { Box::from_raw(ptr) };
+        // Avoid calling init() which creates large stack arrays.
+        // The zeroed memory already has all items as Empty/zero.
+        queue.group = Pubkey::new_unique();
+        queue.admin = Pubkey::new_unique();
+        queue.ctm_signer = Pubkey::new_unique();
+        queue.bump = 1;
+        queue.header.gap_wait_slots = 4;
+        queue.header.liquidity_delay_slots = 25;
         queue
     }
 
@@ -530,5 +535,347 @@ mod tests {
         assert_eq!(queue.header.total_count, 0);
         assert_eq!(queue.header.ctm_count, 0);
         assert_eq!(queue.header.liquidity_count, 0);
+    }
+
+    // ── Phase 1A: CTM Ring Buffer Boundaries (P0) ──
+
+    #[test]
+    fn push_ctm_wraps_around_at_capacity_boundary() {
+        let mut queue = test_queue();
+        // Place an item at sequence 1024 which should map to physical index 0
+        queue.push_ctm(pending_ctm_item(1024, 1)).unwrap();
+        assert_eq!(ExecutionQueue::ctm_slot_index(1024), 0);
+        assert_eq!(queue.ctm_item(1024).sequence, 1024);
+        assert_eq!(queue.ctm_item(1024).status, QueueItemStatus::Pending as u8);
+        assert_eq!(queue.header.ctm_count, 1);
+    }
+
+    #[test]
+    fn push_ctm_rejects_sequence_at_exact_window_edge() {
+        let mut queue = test_queue();
+        // Window is [next, next+1024). Sequence at next+1024 should be rejected.
+        queue.header.next_sequence_to_execute = 0;
+        let result = queue.push_ctm(pending_ctm_item(EXECUTION_QUEUE_CTM_CAPACITY as u64, 1));
+        assert!(result.is_err());
+        assert_eq!(queue.header.ctm_count, 0);
+    }
+
+    #[test]
+    fn push_ctm_accepts_max_valid_sequence() {
+        let mut queue = test_queue();
+        // Window is [0, 1024). Sequence 1023 should be accepted.
+        queue.header.next_sequence_to_execute = 0;
+        queue
+            .push_ctm(pending_ctm_item(
+                EXECUTION_QUEUE_CTM_CAPACITY as u64 - 1,
+                1,
+            ))
+            .unwrap();
+        assert_eq!(queue.header.ctm_count, 1);
+    }
+
+    #[test]
+    fn push_ctm_collision_with_cleared_slot_succeeds() {
+        let mut queue = test_queue();
+        // Push at seq 0, clear it, advance head, then push at seq 1024 (same physical slot)
+        queue.push_ctm(pending_ctm_item(0, 1)).unwrap();
+        queue.header.max_seen_sequence = 0;
+        queue.clear_current_ctm_head_and_advance();
+        assert_eq!(queue.header.ctm_count, 0);
+        assert_eq!(queue.header.next_sequence_to_execute, 1);
+
+        // seq 1024 maps to physical index 0, same as seq 0 did
+        queue
+            .push_ctm(pending_ctm_item(EXECUTION_QUEUE_CTM_CAPACITY as u64, 2))
+            .unwrap();
+        assert_eq!(queue.header.ctm_count, 1);
+        assert_eq!(
+            queue
+                .ctm_item(EXECUTION_QUEUE_CTM_CAPACITY as u64)
+                .sequence,
+            EXECUTION_QUEUE_CTM_CAPACITY as u64
+        );
+    }
+
+    #[test]
+    fn push_ctm_collision_with_pending_different_sequence_errors() {
+        let mut queue = test_queue();
+        // Push seq 0 (physical index 0), then try seq 1024 (also physical index 0)
+        // but seq 0 is still pending, so the slot is occupied
+        queue.push_ctm(pending_ctm_item(0, 1)).unwrap();
+        let result = queue.push_ctm(pending_ctm_item(EXECUTION_QUEUE_CTM_CAPACITY as u64, 2));
+        // seq 1024 is outside the window [0, 1024) so it's rejected as full
+        assert!(result.is_err());
+        assert_eq!(queue.header.ctm_count, 1);
+    }
+
+    #[test]
+    fn ctm_slot_index_u64_max_does_not_panic() {
+        // Ensure no overflow at u64::MAX
+        let index = ExecutionQueue::ctm_slot_index(u64::MAX);
+        assert!(index < EXECUTION_QUEUE_CTM_CAPACITY);
+    }
+
+    #[test]
+    fn full_ctm_ring_then_drain_all() {
+        let mut queue = test_queue();
+        // Push 1024 items
+        for i in 0..EXECUTION_QUEUE_CTM_CAPACITY as u64 {
+            queue.push_ctm(pending_ctm_item(i, (i % 256) as u8)).unwrap();
+        }
+        assert_eq!(queue.header.ctm_count, EXECUTION_QUEUE_CTM_CAPACITY as u32);
+        assert_eq!(
+            queue.header.total_count,
+            EXECUTION_QUEUE_CTM_CAPACITY as u32
+        );
+
+        // Verify the queue rejects one more
+        let result = queue.push_ctm(pending_ctm_item(EXECUTION_QUEUE_CTM_CAPACITY as u64, 1));
+        assert!(result.is_err());
+
+        // Drain all by clearing head and advancing
+        queue.header.max_seen_sequence = EXECUTION_QUEUE_CTM_CAPACITY as u64 - 1;
+        for _ in 0..EXECUTION_QUEUE_CTM_CAPACITY {
+            queue.clear_current_ctm_head_and_advance();
+        }
+        assert_eq!(queue.header.ctm_count, 0);
+        assert_eq!(queue.header.total_count, 0);
+        assert!(queue.current_ctm_head().is_none());
+    }
+
+    // ── Phase 1B: Liquidity Ring Buffer Boundaries (P0) ──
+
+    #[test]
+    fn push_liquidity_fills_to_128_then_rejects() {
+        let mut queue = test_queue();
+        for i in 0..EXECUTION_QUEUE_LIQUIDITY_CAPACITY as u64 {
+            queue
+                .push_liquidity(pending_liquidity_item(i, QueueItemKind::LiquidityDeposit))
+                .unwrap();
+        }
+        assert_eq!(
+            queue.header.liquidity_count,
+            EXECUTION_QUEUE_LIQUIDITY_CAPACITY as u32
+        );
+
+        // 129th push should fail
+        let result = queue.push_liquidity(pending_liquidity_item(
+            EXECUTION_QUEUE_LIQUIDITY_CAPACITY as u64,
+            QueueItemKind::LiquidityDeposit,
+        ));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn liquidity_wraparound_head_and_tail() {
+        let mut queue = test_queue();
+        // Push 3 items, pop 2 (head advances to 2), push 2 more -> test FIFO across wrap
+        for i in 0..3u64 {
+            queue
+                .push_liquidity(pending_liquidity_item(i, QueueItemKind::LiquidityDeposit))
+                .unwrap();
+        }
+        let first = queue.pop_liquidity_head().unwrap();
+        let second = queue.pop_liquidity_head().unwrap();
+        assert_eq!(first.sequence, 0);
+        assert_eq!(second.sequence, 1);
+        assert_eq!(queue.header.liquidity_head, 2);
+
+        // Now push enough to wrap around
+        for i in 3..EXECUTION_QUEUE_LIQUIDITY_CAPACITY as u64 + 1 {
+            queue
+                .push_liquidity(pending_liquidity_item(i, QueueItemKind::LiquidityDeposit))
+                .unwrap();
+        }
+        // Verify FIFO: head should be seq 2
+        let head = queue.liquidity_head_item().unwrap();
+        assert_eq!(head.sequence, 2);
+
+        // Pop all and verify order
+        let mut prev_seq = 1u64;
+        while queue.header.liquidity_count > 0 {
+            let item = queue.pop_liquidity_head().unwrap();
+            assert!(item.sequence > prev_seq);
+            prev_seq = item.sequence;
+        }
+    }
+
+    #[test]
+    fn pop_liquidity_head_from_empty_returns_none() {
+        let mut queue = test_queue();
+        assert!(queue.pop_liquidity_head().is_none());
+        assert_eq!(queue.header.liquidity_count, 0);
+    }
+
+    #[test]
+    fn liquidity_tail_index_wraps() {
+        let mut queue = test_queue();
+        queue.header.liquidity_head = 120;
+        queue.header.liquidity_count = 10;
+        // tail = (120 + 10) % 128 = 2
+        assert_eq!(queue.liquidity_tail_index(), 2);
+    }
+
+    // ── Phase 1C: Gap/Head Advancement (P0) ──
+
+    #[test]
+    fn clear_ctm_item_at_advances_past_contiguous_empty_front() {
+        let mut queue = test_queue();
+        // Push seq 0, 1, 2, 5 (gap at 3, 4)
+        queue.push_ctm(pending_ctm_item(0, 1)).unwrap();
+        queue.push_ctm(pending_ctm_item(1, 2)).unwrap();
+        queue.push_ctm(pending_ctm_item(2, 3)).unwrap();
+        queue.push_ctm(pending_ctm_item(5, 5)).unwrap();
+        queue.header.max_seen_sequence = 5;
+
+        // Clear 0, 1, 2 in order — head should advance past the gap at 3, 4 to 5
+        queue.clear_ctm_item_at(0);
+        // After clearing 0: head tries to advance, but 1 is pending → stops at 1
+        assert_eq!(queue.header.next_sequence_to_execute, 1);
+
+        queue.clear_ctm_item_at(1);
+        // After clearing 1: head tries to advance, 2 is pending → stops at 2
+        assert_eq!(queue.header.next_sequence_to_execute, 2);
+
+        queue.clear_ctm_item_at(2);
+        // After clearing 2: slot 3 is empty (gap), slot 4 is empty (gap), slot 5 is pending → stops at 5
+        assert_eq!(queue.header.next_sequence_to_execute, 5);
+        assert_eq!(queue.current_ctm_head().unwrap().sequence, 5);
+    }
+
+    #[test]
+    fn clear_ctm_item_at_does_not_advance_past_pending() {
+        let mut queue = test_queue();
+        queue.push_ctm(pending_ctm_item(0, 1)).unwrap();
+        queue.push_ctm(pending_ctm_item(1, 2)).unwrap();
+        queue.push_ctm(pending_ctm_item(3, 3)).unwrap();
+        queue.header.max_seen_sequence = 3;
+
+        // Clear seq 0 — head should advance to seq 1 (pending), not further
+        queue.clear_ctm_item_at(0);
+        assert_eq!(queue.header.next_sequence_to_execute, 1);
+        assert_eq!(queue.current_ctm_head().unwrap().sequence, 1);
+    }
+
+    #[test]
+    fn clear_ctm_item_at_middle_item_no_head_advance() {
+        let mut queue = test_queue();
+        queue.push_ctm(pending_ctm_item(0, 1)).unwrap();
+        queue.push_ctm(pending_ctm_item(1, 2)).unwrap();
+        queue.push_ctm(pending_ctm_item(2, 3)).unwrap();
+        queue.header.max_seen_sequence = 2;
+
+        // Clear seq 1 (middle) — head should NOT advance since seq 0 is still pending
+        queue.clear_ctm_item_at(1);
+        assert_eq!(queue.header.next_sequence_to_execute, 0);
+        assert_eq!(queue.current_ctm_head().unwrap().sequence, 0);
+        assert_eq!(queue.header.ctm_count, 2);
+    }
+
+    #[test]
+    fn find_matching_ctm_item_at_max_scan_boundary() {
+        let mut queue = test_queue();
+        // Place items at seq 0 and seq 5
+        queue.push_ctm(pending_ctm_item(0, 1)).unwrap();
+        queue.push_ctm(pending_ctm_item(5, 5)).unwrap();
+        queue.header.max_seen_sequence = 5;
+
+        // Scan limit of 5 covers [0..5), so seq 5 is NOT reached
+        assert!(queue.find_matching_ctm_item(&[5; 32], 5).is_none());
+
+        // Scan limit of 6 covers [0..6), so seq 5 IS reached
+        let (seq, _) = queue.find_matching_ctm_item(&[5; 32], 6).unwrap();
+        assert_eq!(seq, 5);
+    }
+
+    // ── Phase 1D: Signer Rotation (P1) ──
+
+    #[test]
+    fn maybe_activate_pending_ctm_at_exact_slot() {
+        let mut queue = test_queue();
+        let new_signer = Pubkey::new_unique();
+        queue.pending_ctm_signer = new_signer;
+        queue.pending_ctm_activate_slot = 100;
+
+        // At exact slot = 100, activation should occur
+        queue.maybe_activate_pending_ctm(100);
+        assert_eq!(queue.ctm_signer, new_signer);
+        assert_eq!(queue.pending_ctm_signer, Pubkey::default());
+        assert_eq!(queue.pending_ctm_activate_slot, 0);
+    }
+
+    #[test]
+    fn maybe_activate_pending_ctm_before_slot() {
+        let mut queue = test_queue();
+        let old_signer = queue.ctm_signer;
+        let new_signer = Pubkey::new_unique();
+        queue.pending_ctm_signer = new_signer;
+        queue.pending_ctm_activate_slot = 100;
+
+        // At slot 99, activation should NOT occur
+        queue.maybe_activate_pending_ctm(99);
+        assert_eq!(queue.ctm_signer, old_signer);
+        assert_eq!(queue.pending_ctm_signer, new_signer);
+        assert_eq!(queue.pending_ctm_activate_slot, 100);
+    }
+
+    #[test]
+    fn maybe_activate_pending_ctm_noop_when_no_pending() {
+        let mut queue = test_queue();
+        let original_signer = queue.ctm_signer;
+        // No pending signer (default)
+        assert_eq!(queue.pending_ctm_signer, Pubkey::default());
+
+        queue.maybe_activate_pending_ctm(u64::MAX);
+        // Signer should remain unchanged
+        assert_eq!(queue.ctm_signer, original_signer);
+    }
+
+    // ── Phase 1E: Overflow/Edge (P1) ──
+
+    #[test]
+    fn counts_never_underflow_below_zero() {
+        let mut queue = test_queue();
+        // Counts start at 0; clearing/popping on empty should not underflow
+        queue.clear_current_ctm_head_and_advance();
+        assert_eq!(queue.header.ctm_count, 0);
+        assert_eq!(queue.header.total_count, 0);
+
+        assert!(queue.pop_liquidity_head().is_none());
+        assert_eq!(queue.header.liquidity_count, 0);
+        assert_eq!(queue.header.total_count, 0);
+    }
+
+    #[test]
+    fn sequence_overflow_u64_max() {
+        let mut queue = test_queue();
+        queue.header.next_sequence_to_execute = u64::MAX - 5;
+        // can_enqueue_ctm_sequence uses saturating_add, so no panic
+        assert!(queue.can_enqueue_ctm_sequence(u64::MAX - 5));
+        assert!(queue.can_enqueue_ctm_sequence(u64::MAX));
+        // Push at u64::MAX should not panic
+        queue
+            .push_ctm(pending_ctm_item(u64::MAX - 5, 1))
+            .unwrap();
+        assert_eq!(queue.header.ctm_count, 1);
+    }
+
+    #[test]
+    fn is_full_requires_both_queues_full() {
+        let mut queue = test_queue();
+        // Fill only CTM
+        queue.header.ctm_count = EXECUTION_QUEUE_CTM_CAPACITY as u32;
+        queue.header.liquidity_count = 0;
+        assert!(!queue.is_full());
+
+        // Fill only liquidity
+        queue.header.ctm_count = 0;
+        queue.header.liquidity_count = EXECUTION_QUEUE_LIQUIDITY_CAPACITY as u32;
+        assert!(!queue.is_full());
+
+        // Fill both
+        queue.header.ctm_count = EXECUTION_QUEUE_CTM_CAPACITY as u32;
+        queue.header.liquidity_count = EXECUTION_QUEUE_LIQUIDITY_CAPACITY as u32;
+        assert!(queue.is_full());
     }
 }

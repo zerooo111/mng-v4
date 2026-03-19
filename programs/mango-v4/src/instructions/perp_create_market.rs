@@ -95,7 +95,8 @@ pub fn perp_create_market(
         fees_withdrawn: 0,
         platform_liquidation_fee: I80F48::from_num(platform_liquidation_fee),
         accrued_liquidation_fees: I80F48::ZERO,
-        reserved: [0; 1848],
+        unsocialized_loss: I80F48::ZERO,
+        reserved: [0; 1832],
     };
 
     let oracle_ref = &AccountInfoRef::borrow(ctx.accounts.oracle.as_ref())?;

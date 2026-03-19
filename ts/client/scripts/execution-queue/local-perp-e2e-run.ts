@@ -52,6 +52,7 @@ type E2EConfig = {
   };
   relayer: {
     bindAddr: string;
+    payerKeypairPath?: string;
   };
 };
 
@@ -71,6 +72,9 @@ const MAKER_MAX_QUOTE_QTY = Number(process.env.E2E_MAKER_MAX_QUOTE_QTY || '1000'
 const TAKER_MAX_QUOTE_QTY = Number(process.env.E2E_TAKER_MAX_QUOTE_QTY || '1000');
 const QUEUE_EMPTY_TIMEOUT_MS = Number(process.env.E2E_QUEUE_EMPTY_TIMEOUT_MS || '90000');
 const POLL_MS = Number(process.env.E2E_POLL_MS || '1000');
+const POSITION_SETTLE_TIMEOUT_MS = Number(
+  process.env.E2E_POSITION_SETTLE_TIMEOUT_MS || '15000',
+);
 
 function readKeypair(rawPathOrJson: string): Keypair {
   const maybeFile = path.resolve(rawPathOrJson);
@@ -171,6 +175,73 @@ async function snapshotAccount(params: {
   };
 }
 
+async function waitForMatchedPositions(params: {
+  adminClient: MangoClient;
+  adminGroup: Group;
+  marketIndex: PerpMarketIndex;
+  makerClient: MangoClient;
+  makerGroup: Group;
+  makerAccountPk: PublicKey;
+  makerOwner: PublicKey;
+  takerClient: MangoClient;
+  takerGroup: Group;
+  takerAccountPk: PublicKey;
+  takerOwner: PublicKey;
+  usdcMint: PublicKey;
+}): Promise<{
+  makerState: Awaited<ReturnType<typeof snapshotAccount>>;
+  takerState: Awaited<ReturnType<typeof snapshotAccount>>;
+}> {
+  const deadline = Date.now() + POSITION_SETTLE_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    await params.adminClient.perpConsumeAllEvents(params.adminGroup, params.marketIndex);
+    await params.adminGroup.reloadAll(params.adminClient);
+    await params.makerGroup.reloadAll(params.makerClient);
+    await params.takerGroup.reloadAll(params.takerClient);
+
+    const makerState = await snapshotAccount({
+      client: params.makerClient,
+      group: params.makerGroup,
+      accountPk: params.makerAccountPk,
+      owner: params.makerOwner,
+      usdcMint: params.usdcMint,
+      marketIndex: params.marketIndex,
+    });
+    const takerState = await snapshotAccount({
+      client: params.takerClient,
+      group: params.takerGroup,
+      accountPk: params.takerAccountPk,
+      owner: params.takerOwner,
+      usdcMint: params.usdcMint,
+      marketIndex: params.marketIndex,
+    });
+
+    if (makerState.baseLots.gt(new BN(0)) && takerState.baseLots.lt(new BN(0))) {
+      return { makerState, takerState };
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, POLL_MS));
+  }
+
+  const makerState = await snapshotAccount({
+    client: params.makerClient,
+    group: params.makerGroup,
+    accountPk: params.makerAccountPk,
+    owner: params.makerOwner,
+    usdcMint: params.usdcMint,
+    marketIndex: params.marketIndex,
+  });
+  const takerState = await snapshotAccount({
+    client: params.takerClient,
+    group: params.takerGroup,
+    accountPk: params.takerAccountPk,
+    owner: params.takerOwner,
+    usdcMint: params.usdcMint,
+    marketIndex: params.marketIndex,
+  });
+  return { makerState, takerState };
+}
+
 async function submitIntentViaRelayer(params: {
   relayerClient: any;
   group: PublicKey;
@@ -243,6 +314,9 @@ async function main(): Promise<void> {
 
   const makerKp = readKeypair(config.maker.keypairPath);
   const takerKp = readKeypair(config.taker.keypairPath);
+  const adminKp = readKeypair(
+    config.relayer.payerKeypairPath || '/home/ec2-user/.config/solana/id.json',
+  );
 
   const makerProvider = new AnchorProvider(
     connection,
@@ -252,6 +326,11 @@ async function main(): Promise<void> {
   const takerProvider = new AnchorProvider(
     connection,
     new Wallet(takerKp),
+    AnchorProvider.defaultOptions(),
+  );
+  const adminProvider = new AnchorProvider(
+    connection,
+    new Wallet(adminKp),
     AnchorProvider.defaultOptions(),
   );
   const makerClient = await MangoClient.connect(
@@ -266,7 +345,14 @@ async function main(): Promise<void> {
     programId,
     { idsSource: 'get-program-accounts' },
   );
+  const adminClient = await MangoClient.connect(
+    adminProvider,
+    config.cluster,
+    programId,
+    { idsSource: 'get-program-accounts' },
+  );
 
+  const adminGroup = await adminClient.getGroup(groupPk);
   const makerGroup = await makerClient.getGroup(groupPk);
   const takerGroup = await takerClient.getGroup(groupPk);
   const makerAccount = await makerClient.getMangoAccount(new PublicKey(config.maker.mangoAccount));
@@ -364,25 +450,19 @@ async function main(): Promise<void> {
   });
 
   await waitForQueueToDrain(connection, executionQueuePk);
-
-  await makerClient.perpConsumeAllEvents(makerGroup, marketIndex);
-  await makerGroup.reloadAll(makerClient);
-
-  const makerState = await snapshotAccount({
-    client: makerClient,
-    group: makerGroup,
-    accountPk: makerAccount.publicKey,
-    owner: makerKp.publicKey,
-    usdcMint: usdcMintPk,
+  const { makerState, takerState } = await waitForMatchedPositions({
+    adminClient,
+    adminGroup,
     marketIndex,
-  });
-  const takerState = await snapshotAccount({
-    client: takerClient,
-    group: takerGroup,
-    accountPk: takerAccount.publicKey,
-    owner: takerKp.publicKey,
+    makerClient,
+    makerGroup,
+    makerAccountPk: makerAccount.publicKey,
+    makerOwner: makerKp.publicKey,
+    takerClient,
+    takerGroup,
+    takerAccountPk: takerAccount.publicKey,
+    takerOwner: takerKp.publicKey,
     usdcMint: usdcMintPk,
-    marketIndex,
   });
 
   if (!makerState.baseLots.gt(new BN(0)) || !takerState.baseLots.lt(new BN(0))) {

@@ -5,6 +5,7 @@
   "tsdb_enabled": false,
   "tsdb_table": "fermi_trade_ticks"
 }
+[2026-03-19T20:03:55Z] supervisor starting bridge
 {
   "msg": "ctm-relayer-http-bridge listening",
   "bind": "127.0.0.1:9092",

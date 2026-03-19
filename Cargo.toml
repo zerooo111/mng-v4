@@ -36,3 +36,4 @@ overflow-checks = true
 jsonrpc-core-client = { git = "https://github.com/ckamm/jsonrpc.git", branch = "ckamm/http-with-gzip" }
 ahash_07 = { package = "ahash", path = "third-party/ahash-0.7.8-local" }
 ahash_08 = { package = "ahash", path = "third-party/ahash-0.8.11-local" }
+solana-program = { path = "third-party/solana-program-1.16.14-local" }

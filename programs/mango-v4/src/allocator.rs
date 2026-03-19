@@ -7,15 +7,15 @@ use std::alloc::{GlobalAlloc, Layout};
 /// The actual size of the heap is currently not available at runtime.
 pub const HEAP_END_ADDRESS: usize = 0x400000000;
 
-#[cfg(not(feature = "no-entrypoint"))]
+#[cfg(all(not(feature = "no-entrypoint"), feature = "custom-heap"))]
 #[global_allocator]
 pub static ALLOCATOR: BumpAllocator = BumpAllocator {};
 
 pub fn heap_used() -> usize {
-    #[cfg(not(feature = "no-entrypoint"))]
+    #[cfg(all(not(feature = "no-entrypoint"), feature = "custom-heap"))]
     return ALLOCATOR.used();
 
-    #[cfg(feature = "no-entrypoint")]
+    #[cfg(any(feature = "no-entrypoint", not(feature = "custom-heap")))]
     return 0;
 }
 
