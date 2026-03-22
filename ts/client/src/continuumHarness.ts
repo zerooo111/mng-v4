@@ -176,6 +176,7 @@ export type OpenOrderSummary = {
   quote_lots: string;
   client_order_id: string;
   sequence: string;
+  expiry_timestamp: string;
   status: 'open';
 };
 
@@ -570,6 +571,7 @@ type InternalOrder = {
   quote_lots: bigint;
   client_order_id: bigint;
   sequence: bigint;
+  expiry_timestamp: bigint;
 };
 
 type InternalTrade = {
@@ -1252,6 +1254,8 @@ export class ContinuumStateEngine {
       }
     }
 
+    this.pruneExpiredOrders(projection, BigInt(Math.floor(Date.now() / 1000)));
+
     for (const market of projection.markets.values()) {
       const marketIntents = intents.filter((it) => it.market === market.market);
       const optimisticSeq = maxBigintFrom(
@@ -1352,6 +1356,9 @@ export class ContinuumStateEngine {
     market: InternalMarket,
     takerUser: InternalUser,
   ): void {
+    const nowTs = BigInt(Math.floor(intent.accepted_ts_ms / 1000));
+    this.pruneExpiredOrdersForMarket(market, projection, nowTs);
+
     const side: 'bid' | 'ask' = payload.side === 0 ? 'bid' : 'ask';
     let remainingBaseLots =
       payload.max_base_lots < 0n ? -payload.max_base_lots : payload.max_base_lots;
@@ -1447,6 +1454,10 @@ export class ContinuumStateEngine {
       return;
     }
 
+    if (this.isExpiredAt(payload.expiry_timestamp, nowTs)) {
+      return;
+    }
+
     const restQuoteLots = payload.price_lots * remainingBaseLots;
     const orderId = `${intent.group}:${intent.market}:${intent.sequence.toString()}:${payload.client_order_id.toString()}`;
     const order: InternalOrder = {
@@ -1460,6 +1471,7 @@ export class ContinuumStateEngine {
       quote_lots: restQuoteLots > 0n ? restQuoteLots : 0n,
       client_order_id: payload.client_order_id,
       sequence: intent.sequence,
+      expiry_timestamp: payload.expiry_timestamp,
     };
     market.orders.set(orderId, order);
     takerUser.orders.add(orderId);
@@ -1560,6 +1572,43 @@ export class ContinuumStateEngine {
     }
   }
 
+  private isExpiredAt(expiryTimestamp: bigint, nowTs: bigint): boolean {
+    return expiryTimestamp > 0n && nowTs >= expiryTimestamp;
+  }
+
+  private removeOrder(
+    market: InternalMarket,
+    projection: InternalProjection,
+    order: InternalOrder,
+  ): void {
+    this.accumulateDepth(market, order.side, order.price_lots, -order.base_lots);
+    market.orders.delete(order.order_id);
+    const ownerUser = this.getOrCreateUser(projection, order.owner);
+    ownerUser.orders.delete(order.order_id);
+  }
+
+  private pruneExpiredOrdersForMarket(
+    market: InternalMarket,
+    projection: InternalProjection,
+    nowTs: bigint,
+  ): void {
+    for (const order of Array.from(market.orders.values())) {
+      if (!this.isExpiredAt(order.expiry_timestamp, nowTs)) {
+        continue;
+      }
+      this.removeOrder(market, projection, order);
+    }
+  }
+
+  private pruneExpiredOrders(
+    projection: InternalProjection,
+    nowTs: bigint,
+  ): void {
+    for (const market of projection.markets.values()) {
+      this.pruneExpiredOrdersForMarket(market, projection, nowTs);
+    }
+  }
+
   private getOrCreateMarket(projection: InternalProjection, market: string): InternalMarket {
     const existing = projection.markets.get(market);
     if (existing) {
@@ -1623,6 +1672,7 @@ export class ContinuumStateEngine {
       quote_lots: o.quote_lots.toString(),
       client_order_id: o.client_order_id.toString(),
       sequence: o.sequence.toString(),
+      expiry_timestamp: o.expiry_timestamp.toString(),
       status: 'open',
     };
   }

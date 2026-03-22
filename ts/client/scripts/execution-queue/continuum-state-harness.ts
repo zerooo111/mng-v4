@@ -22,9 +22,12 @@ import path from 'path';
 import { MANGO_V4_ID } from '../../src/constants';
 import {
   ContinuumStateEngine,
+  EngineSnapshot,
   HarnessEvent,
+  OpenOrderSummary,
   QueueView,
   RelayIntentAcceptedEvent,
+  UserState,
   decodeQueueAnchorEvent,
   parseProgramDataLogLine,
 } from '../../src/continuumHarness';
@@ -97,10 +100,14 @@ const HARNESS_SANITY_INTERVAL_MS = Number(
 const HARNESS_ONCHAIN_CACHE_TTL_MS = Number(
   process.env.CONTINUUM_HARNESS_ONCHAIN_CACHE_TTL_MS || '5000',
 );
+const HARNESS_RECONCILE_INTERVAL_MS = Number(
+  process.env.CONTINUUM_HARNESS_RECONCILE_INTERVAL_MS || '10000',
+);
 
 const engine = new ContinuumStateEngine();
 const sseClients = new Set<ServerResponse>();
 const sanityStateByOwner = new Map<string, string>();
+let lastReconciliationSig = '';
 
 type HarnessGroup = Awaited<ReturnType<MangoClient['getGroup']>>;
 
@@ -142,6 +149,37 @@ type AirdropContext = OnchainContext & {
   defaultUiAmount: number;
   maxUiAmount: number;
   depositUiAmount: number;
+};
+
+type ReconciliationMarketDrift = {
+  replay_open_orders: number;
+  onchain_open_orders: number;
+  replay_best_bid: string | null;
+  onchain_best_bid: string | null;
+  replay_best_ask: string | null;
+  onchain_best_ask: string | null;
+  bid_base_lots_abs_diff: string;
+  ask_base_lots_abs_diff: string;
+};
+
+type ReconciliationSnapshot = {
+  ts_ms: number;
+  replay_generated_ts_ms: number;
+  onchain_generated_ts_ms: number;
+  totals: {
+    replay_open_orders: number;
+    onchain_open_orders: number;
+    bid_base_lots_abs_diff: string;
+    ask_base_lots_abs_diff: string;
+    markets_with_drift: number;
+  };
+  markets: Record<string, ReconciliationMarketDrift>;
+};
+
+type OnchainSyncState = {
+  snapshot: EngineSnapshot | null;
+  drift: ReconciliationSnapshot | null;
+  last_error: string | null;
 };
 
 function ensureDirForFile(filePath: string): void {
@@ -298,6 +336,174 @@ async function getMarketMetadataMap(
   return metadata;
 }
 
+function emptyUserState(owner: string): UserState {
+  return {
+    owner,
+    mango_accounts: [],
+    open_orders: [],
+    per_market: [],
+    margin_summary: {
+      status: 'placeholder',
+      source: 'onchain-sync',
+    },
+  };
+}
+
+function getSnapshotForView(
+  view: QueueView,
+  onchainSync: OnchainSyncState,
+): EngineSnapshot {
+  if (view === 'confirmed' && onchainSync.snapshot) {
+    return onchainSync.snapshot;
+  }
+  return engine.getSnapshot(view);
+}
+
+function getUserStateForView(
+  owner: string,
+  view: QueueView,
+  onchainSync: OnchainSyncState,
+): UserState {
+  const snapshot = getSnapshotForView(view, onchainSync);
+  return snapshot.users[owner] || emptyUserState(owner);
+}
+
+function getBalancesForUserState(
+  user: UserState,
+  view: QueueView,
+) {
+  let totalBid = 0n;
+  let totalAsk = 0n;
+  let totalQuoteReserved = 0n;
+  for (const entry of user.per_market) {
+    totalBid += BigInt(entry.open_order_base_lots_bid);
+    totalAsk += BigInt(entry.open_order_base_lots_ask);
+    totalQuoteReserved += BigInt(entry.quote_reserved_lots);
+  }
+
+  return {
+    owner: user.owner,
+    mango_accounts: user.mango_accounts,
+    per_market: user.per_market,
+    totals: {
+      total_open_order_base_lots_bid: totalBid.toString(),
+      total_open_order_base_lots_ask: totalAsk.toString(),
+      total_quote_reserved_lots: totalQuoteReserved.toString(),
+    },
+    margin_summary: user.margin_summary,
+    view,
+  };
+}
+
+function aggregateDepth(
+  levels: Array<{ price_lots: string; base_lots: string }>,
+): Map<string, bigint> {
+  const out = new Map<string, bigint>();
+  for (const level of levels) {
+    const current = out.get(level.price_lots) || 0n;
+    out.set(level.price_lots, current + BigInt(level.base_lots));
+  }
+  return out;
+}
+
+function absDiffAcrossLevels(
+  lhs: Map<string, bigint>,
+  rhs: Map<string, bigint>,
+): bigint {
+  let total = 0n;
+  const keys = new Set<string>([...lhs.keys(), ...rhs.keys()]);
+  for (const key of keys) {
+    const diff = (lhs.get(key) || 0n) - (rhs.get(key) || 0n);
+    total += diff < 0n ? -diff : diff;
+  }
+  return total;
+}
+
+function decimalStringToBigintTrunc(value: string): bigint {
+  const trimmed = value.trim();
+  if (!trimmed.length) {
+    return 0n;
+  }
+  const negative = trimmed.startsWith('-');
+  const unsigned = negative ? trimmed.slice(1) : trimmed;
+  const whole = unsigned.split('.')[0] || '0';
+  const parsed = BigInt(whole);
+  return negative ? -parsed : parsed;
+}
+
+function buildReconciliationSnapshot(
+  replay: EngineSnapshot,
+  onchainSnapshot: EngineSnapshot,
+): ReconciliationSnapshot {
+  const marketKeys = new Set<string>([
+    ...Object.keys(replay.markets),
+    ...Object.keys(onchainSnapshot.markets),
+  ]);
+  const markets: Record<string, ReconciliationMarketDrift> = {};
+  let totalReplayOpenOrders = 0;
+  let totalOnchainOpenOrders = 0;
+  let totalBidAbsDiff = 0n;
+  let totalAskAbsDiff = 0n;
+  let marketsWithDrift = 0;
+
+  for (const market of marketKeys) {
+    const replayMarket = replay.markets[market];
+    const onchainMarket = onchainSnapshot.markets[market];
+    const replayOrders = replayMarket?.open_orders.length || 0;
+    const onchainOrders = onchainMarket?.open_orders.length || 0;
+    const replayBids = aggregateDepth(replayMarket?.bids || []);
+    const onchainBids = aggregateDepth(onchainMarket?.bids || []);
+    const replayAsks = aggregateDepth(replayMarket?.asks || []);
+    const onchainAsks = aggregateDepth(onchainMarket?.asks || []);
+    const bidDiff = absDiffAcrossLevels(replayBids, onchainBids);
+    const askDiff = absDiffAcrossLevels(replayAsks, onchainAsks);
+    const replayBestBid = replayMarket?.bids?.[0]?.price_lots || null;
+    const onchainBestBid = onchainMarket?.bids?.[0]?.price_lots || null;
+    const replayBestAsk = replayMarket?.asks?.[0]?.price_lots || null;
+    const onchainBestAsk = onchainMarket?.asks?.[0]?.price_lots || null;
+
+    totalReplayOpenOrders += replayOrders;
+    totalOnchainOpenOrders += onchainOrders;
+    totalBidAbsDiff += bidDiff;
+    totalAskAbsDiff += askDiff;
+
+    if (
+      replayOrders !== onchainOrders ||
+      bidDiff > 0n ||
+      askDiff > 0n ||
+      replayBestBid !== onchainBestBid ||
+      replayBestAsk !== onchainBestAsk
+    ) {
+      marketsWithDrift += 1;
+    }
+
+    markets[market] = {
+      replay_open_orders: replayOrders,
+      onchain_open_orders: onchainOrders,
+      replay_best_bid: replayBestBid,
+      onchain_best_bid: onchainBestBid,
+      replay_best_ask: replayBestAsk,
+      onchain_best_ask: onchainBestAsk,
+      bid_base_lots_abs_diff: bidDiff.toString(),
+      ask_base_lots_abs_diff: askDiff.toString(),
+    };
+  }
+
+  return {
+    ts_ms: Date.now(),
+    replay_generated_ts_ms: replay.generated_ts_ms,
+    onchain_generated_ts_ms: onchainSnapshot.generated_ts_ms,
+    totals: {
+      replay_open_orders: totalReplayOpenOrders,
+      onchain_open_orders: totalOnchainOpenOrders,
+      bid_base_lots_abs_diff: totalBidAbsDiff.toString(),
+      ask_base_lots_abs_diff: totalAskAbsDiff.toString(),
+      markets_with_drift: marketsWithDrift,
+    },
+    markets,
+  };
+}
+
 function writeSseEvent(res: ServerResponse, eventName: string, data: unknown): void {
   res.write(`event: ${eventName}\n`);
   res.write(`data: ${JSON.stringify(data)}\n\n`);
@@ -415,7 +621,7 @@ async function runOnchainBalanceSanityCheck(
     string,
     { mangoAccounts: string[]; usdcUiBalance: number }
   >();
-  for (const account of allAccounts) {
+    for (const account of allAccounts) {
     const owner = account.owner.toBase58();
     let row = ownerToOnchain.get(owner);
     if (!row) {
@@ -774,6 +980,286 @@ async function enrichOwnerStateWithOnchain(
   } catch (err) {
     console.warn(`failed to enrich ${view} balances for ${ownerRaw}: ${err}`);
     return baseState;
+  }
+}
+
+async function buildOnchainConfirmedSnapshot(
+  onchain: OnchainContext | null,
+): Promise<EngineSnapshot | null> {
+  const group = await getFreshGroup(onchain);
+  if (!group || !onchain?.mangoClient) {
+    return null;
+  }
+
+  const replayConfirmed = engine.getSnapshot('confirmed');
+  const allAccounts = await onchain.mangoClient.getAllMangoAccounts(group);
+  const ownerByMangoAccount = new Map<string, string>();
+  const users = new Map<string, UserState>();
+  const perUserMarket = new Map<
+    string,
+    Map<
+      string,
+      {
+        openBid: bigint;
+        openAsk: bigint;
+        quoteReserved: bigint;
+        basePositionLots: bigint;
+        quotePositionNative: bigint;
+      }
+    >
+  >();
+
+  const ensureUser = (owner: string): UserState => {
+    const existing = users.get(owner);
+    if (existing) {
+      return existing;
+    }
+    const created = emptyUserState(owner);
+    users.set(owner, created);
+    return created;
+  };
+
+  const ensureUserMarket = (
+    owner: string,
+    market: string,
+  ) => {
+    let ownerMap = perUserMarket.get(owner);
+    if (!ownerMap) {
+      ownerMap = new Map();
+      perUserMarket.set(owner, ownerMap);
+    }
+    const existing = ownerMap.get(market);
+    if (existing) {
+      return existing;
+    }
+    const created = {
+      openBid: 0n,
+      openAsk: 0n,
+      quoteReserved: 0n,
+      basePositionLots: 0n,
+      quotePositionNative: 0n,
+    };
+    ownerMap.set(market, created);
+    return created;
+  };
+
+  for (const account of allAccounts) {
+    const mangoAccount = account.publicKey.toBase58();
+    const owner = account.owner.toBase58();
+    ownerByMangoAccount.set(mangoAccount, owner);
+    const user = ensureUser(owner);
+    if (!user.mango_accounts.includes(mangoAccount)) {
+      user.mango_accounts.push(mangoAccount);
+    }
+    for (const perpPosition of account.perpActive()) {
+      const agg = ensureUserMarket(owner, `${perpPosition.marketIndex}`);
+      agg.basePositionLots += BigInt(perpPosition.basePositionLots.toString());
+      agg.quotePositionNative += decimalStringToBigintTrunc(
+        perpPosition.quotePositionNative.toString(),
+      );
+    }
+  }
+
+  const markets = {} as EngineSnapshot['markets'];
+  for (const [marketIndex, perpMarket] of group.perpMarketsMapByMarketIndex.entries()) {
+    const market = `${marketIndex}`;
+    const [bidsBook, asksBook] = await Promise.all([
+      perpMarket.loadBids(onchain.mangoClient, true),
+      perpMarket.loadAsks(onchain.mangoClient, true),
+    ]);
+    const bids = new Map<string, bigint>();
+    const asks = new Map<string, bigint>();
+    const openOrders: OpenOrderSummary[] = [];
+
+    const recordOrder = (
+      side: 'bid' | 'ask',
+      priceLotsStr: string,
+      baseLots: bigint,
+      quoteLots: bigint,
+      mangoAccount: string,
+      owner: string,
+      sequence: string,
+      expiryTimestamp: string,
+      orderId: string,
+    ) => {
+      const depth = side === 'bid' ? bids : asks;
+      depth.set(priceLotsStr, (depth.get(priceLotsStr) || 0n) + baseLots);
+      const user = ensureUser(owner);
+      if (!user.mango_accounts.includes(mangoAccount)) {
+        user.mango_accounts.push(mangoAccount);
+      }
+      user.open_orders.push({
+        order_id: orderId,
+        owner,
+        mango_account: mangoAccount,
+        market,
+        side,
+        price_lots: priceLotsStr,
+        base_lots: baseLots.toString(),
+        quote_lots: quoteLots.toString(),
+        client_order_id: '0',
+        sequence,
+        expiry_timestamp: expiryTimestamp,
+        status: 'open',
+      });
+      const agg = ensureUserMarket(owner, market);
+      if (side === 'bid') {
+        agg.openBid += baseLots;
+      } else {
+        agg.openAsk += baseLots;
+      }
+      agg.quoteReserved += quoteLots;
+    };
+
+    for (const order of bidsBook.itemsValid()) {
+      const mangoAccount = order.owner.toBase58();
+      const owner = ownerByMangoAccount.get(mangoAccount) || mangoAccount;
+      const baseLots = BigInt(order.sizeLots.toString());
+      const priceLotsStr = order.priceLots.toString();
+      const quoteLots = BigInt(order.priceLots.toString()) * baseLots;
+      recordOrder(
+        'bid',
+        priceLotsStr,
+        baseLots,
+        quoteLots,
+        mangoAccount,
+        owner,
+        order.seqNum.toString(),
+        order.expiryTimestamp.toString(),
+        `${group.publicKey.toBase58()}:${market}:${order.orderId.toString()}`,
+      );
+    }
+
+    for (const order of asksBook.itemsValid()) {
+      const mangoAccount = order.owner.toBase58();
+      const owner = ownerByMangoAccount.get(mangoAccount) || mangoAccount;
+      const baseLots = BigInt(order.sizeLots.toString());
+      const priceLotsStr = order.priceLots.toString();
+      const quoteLots = BigInt(order.priceLots.toString()) * baseLots;
+      recordOrder(
+        'ask',
+        priceLotsStr,
+        baseLots,
+        quoteLots,
+        mangoAccount,
+        owner,
+        order.seqNum.toString(),
+        order.expiryTimestamp.toString(),
+        `${group.publicKey.toBase58()}:${market}:${order.orderId.toString()}`,
+      );
+    }
+
+    const toLevels = (depth: Map<string, bigint>, descending: boolean) =>
+      Array.from(depth.entries())
+        .map(([price_lots, base_lots]) => ({
+          price_lots,
+          base_lots: base_lots.toString(),
+        }))
+        .sort((a, b) => {
+          const av = BigInt(a.price_lots);
+          const bv = BigInt(b.price_lots);
+          if (av === bv) {
+            return 0;
+          }
+          if (descending) {
+            return av > bv ? -1 : 1;
+          }
+          return av < bv ? -1 : 1;
+        });
+
+    const replayMarket = replayConfirmed.markets[market];
+    markets[market] = {
+      market,
+      bids: toLevels(bids, true),
+      asks: toLevels(asks, false),
+      open_orders: openOrders,
+      watermarks: replayMarket?.watermarks || {
+        optimistic_seq: '0',
+        confirmed_seq: '0',
+        last_slot: '0',
+      },
+    };
+  }
+
+  const userStates = {} as EngineSnapshot['users'];
+  for (const [owner, user] of users.entries()) {
+    const perMarketEntries = Array.from((perUserMarket.get(owner) || new Map()).entries())
+      .map(([market, agg]) => ({
+        market,
+        open_order_base_lots_bid: agg.openBid.toString(),
+        open_order_base_lots_ask: agg.openAsk.toString(),
+        quote_reserved_lots: agg.quoteReserved.toString(),
+        base_position_lots: agg.basePositionLots.toString(),
+        quote_position_native: agg.quotePositionNative.toString(),
+      }))
+      .sort((a, b) => a.market.localeCompare(b.market));
+    userStates[owner] = {
+      owner,
+      mango_accounts: [...user.mango_accounts].sort(),
+      open_orders: [...user.open_orders].sort((a, b) => {
+        if (a.market !== b.market) {
+          return a.market.localeCompare(b.market);
+        }
+        if (a.side !== b.side) {
+          return a.side.localeCompare(b.side);
+        }
+        const ap = BigInt(a.price_lots);
+        const bp = BigInt(b.price_lots);
+        if (ap !== bp) {
+          return ap < bp ? -1 : 1;
+        }
+        return BigInt(a.sequence) < BigInt(b.sequence) ? -1 : 1;
+      }),
+      per_market: perMarketEntries,
+      margin_summary: {
+        status: 'placeholder',
+        source: 'onchain-sync',
+      },
+    };
+  }
+
+  return {
+    view: 'confirmed',
+    markets,
+    users: userStates,
+    queue: replayConfirmed.queue,
+    generated_ts_ms: Date.now(),
+  };
+}
+
+async function runOnchainReconciliation(
+  onchain: OnchainContext | null,
+  onchainSync: OnchainSyncState,
+): Promise<void> {
+  const onchainSnapshot = await buildOnchainConfirmedSnapshot(onchain);
+  if (!onchainSnapshot) {
+    return;
+  }
+  const replaySnapshot = engine.getSnapshot('confirmed');
+  const drift = buildReconciliationSnapshot(replaySnapshot, onchainSnapshot);
+  onchainSync.snapshot = onchainSnapshot;
+  onchainSync.drift = drift;
+  onchainSync.last_error = null;
+
+  const driftSig = JSON.stringify(drift.totals);
+  if (driftSig !== lastReconciliationSig) {
+    lastReconciliationSig = driftSig;
+    console.log(
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        msg: 'continuum-onchain-reconciliation',
+        ...drift,
+      }),
+    );
+    if (drift.totals.markets_with_drift > 0) {
+      engine.reportExternalDivergence('onchain_reconciliation_drift', 'confirmed', {
+        replay_open_orders: `${drift.totals.replay_open_orders}`,
+        onchain_open_orders: `${drift.totals.onchain_open_orders}`,
+        bid_base_lots_abs_diff: drift.totals.bid_base_lots_abs_diff,
+        ask_base_lots_abs_diff: drift.totals.ask_base_lots_abs_diff,
+        markets_with_drift: `${drift.totals.markets_with_drift}`,
+      });
+    }
   }
 }
 
@@ -1338,6 +1824,7 @@ async function processDepositContextRequest(
 function buildHttpServer(
   onchain: OnchainContext | null,
   airdrop: AirdropContext | null,
+  onchainSync: OnchainSyncState,
 ): http.Server {
   return http.createServer(async (req, res) => {
     try {
@@ -1353,6 +1840,10 @@ function buildHttpServer(
           market_metadata_total: Object.keys(marketMetadata).length,
           airdrop_enabled: !!airdrop,
           airdrop_deposit_enabled: !!airdrop?.groupPk && !!airdrop?.mangoClient,
+          reconcile_interval_ms: Math.max(1000, HARNESS_RECONCILE_INTERVAL_MS),
+          last_reconcile_ts_ms: onchainSync.drift?.ts_ms || null,
+          reconcile_markets_with_drift:
+            onchainSync.drift?.totals.markets_with_drift || 0,
           generated_ts_ms: Date.now(),
         });
         return;
@@ -1372,6 +1863,14 @@ function buildHttpServer(
         const limit = Number(url.searchParams.get('limit') || '200');
         writeJson(res, 200, {
           items: engine.listDivergences(limit),
+        });
+        return;
+      }
+
+      if (method === 'GET' && url.pathname === '/diagnostics/reconciliation') {
+        writeJson(res, 200, {
+          data: onchainSync.drift,
+          last_error: onchainSync.last_error,
         });
         return;
       }
@@ -1491,11 +1990,23 @@ function buildHttpServer(
       if (method === 'GET' && url.pathname.startsWith('/state/markets/')) {
         const market = decodeURIComponent(url.pathname.slice('/state/markets/'.length));
         const view = parseView(url);
+        const snapshot = getSnapshotForView(view, onchainSync);
         const marketMetadata = await getMarketMetadataMap(onchain);
         writeJson(res, 200, {
           view,
           metadata: marketMetadata[market] || null,
-          data: engine.getMarketState(market, view),
+          data:
+            snapshot.markets[market] || {
+              market,
+              bids: [],
+              asks: [],
+              open_orders: [],
+              watermarks: {
+                optimistic_seq: '0',
+                confirmed_seq: '0',
+                last_slot: '0',
+              },
+            },
         });
         return;
       }
@@ -1503,7 +2014,7 @@ function buildHttpServer(
       if (method === 'GET' && url.pathname.startsWith('/state/users/')) {
         const owner = decodeURIComponent(url.pathname.slice('/state/users/'.length));
         const view = parseView(url);
-        const baseUserState = engine.getUserState(owner, view);
+        const baseUserState = getUserStateForView(owner, view, onchainSync);
         const includeOnchain =
           (url.searchParams.get('onchain') || 'true').toLowerCase() !== 'false';
         const data = includeOnchain
@@ -1526,7 +2037,10 @@ function buildHttpServer(
           url.pathname.slice('/state/balances/'.length),
         );
         const view = parseView(url);
-        const baseBalances = engine.getBalances(owner, view);
+        const baseBalances = getBalancesForUserState(
+          getUserStateForView(owner, view, onchainSync),
+          view,
+        );
         const includeOnchain =
           (url.searchParams.get('onchain') || 'true').toLowerCase() !== 'false';
         const data = includeOnchain
@@ -1548,11 +2062,16 @@ function buildHttpServer(
         const market = decodeURIComponent(url.pathname.slice('/state/orders/'.length));
         const view = parseView(url);
         const owner = url.searchParams.get('owner');
+        const snapshot = getSnapshotForView(view, onchainSync);
+        const data =
+          snapshot.markets[market]?.open_orders.filter((order) => {
+            return !owner || order.owner === owner;
+          }) || [];
         writeJson(res, 200, {
           view,
           market,
           owner,
-          data: engine.getOrders(market, owner, view),
+          data,
         });
         return;
       }
@@ -1609,7 +2128,7 @@ function buildHttpServer(
       if (method === 'GET' && url.pathname === '/state/full') {
         const view = parseView(url);
         const market = url.searchParams.get('market');
-        const snapshot = engine.getSnapshot(view);
+        const snapshot = getSnapshotForView(view, onchainSync);
         const marketMetadata = await getMarketMetadataMap(onchain);
         if (!market) {
           writeJson(res, 200, {
@@ -1678,6 +2197,11 @@ async function main(): Promise<void> {
   await maybeBackfillProgramLogs(connection, programId);
   const onchain = await buildOnchainContext(connection, programId);
   const airdrop = await buildAirdropContext(onchain);
+  const onchainSync: OnchainSyncState = {
+    snapshot: null,
+    drift: null,
+    last_error: null,
+  };
 
   engine.subscribe((event) => {
     appendEventLog(event);
@@ -1692,7 +2216,7 @@ async function main(): Promise<void> {
     HARNESS_COMMITMENT,
   );
 
-  const server = buildHttpServer(onchain, airdrop);
+  const server = buildHttpServer(onchain, airdrop, onchainSync);
   const { host, port } = parseBindAddress(HARNESS_BIND_ADDR);
 
   setInterval(() => {
@@ -1708,6 +2232,17 @@ async function main(): Promise<void> {
   }, Math.max(1000, HARNESS_SANITY_INTERVAL_MS));
   runOnchainBalanceSanityCheck(onchain).catch((err) => {
     console.warn(`initial onchain sanity check failed: ${err}`);
+  });
+
+  setInterval(() => {
+    runOnchainReconciliation(onchain, onchainSync).catch((err) => {
+      onchainSync.last_error = `${err}`;
+      console.warn(`onchain reconciliation failed: ${err}`);
+    });
+  }, Math.max(1000, HARNESS_RECONCILE_INTERVAL_MS));
+  runOnchainReconciliation(onchain, onchainSync).catch((err) => {
+    onchainSync.last_error = `${err}`;
+    console.warn(`initial onchain reconciliation failed: ${err}`);
   });
 
   server.listen(port, host, () => {

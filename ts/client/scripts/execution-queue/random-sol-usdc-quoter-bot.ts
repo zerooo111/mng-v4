@@ -118,6 +118,7 @@ const COMMITMENT: Commitment =
   (process.env.QUOTER_COMMITMENT as Commitment) || 'confirmed';
 const INTERVAL_MS = Number(process.env.QUOTER_INTERVAL_MS || '2000');
 const PRICE_RANGE_BPS = Number(process.env.QUOTER_PRICE_RANGE_BPS || '200');
+const BID_OVERLAP_BPS = Number(process.env.QUOTER_BID_OVERLAP_BPS || '50');
 const SIZE_MIN_SOL = Number(process.env.QUOTER_SIZE_MIN_SOL || '1');
 const SIZE_MAX_SOL = Number(process.env.QUOTER_SIZE_MAX_SOL || '3');
 const ORDER_EXPIRY_SECS = Number(process.env.QUOTER_ORDER_EXPIRY_SECS || '120');
@@ -270,9 +271,11 @@ function randomQuotePrice(
   referencePrice: number,
   side: PerpOrderSide,
 ): number {
-  const fraction = randomFloat(0, PRICE_RANGE_BPS / 10_000);
-  const multiplier =
-    side === PerpOrderSide.bid ? 1 - fraction : 1 + fraction;
+  const offsetBps =
+    side === PerpOrderSide.bid
+      ? randomFloat(-PRICE_RANGE_BPS, BID_OVERLAP_BPS)
+      : randomFloat(0, PRICE_RANGE_BPS);
+  const multiplier = 1 + offsetBps / 10_000;
   return Number((referencePrice * multiplier).toFixed(4));
 }
 
@@ -556,6 +559,9 @@ async function main(): Promise<void> {
   if (PRICE_RANGE_BPS <= 0 || PRICE_RANGE_BPS > 1000) {
     throw new Error('QUOTER_PRICE_RANGE_BPS must be in (0, 1000]');
   }
+  if (!Number.isFinite(BID_OVERLAP_BPS) || BID_OVERLAP_BPS < 0 || BID_OVERLAP_BPS > 500) {
+    throw new Error('QUOTER_BID_OVERLAP_BPS must be in [0, 500]');
+  }
   if (SIZE_MIN_SOL <= 0 || SIZE_MAX_SOL < SIZE_MIN_SOL) {
     throw new Error('invalid QUOTER_SIZE_MIN_SOL / QUOTER_SIZE_MAX_SOL');
   }
@@ -688,6 +694,7 @@ async function main(): Promise<void> {
       relayerAddr,
       intervalMs: INTERVAL_MS,
       priceRangeBps: PRICE_RANGE_BPS,
+      bidOverlapBps: BID_OVERLAP_BPS,
       orderExpirySecs: ORDER_EXPIRY_SECS,
       closePositionProbabilityBps: CLOSE_POSITION_PROBABILITY_BPS,
       sizeMinSol: SIZE_MIN_SOL,
@@ -793,6 +800,7 @@ async function main(): Promise<void> {
         orderLimit: ORDER_LIMIT,
         botDispatchMode: BOT_DISPATCH_MODE,
         priceRangeBps: PRICE_RANGE_BPS,
+        bidOverlapBps: BID_OVERLAP_BPS,
         minExecuteSlotOffset: MIN_EXECUTE_SLOT_OFFSET.toString(),
         orderExpirySecs: ORDER_EXPIRY_SECS,
         closePositionProbabilityBps: CLOSE_POSITION_PROBABILITY_BPS,

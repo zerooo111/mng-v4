@@ -20,4 +20,5 @@ err-txs
 
 .localnet
 .localnet.bak.*
+.devnet
 third-party
