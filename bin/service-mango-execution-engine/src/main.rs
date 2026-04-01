@@ -2706,7 +2706,7 @@ impl Engine {
                     let mut seen: std::collections::HashSet<[u8; 32]> =
                         matched.iter().map(|l| l.hash).collect();
                     for lane in &lanes {
-                        if seen.len() >= 5 {
+                        if seen.len() >= 2 {
                             break;
                         }
                         if seen.contains(&lane.hash) {
