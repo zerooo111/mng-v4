@@ -1749,19 +1749,7 @@ pub fn execution_queue_execute_multi(
 
         let lane_idx = match matched_lane {
             Some(li) => li,
-            None => {
-                // Debug: log the mismatch to help diagnose C-1 flag divergence
-                msg!(
-                    "HLT mismatch: seq={} stored_hash={:?} lane_count={}",
-                    candidate.sequence,
-                    &candidate.accounts_hash[..8],
-                    precomputed_lane_hashes.len(),
-                );
-                for (i, h) in precomputed_lane_hashes.iter().enumerate() {
-                    msg!("  lane[{}] hash={:?}", i, &h[..8]);
-                }
-                break;
-            }
+            None => break,
         };
 
         let dispatch_accounts = lane_slices[lane_idx];
