@@ -102,7 +102,7 @@ pub fn account_buyback_fees_with_mngo(
     let (dao_mngo_token_position, dao_mngo_raw_token_index, _) =
         dao_account.ensure_token_position(mngo_bank.token_index)?;
     require!(
-        dao_mngo_token_position.indexed_position >= I80F48::ZERO,
+        { dao_mngo_token_position.indexed_position } >= I80F48::ZERO,
         MangoError::SomeError
     );
     let in_use =

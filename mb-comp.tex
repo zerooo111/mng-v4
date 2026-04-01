@@ -1,0 +1,93 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{hyperref}
+\usepackage{enumitem}
+
+\title{Mango V4 Execution Queue vs MagicBlock Ephemeral Rollups}
+\date{March 2026}
+
+\begin{document}
+\maketitle
+
+\section{Architecture Comparison}
+
+\begin{longtable}{p{3cm}p{5.5cm}p{5.5cm}}
+\toprule
+\textbf{Dimension} & \textbf{Mango V4 (Execution Queue)} & \textbf{MagicBlock Ephemeral Rollups} \\
+\midrule
+Core Model & On-chain ring buffer queue + off-chain deterministic state engine & Off-chain SVM validator + on-chain delegation program \\
+\midrule
+Execution Location & \textbf{On-chain} (Solana L1 executes every order) & \textbf{Off-chain} (ephemeral SVM processes txs, settles batches to L1) \\
+\midrule
+State Authority & Solana L1 is always authoritative; harness is optimistic projection & State is cloned off-chain; L1 account is locked until undelegation \\
+\midrule
+Sequencing & CTM signer assigns monotonic sequence; FIFO enforced on-chain & Single operator/sequencer inside ER; no on-chain ordering guarantee \\
+\midrule
+Settlement & Implicit --- every order executes as a Solana tx & Explicit --- periodic CommitState + challenge window + Finalize \\
+\bottomrule
+\end{longtable}
+
+\section{Key Tradeoffs}
+
+\subsection{Where MagicBlock Wins}
+
+\begin{itemize}
+  \item \textbf{Latency}: 10--50ms per tx (no consensus overhead) vs 400ms--1.2s (Solana slot time)
+  \item \textbf{Throughput}: Unbounded horizontal scaling (spin up more ERs) vs 1,024-item ring buffer bottleneck
+  \item \textbf{Compute costs}: Near-zero fees inside ER; Mango pays full Solana CU per order (\textasciitilde30--50K CU each)
+  \item \textbf{No stall problem}: Execution isn't bottlenecked by L1 compute budgets (STALL-1/STALL-4 don't exist)
+\end{itemize}
+
+\subsection{Where Mango V4 Wins}
+
+\begin{itemize}
+  \item \textbf{No new trust assumptions}: Crankers are fully untrusted; MagicBlock requires trusting the ER operator for ordering/censorship resistance during the session
+  \item \textbf{No fraud-proof complexity}: Settlement is atomic per-tx on L1 --- no challenge windows, no dispute resolution, no data availability assumptions
+  \item \textbf{Full L1 composability during execution}: Every order is a native Solana tx composable with all of DeFi; MagicBlock locks accounts on L1 while delegated
+  \item \textbf{Deterministic auditability}: Dual-signature scheme (user intent + CTM envelope) creates a cryptographic audit trail fully verifiable on-chain; MagicBlock's off-chain execution is opaque until commitment
+  \item \textbf{Simpler recovery}: Divergence = re-read L1 state. MagicBlock recovery involves fraud proofs, forced undelegation, and potential state reversion
+\end{itemize}
+
+\section{Security Model Comparison}
+
+\begin{longtable}{p{3cm}p{5.5cm}p{5.5cm}}
+\toprule
+\textbf{Concern} & \textbf{Mango V4} & \textbf{MagicBlock} \\
+\midrule
+Sequencer censorship & CTM signer can censor; mitigated by direct-submit bypass (C-4 fix, 10-slot delay) & ER operator can censor; mitigated by time-bound delegation auto-expiry \\
+\midrule
+Execution integrity & Verified per-tx on L1 (payload hash + accounts hash) & Optimistic --- trust operator, then fraud-proof window \\
+\midrule
+Data availability & All data on-chain (Solana is the DA layer) & Operator must publish data; if withheld, fraud proofs can't be constructed \\
+\midrule
+Account safety & Accounts never leave L1 ownership & Accounts change owner to Delegation Program; locked on L1 \\
+\midrule
+MEV protection & Strict FIFO + cryptographic binding prevents reordering & Operator has full reordering power within ER \\
+\bottomrule
+\end{longtable}
+
+\section{Fundamental Architectural Difference}
+
+Mango V4 is a \textbf{sequenced execution queue on L1} --- accepting L1 latency/throughput constraints but gaining zero new trust assumptions. Every order is a real Solana transaction.
+
+MagicBlock is an \textbf{off-chain execution environment} --- breaking free of L1 constraints but introducing operator trust, fraud proofs, and state locking complexity.
+
+\section{Potential Hybrid Approach}
+
+The two architectures are not mutually exclusive:
+
+\begin{enumerate}
+  \item \textbf{Use MagicBlock ERs as the execution engine} --- delegate the execution queue + orderbook accounts to an ER, process orders at 10--50ms, then settle batches back
+  \item \textbf{Keep CTM sequencing layer} --- MagicBlock's single-operator model lacks cryptographic ordering guarantees; CTM envelope + FIFO could run \emph{inside} the ER
+  \item \textbf{Selective delegation} --- use ERs only for high-frequency markets, keep lower-volume markets on the current L1 queue
+\end{enumerate}
+
+This would yield MagicBlock's latency (\textasciitilde50ms) with Mango's security properties (cryptographic sequencing, permissionless verification, no MEV reordering).
+
+\section{Conclusion}
+
+Mango V4 prioritizes \textbf{trustlessness and auditability} over raw speed. MagicBlock prioritizes \textbf{performance} at the cost of new trust assumptions. For a DeFi protocol handling real money, the conservative approach has merit --- but the latency gap is significant for competitive market making.
+
+\end{document}

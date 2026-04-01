@@ -483,11 +483,9 @@ impl<'a, 'info> ScanningAccountRetriever<'a, 'info> {
                     let bank = loaded?;
                     require_keys_eq!(bank.group, *group);
                     let previous = token_index_map.insert(bank.token_index, i);
-                    require_msg!(
-                        previous.is_none(),
-                        "duplicate bank for token index {}",
+                    require_msg!(previous.is_none(), "duplicate bank for token index {}", {
                         bank.token_index
-                    );
+                    });
                     Ok(())
                 })()
                 .with_context(|| format!("scanning banks, health account index {}", i))
@@ -509,7 +507,7 @@ impl<'a, 'info> ScanningAccountRetriever<'a, 'info> {
                     require_msg!(
                         previous.is_none(),
                         "duplicate perp market for perp market index {}",
-                        perp_market.perp_market_index
+                        { perp_market.perp_market_index }
                     );
                     Ok(())
                 })()

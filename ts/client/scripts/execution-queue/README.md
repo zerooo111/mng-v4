@@ -137,6 +137,7 @@ CLUSTER_URL_OVERRIDE=http://127.0.0.1:8899 \
 CTM_RELAYER_PAYER_KEYPAIR=~/.config/solana/id.json \
 CTM_RELAYER_CTM_KEYPAIR=~/.config/solana/id.json \
 CTM_RELAYER_EVENT_SINK_URL=http://127.0.0.1:9091/ingest/relay-intent \
+CTM_RELAYER_HARNESS_BASE_URL=http://127.0.0.1:9091 \
 EXECUTION_QUEUE_GROUP_PK=<group-pubkey> \
 EXECUTION_QUEUE_PK=<queue-pubkey> \
 EXECUTION_QUEUE_ENGINE_ENABLED=false \
@@ -150,6 +151,9 @@ The startup scripts now default to `CTM_RELAYER_IMPL=rust` and
 Rust engine exposes `GET /healthz` and `GET /metrics` on
 `CTM_EXECUTION_ENGINE_HTTP_BIND_ADDR`.
 `EXECUTION_QUEUE_BUFFER_PK` is now optional and treated as an alias of `EXECUTION_QUEUE_PK` for older tooling.
+When `CTM_RELAYER_HARNESS_BASE_URL` is set, submit now performs a cached pre-enqueue harness gate:
+`/healthz` must be fresh, on-chain reconciliation must be fresh when enabled, and any market with
+active harness reconciliation drift is rejected before the relayer sends the enqueue transaction.
 
 Quick checks:
 
@@ -162,6 +166,7 @@ Additional executor metrics now exposed by the Rust engine:
 - `execution_engine_submit_parse_avg_ms`
 - `execution_engine_submit_prepare_avg_ms`
 - `execution_engine_submit_send_avg_ms`
+- `execution_engine_harness_submit_rejects_total`
 - `execution_engine_execute_head_missing_total`
 - `execution_engine_execute_head_blocked_total`
 - `execution_engine_execute_confirmed_no_advance_total`
@@ -170,6 +175,25 @@ Additional executor metrics now exposed by the Rust engine:
 
 The executor now defaults to reason-coded head inspection and only uses speculative execute sends
 for queue-gap recovery (`EXECUTION_QUEUE_CRANK_SAFE_SPECULATIVE=true`).
+
+### Devnet RPC Provider Selection
+
+The persistent devnet stack can switch write-path RPC providers for the relayer and quoter via:
+- `default`: public Solana devnet RPC
+- `helius`: Helius devnet RPC
+- `triton`: Triton / RPCPool devnet RPC
+
+Render the systemd env with one of these:
+
+```bash
+./scripts/render_devnet_runtime.sh --rpc-provider default
+./scripts/render_devnet_runtime.sh --rpc-provider helius --helius-api-key <key>
+./scripts/render_devnet_runtime.sh --rpc-provider triton --triton-rpc-url https://<endpoint>.devnet.rpcpool.com/<token>
+```
+
+For Triton websocket-compatible subscriptions, the runtime renderer derives
+`CLUSTER_WS_URL_OVERRIDE` from the HTTPS endpoint and appends `/whirligig`
+unless you pass `--triton-ws-url` explicitly.
 
 ### Legacy TS Relayer Fallback
 

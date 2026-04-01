@@ -66,10 +66,8 @@ pub fn perp_settle_pnl(ctx: Context<PerpSettlePnl>) -> Result<()> {
     // not just in the health cache. Prevents selective settlement timing with stale oracles.
     let now_slot = Some(Clock::get()?.slot);
     let oracle_ref = &AccountInfoRef::borrow(ctx.accounts.oracle.as_ref())?;
-    let oracle_price = perp_market.oracle_price(
-        &OracleAccountInfos::from_reader(oracle_ref),
-        now_slot,
-    )?;
+    let oracle_price =
+        perp_market.oracle_price(&OracleAccountInfos::from_reader(oracle_ref), now_slot)?;
     let settle_oracle_ref = &AccountInfoRef::borrow(ctx.accounts.settle_oracle.as_ref())?;
     let settle_token_oracle_price = settle_bank.oracle_price(
         &OracleAccountInfos::from_reader(settle_oracle_ref),

@@ -169,7 +169,7 @@ impl<'a, 'info> DepositCommon<'a, 'info> {
                 MangoError::DepositLimit,
                 "assets ({}) can't cross deposit limit on the group ({})",
                 assets,
-                group.deposit_limit_quote
+                { group.deposit_limit_quote }
             );
         }
 

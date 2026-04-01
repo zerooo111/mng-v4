@@ -21,7 +21,7 @@ KEYPAIRS_DIR="${KEYPAIRS_DIR:-${ROOT_DIR}/keypairs}"
 
 PROGRAM_KEYPAIR="${ROOT_DIR}/target/deploy/mango_v4-keypair.json"
 PROGRAM_SO="${ROOT_DIR}/target/deploy/mango_v4.so"
-PROGRAM_ID="${PROGRAM_ID:-7ftfLAYEtDrz8xjhaqa6wUYMrjrmbZ3tjw7J7Rb3QA37}"
+PROGRAM_ID="${PROGRAM_ID:-4CGsiGHZXSnweudEcN235xkLz4twT2DJB35hS7t89cUm}"
 
 DEFAULT_SOLANA_URL="http://127.0.0.1:8899"
 if [[ "${STACK_CLUSTER}" == "devnet" ]]; then

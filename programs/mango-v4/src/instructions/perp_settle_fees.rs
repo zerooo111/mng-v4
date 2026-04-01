@@ -33,10 +33,8 @@ pub fn perp_settle_fees(ctx: Context<PerpSettleFees>, max_settle_amount: u64) ->
     // H-11 fix: Enforce staleness check on oracle prices used for fee settlement.
     let now_slot = Some(Clock::get()?.slot);
     let oracle_ref = &AccountInfoRef::borrow(ctx.accounts.oracle.as_ref())?;
-    let oracle_price = perp_market.oracle_price(
-        &OracleAccountInfos::from_reader(oracle_ref),
-        now_slot,
-    )?;
+    let oracle_price =
+        perp_market.oracle_price(&OracleAccountInfos::from_reader(oracle_ref), now_slot)?;
     let settle_oracle_ref = &AccountInfoRef::borrow(ctx.accounts.settle_oracle.as_ref())?;
     let settle_token_oracle_price = settle_bank.oracle_price(
         &OracleAccountInfos::from_reader(settle_oracle_ref),
@@ -58,7 +56,7 @@ pub fn perp_settle_fees(ctx: Context<PerpSettleFees>, max_settle_amount: u64) ->
         msg!(
             "Not settling: pnl {}, perp_market.fees_accrued {}, settleable_pnl {}",
             pnl,
-            perp_market.fees_accrued,
+            { perp_market.fees_accrued },
             settleable_pnl
         );
         return Ok(());
@@ -72,7 +70,7 @@ pub fn perp_settle_fees(ctx: Context<PerpSettleFees>, max_settle_amount: u64) ->
     require!(settlement >= 0, MangoError::SettlementAmountMustBePositive);
 
     perp_position.record_settle(-settlement, &perp_market); // settle the negative pnl on the user perp position
-    perp_market.fees_accrued -= settlement;
+    perp_market.fees_accrued = { perp_market.fees_accrued } - settlement;
 
     emit_perp_balances(
         ctx.accounts.group.key(),
@@ -103,7 +101,7 @@ pub fn perp_settle_fees(ctx: Context<PerpSettleFees>, max_settle_amount: u64) ->
         Clock::get()?.unix_timestamp.try_into().unwrap(),
     )?;
     // Update the settled balance on the market itself
-    perp_market.fees_settled += settlement;
+    perp_market.fees_settled = { perp_market.fees_settled } + settlement;
 
     emit_stack(TokenBalanceLog {
         mango_group: ctx.accounts.group.key(),

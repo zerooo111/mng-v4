@@ -55,7 +55,7 @@ fi
 
 PROGRAM_KEYPAIR="${MNG_DIR}/target/deploy/mango_v4-keypair.json"
 PROGRAM_SO="${MNG_DIR}/target/deploy/mango_v4.so"
-PROGRAM_ID="${PROGRAM_ID:-7ftfLAYEtDrz8xjhaqa6wUYMrjrmbZ3tjw7J7Rb3QA37}"
+PROGRAM_ID="${PROGRAM_ID:-4CGsiGHZXSnweudEcN235xkLz4twT2DJB35hS7t89cUm}"
 PROGRAM_ID_EFFECTIVE="${PROGRAM_ID}"
 
 DEPLOY_MODE="${DEPLOY_MODE:-auto}" # auto|cli|preload

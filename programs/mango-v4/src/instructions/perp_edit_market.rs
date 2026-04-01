@@ -50,8 +50,8 @@ pub fn perp_edit_market(
     if let Some(oracle_config) = oracle_config_opt {
         msg!(
         "Oracle config: old - conf_filter {:?}, max_staleness_slots {:?},  new - conf_filter {:?}, max_staleness_slots {:?}",
-        perp_market.oracle_config.conf_filter,
-        perp_market.oracle_config.max_staleness_slots,
+        { perp_market.oracle_config.conf_filter },
+        { perp_market.oracle_config.max_staleness_slots },
         oracle_config.conf_filter,
         oracle_config.max_staleness_slots
     );
@@ -69,17 +69,19 @@ pub fn perp_edit_market(
         let oracle_ref = &AccountInfoRef::borrow(ctx.accounts.oracle.as_ref())?;
         let oracle_price =
             perp_market.oracle_price(&OracleAccountInfos::from_reader(oracle_ref), None)?;
-        perp_market.stable_price_model.reset_to_price(
+        let mut spm = { perp_market.stable_price_model };
+        spm.reset_to_price(
             oracle_price.to_num(),
             Clock::get()?.unix_timestamp.try_into().unwrap(),
         );
+        perp_market.stable_price_model = spm;
         require_group_admin = true;
     }
 
     if let Some(maint_base_asset_weight) = maint_base_asset_weight_opt {
         msg!(
             "Maint base asset weight: old - {:?}, new - {:?}",
-            perp_market.maint_base_asset_weight,
+            { perp_market.maint_base_asset_weight },
             maint_base_asset_weight
         );
         perp_market.maint_base_asset_weight = I80F48::from_num(maint_base_asset_weight);
@@ -88,7 +90,7 @@ pub fn perp_edit_market(
     if let Some(init_base_asset_weight) = init_base_asset_weight_opt {
         msg!(
             "Init base asset weight: old - {:?}, new - {:?}",
-            perp_market.init_base_asset_weight,
+            { perp_market.init_base_asset_weight },
             init_base_asset_weight
         );
         require_gte!(
@@ -103,7 +105,7 @@ pub fn perp_edit_market(
     if let Some(maint_base_liab_weight) = maint_base_liab_weight_opt {
         msg!(
             "Maint base liab weight: old - {:?}, new - {:?}",
-            perp_market.maint_base_liab_weight,
+            { perp_market.maint_base_liab_weight },
             maint_base_liab_weight
         );
         perp_market.maint_base_liab_weight = I80F48::from_num(maint_base_liab_weight);
@@ -112,7 +114,7 @@ pub fn perp_edit_market(
     if let Some(init_base_liab_weight) = init_base_liab_weight_opt {
         msg!(
             "Init base liab weight: old - {:?}, new - {:?}",
-            perp_market.init_base_liab_weight,
+            { perp_market.init_base_liab_weight },
             init_base_liab_weight
         );
         perp_market.init_base_liab_weight = I80F48::from_num(init_base_liab_weight);
@@ -121,7 +123,7 @@ pub fn perp_edit_market(
     if let Some(maint_overall_asset_weight) = maint_overall_asset_weight_opt {
         msg!(
             "Maint pnl asset weight: old - {:?}, new - {:?}",
-            perp_market.maint_overall_asset_weight,
+            { perp_market.maint_overall_asset_weight },
             maint_overall_asset_weight
         );
         perp_market.maint_overall_asset_weight = I80F48::from_num(maint_overall_asset_weight);
@@ -130,7 +132,7 @@ pub fn perp_edit_market(
     if let Some(init_overall_asset_weight) = init_overall_asset_weight_opt {
         msg!(
             "Init pnl asset weight: old - {:?}, new - {:?}",
-            perp_market.init_overall_asset_weight,
+            { perp_market.init_overall_asset_weight },
             init_overall_asset_weight
         );
         perp_market.init_overall_asset_weight = I80F48::from_num(init_overall_asset_weight);
@@ -144,7 +146,7 @@ pub fn perp_edit_market(
     if let Some(base_liquidation_fee) = base_liquidation_fee_opt {
         msg!(
             "Base liquidation fee: old - {:?}, new - {:?}",
-            perp_market.base_liquidation_fee,
+            { perp_market.base_liquidation_fee },
             base_liquidation_fee
         );
         perp_market.base_liquidation_fee = I80F48::from_num(base_liquidation_fee);
@@ -154,7 +156,7 @@ pub fn perp_edit_market(
     if let Some(maker_fee) = maker_fee_opt {
         msg!(
             "Maker fee: old - {:?}, new - {:?}",
-            perp_market.maker_fee,
+            { perp_market.maker_fee },
             maker_fee
         );
         perp_market.maker_fee = I80F48::from_num(maker_fee);
@@ -163,7 +165,7 @@ pub fn perp_edit_market(
     if let Some(taker_fee) = taker_fee_opt {
         msg!(
             "Taker fee: old - {:?}, new - {:?}",
-            perp_market.taker_fee,
+            { perp_market.taker_fee },
             taker_fee
         );
         perp_market.taker_fee = I80F48::from_num(taker_fee);
@@ -173,7 +175,7 @@ pub fn perp_edit_market(
     if let Some(min_funding) = min_funding_opt {
         msg!(
             "Min funding: old - {:?}, new - {:?}",
-            perp_market.min_funding,
+            { perp_market.min_funding },
             min_funding
         );
         perp_market.min_funding = I80F48::from_num(min_funding);
@@ -182,7 +184,7 @@ pub fn perp_edit_market(
     if let Some(max_funding) = max_funding_opt {
         msg!(
             "Max funding: old - {:?}, new - {:?}",
-            perp_market.max_funding,
+            { perp_market.max_funding },
             max_funding
         );
         perp_market.max_funding = I80F48::from_num(max_funding);
@@ -191,7 +193,7 @@ pub fn perp_edit_market(
     if let Some(impact_quantity) = impact_quantity_opt {
         msg!(
             "Impact quantity: old - {:?}, new - {:?}",
-            perp_market.impact_quantity,
+            { perp_market.impact_quantity },
             impact_quantity
         );
         perp_market.impact_quantity = impact_quantity;
@@ -200,7 +202,7 @@ pub fn perp_edit_market(
     if let Some(fee_penalty) = fee_penalty_opt {
         msg!(
             "Fee penalty: old - {:?}, new - {:?}",
-            perp_market.fee_penalty,
+            { perp_market.fee_penalty },
             fee_penalty
         );
         perp_market.fee_penalty = fee_penalty;
@@ -230,7 +232,7 @@ pub fn perp_edit_market(
     if let Some(settle_fee_flat) = settle_fee_flat_opt {
         msg!(
             "Settle fee flat: old - {:?}, new - {:?}",
-            perp_market.settle_fee_flat,
+            { perp_market.settle_fee_flat },
             settle_fee_flat
         );
         perp_market.settle_fee_flat = settle_fee_flat;
@@ -239,7 +241,7 @@ pub fn perp_edit_market(
     if let Some(settle_fee_amount_threshold) = settle_fee_amount_threshold_opt {
         msg!(
             "Settle fee amount threshold: old - {:?}, new - {:?}",
-            perp_market.settle_fee_amount_threshold,
+            { perp_market.settle_fee_amount_threshold },
             settle_fee_amount_threshold
         );
         perp_market.settle_fee_amount_threshold = settle_fee_amount_threshold;
@@ -248,7 +250,7 @@ pub fn perp_edit_market(
     if let Some(settle_fee_fraction_low_health) = settle_fee_fraction_low_health_opt {
         msg!(
             "Settle fee fraction low health: old - {:?}, new - {:?}",
-            perp_market.settle_fee_fraction_low_health,
+            { perp_market.settle_fee_fraction_low_health },
             settle_fee_fraction_low_health
         );
         perp_market.settle_fee_fraction_low_health = settle_fee_fraction_low_health;
@@ -259,7 +261,7 @@ pub fn perp_edit_market(
         // Updating this makes the old delay values slightly inconsistent
         msg!(
             "Stable price delay interval seconds: old - {:?}, new - {:?}",
-            perp_market.stable_price_model.delay_interval_seconds,
+            { perp_market.stable_price_model.delay_interval_seconds },
             stable_price_delay_interval_seconds
         );
         perp_market.stable_price_model.delay_interval_seconds = stable_price_delay_interval_seconds;
@@ -268,7 +270,7 @@ pub fn perp_edit_market(
     if let Some(stable_price_delay_growth_limit) = stable_price_delay_growth_limit_opt {
         msg!(
             "Stable price delay growth limit: old - {:?}, new - {:?}",
-            perp_market.stable_price_model.delay_growth_limit,
+            { perp_market.stable_price_model.delay_growth_limit },
             stable_price_delay_growth_limit
         );
         perp_market.stable_price_model.delay_growth_limit = stable_price_delay_growth_limit;
@@ -277,7 +279,7 @@ pub fn perp_edit_market(
     if let Some(stable_price_growth_limit) = stable_price_growth_limit_opt {
         msg!(
             "Stable price growth limit: old - {:?}, new - {:?}",
-            perp_market.stable_price_model.stable_growth_limit,
+            { perp_market.stable_price_model.stable_growth_limit },
             stable_price_growth_limit
         );
         perp_market.stable_price_model.stable_growth_limit = stable_price_growth_limit;
@@ -287,7 +289,7 @@ pub fn perp_edit_market(
     if let Some(settle_pnl_limit_factor) = settle_pnl_limit_factor_opt {
         msg!(
             "Settle pnl limit factor: old - {:?}, new - {:?}",
-            perp_market.settle_pnl_limit_factor,
+            { perp_market.settle_pnl_limit_factor },
             settle_pnl_limit_factor
         );
         perp_market.settle_pnl_limit_factor = settle_pnl_limit_factor;
@@ -296,7 +298,7 @@ pub fn perp_edit_market(
     if let Some(settle_pnl_limit_window_size_ts) = settle_pnl_limit_window_size_ts_opt {
         msg!(
             "Settle pnl limit window size ts: old - {:?}, new - {:?}",
-            perp_market.settle_pnl_limit_window_size_ts,
+            { perp_market.settle_pnl_limit_window_size_ts },
             settle_pnl_limit_window_size_ts
         );
         perp_market.settle_pnl_limit_window_size_ts = settle_pnl_limit_window_size_ts;
@@ -320,7 +322,7 @@ pub fn perp_edit_market(
     if let Some(positive_pnl_liquidation_fee) = positive_pnl_liquidation_fee_opt {
         msg!(
             "Positive pnl liquidation fee: old - {:?}, new - {:?}",
-            perp_market.positive_pnl_liquidation_fee,
+            { perp_market.positive_pnl_liquidation_fee },
             positive_pnl_liquidation_fee
         );
         perp_market.positive_pnl_liquidation_fee = I80F48::from_num(positive_pnl_liquidation_fee);
@@ -349,7 +351,7 @@ pub fn perp_edit_market(
     if let Some(platform_liquidation_fee) = platform_liquidation_fee_opt {
         msg!(
             "Platform liquidation fee: old - {:?}, new - {:?}",
-            perp_market.platform_liquidation_fee,
+            { perp_market.platform_liquidation_fee },
             platform_liquidation_fee
         );
         perp_market.platform_liquidation_fee = I80F48::from_num(platform_liquidation_fee);

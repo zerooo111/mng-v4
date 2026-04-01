@@ -1,7 +1,10 @@
 import { AnchorProvider, Wallet } from '@coral-xyz/anchor';
 import { Magic as PythMagic } from '@pythnetwork/client';
 import { AccountInfo, Connection, Keypair, PublicKey } from '@solana/web3.js';
-import { SB_ON_DEMAND_PID } from '@switchboard-xyz/on-demand';
+import {
+  ON_DEMAND_MAINNET_PID,
+  ON_DEMAND_DEVNET_PID,
+} from '@switchboard-xyz/on-demand';
 import SwitchboardProgram from '@switchboard-xyz/sbv2-lite';
 import Big from 'big.js';
 import BN from 'bn.js';
@@ -190,7 +193,11 @@ export async function parseSwitchboardOracle(
   accountInfo: AccountInfo<Buffer>,
   connection: Connection,
 ): Promise<{ price: number; lastUpdatedSlot: number; uiDeviation: number }> {
-  if (accountInfo.owner.equals(SB_ON_DEMAND_PID)) {
+  if (
+    accountInfo.owner.equals(ON_DEMAND_MAINNET_PID) ||
+    accountInfo.owner.equals(ON_DEMAND_DEVNET_PID)
+  ) {
+    const onDemandPid = accountInfo.owner;
     if (!sbOnDemandProgram) {
       const options = AnchorProvider.defaultOptions();
       const provider = new AnchorProvider(
@@ -198,7 +205,7 @@ export async function parseSwitchboardOracle(
         new Wallet(new Keypair()),
         options,
       );
-      const idl = await Anchor30Program.fetchIdl(SB_ON_DEMAND_PID, provider);
+      const idl = await Anchor30Program.fetchIdl(onDemandPid, provider);
       sbOnDemandProgram = new Anchor30Program(idl!, provider);
     }
     return parseSwitchboardOnDemandOracle(
@@ -238,7 +245,8 @@ export function isSwitchboardOracle(accountInfo: AccountInfo<Buffer>): boolean {
     accountInfo.owner.equals(SBV1_MAINNET_PID) ||
     accountInfo.owner.equals(SwitchboardProgram.devnetPid) ||
     accountInfo.owner.equals(SwitchboardProgram.mainnetPid) ||
-    accountInfo.owner.equals(SB_ON_DEMAND_PID)
+    accountInfo.owner.equals(ON_DEMAND_MAINNET_PID) ||
+    accountInfo.owner.equals(ON_DEMAND_DEVNET_PID)
   ) {
     return true;
   }

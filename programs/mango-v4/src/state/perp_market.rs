@@ -21,6 +21,7 @@ use super::{
 
 pub type PerpMarketIndex = u16;
 
+#[repr(C, packed)]
 #[account(zero_copy)]
 #[derive(Derivative)]
 #[derivative(Debug)]
@@ -293,10 +294,11 @@ impl PerpMarket {
     ) -> Result<OracleState> {
         require_keys_eq!(self.oracle, *oracle_acc_infos.oracle.key());
         let state = oracle::oracle_state_unchecked(oracle_acc_infos, self.base_decimals)?;
+        let oracle_config = { self.oracle_config };
         state
-            .check_confidence_and_maybe_staleness(&self.oracle_config, staleness_slot)
+            .check_confidence_and_maybe_staleness(&oracle_config, staleness_slot)
             .with_context(|| {
-                oracle_log_context(self.name(), &state, &self.oracle_config, staleness_slot)
+                oracle_log_context(self.name(), &state, &oracle_config, staleness_slot)
             })?;
         Ok(state)
     }
@@ -354,12 +356,13 @@ impl PerpMarket {
         // The number of native quote that one base lot should pay in funding
         let funding_delta = oracle_price * base_lot_size * funding_rate * time_factor;
 
-        self.long_funding += funding_delta;
-        self.short_funding += funding_delta;
+        self.long_funding = { self.long_funding } + funding_delta;
+        self.short_funding = { self.short_funding } + funding_delta;
         self.funding_last_updated = now_ts;
 
-        self.stable_price_model
-            .update(now_ts, oracle_price.to_num());
+        let mut spm = { self.stable_price_model };
+        spm.update(now_ts, oracle_price.to_num());
+        self.stable_price_model = spm;
 
         emit_stack(PerpUpdateFundingLogV2 {
             mango_group: self.group,
@@ -416,13 +419,13 @@ impl PerpMarket {
             // C-5 fix: Track unsocialized loss instead of silently discarding it.
             // This loss represents a shortfall that should be covered by the insurance fund
             // or governance action.
-            self.unsocialized_loss += loss; // loss is negative, so this accumulates
+            self.unsocialized_loss = { self.unsocialized_loss } + loss; // loss is negative, so this accumulates
             I80F48::ZERO
         } else {
             loss / I80F48::from(self.open_interest)
         };
-        self.long_funding -= socialized_loss;
-        self.short_funding += socialized_loss;
+        self.long_funding = { self.long_funding } - socialized_loss;
+        self.short_funding = { self.short_funding } + socialized_loss;
         Ok(socialized_loss)
     }
 
@@ -467,7 +470,7 @@ impl PerpMarket {
 
         let flat_fee = I80F48::from_num(self.settle_fee_flat);
 
-        let mut fee = if settlement >= self.settle_fee_amount_threshold {
+        let mut fee = if settlement >= { self.settle_fee_amount_threshold } {
             // If the settlement is big enough: give the flat fee
             flat_fee
         } else {

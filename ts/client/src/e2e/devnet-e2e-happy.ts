@@ -2,7 +2,7 @@
  * Devnet E2E Happy Path Tests
  *
  * Tests against the live devnet deployment:
- *   Program: 7ftfLAYEtDrz8xjhaqa6wUYMrjrmbZ3tjw7J7Rb3QA37
+ *   Program: 4CGsiGHZXSnweudEcN235xkLz4twT2DJB35hS7t89cUm
  *   Group:   42ZYDpNAUM8NZgmuQHwrUXsEWb98AkjJfJHYFFoCZpCi
  *   Queue:   2Bs3tGdMs4PQV98qFLXaafSi8AJWH55eT2WwN8ZKJMkn
  *
@@ -29,7 +29,7 @@ import {
 
 // ── Devnet constants ──
 const RPC = 'https://api.devnet.solana.com';
-const PROGRAM_ID = new PublicKey('7ftfLAYEtDrz8xjhaqa6wUYMrjrmbZ3tjw7J7Rb3QA37');
+const PROGRAM_ID = new PublicKey('4CGsiGHZXSnweudEcN235xkLz4twT2DJB35hS7t89cUm');
 const GROUP = new PublicKey('42ZYDpNAUM8NZgmuQHwrUXsEWb98AkjJfJHYFFoCZpCi');
 const EXEC_QUEUE = new PublicKey('2Bs3tGdMs4PQV98qFLXaafSi8AJWH55eT2WwN8ZKJMkn');
 const PERP_MARKET = new PublicKey('2K6J5ACxtxh6zjKagTi3AzJpde1CHmWHQa2gyWwN2Aaf');

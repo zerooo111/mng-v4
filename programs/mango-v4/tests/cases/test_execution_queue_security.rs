@@ -318,8 +318,7 @@ async fn test_security_forged_mango_account() -> Result<(), TransportError> {
 
     let ctm_signer = TestKeypair::new();
     let execution_queue =
-        create_initialized_execution_queue(solana, group1, admin, payer, ctm_signer.pubkey())
-            .await;
+        create_initialized_execution_queue(solana, group1, admin, payer, ctm_signer.pubkey()).await;
 
     // Create a mango account belonging to group2
     let mango_account_group2 = send_tx(
@@ -368,7 +367,10 @@ async fn test_security_forged_mango_account() -> Result<(), TransportError> {
     .await;
 
     // Should fail because the mango_account belongs to group2, not group1
-    assert!(result.is_err(), "enqueue with forged mango_account should fail");
+    assert!(
+        result.is_err(),
+        "enqueue with forged mango_account should fail"
+    );
 
     Ok(())
 }
@@ -399,8 +401,7 @@ async fn test_security_non_admin_drop() -> Result<(), TransportError> {
 
     let ctm_signer = TestKeypair::new();
     let execution_queue =
-        create_initialized_execution_queue(solana, group, admin, payer, ctm_signer.pubkey())
-            .await;
+        create_initialized_execution_queue(solana, group, admin, payer, ctm_signer.pubkey()).await;
 
     // Create a mango account and enqueue a CTM item
     let mango_account = send_tx(
@@ -465,12 +466,8 @@ async fn test_security_non_admin_drop() -> Result<(), TransportError> {
 
     // Try to drop using a non-admin keypair
     let non_admin = TestKeypair::new();
-    let drop_instruction = build_execution_queue_drop_ctm_instruction(
-        group,
-        execution_queue,
-        non_admin.pubkey(),
-        0,
-    );
+    let drop_instruction =
+        build_execution_queue_drop_ctm_instruction(group, execution_queue, non_admin.pubkey(), 0);
     let result = solana
         .process_transaction(&[drop_instruction], Some(&[non_admin]))
         .await;
@@ -533,8 +530,7 @@ async fn test_security_non_admin_configure() -> Result<(), TransportError> {
 
     let ctm_signer = TestKeypair::new();
     let _execution_queue =
-        create_initialized_execution_queue(solana, group, admin, payer, ctm_signer.pubkey())
-            .await;
+        create_initialized_execution_queue(solana, group, admin, payer, ctm_signer.pubkey()).await;
 
     // Try to configure using a non-admin keypair
     let non_admin = TestKeypair::new();
@@ -592,8 +588,7 @@ async fn test_security_replay_same_envelope_after_execution() -> Result<(), Tran
 
     let ctm_signer = TestKeypair::new();
     let execution_queue =
-        create_initialized_execution_queue(solana, group, admin, payer, ctm_signer.pubkey())
-            .await;
+        create_initialized_execution_queue(solana, group, admin, payer, ctm_signer.pubkey()).await;
 
     let mango_account = send_tx(
         solana,
@@ -684,8 +679,11 @@ async fn test_security_replay_same_envelope_after_execution() -> Result<(), Tran
         .await;
     assert_eq!(queue.header.total_count, 0);
     assert_eq!(queue.header.ctm_count, 0);
-    assert!(queue.header.next_sequence_to_execute >= 1,
-        "expected next_sequence >= 1, got {}", queue.header.next_sequence_to_execute);
+    assert!(
+        queue.header.next_sequence_to_execute >= 1,
+        "expected next_sequence >= 1, got {}",
+        queue.header.next_sequence_to_execute
+    );
 
     // Try to replay the same envelope with seq 0
     let replay_result = send_signed_ctm_enqueue(
@@ -735,8 +733,7 @@ async fn test_security_same_payload_different_sequence() -> Result<(), Transport
 
     let ctm_signer = TestKeypair::new();
     let execution_queue =
-        create_initialized_execution_queue(solana, group, admin, payer, ctm_signer.pubkey())
-            .await;
+        create_initialized_execution_queue(solana, group, admin, payer, ctm_signer.pubkey()).await;
 
     let mango_account = send_tx(
         solana,
@@ -1108,8 +1105,7 @@ async fn test_security_spoofed_instructions_sysvar() -> Result<(), TransportErro
 
     let ctm_signer = TestKeypair::new();
     let execution_queue =
-        create_initialized_execution_queue(solana, group, admin, payer, ctm_signer.pubkey())
-            .await;
+        create_initialized_execution_queue(solana, group, admin, payer, ctm_signer.pubkey()).await;
 
     let mango_account = send_tx(
         solana,
@@ -1144,12 +1140,8 @@ async fn test_security_spoofed_instructions_sysvar() -> Result<(), TransportErro
     };
 
     // Build the ed25519 pre-instructions normally
-    let user_message = canonical_user_intent_message(
-        group,
-        mango_account,
-        owner.pubkey(),
-        &envelope,
-    );
+    let user_message =
+        canonical_user_intent_message(group, mango_account, owner.pubkey(), &envelope);
     let envelope_message = canonical_envelope_message(group, &envelope);
     let user_signature: [u8; 64] = owner
         .to_keypair()
@@ -1244,8 +1236,7 @@ async fn test_security_concurrent_same_sequence() -> Result<(), TransportError> 
 
     let ctm_signer = TestKeypair::new();
     let execution_queue =
-        create_initialized_execution_queue(solana, group, admin, payer, ctm_signer.pubkey())
-            .await;
+        create_initialized_execution_queue(solana, group, admin, payer, ctm_signer.pubkey()).await;
 
     let mango_account = send_tx(
         solana,
@@ -1356,12 +1347,10 @@ async fn test_security_stale_oracle_blocks_queue_health() -> Result<(), Transpor
     .create(solana)
     .await;
 
-    let account =
-        create_funded_account(solana, group, owner, 0, &users[1], mints, 10000, 0).await;
+    let account = create_funded_account(solana, group, owner, 0, &users[1], mints, 10000, 0).await;
     let ctm_signer = TestKeypair::new();
     let execution_queue =
-        create_initialized_execution_queue(solana, group, admin, payer, ctm_signer.pubkey())
-            .await;
+        create_initialized_execution_queue(solana, group, admin, payer, ctm_signer.pubkey()).await;
 
     let mango_v4::accounts::PerpCreateMarket {
         perp_market,
@@ -1401,9 +1390,9 @@ async fn test_security_stale_oracle_blocks_queue_health() -> Result<(), Transpor
     let payload = encode_perp_place_order_v2_payload(
         Side::Bid,
         price_lots,
-        1,           // max_base_lots
-        i64::MAX,    // max_quote_lots
-        42,          // client_order_id
+        1,        // max_base_lots
+        i64::MAX, // max_quote_lots
+        42,       // client_order_id
         PlaceOrderType::Limit,
         SelfTradeBehavior::DecrementTake,
         false,
@@ -1529,12 +1518,10 @@ async fn test_security_oracle_confidence_too_wide() -> Result<(), TransportError
     .create(solana)
     .await;
 
-    let account =
-        create_funded_account(solana, group, owner, 0, &users[1], mints, 10000, 0).await;
+    let account = create_funded_account(solana, group, owner, 0, &users[1], mints, 10000, 0).await;
     let ctm_signer = TestKeypair::new();
     let execution_queue =
-        create_initialized_execution_queue(solana, group, admin, payer, ctm_signer.pubkey())
-            .await;
+        create_initialized_execution_queue(solana, group, admin, payer, ctm_signer.pubkey()).await;
 
     let mango_v4::accounts::PerpCreateMarket {
         perp_market,
@@ -1701,12 +1688,10 @@ async fn test_security_oracle_stale_does_not_block_cancel() -> Result<(), Transp
     .create(solana)
     .await;
 
-    let account =
-        create_funded_account(solana, group, owner, 0, &users[1], mints, 1000, 0).await;
+    let account = create_funded_account(solana, group, owner, 0, &users[1], mints, 1000, 0).await;
     let ctm_signer = TestKeypair::new();
     let execution_queue =
-        create_initialized_execution_queue(solana, group, admin, payer, ctm_signer.pubkey())
-            .await;
+        create_initialized_execution_queue(solana, group, admin, payer, ctm_signer.pubkey()).await;
 
     let mango_v4::accounts::PerpCreateMarket {
         perp_market,
@@ -1864,12 +1849,10 @@ async fn test_security_execute_rejects_cpi() -> Result<(), TransportError> {
     .create(solana)
     .await;
 
-    let account =
-        create_funded_account(solana, group, owner, 0, &users[1], mints, 1000, 0).await;
+    let account = create_funded_account(solana, group, owner, 0, &users[1], mints, 1000, 0).await;
     let ctm_signer = TestKeypair::new();
     let execution_queue =
-        create_initialized_execution_queue(solana, group, admin, payer, ctm_signer.pubkey())
-            .await;
+        create_initialized_execution_queue(solana, group, admin, payer, ctm_signer.pubkey()).await;
 
     let mango_v4::accounts::PerpCreateMarket {
         perp_market,
@@ -2013,12 +1996,10 @@ async fn test_security_dispatch_cannot_modify_queue_account() -> Result<(), Tran
     .create(solana)
     .await;
 
-    let account =
-        create_funded_account(solana, group, owner, 0, &users[1], mints, 1000, 0).await;
+    let account = create_funded_account(solana, group, owner, 0, &users[1], mints, 1000, 0).await;
     let ctm_signer = TestKeypair::new();
     let execution_queue =
-        create_initialized_execution_queue(solana, group, admin, payer, ctm_signer.pubkey())
-            .await;
+        create_initialized_execution_queue(solana, group, admin, payer, ctm_signer.pubkey()).await;
 
     let mango_v4::accounts::PerpCreateMarket {
         perp_market,

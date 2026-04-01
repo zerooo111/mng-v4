@@ -209,15 +209,11 @@ pub fn token_withdraw(ctx: Context<TokenWithdraw>, amount: u64, allow_borrow: bo
         // When borrowing the price has be trustworthy, so we can do a reasonable
         // net borrow check.
         let slot_opt = Some(Clock::get()?.slot);
+        let oracle_config = { bank.oracle_config };
         unsafe_oracle_state
-            .check_confidence_and_maybe_staleness(&bank.oracle_config, slot_opt)
+            .check_confidence_and_maybe_staleness(&oracle_config, slot_opt)
             .with_context(|| {
-                oracle_log_context(
-                    bank.name(),
-                    &unsafe_oracle_state,
-                    &bank.oracle_config,
-                    slot_opt,
-                )
+                oracle_log_context(bank.name(), &unsafe_oracle_state, &oracle_config, slot_opt)
             })?;
         bank.check_net_borrows(unsafe_oracle_state.price)?;
     } else {

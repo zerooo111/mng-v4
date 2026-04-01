@@ -72,7 +72,7 @@ pub fn token_force_close_borrows_with_token(
         // only allow combination of asset and liab token,
         // where liqee's health would be guaranteed to not decrease
         require_gte!(
-            liab_bank.init_liab_weight,
+            { liab_bank.init_liab_weight },
             asset_bank.init_liab_weight * fee_factor_total,
             MangoError::SomeError
         );
@@ -106,8 +106,10 @@ pub fn token_force_close_borrows_with_token(
         let asset_transfer_from_liqee = asset_transfer_base * fee_factor_total;
 
         let asset_liquidation_fee = asset_transfer_from_liqee - asset_transfer_to_liqor;
-        asset_bank.collected_fees_native += asset_liquidation_fee;
-        asset_bank.collected_liquidation_fees += asset_liquidation_fee;
+        asset_bank.collected_fees_native =
+            { asset_bank.collected_fees_native } + asset_liquidation_fee;
+        asset_bank.collected_liquidation_fees =
+            { asset_bank.collected_liquidation_fees } + asset_liquidation_fee;
 
         // Apply the balance changes to the liqor and liqee accounts
         let liqee_liab_active =

@@ -1,0 +1,16 @@
+[2026-03-31T19:05:00.334866488Z INFO  solana_test_validator] agave-validator 1.18.26 (src:c2b35002; feat:3241752014, client:Agave)
+[2026-03-31T19:05:00.334881434Z INFO  solana_test_validator] Starting validator with: ArgsOs {
+        inner: [
+            "solana-test-validator",
+            "--bpf-program",
+            "Bgjnb7rn2T157TSradRsENVcW86Ss58oMvGGvBgQxTEt",
+            "target/deploy/mango_v4.so",
+            "--reset",
+            "--quiet",
+        ],
+    }
+[2026-03-31T19:05:00.334891545Z WARN  solana_perf] CUDA is disabled
+[2026-03-31T19:05:00.334900203Z INFO  solana_perf] AVX detected
+[2026-03-31T19:05:00.334901660Z INFO  solana_perf] AVX2 detected
+[2026-03-31T19:05:00.335890251Z ERROR solana_faucet::faucet] Faucet failed to start: Address already in use (os error 98)
+[2026-03-31T19:05:00.335913338Z INFO  solana_metrics::metrics] metrics disabled: environment variable not found

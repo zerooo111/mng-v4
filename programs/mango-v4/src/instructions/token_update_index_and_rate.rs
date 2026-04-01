@@ -104,7 +104,7 @@ pub fn token_update_index_and_rate(
         let (deposit_index, borrow_index, borrow_fees, borrow_rate, deposit_rate) =
             some_bank.compute_index(indexed_total_deposits, indexed_total_borrows, diff_ts)?;
 
-        some_bank.collected_fees_native += borrow_fees;
+        some_bank.collected_fees_native = { some_bank.collected_fees_native } + borrow_fees;
 
         let new_avg_utilization = some_bank.compute_new_avg_utilization(
             indexed_total_deposits,
@@ -112,10 +112,10 @@ pub fn token_update_index_and_rate(
             now_ts,
         );
 
-        some_bank
-            .stable_price_model
-            .update(now_ts as u64, price.to_num());
-        let stable_price_model = some_bank.stable_price_model;
+        let mut spm = { some_bank.stable_price_model };
+        spm.update(now_ts as u64, price.to_num());
+        some_bank.stable_price_model = spm;
+        let stable_price_model = { some_bank.stable_price_model };
 
         // If a maint weight shift is done, copy the target into the normal values
         // and clear the transition parameters.
@@ -187,9 +187,9 @@ pub fn token_update_index_and_rate(
                 some_bank.interest_target_utilization = some_bank.util0.to_num();
 
                 let descale_factor = I80F48::from_num(1.0 / some_bank.interest_curve_scaling);
-                some_bank.rate0 *= descale_factor;
-                some_bank.rate1 *= descale_factor;
-                some_bank.max_rate *= descale_factor;
+                some_bank.rate0 = { some_bank.rate0 } * descale_factor;
+                some_bank.rate1 = { some_bank.rate1 } * descale_factor;
+                some_bank.max_rate = { some_bank.max_rate } * descale_factor;
             }
 
             some_bank.update_interest_rate_scaling();

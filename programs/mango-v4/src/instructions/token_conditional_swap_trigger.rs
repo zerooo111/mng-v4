@@ -323,7 +323,8 @@ fn action(
     )?;
     let liqor_sell_active = sell_transfer.target_is_active;
 
-    sell_bank.collected_fees_native += I80F48::from(maker_fee + taker_fee);
+    sell_bank.collected_fees_native =
+        { sell_bank.collected_fees_native } + I80F48::from(maker_fee + taker_fee);
 
     let post_liqee_sell_token = liqee_sell_token.native(&sell_bank);
     let post_liqor_sell_token = liqor_sell_token.native(&sell_bank);

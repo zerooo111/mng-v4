@@ -1,8 +1,8 @@
 use super::*;
-use anchor_lang::AnchorSerialize;
-use anchor_lang::solana_program::hash::hashv;
 use anchor_lang::solana_program::ed25519_program;
+use anchor_lang::solana_program::hash::hashv;
 use anchor_lang::solana_program::sysvar;
+use anchor_lang::AnchorSerialize;
 use mango_v4::instructions::CtmEnvelope;
 use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::signature::Signer;
@@ -272,8 +272,12 @@ async fn send_signed_ctm_enqueue(
     ctm_signer: TestKeypair,
     remaining_accounts: Vec<AccountMeta>,
 ) -> Result<(), TransportError> {
-    let user_message =
-        canonical_user_intent_message(group, remaining_accounts[1].pubkey, user_owner.pubkey(), &envelope);
+    let user_message = canonical_user_intent_message(
+        group,
+        remaining_accounts[1].pubkey,
+        user_owner.pubkey(),
+        &envelope,
+    );
     let envelope_message = canonical_envelope_message(group, &envelope);
     let user_signature: [u8; 64] = user_owner
         .to_keypair()
@@ -287,10 +291,16 @@ async fn send_signed_ctm_enqueue(
         .as_ref()
         .try_into()
         .unwrap();
-    let user_preinstruction =
-        build_presigned_ed25519_instruction(user_owner.pubkey().to_bytes(), &user_message, user_signature);
-    let ctm_preinstruction =
-        build_presigned_ed25519_instruction(ctm_signer.pubkey().to_bytes(), &envelope_message, ctm_signature);
+    let user_preinstruction = build_presigned_ed25519_instruction(
+        user_owner.pubkey().to_bytes(),
+        &user_message,
+        user_signature,
+    );
+    let ctm_preinstruction = build_presigned_ed25519_instruction(
+        ctm_signer.pubkey().to_bytes(),
+        &envelope_message,
+        ctm_signature,
+    );
     let enqueue_instruction = build_execution_queue_enqueue_ctm_instruction(
         group,
         execution_queue,
@@ -420,7 +430,9 @@ async fn test_execution_queue_lifecycle_and_liquidity_enqueue() -> Result<(), Tr
     let execution_queue =
         create_initialized_execution_queue(solana, group, admin, payer, ctm_signer).await;
 
-    let queue = solana.get_account_boxed::<ExecutionQueue>(execution_queue).await;
+    let queue = solana
+        .get_account_boxed::<ExecutionQueue>(execution_queue)
+        .await;
     assert_eq!(queue.group, group);
     assert_eq!(queue.admin, admin.pubkey());
     assert_eq!(queue.ctm_signer, ctm_signer);
@@ -455,7 +467,9 @@ async fn test_execution_queue_lifecycle_and_liquidity_enqueue() -> Result<(), Tr
     .await
     .unwrap();
 
-    let queue = solana.get_account_boxed::<ExecutionQueue>(execution_queue).await;
+    let queue = solana
+        .get_account_boxed::<ExecutionQueue>(execution_queue)
+        .await;
     let head = queue.liquidity_head_item().unwrap();
     assert_eq!(queue.header.gap_wait_slots, 7);
     assert_eq!(queue.header.liquidity_delay_slots, 11);
@@ -465,7 +479,10 @@ async fn test_execution_queue_lifecycle_and_liquidity_enqueue() -> Result<(), Tr
     assert_eq!(head.kind, QueueItemKind::LiquidityDeposit as u8);
     assert_eq!(head.status, QueueItemStatus::Pending as u8);
     assert_eq!(head.sequence, 0);
-    assert_eq!(head.payload_len as usize, encode_liquidity_deposit_payload(42, false).len());
+    assert_eq!(
+        head.payload_len as usize,
+        encode_liquidity_deposit_payload(42, false).len()
+    );
     assert!(head.ingress_slot >= before_slot);
     assert_eq!(head.min_execute_slot, head.ingress_slot + 11);
 
@@ -473,7 +490,8 @@ async fn test_execution_queue_lifecycle_and_liquidity_enqueue() -> Result<(), Tr
 }
 
 #[tokio::test]
-async fn test_execution_queue_pause_flags_block_ingress_and_execute() -> Result<(), TransportError> {
+async fn test_execution_queue_pause_flags_block_ingress_and_execute() -> Result<(), TransportError>
+{
     let mut builder = TestContextBuilder::new();
     let mints = builder.create_mints();
     let users = builder.create_users(&mints);
@@ -492,9 +510,14 @@ async fn test_execution_queue_pause_flags_block_ingress_and_execute() -> Result<
     .create(solana)
     .await;
 
-    let execution_queue =
-        create_initialized_execution_queue(solana, group, admin, payer, TestKeypair::new().pubkey())
-            .await;
+    let execution_queue = create_initialized_execution_queue(
+        solana,
+        group,
+        admin,
+        payer,
+        TestKeypair::new().pubkey(),
+    )
+    .await;
     let payload = encode_liquidity_deposit_payload(5, false);
 
     send_tx(
@@ -596,9 +619,14 @@ async fn test_execution_queue_execute_respects_liquidity_delay() -> Result<(), T
     .create(solana)
     .await;
 
-    let execution_queue =
-        create_initialized_execution_queue(solana, group, admin, payer, TestKeypair::new().pubkey())
-            .await;
+    let execution_queue = create_initialized_execution_queue(
+        solana,
+        group,
+        admin,
+        payer,
+        TestKeypair::new().pubkey(),
+    )
+    .await;
 
     send_tx(
         solana,
@@ -641,7 +669,9 @@ async fn test_execution_queue_execute_respects_liquidity_delay() -> Result<(), T
     .await
     .unwrap();
 
-    let queue = solana.get_account_boxed::<ExecutionQueue>(execution_queue).await;
+    let queue = solana
+        .get_account_boxed::<ExecutionQueue>(execution_queue)
+        .await;
     let head = queue.liquidity_head_item().unwrap();
     assert_eq!(queue.header.total_count, 1);
     assert_eq!(queue.header.liquidity_count, 1);
@@ -673,9 +703,14 @@ async fn test_execution_queue_execute_retries_and_drops_failed_liquidity(
     .create(solana)
     .await;
 
-    let execution_queue =
-        create_initialized_execution_queue(solana, group, admin, payer, TestKeypair::new().pubkey())
-            .await;
+    let execution_queue = create_initialized_execution_queue(
+        solana,
+        group,
+        admin,
+        payer,
+        TestKeypair::new().pubkey(),
+    )
+    .await;
 
     send_tx(
         solana,
@@ -708,7 +743,9 @@ async fn test_execution_queue_execute_retries_and_drops_failed_liquidity(
     // drops the item: next_retry = 0 + 1 = 1 >= MAX_RETRIES(1), so pop.
     {
         let current_slot = solana.clock().await.slot;
-        let queue = solana.get_account_boxed::<ExecutionQueue>(execution_queue).await;
+        let queue = solana
+            .get_account_boxed::<ExecutionQueue>(execution_queue)
+            .await;
         let head = queue.liquidity_head_item().unwrap();
         if current_slot < head.min_execute_slot {
             solana
@@ -729,7 +766,9 @@ async fn test_execution_queue_execute_retries_and_drops_failed_liquidity(
         .unwrap();
 
         // Item is dropped on first failure with MAX_RETRIES=1
-        let queue = solana.get_account_boxed::<ExecutionQueue>(execution_queue).await;
+        let queue = solana
+            .get_account_boxed::<ExecutionQueue>(execution_queue)
+            .await;
         assert_eq!(queue.header.total_count, 0);
         assert_eq!(queue.header.liquidity_count, 0);
         assert!(queue.liquidity_head_item().is_none());
@@ -816,7 +855,9 @@ async fn test_execution_queue_enqueue_ctm_and_wrong_lane_execute_preserves_head(
     .await
     .unwrap();
 
-    let queue = solana.get_account_boxed::<ExecutionQueue>(execution_queue).await;
+    let queue = solana
+        .get_account_boxed::<ExecutionQueue>(execution_queue)
+        .await;
     let head = queue.current_ctm_head().unwrap();
     assert_eq!(queue.header.total_count, 1);
     assert_eq!(queue.header.ctm_count, 1);
@@ -837,7 +878,9 @@ async fn test_execution_queue_enqueue_ctm_and_wrong_lane_execute_preserves_head(
     .await
     .unwrap();
 
-    let queue = solana.get_account_boxed::<ExecutionQueue>(execution_queue).await;
+    let queue = solana
+        .get_account_boxed::<ExecutionQueue>(execution_queue)
+        .await;
     let head = queue.current_ctm_head().unwrap();
     assert_eq!(queue.header.total_count, 1);
     assert_eq!(queue.header.ctm_count, 1);
@@ -849,8 +892,8 @@ async fn test_execution_queue_enqueue_ctm_and_wrong_lane_execute_preserves_head(
 }
 
 #[tokio::test]
-async fn test_execution_queue_execute_matched_failed_ctm_clears_head(
-) -> Result<(), TransportError> {
+async fn test_execution_queue_execute_matched_failed_ctm_clears_head() -> Result<(), TransportError>
+{
     let mut builder = TestContextBuilder::new();
     let mints = builder.create_mints();
     let users = builder.create_users(&mints);
@@ -931,7 +974,9 @@ async fn test_execution_queue_execute_matched_failed_ctm_clears_head(
     .await
     .unwrap();
 
-    let queue = solana.get_account_boxed::<ExecutionQueue>(execution_queue).await;
+    let queue = solana
+        .get_account_boxed::<ExecutionQueue>(execution_queue)
+        .await;
     assert_eq!(queue.header.total_count, 0);
     assert_eq!(queue.header.ctm_count, 0);
     assert_eq!(queue.header.next_sequence_to_execute, 0);
@@ -1063,7 +1108,9 @@ async fn test_execution_queue_execute_matched_successful_ctm_cancels_perp_orders
     .await
     .unwrap();
 
-    let queue = solana.get_account_boxed::<ExecutionQueue>(execution_queue).await;
+    let queue = solana
+        .get_account_boxed::<ExecutionQueue>(execution_queue)
+        .await;
     assert_eq!(queue.header.total_count, 0);
     assert_eq!(queue.header.ctm_count, 0);
     assert!(queue.current_ctm_head().is_none());
@@ -1215,7 +1262,9 @@ async fn test_execution_queue_execute_matched_failed_perp_place_due_to_health_ke
         MangoError::HealthMustBePositiveOrIncrease,
     );
 
-    let queue = solana.get_account_boxed::<ExecutionQueue>(execution_queue).await;
+    let queue = solana
+        .get_account_boxed::<ExecutionQueue>(execution_queue)
+        .await;
     assert_eq!(queue.header.total_count, 1);
     assert_eq!(queue.header.ctm_count, 1);
     let head = queue.current_ctm_head().copied().unwrap();
@@ -1234,8 +1283,7 @@ async fn test_execution_queue_execute_matched_failed_perp_place_due_to_health_ke
 }
 
 #[tokio::test]
-async fn test_execution_queue_pending_ctm_signer_activates_by_slot(
-) -> Result<(), TransportError> {
+async fn test_execution_queue_pending_ctm_signer_activates_by_slot() -> Result<(), TransportError> {
     let mut builder = TestContextBuilder::new();
     let mints = builder.create_mints();
     let users = builder.create_users(&mints);
@@ -1319,12 +1367,16 @@ async fn test_execution_queue_pending_ctm_signer_activates_by_slot(
     .await
     .unwrap();
 
-    let queue = solana.get_account_boxed::<ExecutionQueue>(execution_queue).await;
+    let queue = solana
+        .get_account_boxed::<ExecutionQueue>(execution_queue)
+        .await;
     assert_eq!(queue.pending_ctm_signer, ctm_signer_new.pubkey());
     assert_eq!(queue.ctm_signer, ctm_signer_old.pubkey());
     assert_eq!(queue.header.total_count, 1);
 
-    solana.advance_by_slots(activate_at_slot - solana.clock().await.slot).await;
+    solana
+        .advance_by_slots(activate_at_slot - solana.clock().await.slot)
+        .await;
 
     let new_envelope = CtmEnvelope {
         sequence: 1,
@@ -1361,7 +1413,9 @@ async fn test_execution_queue_pending_ctm_signer_activates_by_slot(
     .await
     .unwrap();
 
-    let queue = solana.get_account_boxed::<ExecutionQueue>(execution_queue).await;
+    let queue = solana
+        .get_account_boxed::<ExecutionQueue>(execution_queue)
+        .await;
     assert_eq!(queue.pending_ctm_signer, Pubkey::default());
     assert_eq!(queue.pending_ctm_activate_slot, 0);
     assert_eq!(queue.ctm_signer, ctm_signer_new.pubkey());
@@ -1509,7 +1563,10 @@ async fn test_execution_queue_execute_multi_underwater_perp_place_keeps_head(
         vec![lane_hash],
         lane_accounts,
     );
-    let result = solana.process_transaction(&[instruction], None).await.unwrap();
+    let result = solana
+        .process_transaction(&[instruction], None)
+        .await
+        .unwrap();
     let result = result.result.map_err(TransportError::TransactionError);
     assert_mango_error(
         &result,
@@ -1517,7 +1574,9 @@ async fn test_execution_queue_execute_multi_underwater_perp_place_keeps_head(
         "queued multi execute health failure".to_string(),
     );
 
-    let queue = solana.get_account_boxed::<ExecutionQueue>(execution_queue).await;
+    let queue = solana
+        .get_account_boxed::<ExecutionQueue>(execution_queue)
+        .await;
     assert_eq!(queue.header.total_count, 1);
     assert_eq!(queue.header.ctm_count, 1);
     let head = queue.current_ctm_head().copied().unwrap();
@@ -1677,12 +1736,8 @@ async fn test_execution_queue_drop_ctm_requires_pause_and_clears_sticky_head(
         "queued place health failure".to_string(),
     );
 
-    let drop_instruction = build_execution_queue_drop_ctm_instruction(
-        group,
-        execution_queue,
-        admin.pubkey(),
-        0,
-    );
+    let drop_instruction =
+        build_execution_queue_drop_ctm_instruction(group, execution_queue, admin.pubkey(), 0);
     let drop_result = solana
         .process_transaction(&[drop_instruction.clone()], Some(&[admin]))
         .await
@@ -1714,7 +1769,9 @@ async fn test_execution_queue_drop_ctm_requires_pause_and_clears_sticky_head(
         .unwrap();
     drop_result.result?;
 
-    let queue = solana.get_account_boxed::<ExecutionQueue>(execution_queue).await;
+    let queue = solana
+        .get_account_boxed::<ExecutionQueue>(execution_queue)
+        .await;
     assert_eq!(queue.header.total_count, 0);
     assert_eq!(queue.header.ctm_count, 0);
     assert!(queue.current_ctm_head().is_none());
@@ -2214,7 +2271,9 @@ async fn test_enqueue_ctm_sequence_below_floor() -> Result<(), TransportError> {
     .unwrap();
 
     // Verify next_sequence_to_execute advanced past 0
-    let queue = solana.get_account_boxed::<ExecutionQueue>(execution_queue).await;
+    let queue = solana
+        .get_account_boxed::<ExecutionQueue>(execution_queue)
+        .await;
     assert!(queue.header.next_sequence_to_execute >= 1);
 
     // Now try to enqueue seq 0 again — it's below next_sequence_to_execute
@@ -2398,8 +2457,11 @@ async fn test_enqueue_ctm_missing_ctm_signature() -> Result<(), TransportError> 
         .as_ref()
         .try_into()
         .unwrap();
-    let user_preinstruction =
-        build_presigned_ed25519_instruction(owner.pubkey().to_bytes(), &user_message, user_signature);
+    let user_preinstruction = build_presigned_ed25519_instruction(
+        owner.pubkey().to_bytes(),
+        &user_message,
+        user_signature,
+    );
     let enqueue_instruction = build_execution_queue_enqueue_ctm_instruction(
         group,
         execution_queue,
@@ -2845,9 +2907,9 @@ async fn test_enqueue_ctm_nonzero_flags() -> Result<(), TransportError> {
 
     // Build payload with nonzero flags (flags = 1 instead of 0)
     let mut payload = Vec::with_capacity(6);
-    payload.push(1);  // version
-    payload.push(3);  // variant = cancel_all_orders
-    payload.extend_from_slice(&1u16.to_le_bytes());  // flags = 1 (nonzero!)
+    payload.push(1); // version
+    payload.push(3); // variant = cancel_all_orders
+    payload.extend_from_slice(&1u16.to_le_bytes()); // flags = 1 (nonzero!)
     payload.push(10); // limit body
     let envelope = CtmEnvelope {
         sequence: 0,
@@ -2949,7 +3011,9 @@ async fn test_enqueue_ctm_zero_expiry_never_expires() -> Result<(), TransportErr
     .await
     .unwrap();
 
-    let queue = solana.get_account_boxed::<ExecutionQueue>(execution_queue).await;
+    let queue = solana
+        .get_account_boxed::<ExecutionQueue>(execution_queue)
+        .await;
     assert_eq!(queue.header.total_count, 1);
     assert_eq!(queue.header.ctm_count, 1);
 
@@ -2978,9 +3042,14 @@ async fn test_enqueue_liquidity_invalid_kind_ctm_wrapped() -> Result<(), Transpo
     .create(solana)
     .await;
 
-    let execution_queue =
-        create_initialized_execution_queue(solana, group, admin, payer, TestKeypair::new().pubkey())
-            .await;
+    let execution_queue = create_initialized_execution_queue(
+        solana,
+        group,
+        admin,
+        payer,
+        TestKeypair::new().pubkey(),
+    )
+    .await;
 
     send_tx_expect_error!(
         solana,
@@ -3017,9 +3086,14 @@ async fn test_enqueue_liquidity_kind_mismatch() -> Result<(), TransportError> {
     .create(solana)
     .await;
 
-    let execution_queue =
-        create_initialized_execution_queue(solana, group, admin, payer, TestKeypair::new().pubkey())
-            .await;
+    let execution_queue = create_initialized_execution_queue(
+        solana,
+        group,
+        admin,
+        payer,
+        TestKeypair::new().pubkey(),
+    )
+    .await;
 
     // kind = LiquidityDeposit (1) but payload variant = LiquidityWithdraw (6)
     send_tx_expect_error!(
@@ -3057,9 +3131,14 @@ async fn test_enqueue_liquidity_payload_too_large() -> Result<(), TransportError
     .create(solana)
     .await;
 
-    let execution_queue =
-        create_initialized_execution_queue(solana, group, admin, payer, TestKeypair::new().pubkey())
-            .await;
+    let execution_queue = create_initialized_execution_queue(
+        solana,
+        group,
+        admin,
+        payer,
+        TestKeypair::new().pubkey(),
+    )
+    .await;
 
     // Payload > 256 bytes
     let oversized_payload = vec![1u8; 257];
@@ -3098,9 +3177,14 @@ async fn test_enqueue_liquidity_ring_full() -> Result<(), TransportError> {
     .create(solana)
     .await;
 
-    let execution_queue =
-        create_initialized_execution_queue(solana, group, admin, payer, TestKeypair::new().pubkey())
-            .await;
+    let execution_queue = create_initialized_execution_queue(
+        solana,
+        group,
+        admin,
+        payer,
+        TestKeypair::new().pubkey(),
+    )
+    .await;
 
     // Fill 128 items (EXECUTION_QUEUE_LIQUIDITY_CAPACITY)
     for _ in 0..128 {
@@ -3154,9 +3238,14 @@ async fn test_enqueue_liquidity_empty_remaining_accounts() -> Result<(), Transpo
     .create(solana)
     .await;
 
-    let execution_queue =
-        create_initialized_execution_queue(solana, group, admin, payer, TestKeypair::new().pubkey())
-            .await;
+    let execution_queue = create_initialized_execution_queue(
+        solana,
+        group,
+        admin,
+        payer,
+        TestKeypair::new().pubkey(),
+    )
+    .await;
 
     send_tx_expect_error!(
         solana,
@@ -3261,7 +3350,9 @@ async fn test_execute_blocked_by_min_execute_slot() -> Result<(), TransportError
     .unwrap();
 
     // Item should still be pending
-    let queue = solana.get_account_boxed::<ExecutionQueue>(execution_queue).await;
+    let queue = solana
+        .get_account_boxed::<ExecutionQueue>(execution_queue)
+        .await;
     let head = queue.current_ctm_head().unwrap();
     assert_eq!(head.sequence, 0);
     assert_eq!(head.status, QueueItemStatus::Pending as u8);
@@ -3359,7 +3450,9 @@ async fn test_execute_gap_skip_after_wait() -> Result<(), TransportError> {
     .unwrap();
 
     // Verify queue state: head at seq 0 (gap), ctm_count=1, max_seen=1
-    let queue = solana.get_account_boxed::<ExecutionQueue>(execution_queue).await;
+    let queue = solana
+        .get_account_boxed::<ExecutionQueue>(execution_queue)
+        .await;
     assert_eq!(queue.header.next_sequence_to_execute, 0);
     assert_eq!(queue.header.ctm_count, 1);
     assert_eq!(queue.header.max_seen_sequence, 1);
@@ -3378,7 +3471,9 @@ async fn test_execute_gap_skip_after_wait() -> Result<(), TransportError> {
     .unwrap();
 
     // Gap was observed but not yet skipped — still at seq 0
-    let queue = solana.get_account_boxed::<ExecutionQueue>(execution_queue).await;
+    let queue = solana
+        .get_account_boxed::<ExecutionQueue>(execution_queue)
+        .await;
     assert_eq!(queue.header.next_sequence_to_execute, 0);
     assert!(queue.header.gap_observed_slot > 0);
 
@@ -3399,10 +3494,15 @@ async fn test_execute_gap_skip_after_wait() -> Result<(), TransportError> {
     .unwrap();
 
     // seq 0 (gap) should have been skipped, seq 1 should have been executed or attempted
-    let queue = solana.get_account_boxed::<ExecutionQueue>(execution_queue).await;
+    let queue = solana
+        .get_account_boxed::<ExecutionQueue>(execution_queue)
+        .await;
     // next_sequence_to_execute should be past seq 1 (gap skipped, then item cleared)
-    assert!(queue.header.next_sequence_to_execute >= 1,
-        "expected next_sequence >= 1, got {}", queue.header.next_sequence_to_execute);
+    assert!(
+        queue.header.next_sequence_to_execute >= 1,
+        "expected next_sequence >= 1, got {}",
+        queue.header.next_sequence_to_execute
+    );
 
     Ok(())
 }
@@ -3510,7 +3610,9 @@ async fn test_execute_gap_skip_limited_to_32() -> Result<(), TransportError> {
     .await
     .unwrap();
 
-    let queue = solana.get_account_boxed::<ExecutionQueue>(execution_queue).await;
+    let queue = solana
+        .get_account_boxed::<ExecutionQueue>(execution_queue)
+        .await;
     // Should have advanced by at most 32 gap slots from 0
     assert!(queue.header.next_sequence_to_execute <= 32);
 
@@ -3537,9 +3639,14 @@ async fn test_execute_empty_queue_is_noop() -> Result<(), TransportError> {
     .create(solana)
     .await;
 
-    let execution_queue =
-        create_initialized_execution_queue(solana, group, admin, payer, TestKeypair::new().pubkey())
-            .await;
+    let execution_queue = create_initialized_execution_queue(
+        solana,
+        group,
+        admin,
+        payer,
+        TestKeypair::new().pubkey(),
+    )
+    .await;
 
     // Execute on empty queue should succeed
     send_tx(
@@ -3554,7 +3661,9 @@ async fn test_execute_empty_queue_is_noop() -> Result<(), TransportError> {
     .await
     .unwrap();
 
-    let queue = solana.get_account_boxed::<ExecutionQueue>(execution_queue).await;
+    let queue = solana
+        .get_account_boxed::<ExecutionQueue>(execution_queue)
+        .await;
     assert_eq!(queue.header.total_count, 0);
     assert_eq!(queue.header.ctm_count, 0);
     assert_eq!(queue.header.liquidity_count, 0);
@@ -3584,20 +3693,28 @@ async fn test_execute_multi_lane_count_zero_rejected() -> Result<(), TransportEr
     .create(solana)
     .await;
 
-    let execution_queue =
-        create_initialized_execution_queue(solana, group, admin, payer, TestKeypair::new().pubkey())
-            .await;
+    let execution_queue = create_initialized_execution_queue(
+        solana,
+        group,
+        admin,
+        payer,
+        TestKeypair::new().pubkey(),
+    )
+    .await;
 
     let instruction = build_execution_queue_execute_multi_instruction(
         group,
         execution_queue,
-        1,        // max_items
-        0,        // lane_count = 0 (invalid)
-        1,        // accounts_per_lane
-        vec![],   // no lane hashes
+        1,      // max_items
+        0,      // lane_count = 0 (invalid)
+        1,      // accounts_per_lane
+        vec![], // no lane hashes
         dummy_dispatch_accounts(),
     );
-    let result = solana.process_transaction(&[instruction], None).await.unwrap();
+    let result = solana
+        .process_transaction(&[instruction], None)
+        .await
+        .unwrap();
     assert!(result.result.is_err());
 
     Ok(())
@@ -3623,21 +3740,29 @@ async fn test_execute_multi_lane_count_exceeds_20_rejected() -> Result<(), Trans
     .create(solana)
     .await;
 
-    let execution_queue =
-        create_initialized_execution_queue(solana, group, admin, payer, TestKeypair::new().pubkey())
-            .await;
+    let execution_queue = create_initialized_execution_queue(
+        solana,
+        group,
+        admin,
+        payer,
+        TestKeypair::new().pubkey(),
+    )
+    .await;
 
     let lane_hashes: Vec<[u8; 32]> = (0..21).map(|i| [i as u8; 32]).collect();
     let instruction = build_execution_queue_execute_multi_instruction(
         group,
         execution_queue,
-        1,       // max_items
-        21,      // lane_count = 21 (exceeds limit of 20)
-        1,       // accounts_per_lane
+        1,  // max_items
+        21, // lane_count = 21 (exceeds limit of 20)
+        1,  // accounts_per_lane
         lane_hashes,
         dummy_dispatch_accounts(),
     );
-    let result = solana.process_transaction(&[instruction], None).await.unwrap();
+    let result = solana
+        .process_transaction(&[instruction], None)
+        .await
+        .unwrap();
     assert!(result.result.is_err());
 
     Ok(())
@@ -3665,9 +3790,14 @@ async fn test_drop_ctm_non_pending_rejected() -> Result<(), TransportError> {
     .create(solana)
     .await;
 
-    let execution_queue =
-        create_initialized_execution_queue(solana, group, admin, payer, TestKeypair::new().pubkey())
-            .await;
+    let execution_queue = create_initialized_execution_queue(
+        solana,
+        group,
+        admin,
+        payer,
+        TestKeypair::new().pubkey(),
+    )
+    .await;
 
     // Pause execute so drop is allowed
     send_tx(
@@ -3685,12 +3815,8 @@ async fn test_drop_ctm_non_pending_rejected() -> Result<(), TransportError> {
     .unwrap();
 
     // Try to drop sequence 0 which was never enqueued
-    let drop_instruction = build_execution_queue_drop_ctm_instruction(
-        group,
-        execution_queue,
-        admin.pubkey(),
-        0,
-    );
+    let drop_instruction =
+        build_execution_queue_drop_ctm_instruction(group, execution_queue, admin.pubkey(), 0);
     let result = solana
         .process_transaction(&[drop_instruction], Some(&[admin]))
         .await
@@ -3772,7 +3898,9 @@ async fn test_execution_queue_full_lifecycle() -> Result<(), TransportError> {
     .await
     .unwrap();
 
-    let queue = solana.get_account_boxed::<ExecutionQueue>(queue_pubkey).await;
+    let queue = solana
+        .get_account_boxed::<ExecutionQueue>(queue_pubkey)
+        .await;
     assert_eq!(queue.group, group);
     assert_eq!(queue.admin, admin.pubkey());
     assert_eq!(queue.ctm_signer, ctm_signer);
@@ -3792,7 +3920,9 @@ async fn test_execution_queue_full_lifecycle() -> Result<(), TransportError> {
     .await
     .unwrap();
 
-    let queue = solana.get_account_boxed::<ExecutionQueue>(queue_pubkey).await;
+    let queue = solana
+        .get_account_boxed::<ExecutionQueue>(queue_pubkey)
+        .await;
     assert_eq!(queue.header.gap_wait_slots, 10);
     assert_eq!(queue.header.liquidity_delay_slots, 20);
     assert_eq!(queue.header.total_count, 0);
@@ -4263,7 +4393,9 @@ async fn test_execute_perp_place_order_v2_happy() -> Result<(), TransportError> 
     .await
     .unwrap();
 
-    let queue = solana.get_account_boxed::<ExecutionQueue>(execution_queue).await;
+    let queue = solana
+        .get_account_boxed::<ExecutionQueue>(execution_queue)
+        .await;
     assert_eq!(queue.header.total_count, 0);
     assert_eq!(queue.header.ctm_count, 0);
     assert!(queue.current_ctm_head().is_none());
@@ -4405,7 +4537,9 @@ async fn test_execute_perp_cancel_order_happy() -> Result<(), TransportError> {
     .await
     .unwrap();
 
-    let queue = solana.get_account_boxed::<ExecutionQueue>(execution_queue).await;
+    let queue = solana
+        .get_account_boxed::<ExecutionQueue>(execution_queue)
+        .await;
     assert_eq!(queue.header.total_count, 0);
 
     // Verify order removed from book
@@ -4697,7 +4831,9 @@ async fn test_execute_perp_cancel_order_by_client_order_id_happy() -> Result<(),
     .await
     .unwrap();
 
-    let queue = solana.get_account_boxed::<ExecutionQueue>(execution_queue).await;
+    let queue = solana
+        .get_account_boxed::<ExecutionQueue>(execution_queue)
+        .await;
     assert_eq!(queue.header.total_count, 0);
 
     // Verify order removed
@@ -4731,9 +4867,14 @@ async fn test_execute_liquidity_deposit_happy() -> Result<(), TransportError> {
     .await;
 
     let account = create_funded_account(solana, group, owner, 0, &users[1], mints, 10000, 0).await;
-    let execution_queue =
-        create_initialized_execution_queue(solana, group, admin, payer, TestKeypair::new().pubkey())
-            .await;
+    let execution_queue = create_initialized_execution_queue(
+        solana,
+        group,
+        admin,
+        payer,
+        TestKeypair::new().pubkey(),
+    )
+    .await;
 
     // Get remaining_accounts from TokenDepositInstruction
     let deposit_ix = TokenDepositInstruction {
@@ -4772,7 +4913,9 @@ async fn test_execute_liquidity_deposit_happy() -> Result<(), TransportError> {
     .unwrap();
 
     // Advance past liquidity delay
-    let queue = solana.get_account_boxed::<ExecutionQueue>(execution_queue).await;
+    let queue = solana
+        .get_account_boxed::<ExecutionQueue>(execution_queue)
+        .await;
     let head = queue.liquidity_head_item().unwrap();
     let current_slot = solana.clock().await.slot;
     if current_slot < head.min_execute_slot {
@@ -4793,7 +4936,9 @@ async fn test_execute_liquidity_deposit_happy() -> Result<(), TransportError> {
     .await
     .unwrap();
 
-    let queue = solana.get_account_boxed::<ExecutionQueue>(execution_queue).await;
+    let queue = solana
+        .get_account_boxed::<ExecutionQueue>(execution_queue)
+        .await;
     // Item should have been processed (either succeeded and popped, or failed and popped due to MAX_RETRIES=1)
     assert_eq!(queue.header.liquidity_count, 0);
 
@@ -4822,9 +4967,14 @@ async fn test_execute_liquidity_withdraw_happy() -> Result<(), TransportError> {
     .await;
 
     let account = create_funded_account(solana, group, owner, 0, &users[1], mints, 10000, 0).await;
-    let execution_queue =
-        create_initialized_execution_queue(solana, group, admin, payer, TestKeypair::new().pubkey())
-            .await;
+    let execution_queue = create_initialized_execution_queue(
+        solana,
+        group,
+        admin,
+        payer,
+        TestKeypair::new().pubkey(),
+    )
+    .await;
 
     // Get remaining_accounts from TokenWithdrawInstruction
     let withdraw_ix = TokenWithdrawInstruction {
@@ -4859,7 +5009,9 @@ async fn test_execute_liquidity_withdraw_happy() -> Result<(), TransportError> {
     .unwrap();
 
     // Advance past liquidity delay
-    let queue = solana.get_account_boxed::<ExecutionQueue>(execution_queue).await;
+    let queue = solana
+        .get_account_boxed::<ExecutionQueue>(execution_queue)
+        .await;
     let head = queue.liquidity_head_item().unwrap();
     let current_slot = solana.clock().await.slot;
     if current_slot < head.min_execute_slot {
@@ -4880,7 +5032,9 @@ async fn test_execute_liquidity_withdraw_happy() -> Result<(), TransportError> {
     .await
     .unwrap();
 
-    let queue = solana.get_account_boxed::<ExecutionQueue>(execution_queue).await;
+    let queue = solana
+        .get_account_boxed::<ExecutionQueue>(execution_queue)
+        .await;
     assert_eq!(queue.header.liquidity_count, 0);
 
     Ok(())
@@ -5030,7 +5184,9 @@ async fn test_execute_reduce_only_bypasses_health() -> Result<(), TransportError
     .await
     .unwrap();
 
-    let queue = solana.get_account_boxed::<ExecutionQueue>(execution_queue).await;
+    let queue = solana
+        .get_account_boxed::<ExecutionQueue>(execution_queue)
+        .await;
     assert_eq!(queue.header.total_count, 0);
 
     Ok(())
@@ -5165,7 +5321,9 @@ async fn test_execute_cancel_ignores_health() -> Result<(), TransportError> {
     .await
     .unwrap();
 
-    let queue = solana.get_account_boxed::<ExecutionQueue>(execution_queue).await;
+    let queue = solana
+        .get_account_boxed::<ExecutionQueue>(execution_queue)
+        .await;
     assert_eq!(queue.header.total_count, 0);
 
     // Verify orders cleared
@@ -5291,7 +5449,9 @@ async fn test_execute_multi_two_lanes_match_both() -> Result<(), TransportError>
     .await
     .unwrap();
 
-    let queue = solana.get_account_boxed::<ExecutionQueue>(execution_queue).await;
+    let queue = solana
+        .get_account_boxed::<ExecutionQueue>(execution_queue)
+        .await;
     assert_eq!(queue.header.ctm_count, 2);
 
     // Execute multi with 2 lanes, both using same accounts
@@ -5308,10 +5468,15 @@ async fn test_execute_multi_two_lanes_match_both() -> Result<(), TransportError>
         vec![lane_hash, lane_hash],
         all_remaining,
     );
-    let result = solana.process_transaction(&[instruction], None).await.unwrap();
+    let result = solana
+        .process_transaction(&[instruction], None)
+        .await
+        .unwrap();
     result.result?;
 
-    let queue = solana.get_account_boxed::<ExecutionQueue>(execution_queue).await;
+    let queue = solana
+        .get_account_boxed::<ExecutionQueue>(execution_queue)
+        .await;
     assert_eq!(queue.header.ctm_count, 0);
     assert_eq!(queue.header.total_count, 0);
 
@@ -5338,21 +5503,29 @@ async fn test_execute_multi_hash_count_mismatch() -> Result<(), TransportError> 
     .create(solana)
     .await;
 
-    let execution_queue =
-        create_initialized_execution_queue(solana, group, admin, payer, TestKeypair::new().pubkey())
-            .await;
+    let execution_queue = create_initialized_execution_queue(
+        solana,
+        group,
+        admin,
+        payer,
+        TestKeypair::new().pubkey(),
+    )
+    .await;
 
     // lane_count=2 but lane_hashes has 1 entry (mismatch)
     let instruction = build_execution_queue_execute_multi_instruction(
         group,
         execution_queue,
         1,
-        2,            // lane_count = 2
-        1,            // accounts_per_lane
+        2,               // lane_count = 2
+        1,               // accounts_per_lane
         vec![[0u8; 32]], // only 1 lane hash
         dummy_dispatch_accounts(),
     );
-    let result = solana.process_transaction(&[instruction], None).await.unwrap();
+    let result = solana
+        .process_transaction(&[instruction], None)
+        .await
+        .unwrap();
     assert!(result.result.is_err());
 
     Ok(())
@@ -5378,21 +5551,29 @@ async fn test_execute_multi_insufficient_remaining_accounts() -> Result<(), Tran
     .create(solana)
     .await;
 
-    let execution_queue =
-        create_initialized_execution_queue(solana, group, admin, payer, TestKeypair::new().pubkey())
-            .await;
+    let execution_queue = create_initialized_execution_queue(
+        solana,
+        group,
+        admin,
+        payer,
+        TestKeypair::new().pubkey(),
+    )
+    .await;
 
     // lane_count=2, accounts_per_lane=3, but only 1 remaining account provided (need 6)
     let instruction = build_execution_queue_execute_multi_instruction(
         group,
         execution_queue,
         1,
-        2,            // lane_count = 2
-        3,            // accounts_per_lane = 3 (need 6 total)
+        2, // lane_count = 2
+        3, // accounts_per_lane = 3 (need 6 total)
         vec![[0u8; 32], [1u8; 32]],
         dummy_dispatch_accounts(), // only 1 account
     );
-    let result = solana.process_transaction(&[instruction], None).await.unwrap();
+    let result = solana
+        .process_transaction(&[instruction], None)
+        .await
+        .unwrap();
     assert!(result.result.is_err());
 
     Ok(())
@@ -5512,9 +5693,15 @@ async fn test_execute_multi_gap_handling_across_lanes() -> Result<(), TransportE
         vec![lane_hash],
         remaining_accounts.clone(),
     );
-    solana.process_transaction(&[instruction], None).await.unwrap().result?;
+    solana
+        .process_transaction(&[instruction], None)
+        .await
+        .unwrap()
+        .result?;
 
-    let queue = solana.get_account_boxed::<ExecutionQueue>(execution_queue).await;
+    let queue = solana
+        .get_account_boxed::<ExecutionQueue>(execution_queue)
+        .await;
     assert_eq!(queue.header.next_sequence_to_execute, 0);
     assert!(queue.header.gap_observed_slot > 0);
 
@@ -5531,9 +5718,15 @@ async fn test_execute_multi_gap_handling_across_lanes() -> Result<(), TransportE
         vec![lane_hash],
         remaining_accounts,
     );
-    solana.process_transaction(&[instruction], None).await.unwrap().result?;
+    solana
+        .process_transaction(&[instruction], None)
+        .await
+        .unwrap()
+        .result?;
 
-    let queue = solana.get_account_boxed::<ExecutionQueue>(execution_queue).await;
+    let queue = solana
+        .get_account_boxed::<ExecutionQueue>(execution_queue)
+        .await;
     assert!(queue.header.next_sequence_to_execute >= 1);
     assert_eq!(queue.header.ctm_count, 0);
 
@@ -5727,7 +5920,9 @@ async fn test_sig_hex_utf8_format() -> Result<(), TransportError> {
         .unwrap();
     result.result?;
 
-    let queue = solana.get_account_boxed::<ExecutionQueue>(execution_queue).await;
+    let queue = solana
+        .get_account_boxed::<ExecutionQueue>(execution_queue)
+        .await;
     assert_eq!(queue.header.ctm_count, 1);
 
     Ok(())
@@ -5833,7 +6028,9 @@ async fn test_sig_different_tx_positions() -> Result<(), TransportError> {
         .unwrap();
     result.result?;
 
-    let queue = solana.get_account_boxed::<ExecutionQueue>(execution_queue).await;
+    let queue = solana
+        .get_account_boxed::<ExecutionQueue>(execution_queue)
+        .await;
     assert_eq!(queue.header.ctm_count, 1);
 
     Ok(())
@@ -5849,7 +6046,7 @@ fn build_dual_ed25519_instruction(
 ) -> Instruction {
     // 2 signatures, each with 14-byte offsets header, then data blobs
     let header_len = 2 + 2 * 14; // 2 bytes header + 2 * 14 bytes offsets
-    // Entry 1: sig1 (64) + pubkey1 (32) + message1
+                                 // Entry 1: sig1 (64) + pubkey1 (32) + message1
     let sig1_offset = header_len;
     let pk1_offset = sig1_offset + 64;
     let msg1_offset = pk1_offset + 32;
@@ -5997,7 +6194,9 @@ async fn test_sig_multiple_sigs_in_one_ix() -> Result<(), TransportError> {
         .unwrap();
     result.result?;
 
-    let queue = solana.get_account_boxed::<ExecutionQueue>(execution_queue).await;
+    let queue = solana
+        .get_account_boxed::<ExecutionQueue>(execution_queue)
+        .await;
     assert_eq!(queue.header.ctm_count, 1);
 
     Ok(())
@@ -6202,11 +6401,8 @@ async fn test_sig_replay_from_different_envelope() -> Result<(), TransportError>
         .unwrap();
 
     // Try to use envelope A's signatures with envelope B's data
-    let user_pre_a = build_presigned_ed25519_instruction(
-        owner.pubkey().to_bytes(),
-        &user_message_a,
-        user_sig_a,
-    );
+    let user_pre_a =
+        build_presigned_ed25519_instruction(owner.pubkey().to_bytes(), &user_message_a, user_sig_a);
     let ctm_pre_a = build_presigned_ed25519_instruction(
         ctm_signer.pubkey().to_bytes(),
         &envelope_message_a,

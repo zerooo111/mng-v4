@@ -4,7 +4,7 @@ export type StackCluster = 'localnet' | 'devnet';
 
 const DEFAULT_LOCALNET_RPC_URL = 'http://127.0.0.1:8899';
 const DEFAULT_DEVNET_RPC_URL = 'https://api.devnet.solana.com';
-const DEFAULT_RUNTIME_ROOT = '/home/ec2-user/stagin4/mng-v4';
+const DEFAULT_RUNTIME_ROOT = process.env.RUNTIME_ROOT || path.resolve(__dirname, '../../../..');
 const DEFAULT_KEYPAIRS_DIR = path.resolve(DEFAULT_RUNTIME_ROOT, 'keypairs');
 
 export function stackCluster(): StackCluster {

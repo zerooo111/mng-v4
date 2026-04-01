@@ -154,6 +154,12 @@ struct ExecutableCandidate {
     is_ctm: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalCtmFailureReason {
+    Expired,
+    InvalidNumericInput,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Ed25519SignatureOffsets {
     signature_offset: u16,
@@ -494,6 +500,33 @@ fn dispatch_perp_place_order_v2<'info>(
         payload.limit,
     )?;
     Ok(())
+}
+
+fn prevalidate_terminal_ctm_payload(
+    payload: &DecodedQueuePayload,
+    now_ts: u64,
+) -> Option<TerminalCtmFailureReason> {
+    match &payload.body {
+        QueuePayloadBody::PerpPlaceOrderV2(place) => {
+            if place.price_lots < 0 {
+                return Some(TerminalCtmFailureReason::InvalidNumericInput);
+            }
+            if place.expiry_timestamp != 0 && place.expiry_timestamp <= now_ts {
+                return Some(TerminalCtmFailureReason::Expired);
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn terminal_ctm_failure_msg(reason: TerminalCtmFailureReason) -> &'static str {
+    match reason {
+        TerminalCtmFailureReason::Expired => "execution_queue: cleared terminal expired CTM",
+        TerminalCtmFailureReason::InvalidNumericInput => {
+            "execution_queue: cleared terminal invalid CTM payload"
+        }
+    }
 }
 
 fn dispatch_perp_cancel_all_orders<'info>(
@@ -986,6 +1019,11 @@ pub fn execution_queue_enqueue_ctm(
         decoded_payload.flags == 0,
         MangoError::ExecutionQueuePayloadDecodeFailed
     );
+    let now_ts: u64 = clock.unix_timestamp.try_into().unwrap_or(0);
+    require!(
+        prevalidate_terminal_ctm_payload(&decoded_payload, now_ts).is_none(),
+        MangoError::SomeError
+    );
     require!(
         queue_item_kind_for_payload_variant(decoded_payload.variant)
             == QueueItemKind::CtmWrapped as u8,
@@ -1116,6 +1154,11 @@ pub fn execution_queue_enqueue_direct(
     require!(
         decoded_payload.flags == 0,
         MangoError::ExecutionQueuePayloadDecodeFailed
+    );
+    let now_ts: u64 = clock.unix_timestamp.try_into().unwrap_or(0);
+    require!(
+        prevalidate_terminal_ctm_payload(&decoded_payload, now_ts).is_none(),
+        MangoError::SomeError
     );
     require!(
         queue_item_kind_for_payload_variant(decoded_payload.variant)
@@ -1285,6 +1328,7 @@ pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u
     }
 
     let provided_accounts_hash = hash_accounts(&account_metas_from_infos(dispatch_accounts));
+    let now_ts: u64 = clock.unix_timestamp.try_into().unwrap_or(0);
     for _ in 0..max_items {
         let mut candidate: Option<ExecutableCandidate> = None;
         let mut blocked = false;
@@ -1409,6 +1453,26 @@ pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u
         }
 
         let item_health_region = queue_health_region_spec(decoded_payload.variant);
+
+        if candidate.is_ctm {
+            if let Some(reason) = prevalidate_terminal_ctm_payload(&decoded_payload, now_ts) {
+                let mut queue = ctx.accounts.execution_queue.load_mut()?;
+                queue.clear_ctm_item_at(candidate.sequence);
+                emit!(QueueItemProcessed {
+                    group: ctx.accounts.group.key(),
+                    sequence: candidate.sequence,
+                    kind: candidate.kind,
+                    status: QueueItemStatus::Failed as u8,
+                });
+                msg!(
+                    "{} seq={} reason={:?}",
+                    terminal_ctm_failure_msg(reason),
+                    candidate.sequence,
+                    reason
+                );
+                continue;
+            }
+        }
 
         // Pre-dispatch check: if a health-gated item has exhausted retries, clear it
         // WITHOUT dispatching. This prevents a permanently-failing health-gated item
@@ -1600,6 +1664,16 @@ pub fn execution_queue_execute_multi(
         );
     }
 
+    let now_ts: u64 = clock.unix_timestamp.try_into().unwrap_or(0);
+
+    // HLT: Precompute lane hashes once before the item loop.
+    // This avoids O(lane_count × accounts_per_lane) SHA256 recomputation
+    // per item, replacing it with O(lane_count) byte comparisons.
+    let precomputed_lane_hashes: Vec<[u8; 32]> = lane_slices
+        .iter()
+        .map(|lane| hash_accounts(&account_metas_from_infos(lane)))
+        .collect();
+
     for _ in 0..max_items {
         let mut candidate: Option<ExecutableCandidate> = None;
         let mut blocked = false;
@@ -1663,20 +1737,31 @@ pub fn execution_queue_execute_multi(
             break;
         };
 
-        // C-1 fix: Compute lane hashes from actual accounts instead of trusting instruction data.
+        // C-1 fix: Use precomputed lane hashes (HLT) instead of recomputing per item.
         // H-8 fix: Strict head-only FIFO — no scan-ahead for non-head items.
         let matched_lane = if candidate.accounts_hash == [0; 32] {
             Some(0)
         } else {
-            lane_slices.iter().position(|lane| {
-                let computed_hash = hash_accounts(&account_metas_from_infos(lane));
-                computed_hash == candidate.accounts_hash
-            })
+            precomputed_lane_hashes
+                .iter()
+                .position(|h| *h == candidate.accounts_hash)
         };
 
         let lane_idx = match matched_lane {
             Some(li) => li,
-            None => break, // Head doesn't match any lane — stop (strict FIFO)
+            None => {
+                // Debug: log the mismatch to help diagnose C-1 flag divergence
+                msg!(
+                    "HLT mismatch: seq={} stored_hash={:?} lane_count={}",
+                    candidate.sequence,
+                    &candidate.accounts_hash[..8],
+                    precomputed_lane_hashes.len(),
+                );
+                for (i, h) in precomputed_lane_hashes.iter().enumerate() {
+                    msg!("  lane[{}] hash={:?}", i, &h[..8]);
+                }
+                break;
+            }
         };
 
         let dispatch_accounts = lane_slices[lane_idx];
@@ -1715,6 +1800,26 @@ pub fn execution_queue_execute_multi(
         }
 
         let item_health_region = queue_health_region_spec(decoded_payload.variant);
+
+        if candidate.is_ctm {
+            if let Some(reason) = prevalidate_terminal_ctm_payload(&decoded_payload, now_ts) {
+                let mut queue = ctx.accounts.execution_queue.load_mut()?;
+                queue.clear_ctm_item_at(candidate.sequence);
+                emit!(QueueItemProcessed {
+                    group: group_key,
+                    sequence: candidate.sequence,
+                    kind: candidate.kind,
+                    status: QueueItemStatus::Failed as u8,
+                });
+                msg!(
+                    "{} seq={} reason={:?}",
+                    terminal_ctm_failure_msg(reason),
+                    candidate.sequence,
+                    reason
+                );
+                continue;
+            }
+        }
 
         // Pre-dispatch check: if a health-gated item has exhausted retries, clear it
         // WITHOUT dispatching (same logic as execute single-lane path).

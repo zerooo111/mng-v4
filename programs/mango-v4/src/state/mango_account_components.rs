@@ -9,10 +9,31 @@ use std::mem::size_of;
 use crate::i80f48::ClampToInt;
 use crate::state::*;
 
+/// Helper macro to implement BorshSerialize and BorshDeserialize for packed Pod types
+/// by serializing as raw bytes (same as their in-memory representation).
+macro_rules! impl_borsh_for_packed_pod {
+    ($t:ty) => {
+        impl borsh::ser::BorshSerialize for $t {
+            fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+                let bytes: &[u8] = bytemuck::bytes_of(self);
+                writer.write_all(bytes)
+            }
+        }
+        impl borsh::de::BorshDeserialize for $t {
+            fn deserialize_reader<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+                let mut buf = [0u8; std::mem::size_of::<$t>()];
+                reader.read_exact(&mut buf)?;
+                Ok(*bytemuck::from_bytes::<$t>(&buf))
+            }
+        }
+    };
+}
+
 pub const FREE_ORDER_SLOT: PerpMarketIndex = PerpMarketIndex::MAX;
 
+#[repr(C, packed)]
 #[zero_copy]
-#[derive(AnchorDeserialize, AnchorSerialize, Derivative, PartialEq)]
+#[derive(Derivative, PartialEq)]
 #[derivative(Debug)]
 pub struct TokenPosition {
     // TODO: Why did we have deposits and borrows as two different values
@@ -52,6 +73,7 @@ const_assert_eq!(
 );
 const_assert_eq!(size_of::<TokenPosition>(), 184);
 const_assert_eq!(size_of::<TokenPosition>() % 8, 0);
+impl_borsh_for_packed_pod!(TokenPosition);
 
 impl Default for TokenPosition {
     fn default() -> Self {
@@ -297,8 +319,9 @@ impl Default for OpenbookV2Orders {
     }
 }
 
+#[repr(C, packed)]
 #[zero_copy]
-#[derive(AnchorSerialize, AnchorDeserialize, Derivative, PartialEq)]
+#[derive(Derivative, PartialEq)]
 #[derivative(Debug)]
 pub struct PerpPosition {
     pub market_index: PerpMarketIndex,
@@ -426,6 +449,7 @@ const_assert_eq!(
     2 + 2 + 4 + 8 + 8 + 16 + 8 + 16 * 2 + 8 * 2 + 8 * 2 + 8 * 5 + 8 + 2 * 16 + 8 + 16 + 88
 );
 const_assert_eq!(size_of::<PerpPosition>(), 304);
+impl_borsh_for_packed_pod!(PerpPosition);
 const_assert_eq!(size_of::<PerpPosition>() % 8, 0);
 
 impl Default for PerpPosition {
@@ -525,7 +549,7 @@ impl PerpPosition {
 
     /// The amount of funding this account still needs to pay, in native quote
     pub fn unsettled_funding(&self, perp_market: &PerpMarket) -> I80F48 {
-        match self.base_position_lots.cmp(&0) {
+        match { self.base_position_lots }.cmp(&0) {
             Ordering::Greater => {
                 (perp_market.long_funding - self.long_settled_funding)
                     * I80F48::from_num(self.base_position_lots)
@@ -541,9 +565,9 @@ impl PerpPosition {
     /// Move unrealized funding payments into the quote_position
     pub fn settle_funding(&mut self, perp_market: &PerpMarket) {
         let funding = self.unsettled_funding(perp_market);
-        self.quote_position_native -= funding;
-        self.oneshot_settle_pnl_allowance -= funding;
-        self.realized_pnl_for_position_native -= funding;
+        self.quote_position_native = { self.quote_position_native } - funding;
+        self.oneshot_settle_pnl_allowance = { self.oneshot_settle_pnl_allowance } - funding;
+        self.realized_pnl_for_position_native = { self.realized_pnl_for_position_native } - funding;
 
         if self.base_position_lots.is_positive() {
             self.cumulative_long_funding += funding.to_num::<f64>();
@@ -635,7 +659,8 @@ impl PerpPosition {
                 increased_lots = 0;
                 let avg_entry = I80F48::from_num(self.avg_entry_price_per_base_lot);
                 newly_realized_pnl = quote_change_native + I80F48::from(base_change) * avg_entry;
-                self.realized_pnl_for_position_native += newly_realized_pnl;
+                self.realized_pnl_for_position_native =
+                    { self.realized_pnl_for_position_native } + newly_realized_pnl;
             }
         }
 
@@ -679,7 +704,7 @@ impl PerpPosition {
         base_change: i64,
         quote_change_native: I80F48,
     ) -> I80F48 {
-        assert_eq!(perp_market.perp_market_index, self.market_index);
+        assert_eq!({ perp_market.perp_market_index }, { self.market_index });
         let realized_pnl = self.update_trade_stats(base_change, quote_change_native, perp_market);
         self.change_base_position(perp_market, base_change);
         self.change_quote_position(quote_change_native);
@@ -688,7 +713,7 @@ impl PerpPosition {
     }
 
     fn change_quote_position(&mut self, quote_change_native: I80F48) {
-        self.quote_position_native += quote_change_native;
+        self.quote_position_native = { self.quote_position_native } + quote_change_native;
     }
 
     /// Does the user have any orders on the book?
@@ -711,7 +736,7 @@ impl PerpPosition {
 
     /// Calculate the average entry price of the position, in native/native units
     pub fn avg_entry_price(&self, market: &PerpMarket) -> f64 {
-        assert_eq!(self.market_index, market.perp_market_index);
+        assert_eq!({ self.market_index }, { market.perp_market_index });
         self.avg_entry_price_per_base_lot / (market.base_lot_size as f64)
     }
 
@@ -720,7 +745,7 @@ impl PerpPosition {
         if self.base_position_lots == 0 {
             return 0.0;
         }
-        assert_eq!(self.market_index, market.perp_market_index);
+        assert_eq!({ self.market_index }, { market.perp_market_index });
         -(self.quote_running_native as f64)
             / ((self.base_position_lots * market.base_lot_size) as f64)
     }
@@ -736,7 +761,7 @@ impl PerpPosition {
     /// Updates the perp pnl limit time windowing, resetting the amount
     /// of used settle-pnl budget if necessary
     pub fn update_settle_limit(&mut self, market: &PerpMarket, now_ts: u64) {
-        assert_eq!(self.market_index, market.perp_market_index);
+        assert_eq!({ self.market_index }, { market.perp_market_index });
         let window_size = market.settle_pnl_limit_window_size_ts;
         let window_start = self.settle_pnl_limit_window as u64 * window_size;
         let window_end = window_start + window_size;
@@ -756,7 +781,7 @@ impl PerpPosition {
     ///    materialized when the position was reduced (see recurring_settle_pnl_allowance)
     /// 3. once-only settlement allowance in a single direction (see oneshot_settle_pnl_allowance)
     pub fn settle_limit(&self, market: &PerpMarket) -> (i64, i64) {
-        assert_eq!(self.market_index, market.perp_market_index);
+        assert_eq!({ self.market_index }, { market.perp_market_index });
         if market.settle_pnl_limit_factor < 0.0 {
             return (i64::MIN, i64::MAX);
         }
@@ -796,7 +821,7 @@ impl PerpPosition {
     /// The available settle limit is the settle_limit() adjusted for the amount of limit
     /// that was already used up this window.
     pub fn available_settle_limit(&self, market: &PerpMarket) -> (i64, i64) {
-        assert_eq!(self.market_index, market.perp_market_index);
+        assert_eq!({ self.market_index }, { market.perp_market_index });
         if market.settle_pnl_limit_factor < 0.0 {
             return (i64::MIN, i64::MAX);
         }
@@ -841,7 +866,8 @@ impl PerpPosition {
                 .max(self.oneshot_settle_pnl_allowance)
                 .min(I80F48::ZERO)
         };
-        self.oneshot_settle_pnl_allowance -= oneshot_reduction;
+        self.oneshot_settle_pnl_allowance =
+            { self.oneshot_settle_pnl_allowance } - oneshot_reduction;
 
         // Consume settle limit budget:
         // We don't track consumption of oneshot_settle_pnl_allowance because settling already
@@ -871,14 +897,14 @@ impl PerpPosition {
     /// Update perp position for a maker/taker fee payment
     pub fn record_trading_fee(&mut self, fee: I80F48) {
         self.change_quote_position(-fee);
-        self.oneshot_settle_pnl_allowance -= fee;
-        self.realized_pnl_for_position_native -= fee;
+        self.oneshot_settle_pnl_allowance = { self.oneshot_settle_pnl_allowance } - fee;
+        self.realized_pnl_for_position_native = { self.realized_pnl_for_position_native } - fee;
     }
 
     /// Adds immediately-settleable realized pnl when a liqor takes over pnl during liquidation
     pub fn record_liquidation_quote_change(&mut self, change: I80F48) {
         self.change_quote_position(change);
-        self.oneshot_settle_pnl_allowance += change;
+        self.oneshot_settle_pnl_allowance = { self.oneshot_settle_pnl_allowance } + change;
     }
 
     /// Takes over a quote position along with recurring and oneshot settle limit allowance
@@ -890,12 +916,14 @@ impl PerpPosition {
     ) {
         self.change_quote_position(change);
         self.recurring_settle_pnl_allowance += recurring_limit;
-        self.oneshot_settle_pnl_allowance += I80F48::from(oneshot_limit);
+        self.oneshot_settle_pnl_allowance =
+            { self.oneshot_settle_pnl_allowance } + I80F48::from(oneshot_limit);
     }
 }
 
+#[repr(C, packed)]
 #[zero_copy]
-#[derive(AnchorSerialize, AnchorDeserialize, Derivative, PartialEq)]
+#[derive(Derivative, PartialEq)]
 #[derivative(Debug)]
 pub struct PerpOpenOrder {
     pub side_and_tree: u8, // SideAndOrderTree -- enums aren't POD
@@ -920,6 +948,7 @@ pub struct PerpOpenOrder {
 const_assert_eq!(size_of::<PerpOpenOrder>(), 1 + 1 + 2 + 4 + 8 + 16 + 8 + 56);
 const_assert_eq!(size_of::<PerpOpenOrder>(), 96);
 const_assert_eq!(size_of::<PerpOpenOrder>() % 8, 0);
+impl_borsh_for_packed_pod!(PerpOpenOrder);
 
 impl Default for PerpOpenOrder {
     fn default() -> Self {

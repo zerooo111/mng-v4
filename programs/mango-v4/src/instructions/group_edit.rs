@@ -60,7 +60,7 @@ pub fn group_edit(
     if let Some(deposit_limit_quote) = deposit_limit_quote_opt {
         msg!(
             "Deposit limit quote old {:?}, new {:?}",
-            group.deposit_limit_quote,
+            { group.deposit_limit_quote },
             deposit_limit_quote
         );
         group.deposit_limit_quote = deposit_limit_quote;
@@ -77,7 +77,7 @@ pub fn group_edit(
     if let Some(buyback_fees_mngo_bonus_factor) = buyback_fees_bonus_factor_opt {
         msg!(
             "Buyback fees mngo bonus factor old {:?}, new {:?}",
-            group.buyback_fees_mngo_bonus_factor,
+            { group.buyback_fees_mngo_bonus_factor },
             buyback_fees_mngo_bonus_factor
         );
         group.buyback_fees_mngo_bonus_factor = buyback_fees_mngo_bonus_factor;
@@ -93,7 +93,7 @@ pub fn group_edit(
     if let Some(mngo_token_index) = mngo_token_index_opt {
         msg!(
             "Mngo token index old {:?}, new {:?}",
-            group.mngo_token_index,
+            { group.mngo_token_index },
             mngo_token_index
         );
         group.mngo_token_index = mngo_token_index;
@@ -102,7 +102,7 @@ pub fn group_edit(
     if let Some(buyback_fees_expiry_interval) = buyback_fees_expiry_interval_opt {
         msg!(
             "Buyback fees expiry interval old {:?}, new {:?}",
-            group.buyback_fees_expiry_interval,
+            { group.buyback_fees_expiry_interval },
             buyback_fees_expiry_interval
         );
         group.buyback_fees_expiry_interval = buyback_fees_expiry_interval;
@@ -111,7 +111,7 @@ pub fn group_edit(
     if let Some(allowed_fast_listings_per_interval) = allowed_fast_listings_per_interval_opt {
         msg!(
             "Allowed fast listings per week old {:?}, new {:?}",
-            group.allowed_fast_listings_per_interval,
+            { group.allowed_fast_listings_per_interval },
             allowed_fast_listings_per_interval
         );
         group.allowed_fast_listings_per_interval = allowed_fast_listings_per_interval;
@@ -120,7 +120,7 @@ pub fn group_edit(
     if let Some(collateral_fee_interval) = collateral_fee_interval_opt {
         msg!(
             "Collateral fee interval old {:?}, new {:?}",
-            group.collateral_fee_interval,
+            { group.collateral_fee_interval },
             collateral_fee_interval
         );
         group.collateral_fee_interval = collateral_fee_interval;

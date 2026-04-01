@@ -69,8 +69,8 @@ pub fn token_edit(
         if let Some(oracle_config) = oracle_config_opt.as_ref() {
             msg!(
                 "Oracle config: old - conf_filter {:?}, max_staleness_slots {:?},  new - conf_filter {:?}, max_staleness_slots {:?}",
-                bank.oracle_config.conf_filter,
-                bank.oracle_config.max_staleness_slots,
+                { bank.oracle_config.conf_filter },
+                { bank.oracle_config.max_staleness_slots },
                 oracle_config.conf_filter,
                 oracle_config.max_staleness_slots
             );
@@ -102,10 +102,12 @@ pub fn token_edit(
             let oracle_ref = &AccountInfoRef::borrow(ctx.accounts.oracle.as_ref())?;
             let oracle_price =
                 bank.oracle_price(&OracleAccountInfos::from_reader(oracle_ref), None)?;
-            bank.stable_price_model.reset_to_price(
+            let mut spm = { bank.stable_price_model };
+            spm.reset_to_price(
                 oracle_price.to_num(),
                 Clock::get()?.unix_timestamp.try_into().unwrap(),
             );
+            bank.stable_price_model = spm;
             require_group_admin = true;
         }
 
@@ -122,12 +124,12 @@ pub fn token_edit(
         if let Some(ref interest_rate_params) = interest_rate_params_opt {
             // TODO: add a require! verifying relation between the parameters
             msg!("Interest rate params: old - adjustment_factor {:?}, util0 {:?}, rate0 {:?}, util1 {:?}, rate1 {:?}, max_rate {:?}, new - adjustment_factor {:?}, util0 {:?}, rate0 {:?}, util1 {:?}, rate1 {:?}, max_rate {:?}",
-            bank.adjustment_factor,
-            bank.util0,
-            bank.rate0,
-            bank.util1,
-            bank.rate1,
-            bank.max_rate,
+            { bank.adjustment_factor },
+            { bank.util0 },
+            { bank.rate0 },
+            { bank.util1 },
+            { bank.rate1 },
+            { bank.max_rate },
             interest_rate_params.adjustment_factor,
             interest_rate_params.util0,
             interest_rate_params.rate0,
@@ -147,7 +149,7 @@ pub fn token_edit(
         if let Some(loan_origination_fee_rate) = loan_origination_fee_rate_opt {
             msg!(
                 "Loan origination fee rate: old - {:?}, new - {:?}",
-                bank.loan_origination_fee_rate,
+                { bank.loan_origination_fee_rate },
                 loan_origination_fee_rate
             );
             bank.loan_origination_fee_rate = I80F48::from_num(loan_origination_fee_rate);
@@ -156,7 +158,7 @@ pub fn token_edit(
         if let Some(loan_fee_rate) = loan_fee_rate_opt {
             msg!(
                 "Loan fee fee rate: old - {:?}, new - {:?}",
-                bank.loan_fee_rate,
+                { bank.loan_fee_rate },
                 loan_fee_rate
             );
             bank.loan_fee_rate = I80F48::from_num(loan_fee_rate);
@@ -166,7 +168,7 @@ pub fn token_edit(
         if let Some(maint_asset_weight) = maint_asset_weight_opt {
             msg!(
                 "Maint asset weight: old - {:?}, new - {:?}",
-                bank.maint_asset_weight,
+                { bank.maint_asset_weight },
                 maint_asset_weight
             );
             bank.maint_asset_weight = I80F48::from_num(maint_asset_weight);
@@ -175,7 +177,7 @@ pub fn token_edit(
         if let Some(init_asset_weight) = init_asset_weight_opt {
             msg!(
                 "Init asset weight: old - {:?}, new - {:?}",
-                bank.init_asset_weight,
+                { bank.init_asset_weight },
                 init_asset_weight
             );
             require_gte!(
@@ -195,7 +197,7 @@ pub fn token_edit(
         if let Some(maint_liab_weight) = maint_liab_weight_opt {
             msg!(
                 "Maint liab weight: old - {:?}, new - {:?}",
-                bank.maint_liab_weight,
+                { bank.maint_liab_weight },
                 maint_liab_weight
             );
             bank.maint_liab_weight = I80F48::from_num(maint_liab_weight);
@@ -204,7 +206,7 @@ pub fn token_edit(
         if let Some(init_liab_weight) = init_liab_weight_opt {
             msg!(
                 "Init liab weight: old - {:?}, new - {:?}",
-                bank.init_liab_weight,
+                { bank.init_liab_weight },
                 init_liab_weight
             );
             bank.init_liab_weight = I80F48::from_num(init_liab_weight);
@@ -213,7 +215,7 @@ pub fn token_edit(
         if let Some(liquidation_fee) = liquidation_fee_opt {
             msg!(
                 "Liquidation fee: old - {:?}, new - {:?}",
-                bank.liquidation_fee,
+                { bank.liquidation_fee },
                 liquidation_fee
             );
             bank.liquidation_fee = I80F48::from_num(liquidation_fee);
@@ -223,7 +225,7 @@ pub fn token_edit(
         if let Some(stable_price_delay_interval_seconds) = stable_price_delay_interval_seconds_opt {
             msg!(
                 "Stable price delay interval seconds: old - {:?}, new - {:?}",
-                bank.stable_price_model.delay_interval_seconds,
+                { bank.stable_price_model.delay_interval_seconds },
                 stable_price_delay_interval_seconds
             );
             // Updating this makes the old delay values slightly inconsistent
@@ -233,7 +235,7 @@ pub fn token_edit(
         if let Some(stable_price_delay_growth_limit) = stable_price_delay_growth_limit_opt {
             msg!(
                 "Stable price delay growth limit: old - {:?}, new - {:?}",
-                bank.stable_price_model.delay_growth_limit,
+                { bank.stable_price_model.delay_growth_limit },
                 stable_price_delay_growth_limit
             );
             bank.stable_price_model.delay_growth_limit = stable_price_delay_growth_limit;
@@ -242,7 +244,7 @@ pub fn token_edit(
         if let Some(stable_price_growth_limit) = stable_price_growth_limit_opt {
             msg!(
                 "Stable price growth limit: old - {:?}, new - {:?}",
-                bank.stable_price_model.stable_growth_limit,
+                { bank.stable_price_model.stable_growth_limit },
                 stable_price_growth_limit
             );
             bank.stable_price_model.stable_growth_limit = stable_price_growth_limit;
@@ -252,7 +254,7 @@ pub fn token_edit(
         if let Some(min_vault_to_deposits_ratio) = min_vault_to_deposits_ratio_opt {
             msg!(
                 "Min vault to deposits ratio: old - {:?}, new - {:?}",
-                bank.min_vault_to_deposits_ratio,
+                { bank.min_vault_to_deposits_ratio },
                 min_vault_to_deposits_ratio
             );
             bank.min_vault_to_deposits_ratio = min_vault_to_deposits_ratio;
@@ -261,7 +263,7 @@ pub fn token_edit(
         if let Some(net_borrow_limit_per_window_quote) = net_borrow_limit_per_window_quote_opt {
             msg!(
                 "Net borrow limit per window quote: old - {:?}, new - {:?}",
-                bank.net_borrow_limit_per_window_quote,
+                { bank.net_borrow_limit_per_window_quote },
                 net_borrow_limit_per_window_quote
             );
             bank.net_borrow_limit_per_window_quote = net_borrow_limit_per_window_quote;
@@ -270,7 +272,7 @@ pub fn token_edit(
         if let Some(net_borrow_limit_window_size_ts) = net_borrow_limit_window_size_ts_opt {
             msg!(
                 "Net borrow limit window size ts: old - {:?}, new - {:?}",
-                bank.net_borrow_limit_window_size_ts,
+                { bank.net_borrow_limit_window_size_ts },
                 net_borrow_limit_window_size_ts
             );
             bank.net_borrow_limit_window_size_ts = net_borrow_limit_window_size_ts;
@@ -286,7 +288,7 @@ pub fn token_edit(
         if let Some(borrow_weight_scale_start_quote) = borrow_weight_scale_start_quote_opt {
             msg!(
                 "Borrow weight scale start quote: old - {:?}, new - {:?}",
-                bank.borrow_weight_scale_start_quote,
+                { bank.borrow_weight_scale_start_quote },
                 borrow_weight_scale_start_quote
             );
             bank.borrow_weight_scale_start_quote = borrow_weight_scale_start_quote;
@@ -295,7 +297,7 @@ pub fn token_edit(
         if let Some(deposit_weight_scale_start_quote) = deposit_weight_scale_start_quote_opt {
             msg!(
                 "Deposit weight scale start quote: old - {:?}, new - {:?}",
-                bank.deposit_weight_scale_start_quote,
+                { bank.deposit_weight_scale_start_quote },
                 deposit_weight_scale_start_quote
             );
             bank.deposit_weight_scale_start_quote = deposit_weight_scale_start_quote;
@@ -339,7 +341,7 @@ pub fn token_edit(
         if let Some(fee_rate) = token_conditional_swap_taker_fee_rate_opt {
             msg!(
                 "Token conditional swap taker fee fraction old {:?}, new {:?}",
-                bank.token_conditional_swap_taker_fee_rate,
+                { bank.token_conditional_swap_taker_fee_rate },
                 fee_rate
             );
             require_gte!(fee_rate, 0.0); // values <0 are not currently supported
@@ -349,7 +351,7 @@ pub fn token_edit(
         if let Some(fee_rate) = token_conditional_swap_maker_fee_rate_opt {
             msg!(
                 "Token conditional swap maker fee fraction old {:?}, new {:?}",
-                bank.token_conditional_swap_maker_fee_rate,
+                { bank.token_conditional_swap_maker_fee_rate },
                 fee_rate
             );
             require_gte!(fee_rate, 0.0); // values <0 are not currently supported
@@ -360,7 +362,7 @@ pub fn token_edit(
         if let Some(fee_rate) = flash_loan_swap_fee_rate_opt {
             msg!(
                 "Flash loan swap fee fraction old {:?}, new {:?}",
-                bank.flash_loan_swap_fee_rate,
+                { bank.flash_loan_swap_fee_rate },
                 fee_rate
             );
             require_gte!(fee_rate, 0.0); // values <0 are not currently supported
@@ -371,7 +373,7 @@ pub fn token_edit(
         if let Some(interest_curve_scaling) = interest_curve_scaling_opt {
             msg!(
                 "Interest curve scaling old {:?}, new {:?}",
-                bank.interest_curve_scaling,
+                { bank.interest_curve_scaling },
                 interest_curve_scaling
             );
             require_gte!(interest_curve_scaling, 1.0);
@@ -381,7 +383,7 @@ pub fn token_edit(
         if let Some(interest_target_utilization) = interest_target_utilization_opt {
             msg!(
                 "Interest target utilization old {:?}, new {:?}",
-                bank.interest_target_utilization,
+                { bank.interest_target_utilization },
                 interest_target_utilization
             );
             require_gte!(interest_target_utilization, 0.0);
@@ -409,7 +411,7 @@ pub fn token_edit(
         if let Some(maint_weight_shift_start) = maint_weight_shift_start_opt {
             msg!(
                 "Maint weight shift start old {:?}, new {:?}",
-                bank.maint_weight_shift_start,
+                { bank.maint_weight_shift_start },
                 maint_weight_shift_start
             );
             bank.maint_weight_shift_start = maint_weight_shift_start;
@@ -418,7 +420,7 @@ pub fn token_edit(
         if let Some(maint_weight_shift_end) = maint_weight_shift_end_opt {
             msg!(
                 "Maint weight shift end old {:?}, new {:?}",
-                bank.maint_weight_shift_end,
+                { bank.maint_weight_shift_end },
                 maint_weight_shift_end
             );
             bank.maint_weight_shift_end = maint_weight_shift_end;
@@ -427,7 +429,7 @@ pub fn token_edit(
         if let Some(maint_weight_shift_asset_target) = maint_weight_shift_asset_target_opt {
             msg!(
                 "Maint weight shift asset target old {:?}, new {:?}",
-                bank.maint_weight_shift_asset_target,
+                { bank.maint_weight_shift_asset_target },
                 maint_weight_shift_asset_target
             );
             bank.maint_weight_shift_asset_target =
@@ -437,31 +439,33 @@ pub fn token_edit(
         if let Some(maint_weight_shift_liab_target) = maint_weight_shift_liab_target_opt {
             msg!(
                 "Maint weight shift liab target old {:?}, new {:?}",
-                bank.maint_weight_shift_liab_target,
+                { bank.maint_weight_shift_liab_target },
                 maint_weight_shift_liab_target
             );
             bank.maint_weight_shift_liab_target = I80F48::from_num(maint_weight_shift_liab_target);
             require_group_admin = true;
         }
         if maint_weight_shift_start_opt.is_some() || maint_weight_shift_end_opt.is_some() {
-            let was_enabled = bank.maint_weight_shift_duration_inv.is_positive();
-            if bank.maint_weight_shift_end <= bank.maint_weight_shift_start {
+            let was_enabled = { bank.maint_weight_shift_duration_inv }.is_positive();
+            if { bank.maint_weight_shift_end } <= { bank.maint_weight_shift_start } {
                 bank.maint_weight_shift_duration_inv = I80F48::ZERO;
             } else {
                 bank.maint_weight_shift_duration_inv = I80F48::ONE
-                    / I80F48::from(bank.maint_weight_shift_end - bank.maint_weight_shift_start);
+                    / I80F48::from(
+                        { bank.maint_weight_shift_end } - { bank.maint_weight_shift_start },
+                    );
             }
             msg!(
                 "Maint weight shift enabled old {}, new {}",
                 was_enabled,
-                bank.maint_weight_shift_duration_inv.is_positive(),
+                { bank.maint_weight_shift_duration_inv }.is_positive(),
             );
         }
 
         if let Some(deposit_limit) = deposit_limit_opt {
             msg!(
                 "Deposit limit old {:?}, new {:?}",
-                bank.deposit_limit,
+                { bank.deposit_limit },
                 deposit_limit
             );
             bank.deposit_limit = deposit_limit;
@@ -471,7 +475,7 @@ pub fn token_edit(
         if let Some(zero_util_rate) = zero_util_rate {
             msg!(
                 "Zero utilization rate old {:?}, new {:?}",
-                bank.zero_util_rate,
+                { bank.zero_util_rate },
                 zero_util_rate
             );
             bank.zero_util_rate = I80F48::from_num(zero_util_rate);
@@ -481,7 +485,7 @@ pub fn token_edit(
         if let Some(platform_liquidation_fee) = platform_liquidation_fee {
             msg!(
                 "Platform liquidation fee old {:?}, new {:?}",
-                bank.platform_liquidation_fee,
+                { bank.platform_liquidation_fee },
                 platform_liquidation_fee
             );
             bank.platform_liquidation_fee = I80F48::from_num(platform_liquidation_fee);
@@ -493,7 +497,7 @@ pub fn token_edit(
         if let Some(collateral_fee_per_day) = collateral_fee_per_day {
             msg!(
                 "Collateral fee per day old {:?}, new {:?}",
-                bank.collateral_fee_per_day,
+                { bank.collateral_fee_per_day },
                 collateral_fee_per_day
             );
             bank.collateral_fee_per_day = collateral_fee_per_day;

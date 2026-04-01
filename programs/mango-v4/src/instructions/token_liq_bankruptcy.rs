@@ -277,7 +277,7 @@ pub fn token_liq_bankruptcy(
         }
 
         // socialized loss always brings the position to zero
-        require_eq!(liqee_liab.indexed_position, I80F48::ZERO);
+        require_eq!({ liqee_liab.indexed_position }, I80F48::ZERO);
     }
 
     // liqee liab

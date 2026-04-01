@@ -155,7 +155,7 @@ pub fn serum3_place_order<'info>(
         // Double-check that we got the right account
         let receiver_bank2 = receiver_bank_ai.load::<Bank>()?;
         assert_eq!(receiver_bank2.group, group_key);
-        assert_eq!(receiver_bank2.token_index, receiver_token_index);
+        assert_eq!({ receiver_bank2.token_index }, receiver_token_index);
     }
 
     drop(retriever);
@@ -550,7 +550,7 @@ impl VaultDifference {
         health_cache: &mut HealthCache,
         bank: &Bank,
     ) -> Result<()> {
-        assert_eq!(bank.token_index, self.token_index);
+        assert_eq!({ bank.token_index }, self.token_index);
         health_cache.adjust_token_balance(bank, self.native_change)?;
         Ok(())
     }
@@ -663,7 +663,8 @@ pub fn apply_settle_changes(
         received_fees = before_oo
             .native_rebates()
             .saturating_sub(after_oo.native_rebates());
-        quote_bank.collected_fees_native += I80F48::from(received_fees);
+        quote_bank.collected_fees_native =
+            { quote_bank.collected_fees_native } + I80F48::from(received_fees);
 
         // Credit the buyback_fees at the current value of the quote token.
         if let Some(quote_oracle_ai) = quote_oracle {
@@ -748,7 +749,9 @@ fn update_bank_potential_tokens_payer_only(
         payer_bank.update_potential_serum_tokens(old_base, new_base);
         serum_orders.potential_base_tokens = new_base;
     } else {
-        assert_eq!(serum_orders.quote_token_index, payer_bank.token_index);
+        assert_eq!({ serum_orders.quote_token_index }, {
+            payer_bank.token_index
+        });
 
         let new_quote = oo.native_quote_total()
             + (oo.native_base_reserved() as f64 * serum_orders.highest_placed_ask) as u64;
@@ -765,8 +768,10 @@ fn update_bank_potential_tokens(
     quote_bank: &mut Bank,
     oo: &OpenOrdersSlim,
 ) {
-    assert_eq!(serum_orders.base_token_index, base_bank.token_index);
-    assert_eq!(serum_orders.quote_token_index, quote_bank.token_index);
+    assert_eq!({ serum_orders.base_token_index }, { base_bank.token_index });
+    assert_eq!({ serum_orders.quote_token_index }, {
+        quote_bank.token_index
+    });
 
     // Potential tokens are all tokens on the side, plus reserved on the other side
     // converted at favorable price. This creates an overestimation of the potential

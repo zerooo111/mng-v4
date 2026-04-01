@@ -21,6 +21,7 @@ pub const YEAR_I80F48: I80F48 = I80F48::from_bits(31_536_000 * I80F48::ONE.to_bi
 
 #[derive(Derivative)]
 #[derivative(Debug)]
+#[repr(C, packed)]
 #[account(zero_copy)]
 pub struct Bank {
     // ABI: Clients rely on this being at offset 8
@@ -397,49 +398,49 @@ impl Bank {
     }
 
     pub fn verify(&self) -> Result<()> {
-        require_gte!(self.oracle_config.conf_filter, 0.0);
-        require_gte!(self.util0, I80F48::ZERO);
-        require_gte!(self.util1, self.util0);
-        require_gte!(I80F48::ONE, self.util1);
-        require_gte!(self.rate0, I80F48::ZERO);
-        require_gte!(self.rate1, I80F48::ZERO);
-        require_gte!(self.max_rate, I80F48::ZERO);
-        require_gte!(self.adjustment_factor, 0.0);
-        require_gte!(self.loan_fee_rate, 0.0);
-        require_gte!(self.loan_origination_fee_rate, 0.0);
-        require_gte!(self.stable_price_model.delay_growth_limit, 0.0);
-        require_gte!(self.stable_price_model.stable_growth_limit, 0.0);
-        require_gte!(self.init_asset_weight, 0.0);
-        require_gte!(self.maint_asset_weight, self.init_asset_weight);
-        require_gte!(self.maint_liab_weight, 0.0);
-        require_gte!(self.init_liab_weight, self.maint_liab_weight);
-        require_gte!(self.liquidation_fee, 0.0);
-        require_gte!(self.min_vault_to_deposits_ratio, 0.0);
-        require_gte!(1.0, self.min_vault_to_deposits_ratio);
-        require_gte!(self.net_borrow_limit_per_window_quote, -1);
-        require_gt!(self.borrow_weight_scale_start_quote, 0.0);
-        require_gt!(self.deposit_weight_scale_start_quote, 0.0);
-        require_gte!(2, self.reduce_only);
-        require_gte!(self.token_conditional_swap_taker_fee_rate, 0.0);
-        require_gte!(self.token_conditional_swap_maker_fee_rate, 0.0);
-        require_gte!(self.flash_loan_swap_fee_rate, 0.0);
-        require_gte!(self.interest_curve_scaling, 1.0);
-        require_gte!(self.interest_target_utilization, 0.0);
-        require_gte!(1.0, self.interest_target_utilization);
-        require_gte!(self.maint_weight_shift_duration_inv, 0.0);
-        require_gte!(self.maint_weight_shift_asset_target, 0.0);
-        require_gte!(self.maint_weight_shift_liab_target, 0.0);
-        require_gte!(self.zero_util_rate, I80F48::ZERO);
-        require_gte!(self.platform_liquidation_fee, 0.0);
+        require_gte!({ self.oracle_config.conf_filter }, 0.0);
+        require_gte!({ self.util0 }, I80F48::ZERO);
+        require_gte!({ self.util1 }, { self.util0 });
+        require_gte!(I80F48::ONE, { self.util1 });
+        require_gte!({ self.rate0 }, I80F48::ZERO);
+        require_gte!({ self.rate1 }, I80F48::ZERO);
+        require_gte!({ self.max_rate }, I80F48::ZERO);
+        require_gte!({ self.adjustment_factor }, 0.0);
+        require_gte!({ self.loan_fee_rate }, 0.0);
+        require_gte!({ self.loan_origination_fee_rate }, 0.0);
+        require_gte!({ self.stable_price_model.delay_growth_limit }, 0.0);
+        require_gte!({ self.stable_price_model.stable_growth_limit }, 0.0);
+        require_gte!({ self.init_asset_weight }, 0.0);
+        require_gte!({ self.maint_asset_weight }, { self.init_asset_weight });
+        require_gte!({ self.maint_liab_weight }, 0.0);
+        require_gte!({ self.init_liab_weight }, { self.maint_liab_weight });
+        require_gte!({ self.liquidation_fee }, 0.0);
+        require_gte!({ self.min_vault_to_deposits_ratio }, 0.0);
+        require_gte!(1.0, { self.min_vault_to_deposits_ratio });
+        require_gte!({ self.net_borrow_limit_per_window_quote }, -1);
+        require_gt!({ self.borrow_weight_scale_start_quote }, 0.0);
+        require_gt!({ self.deposit_weight_scale_start_quote }, 0.0);
+        require_gte!(2, { self.reduce_only });
+        require_gte!({ self.token_conditional_swap_taker_fee_rate }, 0.0);
+        require_gte!({ self.token_conditional_swap_maker_fee_rate }, 0.0);
+        require_gte!({ self.flash_loan_swap_fee_rate }, 0.0);
+        require_gte!({ self.interest_curve_scaling }, 1.0);
+        require_gte!({ self.interest_target_utilization }, 0.0);
+        require_gte!(1.0, { self.interest_target_utilization });
+        require_gte!({ self.maint_weight_shift_duration_inv }, 0.0);
+        require_gte!({ self.maint_weight_shift_asset_target }, 0.0);
+        require_gte!({ self.maint_weight_shift_liab_target }, 0.0);
+        require_gte!({ self.zero_util_rate }, I80F48::ZERO);
+        require_gte!({ self.platform_liquidation_fee }, 0.0);
         if !self.allows_asset_liquidation() {
             require!(self.are_borrows_reduce_only(), MangoError::SomeError);
-            require_eq!(self.maint_asset_weight, I80F48::ZERO);
+            require_eq!({ self.maint_asset_weight }, I80F48::ZERO);
         }
-        require_gte!(self.collateral_fee_per_day, 0.0);
+        require_gte!({ self.collateral_fee_per_day }, 0.0);
         if self.is_force_withdraw() {
             require!(self.are_deposits_reduce_only(), MangoError::SomeError);
             require!(!self.allows_asset_liquidation(), MangoError::SomeError);
-            require_eq!(self.maint_asset_weight, I80F48::ZERO);
+            require_eq!({ self.maint_asset_weight }, I80F48::ZERO);
         }
         Ok(())
     }
@@ -610,19 +611,19 @@ impl Bank {
             let new_indexed_value = position.indexed_position + indexed_change;
             if new_indexed_value.is_negative() {
                 // pay back borrows only, leaving a negative position
-                self.indexed_borrows -= indexed_change;
+                self.indexed_borrows = { self.indexed_borrows } - indexed_change;
                 position.indexed_position = new_indexed_value;
                 return Ok(true);
             } else if new_native_position < I80F48::ONE && allow_dusting {
                 // if there's less than one token deposited, zero the position
-                self.dust += new_native_position;
-                self.indexed_borrows += position.indexed_position;
+                self.dust = { self.dust } + new_native_position;
+                self.indexed_borrows = { self.indexed_borrows } + { position.indexed_position };
                 position.indexed_position = I80F48::ZERO;
                 return Ok(false);
             }
 
             // pay back all borrows
-            self.indexed_borrows += position.indexed_position; // position.value is negative
+            self.indexed_borrows = { self.indexed_borrows } + { position.indexed_position }; // position.value is negative
             position.indexed_position = I80F48::ZERO;
             // deposit the rest
             // note: .max(0) because there's a scenario where new_indexed_value == 0 and new_native_position < 0
@@ -630,9 +631,9 @@ impl Bank {
         }
 
         // add to deposits
-        let indexed_change = div_rounding_up(native_amount, self.deposit_index);
-        self.indexed_deposits += indexed_change;
-        position.indexed_position += indexed_change;
+        let indexed_change = div_rounding_up(native_amount, { self.deposit_index });
+        self.indexed_deposits = { self.indexed_deposits } + indexed_change;
+        position.indexed_position = { position.indexed_position } + indexed_change;
 
         Ok(true)
     }
@@ -733,8 +734,9 @@ impl Bank {
                 // withdraw deposits only
                 if new_native_position < I80F48::ONE && allow_dusting {
                     // zero the account collecting the leftovers in `dust`
-                    self.dust += new_native_position;
-                    self.indexed_deposits -= position.indexed_position;
+                    self.dust = { self.dust } + new_native_position;
+                    self.indexed_deposits =
+                        { self.indexed_deposits } - { position.indexed_position };
                     position.indexed_position = I80F48::ZERO;
                     return Ok(WithdrawResult {
                         position_is_active: false,
@@ -743,9 +745,9 @@ impl Bank {
                     });
                 } else {
                     // withdraw some deposits leaving a positive balance
-                    let indexed_change = native_amount / self.deposit_index;
-                    self.indexed_deposits -= indexed_change;
-                    position.indexed_position -= indexed_change;
+                    let indexed_change = native_amount / { self.deposit_index };
+                    self.indexed_deposits = { self.indexed_deposits } - indexed_change;
+                    position.indexed_position = { position.indexed_position } - indexed_change;
                     return Ok(WithdrawResult {
                         position_is_active: true,
                         loan_origination_fee: I80F48::ZERO,
@@ -755,7 +757,7 @@ impl Bank {
             }
 
             // withdraw all deposits
-            self.indexed_deposits -= position.indexed_position;
+            self.indexed_deposits = { self.indexed_deposits } - { position.indexed_position };
             position.indexed_position = I80F48::ZERO;
             // borrow the rest
             native_amount = -new_native_position;
@@ -763,15 +765,15 @@ impl Bank {
 
         let mut loan_origination_fee = I80F48::ZERO;
         if with_loan_origination_fee {
-            loan_origination_fee = self.loan_origination_fee_rate * native_amount;
-            self.collected_fees_native += loan_origination_fee;
+            loan_origination_fee = { self.loan_origination_fee_rate } * native_amount;
+            self.collected_fees_native = { self.collected_fees_native } + loan_origination_fee;
             native_amount += loan_origination_fee;
         }
 
         // add to borrows
-        let indexed_change = native_amount / self.borrow_index;
-        self.indexed_borrows += indexed_change;
-        position.indexed_position -= indexed_change;
+        let indexed_change = native_amount / { self.borrow_index };
+        self.indexed_borrows = { self.indexed_borrows } + indexed_change;
+        position.indexed_position = { position.indexed_position } - indexed_change;
 
         // net borrows requires updating in only this case, since other branches of the method deal with
         // withdraws and not borrows
@@ -791,8 +793,9 @@ impl Bank {
         already_borrowed_native_amount: I80F48,
         now_ts: u64,
     ) -> Result<WithdrawResult> {
-        let loan_origination_fee = self.loan_origination_fee_rate * already_borrowed_native_amount;
-        self.collected_fees_native += loan_origination_fee;
+        let loan_origination_fee =
+            { self.loan_origination_fee_rate } * already_borrowed_native_amount;
+        self.collected_fees_native = { self.collected_fees_native } + loan_origination_fee;
 
         let position_is_active = self
             .withdraw_internal_wrapper(
@@ -876,7 +879,7 @@ impl Bank {
         let withdraw_result = if !source_amount.is_zero() {
             let withdraw_result = self.withdraw_with_fee(source, source_amount, now_ts)?;
             require!(
-                source.indexed_position >= 0 || !self.are_borrows_reduce_only(),
+                { source.indexed_position } >= 0 || !self.are_borrows_reduce_only(),
                 MangoError::TokenInReduceOnlyMode
             );
             withdraw_result
@@ -891,7 +894,7 @@ impl Bank {
         let target_is_active = if !target_amount.is_zero() {
             let active = self.deposit(target, target_amount, now_ts)?;
             require!(
-                target.indexed_position <= 0 || !self.are_deposits_reduce_only(),
+                { target.indexed_position } <= 0 || !self.are_deposits_reduce_only(),
                 MangoError::TokenInReduceOnlyMode
             );
             active
@@ -900,10 +903,10 @@ impl Bank {
         };
 
         // Adding DELTA here covers the case where we add slightly more than we withdraw
-        if self.indexed_borrows > before_borrows + I80F48::DELTA {
+        if { self.indexed_borrows } > before_borrows + I80F48::DELTA {
             self.check_net_borrows(oracle_price)?;
         }
-        if self.indexed_deposits > before_deposits + I80F48::DELTA {
+        if { self.indexed_deposits } > before_deposits + I80F48::DELTA {
             self.check_deposit_and_oo_limit()?;
         }
 
@@ -952,7 +955,7 @@ impl Bank {
         if remaining_quote < 0 {
             return Err(error_msg_typed!(MangoError::BankNetBorrowsLimitReached,
                     "net_borrows_in_window: {:?}, remaining quote: {:?}, net_borrow_limit_per_window_quote: {:?}, last_net_borrows_window_start_ts: {:?}",
-                    self.net_borrows_in_window, remaining_quote, self.net_borrow_limit_per_window_quote, self.last_net_borrows_window_start_ts
+                    { self.net_borrows_in_window }, remaining_quote, { self.net_borrow_limit_per_window_quote }, { self.last_net_borrows_window_start_ts }
 
             ));
         }
@@ -996,7 +999,7 @@ impl Bank {
                 "deposit limit exceeded: remaining: {}, total: {}, limit: {}, deposits: {}, serum: {}, openbook: {}",
                 remaining,
                 total,
-                self.deposit_limit,
+                { self.deposit_limit },
                 deposits,
                 serum,
                 openbook,
@@ -1200,29 +1203,25 @@ impl Bank {
         staleness_slot: Option<u64>,
     ) -> Result<I80F48> {
         require_keys_eq!(self.oracle, *oracle_acc_infos.oracle.key());
+        let oracle_config = { self.oracle_config };
         let primary_state = oracle::oracle_state_unchecked(oracle_acc_infos, self.mint_decimals)?;
         let primary_ok =
-            primary_state.check_confidence_and_maybe_staleness(&self.oracle_config, staleness_slot);
+            primary_state.check_confidence_and_maybe_staleness(&oracle_config, staleness_slot);
         if primary_ok.is_oracle_error() && oracle_acc_infos.fallback_opt.is_some() {
             let fallback_oracle_acc = oracle_acc_infos.fallback_opt.unwrap();
             require_keys_eq!(self.fallback_oracle, *fallback_oracle_acc.key());
             let fallback_state =
                 oracle::fallback_oracle_state_unchecked(&oracle_acc_infos, self.mint_decimals)?;
-            let fallback_ok = fallback_state
-                .check_confidence_and_maybe_staleness(&self.oracle_config, staleness_slot);
+            let fallback_ok =
+                fallback_state.check_confidence_and_maybe_staleness(&oracle_config, staleness_slot);
             fallback_ok.with_context(|| {
                 format!(
                     "{} {}",
-                    oracle_log_context(
-                        self.name(),
-                        &primary_state,
-                        &self.oracle_config,
-                        staleness_slot
-                    ),
+                    oracle_log_context(self.name(), &primary_state, &oracle_config, staleness_slot),
                     oracle_log_context(
                         self.name(),
                         &fallback_state,
-                        &self.oracle_config,
+                        &oracle_config,
                         staleness_slot
                     )
                 )
@@ -1230,12 +1229,7 @@ impl Bank {
             Ok(fallback_state.price)
         } else {
             primary_ok.with_context(|| {
-                oracle_log_context(
-                    self.name(),
-                    &primary_state,
-                    &self.oracle_config,
-                    staleness_slot,
-                )
+                oracle_log_context(self.name(), &primary_state, &oracle_config, staleness_slot)
             })?;
             Ok(primary_state.price)
         }

@@ -10,7 +10,7 @@ import {
   CrossbarClient,
   Oracle,
   PullFeed,
-  SB_ON_DEMAND_PID,
+  ON_DEMAND_MAINNET_PID,
 } from '@switchboard-xyz/on-demand';
 import fs from 'fs';
 import chunk from 'lodash/chunk';
@@ -322,7 +322,7 @@ async function prepareCandidateOracles(
     .map((o, i) => {
       return { oracle: o, ai: ais[i], decodedPullFeed: undefined };
     })
-    .filter((item) => item.ai?.owner.equals(SB_ON_DEMAND_PID));
+    .filter((item) => item.ai?.owner.equals(ON_DEMAND_MAINNET_PID));
 
   return filteredOracles;
 }
@@ -444,7 +444,7 @@ async function setupSwitchboard(client: MangoClient): Promise<{
   queue: PublicKey;
 }> {
   const idl = await Anchor30Program.fetchIdl(
-    SB_ON_DEMAND_PID,
+    ON_DEMAND_MAINNET_PID,
     client.program.provider,
   );
   const sbOnDemandProgram = new Anchor30Program(idl!, client.program.provider);

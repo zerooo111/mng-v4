@@ -108,8 +108,8 @@ pub fn token_charge_collateral_fees(ctx: Context<TokenChargeCollateralFees>) -> 
             account.deactivate_token_position_and_log(raw_token_index, ctx.accounts.account.key());
         }
 
-        bank.collected_fees_native += fee;
-        bank.collected_collateral_fees += fee;
+        bank.collected_fees_native = { bank.collected_fees_native } + fee;
+        bank.collected_collateral_fees = { bank.collected_collateral_fees } + fee;
 
         let token_info = health_cache.token_info(bank.token_index)?;
         let token_position = account.token_position(bank.token_index)?;

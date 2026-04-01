@@ -103,9 +103,9 @@ pub fn perp_create_market(
     if let Ok(oracle_price) =
         perp_market.oracle_price(&OracleAccountInfos::from_reader(oracle_ref), None)
     {
-        perp_market
-            .stable_price_model
-            .reset_to_price(oracle_price.to_num(), now_ts);
+        let mut spm = { perp_market.stable_price_model };
+        spm.reset_to_price(oracle_price.to_num(), now_ts);
+        perp_market.stable_price_model = spm;
     } else {
         perp_market.stable_price_model.reset_on_nonzero_price = 1;
     }

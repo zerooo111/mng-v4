@@ -5,7 +5,7 @@
 import { Connection, PublicKey, Keypair } from '@solana/web3.js';
 
 const RPC = 'https://api.devnet.solana.com';
-const PROGRAM_ID = new PublicKey('7ftfLAYEtDrz8xjhaqa6wUYMrjrmbZ3tjw7J7Rb3QA37');
+const PROGRAM_ID = new PublicKey('4CGsiGHZXSnweudEcN235xkLz4twT2DJB35hS7t89cUm');
 const GROUP = new PublicKey('42ZYDpNAUM8NZgmuQHwrUXsEWb98AkjJfJHYFFoCZpCi');
 
 async function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }

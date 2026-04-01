@@ -50,6 +50,7 @@ type SubmitIntentHttpBody = {
 const BRIDGE_BIND_ADDR = process.env.CTM_RELAYER_HTTP_BIND_ADDR || '127.0.0.1:9092';
 const RELAYER_GRPC_ADDR = process.env.CTM_RELAYER_ADDR || '127.0.0.1:9090';
 const E2E_CONFIG_PATH =
+  process.env.E2E_CONFIG_PATH ||
   process.env.E2E_OUTPUT_CONFIG_PATH ||
   (process.env.EXECUTION_QUEUE_GROUP_NUM
     ? runtimeConfigPath(`execution-queue-e2e-${process.env.EXECUTION_QUEUE_GROUP_NUM}.json`)

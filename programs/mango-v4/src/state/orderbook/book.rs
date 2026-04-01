@@ -494,7 +494,7 @@ fn apply_fees(
     // Accrue maker fees immediately: they can be negative and applying them later
     // risks that fees_accrued is settled to 0 before they apply. It going negative
     // breaks assumptions.
-    market.fees_accrued += taker_fees + maker_fees;
+    market.fees_accrued = { market.fees_accrued } + taker_fees + maker_fees;
 
     Ok(taker_fees)
 }
@@ -508,6 +508,6 @@ fn apply_penalty(market: &mut PerpMarket, account: &mut MangoAccountRefMut) -> R
 
     let perp_position = account.perp_position_mut(market.perp_market_index)?;
     perp_position.record_trading_fee(fee_penalty);
-    market.fees_accrued += fee_penalty;
+    market.fees_accrued = { market.fees_accrued } + fee_penalty;
     Ok(fee_penalty)
 }

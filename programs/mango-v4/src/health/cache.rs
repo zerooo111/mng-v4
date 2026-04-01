@@ -990,7 +990,11 @@ impl HealthCache {
             .perp_infos
             .iter_mut()
             .find(|m| m.perp_market_index == perp_market.perp_market_index)
-            .ok_or_else(|| error_msg!("perp market {} not found", perp_market.perp_market_index))?;
+            .ok_or_else(|| {
+                error_msg!("perp market {} not found", {
+                    perp_market.perp_market_index
+                })
+            })?;
         *perp_entry = PerpInfo::new(perp_position, perp_market, perp_entry.base_prices.clone())?;
         Ok(())
     }
@@ -1387,13 +1391,13 @@ fn new_health_cache_impl(
             let bank_is_available = available_banks_opt
                 .as_ref()
                 .unwrap()
-                .contains(&position.token_index);
+                .contains(&{ position.token_index });
             if !bank_is_available {
                 require_msg_typed!(
-                    position.indexed_position >= 0,
+                    { position.indexed_position } >= 0,
                     MangoError::InvalidBank,
                     "the bank for token index {} is a required health account when the account has a negative balance in it",
-                    position.token_index
+                    { position.token_index }
                 );
                 continue;
             }
@@ -1403,9 +1407,9 @@ fn new_health_cache_impl(
             retriever.bank_and_oracle(&account.fixed.group, i, position.token_index);
 
         // Allow skipping of bad-oracle banks if the account has a nonnegative balance
-        if allow_skipping_banks
-            && bank_oracle_result.is_oracle_error()
-            && position.indexed_position >= 0
+        if allow_skipping_banks && bank_oracle_result.is_oracle_error() && {
+            position.indexed_position
+        } >= 0
         {
             // Ignore the asset because the oracle is bad, decreasing total health
             continue;

@@ -79,6 +79,7 @@ struct Config {
     executor_group: Option<Pubkey>,
     executor_queue: Option<Pubkey>,
     executor_lane_config_path: Option<PathBuf>,
+    executor_lane_cache_path: Option<PathBuf>,
     executor_relay_event_log_path: Option<PathBuf>,
     sequence_state_path: PathBuf,
     min_execute_slot_offset: u64,
@@ -95,6 +96,11 @@ struct Config {
     sequence_submit_watch_poll_ms: u64,
     prioritization_fee: u64,
     event_sink_url: Option<String>,
+    harness_base_url: Option<String>,
+    harness_health_timeout_ms: u64,
+    harness_health_cache_ms: u64,
+    harness_health_max_age_ms: u64,
+    harness_reject_market_drift: bool,
     executor_enabled: bool,
     executor_interval_ms: u64,
     executor_busy_interval_ms: u64,
@@ -102,6 +108,8 @@ struct Config {
     executor_pending_timeout_ms: u64,
     executor_status_poll_ms: u64,
     executor_max_pending_txs: usize,
+    executor_pipeline_max_per_head: usize,
+    executor_same_head_send_interval_ms: u64,
     executor_rpc_max_retries: Option<usize>,
     executor_max_items: u16,
     executor_prioritization_fee: u64,
@@ -117,6 +125,15 @@ struct Config {
     executor_admin_tx_timeout_ms: u64,
     executor_expired_head_drop_batch_max: usize,
     executor_expired_head_drop_grace_secs: u64,
+    /// Maximum consecutive failures for the same sequence before the executor
+    /// proactively fires an admin-drop tx. This handles the case where the
+    /// normal auto-drop path (via signature status + log inspection) fails
+    /// due to RPC rate-limiting or other transient errors.
+    executor_max_sequence_failures: u32,
+    /// When a head item has had no matching lane for longer than this many
+    /// Solana slots (~400ms each), the executor admin-drops it as a health
+    /// failure rather than spinning forever.  Set 0 to disable.
+    executor_no_lane_match_drop_slots: u64,
 }
 
 impl Config {
@@ -163,6 +180,10 @@ impl Config {
             .ok()
             .filter(|v| !v.trim().is_empty())
             .map(PathBuf::from);
+        let executor_lane_cache_path = std::env::var("EXECUTION_QUEUE_LANE_CACHE_PATH")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .map(PathBuf::from);
         let executor_relay_event_log_path =
             std::env::var("EXECUTION_QUEUE_CRANK_RELAY_EVENT_LOG_PATH")
                 .ok()
@@ -194,6 +215,16 @@ impl Config {
         let event_sink_url = std::env::var("CTM_RELAYER_EVENT_SINK_URL")
             .ok()
             .filter(|v| !v.trim().is_empty());
+        let harness_base_url = std::env::var("CTM_RELAYER_HARNESS_BASE_URL")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .map(|v| v.trim_end_matches('/').to_string())
+            .or_else(|| derive_harness_base_url(event_sink_url.as_deref()));
+        let harness_health_timeout_ms = parse_u64_env("CTM_RELAYER_HARNESS_TIMEOUT_MS", 1_000)?;
+        let harness_health_cache_ms = parse_u64_env("CTM_RELAYER_HARNESS_HEALTH_CACHE_MS", 250)?;
+        let harness_health_max_age_ms = parse_u64_env("CTM_RELAYER_HARNESS_MAX_STALE_MS", 30_000)?;
+        let harness_reject_market_drift =
+            parse_bool_env("CTM_RELAYER_HARNESS_REJECT_MARKET_DRIFT", true);
         let executor_enabled = parse_bool_env("EXECUTION_QUEUE_ENGINE_ENABLED", true)
             && executor_group.is_some()
             && executor_queue.is_some();
@@ -205,6 +236,10 @@ impl Config {
         let executor_status_poll_ms = parse_u64_env("EXECUTION_QUEUE_CRANK_STATUS_POLL_MS", 10)?;
         let executor_max_pending_txs =
             parse_u64_env("EXECUTION_QUEUE_CRANK_MAX_PENDING_TXS", 4)? as usize;
+        let executor_pipeline_max_per_head =
+            parse_u64_env("EXECUTION_QUEUE_CRANK_PIPELINE_MAX_PER_HEAD", 2)? as usize;
+        let executor_same_head_send_interval_ms =
+            parse_u64_env("EXECUTION_QUEUE_CRANK_SAME_HEAD_SEND_INTERVAL_MS", 250)?;
         let executor_rpc_max_retries =
             parse_optional_usize_env("EXECUTION_QUEUE_CRANK_RPC_MAX_RETRIES")?;
         let executor_max_items = parse_u64_env("EXECUTION_QUEUE_CRANK_MAX_ITEMS", 32)? as u16;
@@ -233,6 +268,10 @@ impl Config {
             parse_u64_env("EXECUTION_QUEUE_CRANK_EXPIRED_HEAD_DROP_BATCH_MAX", 8)? as usize;
         let executor_expired_head_drop_grace_secs =
             parse_u64_env("EXECUTION_QUEUE_CRANK_EXPIRED_HEAD_DROP_GRACE_SECS", 5)?;
+        let executor_max_sequence_failures =
+            parse_u64_env("EXECUTION_QUEUE_CRANK_MAX_SEQUENCE_FAILURES", 5)? as u32;
+        let executor_no_lane_match_drop_slots =
+            parse_u64_env("EXECUTION_QUEUE_CRANK_NO_LANE_MATCH_DROP_SLOTS", 2)?;
 
         Ok(Self {
             cluster_url,
@@ -245,6 +284,7 @@ impl Config {
             executor_group,
             executor_queue,
             executor_lane_config_path,
+            executor_lane_cache_path,
             executor_relay_event_log_path,
             sequence_state_path,
             min_execute_slot_offset,
@@ -261,6 +301,11 @@ impl Config {
             sequence_submit_watch_poll_ms,
             prioritization_fee,
             event_sink_url,
+            harness_base_url,
+            harness_health_timeout_ms,
+            harness_health_cache_ms,
+            harness_health_max_age_ms,
+            harness_reject_market_drift,
             executor_enabled,
             executor_interval_ms,
             executor_busy_interval_ms,
@@ -268,6 +313,8 @@ impl Config {
             executor_pending_timeout_ms,
             executor_status_poll_ms,
             executor_max_pending_txs,
+            executor_pipeline_max_per_head,
+            executor_same_head_send_interval_ms,
             executor_rpc_max_retries,
             executor_max_items,
             executor_prioritization_fee,
@@ -283,6 +330,8 @@ impl Config {
             executor_admin_tx_timeout_ms,
             executor_expired_head_drop_batch_max,
             executor_expired_head_drop_grace_secs,
+            executor_max_sequence_failures,
+            executor_no_lane_match_drop_slots,
         })
     }
 }
@@ -299,6 +348,7 @@ struct Metrics {
     submit_parse_total_ms: AtomicU64,
     submit_prepare_total_ms: AtomicU64,
     submit_send_total_ms: AtomicU64,
+    harness_submit_rejects: AtomicU64,
     execute_attempts: AtomicU64,
     execute_sent: AtomicU64,
     execute_errors: AtomicU64,
@@ -309,6 +359,10 @@ struct Metrics {
     execute_lane_suppressed: AtomicU64,
     execute_targeted: AtomicU64,
     execute_speculative: AtomicU64,
+    execute_pipeline_sent: AtomicU64,
+    execute_send_suppressed_pending: AtomicU64,
+    execute_head_advanced: AtomicU64,
+    execute_head_advance_items: AtomicU64,
 }
 
 impl Metrics {
@@ -378,6 +432,11 @@ impl Metrics {
             format!("execution_engine_submit_prepare_avg_ms {:.3}", prepare_avg),
             "# TYPE execution_engine_submit_send_avg_ms gauge".to_string(),
             format!("execution_engine_submit_send_avg_ms {:.3}", send_avg),
+            "# TYPE execution_engine_harness_submit_rejects_total counter".to_string(),
+            format!(
+                "execution_engine_harness_submit_rejects_total {}",
+                self.harness_submit_rejects.load(Ordering::Relaxed)
+            ),
             "# TYPE execution_engine_execute_attempts_total counter".to_string(),
             format!(
                 "execution_engine_execute_attempts_total {}",
@@ -428,6 +487,26 @@ impl Metrics {
                 "execution_engine_execute_speculative_total {}",
                 self.execute_speculative.load(Ordering::Relaxed)
             ),
+            "# TYPE execution_engine_execute_pipeline_sent_total counter".to_string(),
+            format!(
+                "execution_engine_execute_pipeline_sent_total {}",
+                self.execute_pipeline_sent.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_execute_send_suppressed_pending_total counter".to_string(),
+            format!(
+                "execution_engine_execute_send_suppressed_pending_total {}",
+                self.execute_send_suppressed_pending.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_execute_head_advanced_total counter".to_string(),
+            format!(
+                "execution_engine_execute_head_advanced_total {}",
+                self.execute_head_advanced.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_execute_head_advance_items_total counter".to_string(),
+            format!(
+                "execution_engine_execute_head_advance_items_total {}",
+                self.execute_head_advance_items.load(Ordering::Relaxed)
+            ),
         ]
         .join("\n")
     }
@@ -439,6 +518,68 @@ fn avg_ms(total: u64, count: u64) -> f64 {
     } else {
         total as f64 / count as f64
     }
+}
+
+fn derive_harness_base_url(event_sink_url: Option<&str>) -> Option<String> {
+    const HARNESS_INGEST_SUFFIX: &str = "/ingest/relay-intent";
+
+    event_sink_url
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.strip_suffix(HARNESS_INGEST_SUFFIX))
+        .map(|value| value.trim_end_matches('/').to_string())
+}
+
+fn validate_harness_health(
+    health: &HarnessHealthResponse,
+    now_ms: u64,
+    min_freshness_budget_ms: u64,
+) -> std::result::Result<(), String> {
+    if !health.ok {
+        return Err("healthz returned ok=false".to_string());
+    }
+
+    let freshness_budget_ms = min_freshness_budget_ms
+        .max(
+            health
+                .reconcile_interval_ms
+                .unwrap_or_default()
+                .saturating_mul(3),
+        )
+        .max(1_000);
+    let generated_ts_ms = health
+        .generated_ts_ms
+        .ok_or_else(|| "healthz missing generated_ts_ms".to_string())?;
+    let generated_age_ms = now_ms.saturating_sub(generated_ts_ms);
+    if generated_age_ms > freshness_budget_ms {
+        return Err(format!(
+            "generated_ts_ms stale by {}ms (budget={}ms)",
+            generated_age_ms, freshness_budget_ms
+        ));
+    }
+
+    if health.onchain_read_enabled {
+        let last_reconcile_ts_ms = health.last_reconcile_ts_ms.ok_or_else(|| {
+            "healthz missing last_reconcile_ts_ms while onchain_read_enabled=true".to_string()
+        })?;
+        let reconcile_age_ms = now_ms.saturating_sub(last_reconcile_ts_ms);
+        if reconcile_age_ms > freshness_budget_ms {
+            return Err(format!(
+                "last_reconcile_ts_ms stale by {}ms (budget={}ms)",
+                reconcile_age_ms, freshness_budget_ms
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn harness_market_has_drift(drift: &HarnessMarketDrift) -> bool {
+    drift.replay_open_orders != drift.onchain_open_orders
+        || drift.replay_best_bid != drift.onchain_best_bid
+        || drift.replay_best_ask != drift.onchain_best_ask
+        || drift.bid_base_lots_abs_diff != "0"
+        || drift.ask_base_lots_abs_diff != "0"
 }
 
 #[derive(Clone, Deserialize)]
@@ -464,6 +605,52 @@ struct Lane {
     hash: [u8; 32],
 }
 
+#[derive(Clone, Debug, Default)]
+struct HarnessReadiness {
+    drifted_markets: HashSet<String>,
+}
+
+#[derive(Clone, Debug)]
+struct CachedHarnessReadiness {
+    checked_at_ms: u64,
+    result: std::result::Result<HarnessReadiness, String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct HarnessHealthResponse {
+    ok: bool,
+    #[serde(default)]
+    onchain_read_enabled: bool,
+    generated_ts_ms: Option<u64>,
+    last_reconcile_ts_ms: Option<u64>,
+    reconcile_interval_ms: Option<u64>,
+    #[serde(default)]
+    reconcile_markets_with_drift: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct HarnessReconciliationResponse {
+    data: Option<HarnessReconciliationSnapshot>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct HarnessReconciliationSnapshot {
+    #[serde(default)]
+    markets: HashMap<String, HarnessMarketDrift>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct HarnessMarketDrift {
+    replay_open_orders: u64,
+    onchain_open_orders: u64,
+    replay_best_bid: Option<String>,
+    onchain_best_bid: Option<String>,
+    replay_best_ask: Option<String>,
+    onchain_best_ask: Option<String>,
+    bid_base_lots_abs_diff: String,
+    ask_base_lots_abs_diff: String,
+}
+
 struct ExecutorState {
     group: Pubkey,
     execution_queue: Pubkey,
@@ -478,6 +665,17 @@ struct ExecutorState {
     last_dynamic_refresh_ms: Arc<Mutex<u64>>,
     last_inspect_ms: AtomicU64,
     cached_head: Arc<Mutex<Option<QueueHead>>>,
+    last_progress_log_sequence: AtomicU64,
+    /// Per-sequence consecutive failure counter. When a sequence exceeds
+    /// EXECUTOR_MAX_SEQUENCE_FAILURES consecutive execute-tx failures (including
+    /// status-poll failures), the executor proactively fires admin-drop instead
+    /// of retrying forever. This prevents expired health-gated orders from
+    /// permanently stalling the queue when the normal auto-drop path fails
+    /// (e.g., due to RPC rate-limiting preventing signature status checks).
+    sequence_failure_counts: Arc<Mutex<HashMap<u64, u32>>>,
+    /// Tracks the first slot at which the current head had no lane match.
+    /// Tuple of (sequence, first_seen_slot). Reset when the head changes.
+    no_lane_match_since: Arc<Mutex<Option<(u64, u64)>>>,
 }
 
 impl ExecutorState {
@@ -496,6 +694,9 @@ impl ExecutorState {
             last_dynamic_refresh_ms: Arc::new(Mutex::new(0)),
             last_inspect_ms: AtomicU64::new(0),
             cached_head: Arc::new(Mutex::new(None)),
+            last_progress_log_sequence: AtomicU64::new(0),
+            sequence_failure_counts: Arc::new(Mutex::new(HashMap::new())),
+            no_lane_match_since: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -504,8 +705,9 @@ impl ExecutorState {
         lane_name: String,
         remaining_accounts: &[AccountMeta],
         include_legacy: bool,
-    ) {
+    ) -> bool {
         let mut guard = self.lanes.write().await;
+        let mut any_new = false;
         for lane in expand_lane_variants(
             lane_name,
             remaining_accounts,
@@ -515,6 +717,9 @@ impl ExecutorState {
         ) {
             let lane_hash = bytes_to_hex(&lane.hash);
             let lane_name = lane.name.clone();
+            if !guard.contains_key(&lane_hash) {
+                any_new = true;
+            }
             guard.insert(lane_hash.clone(), lane);
             debug!(
                 "executor registered lane name={} hash={} total_lanes={}",
@@ -523,6 +728,7 @@ impl ExecutorState {
                 guard.len(),
             );
         }
+        any_new
     }
 
     async fn lanes_snapshot(&self) -> Vec<Lane> {
@@ -930,6 +1136,7 @@ struct Engine {
     metrics: Arc<Metrics>,
     inflight: Arc<Semaphore>,
     http_client: reqwest::Client,
+    harness_readiness: Arc<Mutex<Option<CachedHarnessReadiness>>>,
     executor: Option<Arc<ExecutorState>>,
     execute_nonce: Arc<AtomicU64>,
 }
@@ -942,6 +1149,7 @@ struct PendingHeadDispatch {
     sent_at_ms: u64,
     last_status_check_ms: u64,
     no_advance_recorded: bool,
+    targeted: bool,
     signature: Signature,
 }
 
@@ -971,6 +1179,12 @@ enum LaneFailureClass {
     DeterministicSigner,
     DeterministicLayout,
     Transient,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalHeadFailureReason {
+    ExpiredOrder,
+    WrongProgramOwner,
 }
 
 impl LaneFailureClass {
@@ -1006,6 +1220,273 @@ fn classify_lane_failure(err: &anyhow::Error) -> LaneFailureClass {
 }
 
 impl Engine {
+    fn harness_reject_status(&self, message: impl Into<String>, drift_related: bool) -> Status {
+        self.metrics
+            .harness_submit_rejects
+            .fetch_add(1, Ordering::Relaxed);
+        let message = message.into();
+        if drift_related {
+            Status::failed_precondition(message)
+        } else {
+            Status::unavailable(message)
+        }
+    }
+
+    async fn ensure_harness_ready(&self, market: &str) -> Result<(), Status> {
+        let Some(harness_base_url) = self.config.harness_base_url.as_deref() else {
+            return Ok(());
+        };
+
+        let now_ms = unix_timestamp_ms();
+        if let Some(cached) = self.harness_readiness.lock().await.clone() {
+            if now_ms.saturating_sub(cached.checked_at_ms) <= self.config.harness_health_cache_ms {
+                return self.evaluate_harness_readiness(market, cached.result);
+            }
+        }
+
+        let refreshed = self
+            .fetch_harness_readiness(harness_base_url)
+            .await
+            .map_err(|err| format!("{err:#}"));
+        *self.harness_readiness.lock().await = Some(CachedHarnessReadiness {
+            checked_at_ms: now_ms,
+            result: refreshed.clone(),
+        });
+        self.evaluate_harness_readiness(market, refreshed)
+    }
+
+    fn evaluate_harness_readiness(
+        &self,
+        market: &str,
+        readiness: std::result::Result<HarnessReadiness, String>,
+    ) -> Result<(), Status> {
+        match readiness {
+            Ok(readiness) => {
+                if self.config.harness_reject_market_drift
+                    && readiness.drifted_markets.contains(market)
+                {
+                    return Err(self.harness_reject_status(
+                        format!(
+                            "harness reconciliation drift active for market={market}; refusing enqueue until harness catches up"
+                        ),
+                        true,
+                    ));
+                }
+                Ok(())
+            }
+            Err(err) => Err(self.harness_reject_status(err, false)),
+        }
+    }
+
+    async fn fetch_harness_readiness(&self, harness_base_url: &str) -> Result<HarnessReadiness> {
+        let timeout = Duration::from_millis(self.config.harness_health_timeout_ms);
+        let health_url = format!("{}/healthz", harness_base_url.trim_end_matches('/'));
+        let health_resp = self
+            .http_client
+            .get(&health_url)
+            .timeout(timeout)
+            .send()
+            .await
+            .with_context(|| format!("harness health request failed: {health_url}"))?;
+        let health_status = health_resp.status();
+        if !health_status.is_success() {
+            return Err(anyhow!(
+                "harness health request returned status {} from {}",
+                health_status,
+                health_url
+            ));
+        }
+        let health: HarnessHealthResponse = health_resp.json().await.with_context(|| {
+            format!("failed to decode harness health payload from {health_url}")
+        })?;
+        validate_harness_health(
+            &health,
+            unix_timestamp_ms(),
+            self.config.harness_health_max_age_ms,
+        )
+        .map_err(|err| anyhow!("harness health rejected: {err}"))?;
+
+        if !self.config.harness_reject_market_drift || health.reconcile_markets_with_drift == 0 {
+            return Ok(HarnessReadiness::default());
+        }
+
+        let reconciliation_url = format!(
+            "{}/diagnostics/reconciliation",
+            harness_base_url.trim_end_matches('/')
+        );
+        let reconciliation_resp = self
+            .http_client
+            .get(&reconciliation_url)
+            .timeout(timeout)
+            .send()
+            .await
+            .with_context(|| {
+                format!("harness reconciliation request failed: {reconciliation_url}")
+            })?;
+        let reconciliation_status = reconciliation_resp.status();
+        if !reconciliation_status.is_success() {
+            return Err(anyhow!(
+                "harness reconciliation request returned status {} from {}",
+                reconciliation_status,
+                reconciliation_url
+            ));
+        }
+        let reconciliation: HarnessReconciliationResponse =
+            reconciliation_resp.json().await.with_context(|| {
+                format!(
+                    "failed to decode harness reconciliation payload from {}",
+                    reconciliation_url
+                )
+            })?;
+        let drifted_markets: HashSet<String> = reconciliation
+            .data
+            .map(|snapshot| {
+                snapshot
+                    .markets
+                    .into_iter()
+                    .filter_map(|(market, drift)| {
+                        harness_market_has_drift(&drift).then_some(market)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if health.reconcile_markets_with_drift > 0 && drifted_markets.is_empty() {
+            return Err(anyhow!(
+                "harness reported {} drifted markets but reconciliation details were empty",
+                health.reconcile_markets_with_drift
+            ));
+        }
+
+        Ok(HarnessReadiness { drifted_markets })
+    }
+
+    fn terminal_head_failure_reason(
+        &self,
+        err: &TransactionError,
+        logs: &[String],
+    ) -> Option<TerminalHeadFailureReason> {
+        if logs
+            .iter()
+            .any(|line| line.contains("Order is already expired"))
+        {
+            return Some(TerminalHeadFailureReason::ExpiredOrder);
+        }
+
+        if matches!(
+            err,
+            TransactionError::InstructionError(_, InstructionError::Custom(3007))
+        ) || logs.iter().any(|line| {
+            line.contains("AccountOwnedByWrongProgram")
+                || line.contains("account owned by a different program")
+                || line.contains("custom program error: 0xbbf")
+        }) {
+            return Some(TerminalHeadFailureReason::WrongProgramOwner);
+        }
+
+        None
+    }
+
+    fn terminal_head_failure_label(reason: TerminalHeadFailureReason) -> &'static str {
+        match reason {
+            TerminalHeadFailureReason::ExpiredOrder => "expired_order",
+            TerminalHeadFailureReason::WrongProgramOwner => "account_owned_by_wrong_program",
+        }
+    }
+
+    async fn maybe_auto_drop_terminal_head(
+        &self,
+        executor: &Arc<ExecutorState>,
+        pending: &PendingHeadDispatch,
+        err: &TransactionError,
+    ) -> bool {
+        if !self.config.executor_auto_drop_expired_heads {
+            return false;
+        }
+        let logs = match self.fetch_transaction_logs(pending.signature).await {
+            Ok(logs) => logs,
+            Err(fetch_err) => {
+                debug!(
+                    "executor failed tx log fetch skipped sequence={} sig={} err={fetch_err:?}",
+                    pending.sequence, pending.signature
+                );
+                return false;
+            }
+        };
+        let Some(reason) = self.terminal_head_failure_reason(err, &logs) else {
+            return false;
+        };
+        match self
+            .drop_ctm_head_with_admin_tx(
+                executor,
+                pending.sequence,
+                Self::terminal_head_failure_label(reason),
+            )
+            .await
+        {
+            Ok(signature) => {
+                info!(
+                    "executor auto-dropped terminal head sequence={} reason={} recovery_tx={}",
+                    pending.sequence,
+                    Self::terminal_head_failure_label(reason),
+                    signature
+                );
+                true
+            }
+            Err(drop_err) => {
+                warn!(
+                    "executor failed to auto-drop terminal head sequence={} reason={} err={drop_err:?}",
+                    pending.sequence,
+                    Self::terminal_head_failure_label(reason),
+                );
+                false
+            }
+        }
+    }
+
+    async fn maybe_auto_drop_sequence_after_failure_threshold(
+        &self,
+        executor: &Arc<ExecutorState>,
+        sequence: u64,
+        context: &str,
+    ) -> bool {
+        let mut should_drop = false;
+        {
+            let mut seq_failures = executor.sequence_failure_counts.lock().await;
+            let count = seq_failures.entry(sequence).or_insert(0);
+            *count = count.saturating_add(1);
+            if *count >= self.config.executor_max_sequence_failures {
+                warn!(
+                    "executor sequence {} hit {} consecutive failures ({context}); attempting proactive admin-drop",
+                    sequence, count
+                );
+                *count = 0;
+                should_drop = true;
+            }
+        }
+        if !should_drop {
+            return false;
+        }
+        match self
+            .drop_ctm_head_with_admin_tx(executor, sequence, "sequence_failure_threshold")
+            .await
+        {
+            Ok(sig) => {
+                info!(
+                    "executor proactive admin-drop succeeded sequence={} recovery_tx={}",
+                    sequence, sig
+                );
+                true
+            }
+            Err(err) => {
+                warn!(
+                    "executor proactive admin-drop failed sequence={} err={err:?}",
+                    sequence
+                );
+                false
+            }
+        }
+    }
+
     fn current_unix_timestamp_secs(&self) -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1013,15 +1494,22 @@ impl Engine {
             .as_secs()
     }
 
-    fn inspect_expired_head_batch(&self, queue_data: &[u8], expected_sequence: u64) -> QueueExpiredHeadBatch {
+    fn inspect_expired_head_batch(
+        &self,
+        queue_data: &[u8],
+        expected_sequence: u64,
+    ) -> QueueExpiredHeadBatch {
         let queue_state = inspect_queue_admin_state(queue_data);
-        if queue_state.head.reason != "ctm_pending" || queue_state.head.next_sequence != expected_sequence {
+        if queue_state.head.reason != "ctm_pending"
+            || queue_state.head.next_sequence != expected_sequence
+        {
             return QueueExpiredHeadBatch {
                 sequences: Vec::new(),
             };
         }
         let now_ts = self.current_unix_timestamp_secs();
-        let expiry_cutoff = now_ts.saturating_sub(self.config.executor_expired_head_drop_grace_secs);
+        let expiry_cutoff =
+            now_ts.saturating_sub(self.config.executor_expired_head_drop_grace_secs);
         let mut sequences = Vec::new();
         let start = queue_state.head.next_sequence;
         let end = queue_state
@@ -1053,7 +1541,9 @@ impl Engine {
                     .try_into()
                     .unwrap_or([0; 2]),
             ) as usize;
-            if payload_len < 4 || payload_len > (EXECUTION_QUEUE_ITEM_SIZE - EXECUTION_QUEUE_ITEM_PAYLOAD_OFFSET) {
+            if payload_len < 4
+                || payload_len > (EXECUTION_QUEUE_ITEM_SIZE - EXECUTION_QUEUE_ITEM_PAYLOAD_OFFSET)
+            {
                 break;
             }
             let payload_offset = item_offset + EXECUTION_QUEUE_ITEM_PAYLOAD_OFFSET;
@@ -1065,11 +1555,10 @@ impl Engine {
             if payload[0] != 1 || payload[1] != 0 || payload[2] != 0 || payload[3] != 0 {
                 break;
             }
-            let decoded =
-                match PerpPlaceOrderV2Payload::try_from_slice(&payload[4..]) {
-                    Ok(decoded) => decoded,
-                    Err(_) => break,
-                };
+            let decoded = match PerpPlaceOrderV2Payload::try_from_slice(&payload[4..]) {
+                Ok(decoded) => decoded,
+                Err(_) => break,
+            };
             if decoded.expiry_timestamp == 0 || decoded.expiry_timestamp > expiry_cutoff {
                 break;
             }
@@ -1151,48 +1640,6 @@ impl Engine {
         }
     }
 
-    async fn maybe_auto_drop_expired_head(
-        &self,
-        executor: &Arc<ExecutorState>,
-        pending: &PendingHeadDispatch,
-    ) -> bool {
-        if !self.config.executor_auto_drop_expired_heads {
-            return false;
-        }
-        let logs = match self.fetch_transaction_logs(pending.signature).await {
-            Ok(logs) => logs,
-            Err(err) => {
-                debug!(
-                    "executor failed tx log fetch skipped sequence={} sig={} err={err:?}",
-                    pending.sequence, pending.signature
-                );
-                return false;
-            }
-        };
-        if !logs.iter().any(|line| line.contains("Order is already expired")) {
-            return false;
-        }
-        match self
-            .drop_ctm_head_with_admin_tx(executor, pending.sequence, "expired_order")
-            .await
-        {
-            Ok(signature) => {
-                info!(
-                    "executor auto-dropped expired head sequence={} recovery_tx={}",
-                    pending.sequence, signature
-                );
-                true
-            }
-            Err(err) => {
-                warn!(
-                    "executor failed to auto-drop expired head sequence={} err={err:?}",
-                    pending.sequence
-                );
-                false
-            }
-        }
-    }
-
     async fn drop_ctm_head_with_admin_tx(
         &self,
         executor: &Arc<ExecutorState>,
@@ -1257,7 +1704,10 @@ impl Engine {
         } else {
             VersionedTransaction::try_new(
                 solana_sdk::message::VersionedMessage::V0(message),
-                &[self.config.payer.as_ref(), self.config.executor_admin.as_ref()],
+                &[
+                    self.config.payer.as_ref(),
+                    self.config.executor_admin.as_ref(),
+                ],
             )?
         };
         let send_cfg = RpcSendTransactionConfig {
@@ -1357,7 +1807,7 @@ impl Engine {
             if parse_failed {
                 continue;
             }
-            executor
+            let is_new = executor
                 .register_dynamic_lane(
                     format!(
                         "dynamic-{}-{}-{}",
@@ -1369,7 +1819,74 @@ impl Engine {
                     self.config.executor_include_legacy_fixed_hash,
                 )
                 .await;
+            if is_new {
+                if let Some(cache_path) = &self.config.executor_lane_cache_path {
+                    let _ = self
+                        .append_lane_cache(cache_path, &event, &remaining_accounts)
+                        .await;
+                }
+            }
         }
+        Ok(())
+    }
+
+    async fn append_lane_cache(
+        &self,
+        cache_path: &PathBuf,
+        event: &RelayIntentAcceptedEvent,
+        remaining_accounts: &[AccountMeta],
+    ) -> Result<()> {
+        #[derive(Serialize, Deserialize)]
+        struct CachedLane {
+            name: String,
+            user_owner: String,
+            #[serde(rename = "remainingAccounts")]
+            remaining_accounts: Vec<CachedLaneAccount>,
+        }
+        #[derive(Serialize, Deserialize)]
+        struct CachedLaneAccount {
+            pubkey: String,
+            #[serde(rename = "isWritable")]
+            is_writable: bool,
+            #[serde(rename = "isSigner")]
+            is_signer: bool,
+        }
+
+        // Read existing cache or start fresh
+        let mut cache: Vec<CachedLane> = if cache_path.exists() {
+            let content = tokio::fs::read_to_string(cache_path)
+                .await
+                .unwrap_or_default();
+            serde_json::from_str(&content).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        // Dedup by user_owner — keep only the latest lane per owner
+        let owner = &event.user_owner;
+        let lane_name = format!("cached-{}-{}", event.market, &owner[..owner.len().min(12)]);
+        cache.retain(|l| l.user_owner != *owner);
+        cache.push(CachedLane {
+            name: lane_name.clone(),
+            user_owner: owner.clone(),
+            remaining_accounts: remaining_accounts
+                .iter()
+                .map(|a| CachedLaneAccount {
+                    pubkey: a.pubkey.to_string(),
+                    is_writable: a.is_writable,
+                    is_signer: a.is_signer,
+                })
+                .collect(),
+        });
+
+        let json = serde_json::to_string_pretty(&cache)?;
+        tokio::fs::write(cache_path, json).await?;
+        info!(
+            "lane cache updated: owner={} lane={} total_cached={}",
+            owner,
+            lane_name,
+            cache.len()
+        );
         Ok(())
     }
 
@@ -1434,6 +1951,7 @@ impl Engine {
                 }
             }
         }
+        self.ensure_harness_ready(&request.market).await?;
         let user_owner = parse_pubkey(&request.user_owner)?;
         let mango_account = parse_pubkey(&request.mango_account)?;
         let remaining_accounts = parse_remaining_accounts(&request.remaining_accounts)?;
@@ -1517,7 +2035,7 @@ impl Engine {
         let prepare_elapsed = parse_started.elapsed().saturating_sub(parse_elapsed);
 
         let mut instructions = vec![
-            ComputeBudgetInstruction::set_compute_unit_limit(900_000),
+            ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
             user_preinstruction,
             ctm_preinstruction,
             enqueue_instruction,
@@ -1764,13 +2282,18 @@ impl Engine {
 
     async fn run_executor(self: Arc<Self>, executor: Arc<ExecutorState>) {
         info!(
-            "execution engine executor enabled for group={}, queue={}, max_items={}, interval_ms={}, busy_interval_ms={}, head_lock_ms={}, match_head_only={}, safe_speculative={}",
+            "execution engine executor enabled for group={}, queue={}, max_items={}, interval_ms={}, busy_interval_ms={}, head_lock_ms={}, pending_timeout_ms={}, status_poll_ms={}, max_pending_txs={}, pipeline_max_per_head={}, same_head_send_interval_ms={}, match_head_only={}, safe_speculative={}",
             executor.group,
             executor.execution_queue,
             self.config.executor_max_items,
             self.config.executor_interval_ms,
             self.config.executor_busy_interval_ms,
             self.config.executor_head_lock_ms,
+            self.config.executor_pending_timeout_ms,
+            self.config.executor_status_poll_ms,
+            self.config.executor_max_pending_txs,
+            self.config.executor_pipeline_max_per_head,
+            self.config.executor_same_head_send_interval_ms,
             self.config.executor_match_head_only,
             self.config.executor_safe_speculative,
         );
@@ -1842,9 +2365,7 @@ impl Engine {
             let mut retained = Vec::with_capacity(pending_dispatches.len());
             for pending in pending_dispatches.drain(..) {
                 let pending_age_ms = now_ms.saturating_sub(pending.sent_at_ms);
-                let same_head = pending.sequence == head.next_sequence
-                    && pending.accounts_hash == head.head_accounts_hash;
-                if !same_head {
+                if pending.targeted && pending.sequence < head.next_sequence {
                     continue;
                 }
                 if pending_age_ms >= self.config.executor_pending_timeout_ms {
@@ -1890,12 +2411,29 @@ impl Engine {
                                     "executor tx confirmed but queue head unchanged sequence={} sig={}",
                                     retained[index].sequence, signature
                                 );
+                                // Treat confirmed-no-advance as a persistent failure;
+                                // if the head doesn't move after N confirmed txs, the
+                                // lane accounts likely have a runtime flag mismatch.
+                                self.maybe_auto_drop_sequence_after_failure_threshold(
+                                    executor,
+                                    retained[index].sequence,
+                                    "confirmed_no_advance",
+                                )
+                                .await;
                             }
                         }
                         Some(status) => {
-                            let auto_recovered =
-                                self.maybe_auto_drop_expired_head(executor, &retained[index])
-                                    .await;
+                            let auto_recovered = match status.err.as_ref() {
+                                Some(err) => {
+                                    self.maybe_auto_drop_terminal_head(
+                                        executor,
+                                        &retained[index],
+                                        err,
+                                    )
+                                    .await
+                                }
+                                None => false,
+                            };
                             warn!(
                                 "executor tx failed sequence={} sig={} err={:?}",
                                 retained[index].sequence, signature, status.err
@@ -1907,6 +2445,19 @@ impl Engine {
                                     "signature_status_failed",
                                 )
                                 .await;
+                                self.maybe_auto_drop_sequence_after_failure_threshold(
+                                    executor,
+                                    retained[index].sequence,
+                                    "confirmed tx failures",
+                                )
+                                .await;
+                            } else {
+                                // Auto-drop succeeded; clear the failure counter
+                                executor
+                                    .sequence_failure_counts
+                                    .lock()
+                                    .await
+                                    .remove(&retained[index].sequence);
                             }
                             failed_indices.insert(index);
                         }
@@ -1927,6 +2478,16 @@ impl Engine {
             }
             Err(err) => {
                 debug!("executor signature status poll failed: {err:?}");
+                // Status poll failure means we cannot confirm whether the tx
+                // succeeded or failed. Treat repeated poll failures exactly like
+                // repeated confirmed failures for queue-unblock purposes.
+                let _ = self
+                    .maybe_auto_drop_sequence_after_failure_threshold(
+                        executor,
+                        head.next_sequence,
+                        "status poll errors",
+                    )
+                    .await;
             }
         }
 
@@ -1942,12 +2503,48 @@ impl Engine {
         let head = if now_ms.saturating_sub(last_inspect) >= inspect_interval_ms {
             let accounts = self.rpc.get_account(&executor.execution_queue).await?;
             let head = inspect_queue_head(&accounts.data);
+            let previous_head = *executor.cached_head.lock().await;
             executor.update_queue_count(head.count);
             executor.update_queue_next_sequence(head.next_sequence);
             executor.update_queue_max_seen_sequence(head.max_seen_sequence);
             executor.update_queue_head_available(head.head_accounts_hash.is_some());
             executor.last_inspect_ms.store(now_ms, Ordering::Relaxed);
             *executor.cached_head.lock().await = Some(head);
+
+            if let Some(prev) = previous_head {
+                if head.next_sequence > prev.next_sequence {
+                    // Head moved — reset no-lane-match tracker
+                    *executor.no_lane_match_since.lock().await = None;
+                    let advanced = head.next_sequence.saturating_sub(prev.next_sequence);
+                    self.metrics
+                        .execute_head_advanced
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.metrics
+                        .execute_head_advance_items
+                        .fetch_add(advanced, Ordering::Relaxed);
+                    let last_logged = executor.last_progress_log_sequence.load(Ordering::Relaxed);
+                    if head.next_sequence > last_logged {
+                        executor
+                            .last_progress_log_sequence
+                            .store(head.next_sequence, Ordering::Relaxed);
+                        info!(
+                            "executor head advanced from={} to={} delta={} queue_count={} prev_queue_count={}",
+                            prev.next_sequence,
+                            head.next_sequence,
+                            advanced,
+                            head.count,
+                            prev.count,
+                        );
+                    }
+                }
+            }
+
+            // Clean up stale per-sequence failure counts: remove entries for
+            // sequences that the on-chain queue has already advanced past.
+            {
+                let mut seq_failures = executor.sequence_failure_counts.lock().await;
+                seq_failures.retain(|&seq, _| seq >= head.next_sequence);
+            }
 
             if head.count == 0 {
                 executor.pending_dispatches.lock().await.clear();
@@ -1965,7 +2562,31 @@ impl Engine {
         let pending_snapshot = self
             .reconcile_pending_dispatches(executor, &head, now_ms)
             .await;
-        if !pending_snapshot.is_empty() {
+        let same_head_pending_count = pending_snapshot
+            .iter()
+            .filter(|pending| {
+                pending.sequence == head.next_sequence
+                    && pending.accounts_hash == head.head_accounts_hash
+            })
+            .count();
+        let latest_same_head_send_ms = pending_snapshot
+            .iter()
+            .filter(|pending| {
+                pending.sequence == head.next_sequence
+                    && pending.accounts_hash == head.head_accounts_hash
+            })
+            .map(|pending| pending.sent_at_ms)
+            .max()
+            .unwrap_or(0);
+        let can_pipeline_same_head = same_head_pending_count
+            < self.config.executor_pipeline_max_per_head
+            && pending_snapshot.len() < self.config.executor_max_pending_txs
+            && now_ms.saturating_sub(latest_same_head_send_ms)
+                >= self.config.executor_same_head_send_interval_ms;
+        if !pending_snapshot.is_empty() && !can_pipeline_same_head {
+            self.metrics
+                .execute_send_suppressed_pending
+                .fetch_add(1, Ordering::Relaxed);
             return Ok(ExecuteLoopOutcome::Busy);
         }
 
@@ -1981,6 +2602,13 @@ impl Engine {
             );
             return Ok(ExecuteLoopOutcome::Busy);
         }
+
+        let gap_skip_mode = self.config.executor_match_head_only
+            && self.config.executor_safe_speculative
+            && matches!(
+                head.reason,
+                "ctm_gap_or_empty_slot" | "ctm_sequence_mismatch"
+            );
 
         let (candidate_lanes, speculative_mode) = if self.config.executor_match_head_only {
             match head.head_accounts_hash {
@@ -2003,6 +2631,61 @@ impl Engine {
                         self.metrics
                             .execute_no_lane_match
                             .fetch_add(1, Ordering::Relaxed);
+
+                        // Auto-drop heads stuck with no lane match for too long.
+                        // Uses wall-clock ms; 2 slots ≈ 800ms, we use slot_count * 400ms.
+                        let drop_slots = self.config.executor_no_lane_match_drop_slots;
+                        if drop_slots > 0 {
+                            let now_ms = unix_timestamp_ms();
+                            let threshold_ms = drop_slots * 400;
+                            let mut tracker = executor.no_lane_match_since.lock().await;
+                            let should_drop = match *tracker {
+                                Some((seq, first_ms)) if seq == head.next_sequence => {
+                                    now_ms.saturating_sub(first_ms) >= threshold_ms
+                                }
+                                _ => {
+                                    *tracker = Some((head.next_sequence, now_ms));
+                                    false
+                                }
+                            };
+                            drop(tracker);
+
+                            if should_drop {
+                                warn!(
+                                    "executor auto-dropping no_lane_match head sequence={} head_hash={} after {}ms threshold",
+                                    head.next_sequence,
+                                    bytes_to_hex(&hash),
+                                    threshold_ms,
+                                );
+                                match self
+                                    .drop_ctm_head_with_admin_tx(
+                                        executor,
+                                        head.next_sequence,
+                                        "no_lane_match_stale",
+                                    )
+                                    .await
+                                {
+                                    Ok(sig) => {
+                                        info!(
+                                            "executor no_lane_match admin-drop succeeded sequence={} tx={}",
+                                            head.next_sequence, sig
+                                        );
+                                        // Reset tracker — head will change on next inspect
+                                        *executor.no_lane_match_since.lock().await = None;
+                                        // Force re-inspect on next iteration
+                                        executor.last_inspect_ms.store(0, Ordering::Relaxed);
+                                    }
+                                    Err(err) => {
+                                        warn!(
+                                            "executor no_lane_match admin-drop failed sequence={} err={err:?}",
+                                            head.next_sequence
+                                        );
+                                    }
+                                }
+                                return Ok(ExecuteLoopOutcome::Busy);
+                            }
+                        }
+
                         debug!(
                             "executor skipped: queue_count={} next_sequence={} reason=no_lane_match head_hash={}",
                             head.count,
@@ -2011,17 +2694,37 @@ impl Engine {
                         );
                         return Ok(ExecuteLoopOutcome::Busy);
                     }
+                    // Include additional lanes so execute_multi can batch
+                    // consecutive items with different hashes in one tx.
+                    // With HLT (precomputed lane hashes), per-item hash matching
+                    // is O(L) byte comparisons, so more lanes are affordable.
+                    // Cap at 5 to stay within tx size limit (1232 bytes).
+                    let head_account_count = matched
+                        .first()
+                        .map(|l| l.remaining_accounts.len())
+                        .unwrap_or(0);
+                    let mut seen: std::collections::HashSet<[u8; 32]> =
+                        matched.iter().map(|l| l.hash).collect();
+                    for lane in &lanes {
+                        if seen.len() >= 5 {
+                            break;
+                        }
+                        if seen.contains(&lane.hash) {
+                            continue;
+                        }
+                        if lane.remaining_accounts.len() != head_account_count {
+                            continue;
+                        }
+                        seen.insert(lane.hash);
+                        matched.push(lane.clone());
+                    }
                     (matched, false)
                 }
                 None => {
                     self.metrics
                         .execute_head_missing
                         .fetch_add(1, Ordering::Relaxed);
-                    let speculative_lanes = if self.config.executor_safe_speculative
-                        && matches!(
-                            head.reason,
-                            "ctm_gap_or_empty_slot" | "ctm_sequence_mismatch"
-                        ) {
+                    let speculative_lanes = if gap_skip_mode {
                         select_gap_speculative_lanes(lanes)
                     } else {
                         Vec::new()
@@ -2057,6 +2760,57 @@ impl Engine {
 
         if pending_snapshot.len() >= self.config.executor_max_pending_txs {
             return Ok(ExecuteLoopOutcome::Busy);
+        }
+
+        if gap_skip_mode {
+            self.metrics
+                .execute_attempts
+                .fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .execute_targeted
+                .fetch_add(1, Ordering::Relaxed);
+            match self.build_gap_skip_tx(executor, head.next_sequence).await {
+                Ok((tx, send_cfg)) => match self
+                    .rpc
+                    .send_transaction_with_config(&tx, send_cfg)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+                {
+                    Ok(signature) => {
+                        self.metrics.execute_sent.fetch_add(1, Ordering::Relaxed);
+                        let mut dispatches = executor.pending_dispatches.lock().await;
+                        dispatches.push(PendingHeadDispatch {
+                            sequence: head.next_sequence,
+                            accounts_hash: None,
+                            lane_hash: [0u8; 32],
+                            sent_at_ms: now_ms,
+                            last_status_check_ms: now_ms,
+                            no_advance_recorded: false,
+                            targeted: true,
+                            signature: signature.clone(),
+                        });
+                        info!(
+                            "executor sent gap-skip sequence={} queue_count={} tx={}",
+                            head.next_sequence, head.count, signature,
+                        );
+                        return Ok(ExecuteLoopOutcome::Sent);
+                    }
+                    Err(err) => {
+                        warn!(
+                            "executor gap-skip send failed sequence={} err={err:?}",
+                            head.next_sequence
+                        );
+                        return Ok(ExecuteLoopOutcome::Busy);
+                    }
+                },
+                Err(err) => {
+                    warn!(
+                        "executor gap-skip build failed sequence={} err={err:?}",
+                        head.next_sequence
+                    );
+                    return Ok(ExecuteLoopOutcome::Busy);
+                }
+            }
         }
 
         // Collect eligible lanes (de-dup by hash, skip backed-off lanes)
@@ -2146,6 +2900,11 @@ impl Engine {
         match send_result {
             Ok(signature) => {
                 self.metrics.execute_sent.fetch_add(1, Ordering::Relaxed);
+                if same_head_pending_count > 0 {
+                    self.metrics
+                        .execute_pipeline_sent
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 let mut dispatches = executor.pending_dispatches.lock().await;
                 dispatches.push(PendingHeadDispatch {
                     sequence: head.next_sequence,
@@ -2154,13 +2913,16 @@ impl Engine {
                     sent_at_ms: now_ms,
                     last_status_check_ms: now_ms,
                     no_advance_recorded: false,
+                    targeted: !speculative_mode,
                     signature: signature.clone(),
                 });
                 info!(
-                    "executor sent multi-lane lanes={} sequence={} queue_count={} tx={}",
+                    "executor sent multi-lane lanes={} sequence={} queue_count={} pending_total={} pending_same_head={} tx={}",
                     eligible_lanes.len(),
                     head.next_sequence,
                     head.count,
+                    pending_snapshot.len() + 1,
+                    same_head_pending_count + 1,
                     signature,
                 );
                 return Ok(ExecuteLoopOutcome::Sent);
@@ -2204,7 +2966,7 @@ impl Engine {
     ) -> Result<(VersionedTransaction, RpcSendTransactionConfig)> {
         let chain = self.blockhashes.snapshot().await;
         let mut instructions = vec![
-            ComputeBudgetInstruction::set_compute_unit_limit(900_000),
+            ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
             build_execute_head_memo_instruction(
                 head_sequence,
                 self.execute_nonce.fetch_add(1, Ordering::Relaxed),
@@ -2256,7 +3018,7 @@ impl Engine {
         // Pass the pre-computed lane hashes (with original flags, not runtime-OR'd)
         let lane_hashes: Vec<[u8; 32]> = lanes.iter().map(|l| l.hash).collect();
         let mut instructions = vec![
-            ComputeBudgetInstruction::set_compute_unit_limit(900_000),
+            ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
             build_execute_head_memo_instruction(
                 head_sequence,
                 self.execute_nonce.fetch_add(1, Ordering::Relaxed),
@@ -2268,6 +3030,53 @@ impl Engine {
                 &lane_accounts,
                 lane_hashes,
                 self.config.executor_max_items,
+            ),
+        ];
+        if self.config.executor_prioritization_fee > 0 {
+            instructions.insert(
+                0,
+                ComputeBudgetInstruction::set_compute_unit_price(
+                    self.config.executor_prioritization_fee,
+                ),
+            );
+        }
+        let message = MessageV0::try_compile(
+            &self.config.payer.pubkey(),
+            &instructions,
+            &[],
+            chain.blockhash,
+        )?;
+        let tx = VersionedTransaction::try_new(
+            solana_sdk::message::VersionedMessage::V0(message),
+            &[self.config.payer.as_ref()],
+        )?;
+        let send_cfg = RpcSendTransactionConfig {
+            skip_preflight: self.config.executor_skip_preflight,
+            preflight_commitment: Some(CommitmentConfig::processed().commitment),
+            max_retries: self.config.executor_rpc_max_retries,
+            ..RpcSendTransactionConfig::default()
+        };
+        Ok((tx, send_cfg))
+    }
+
+    async fn build_gap_skip_tx(
+        &self,
+        executor: &Arc<ExecutorState>,
+        head_sequence: u64,
+    ) -> Result<(VersionedTransaction, RpcSendTransactionConfig)> {
+        let chain = self.blockhashes.snapshot().await;
+        let mut instructions = vec![
+            ComputeBudgetInstruction::set_compute_unit_limit(400_000),
+            build_execute_head_memo_instruction(
+                head_sequence,
+                self.execute_nonce.fetch_add(1, Ordering::Relaxed),
+            ),
+            build_execute_instruction(
+                self.config.program_id,
+                executor.group,
+                executor.execution_queue,
+                &[],
+                self.config.executor_max_items.max(1),
             ),
         ];
         if self.config.executor_prioritization_fee > 0 {
@@ -2582,6 +3391,58 @@ fn load_executor_lanes(config: &Config) -> Result<HashMap<String, Lane>> {
             lanes.insert(bytes_to_hex(&expanded.hash), expanded);
         }
     }
+    let static_count = lanes.len();
+    info!(
+        "loaded static lanes: {} unique hashes from {:?}",
+        static_count, path,
+    );
+
+    // Also load cached lanes
+    if let Some(cache_path) = config.executor_lane_cache_path.as_ref() {
+        if cache_path.exists() {
+            match std::fs::read_to_string(cache_path) {
+                Ok(raw) => {
+                    if let Ok(cached) = serde_json::from_str::<Vec<LaneConfigFile>>(&raw) {
+                        for lane in cached {
+                            let remaining_accounts = lane
+                                .remaining_accounts
+                                .iter()
+                                .map(|account| {
+                                    Ok(AccountMeta {
+                                        pubkey: Pubkey::from_str(&account.pubkey)?,
+                                        is_signer: account.is_signer,
+                                        is_writable: account.is_writable,
+                                    })
+                                })
+                                .collect::<Result<Vec<_>>>();
+                            if let Ok(accounts) = remaining_accounts {
+                                let lane_name = lane.name.unwrap_or_else(|| "cached".to_string());
+                                for expanded in expand_lane_variants(
+                                    lane_name,
+                                    &accounts,
+                                    group,
+                                    execution_queue,
+                                    config.executor_include_legacy_fixed_hash,
+                                ) {
+                                    lanes.insert(bytes_to_hex(&expanded.hash), expanded);
+                                }
+                            }
+                        }
+                        info!(
+                            "loaded lane cache: {} total unique hashes (+{} from cache) from {:?}",
+                            lanes.len(),
+                            lanes.len() - static_count,
+                            cache_path,
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!("failed to read lane cache {:?}: {e}", cache_path);
+                }
+            }
+        }
+    }
+
     Ok(lanes)
 }
 
@@ -3228,7 +4089,14 @@ fn is_execution_queue_duplicate_sequence_error(
 }
 
 fn rpc_status(err: impl std::fmt::Display) -> Status {
-    Status::deadline_exceeded(err.to_string())
+    let message = err.to_string();
+    if message.contains("custom program error: 0x17bc")
+        || message.contains("custom program error: 0x17BD")
+        || message.contains("ExecutionQueueFull")
+    {
+        return Status::resource_exhausted(message);
+    }
+    Status::deadline_exceeded(message)
 }
 
 async fn run_http_server(bind_addr: SocketAddr, metrics: Arc<Metrics>) {
@@ -3283,6 +4151,7 @@ async fn main() -> Result<()> {
         metrics: metrics.clone(),
         inflight: Arc::new(Semaphore::new(config.max_inflight)),
         http_client: reqwest::Client::new(),
+        harness_readiness: Arc::new(Mutex::new(None)),
         executor: executor.clone(),
         execute_nonce: Arc::new(AtomicU64::new(1)),
     });
@@ -3322,6 +4191,68 @@ mod tests {
 
     fn write_u64(data: &mut [u8], offset: usize, value: u64) {
         data[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    #[test]
+    fn derive_harness_base_url_uses_relay_ingest_endpoint() {
+        assert_eq!(
+            derive_harness_base_url(Some("http://127.0.0.1:9091/ingest/relay-intent")),
+            Some("http://127.0.0.1:9091".to_string())
+        );
+        assert_eq!(
+            derive_harness_base_url(Some("http://127.0.0.1:9091/other")),
+            None
+        );
+    }
+
+    #[test]
+    fn validate_harness_health_accepts_fresh_reconciled_payload() {
+        let health = HarnessHealthResponse {
+            ok: true,
+            onchain_read_enabled: true,
+            generated_ts_ms: Some(99_500),
+            last_reconcile_ts_ms: Some(99_400),
+            reconcile_interval_ms: Some(10_000),
+            reconcile_markets_with_drift: 0,
+        };
+
+        assert!(validate_harness_health(&health, 100_000, 30_000).is_ok());
+    }
+
+    #[test]
+    fn validate_harness_health_rejects_stale_reconcile_timestamp() {
+        let health = HarnessHealthResponse {
+            ok: true,
+            onchain_read_enabled: true,
+            generated_ts_ms: Some(90_000),
+            last_reconcile_ts_ms: Some(60_000),
+            reconcile_interval_ms: Some(10_000),
+            reconcile_markets_with_drift: 0,
+        };
+
+        let err = validate_harness_health(&health, 100_000, 30_000).unwrap_err();
+        assert!(err.contains("last_reconcile_ts_ms"));
+    }
+
+    #[test]
+    fn harness_market_has_drift_detects_nonzero_diff_fields() {
+        let clean = HarnessMarketDrift {
+            replay_open_orders: 2,
+            onchain_open_orders: 2,
+            replay_best_bid: Some("100".to_string()),
+            onchain_best_bid: Some("100".to_string()),
+            replay_best_ask: Some("101".to_string()),
+            onchain_best_ask: Some("101".to_string()),
+            bid_base_lots_abs_diff: "0".to_string(),
+            ask_base_lots_abs_diff: "0".to_string(),
+        };
+        let drifted = HarnessMarketDrift {
+            bid_base_lots_abs_diff: "3".to_string(),
+            ..clean.clone()
+        };
+
+        assert!(!harness_market_has_drift(&clean));
+        assert!(harness_market_has_drift(&drifted));
     }
 
     fn queue_item_offset(sequence: u64) -> usize {
@@ -3631,7 +4562,11 @@ mod tests {
         let mut data = vec![0u8; EXECUTION_QUEUE_LIQUIDITY_ITEMS_OFFSET];
         let boundary_seq: u64 = (EXECUTION_QUEUE_CTM_CAPACITY as u64) - 1; // 1023 typically
         write_u32(&mut data, EXECUTION_QUEUE_COUNT_OFFSET, 1);
-        write_u64(&mut data, EXECUTION_QUEUE_NEXT_SEQUENCE_OFFSET, boundary_seq);
+        write_u64(
+            &mut data,
+            EXECUTION_QUEUE_NEXT_SEQUENCE_OFFSET,
+            boundary_seq,
+        );
         write_u64(
             &mut data,
             EXECUTION_QUEUE_MAX_SEEN_SEQUENCE_OFFSET,

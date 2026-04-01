@@ -8,6 +8,7 @@ import * as protoLoader from '@grpc/proto-loader';
 import { MangoClient } from '../../src/client';
 import { MANGO_V4_ID } from '../../src/constants';
 import {
+  PerpMarketIndex,
   PerpOrderSide,
   PerpOrderType,
   PerpSelfTradeBehavior,
@@ -79,7 +80,7 @@ async function executionQueueCanonicalPerpRemainingAccounts(params: {
   marketIndex: number;
   userOwner: PublicKey;
 }): Promise<AccountMeta[]> {
-  const perpMarket = params.group.getPerpMarketByMarketIndex(params.marketIndex);
+  const perpMarket = params.group.getPerpMarketByMarketIndex(params.marketIndex as PerpMarketIndex);
   const healthRemainingAccounts = await params.client.buildHealthRemainingAccounts(
     params.group,
     [params.mangoAccount],
@@ -132,7 +133,7 @@ async function main(): Promise<void> {
   const orderType = parseOrderType();
   const side = PRICE > 0 ? PerpOrderSide.bid : PerpOrderSide.ask;
   const selfTradeBehavior = PerpSelfTradeBehavior.decrementTake;
-  const perpMarket = group.getPerpMarketByMarketIndex(PERP_MARKET_INDEX);
+  const perpMarket = group.getPerpMarketByMarketIndex(PERP_MARKET_INDEX as PerpMarketIndex);
 
   const remainingAccounts = await executionQueueCanonicalPerpRemainingAccounts({
     client,

@@ -82,8 +82,9 @@ pub fn token_register_bootstrap(
     let oracle_ref = &AccountInfoRef::borrow(ctx.accounts.oracle.as_ref())?;
     if let Ok(oracle_price) = bank.oracle_price(&OracleAccountInfos::from_reader(oracle_ref), None)
     {
-        bank.stable_price_model
-            .reset_to_price(oracle_price.to_num(), now_ts);
+        let mut spm = { bank.stable_price_model };
+        spm.reset_to_price(oracle_price.to_num(), now_ts);
+        bank.stable_price_model = spm;
     } else {
         bank.stable_price_model.reset_on_nonzero_price = 1;
     }

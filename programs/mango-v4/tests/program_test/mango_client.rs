@@ -214,7 +214,11 @@ fn anchor_discriminator(ix_name: &str) -> [u8; 8] {
 }
 
 pub fn execution_queue_pda(group: Pubkey) -> Pubkey {
-    Pubkey::find_program_address(&[b"ExecutionQueue".as_ref(), group.as_ref()], &mango_v4::id()).0
+    Pubkey::find_program_address(
+        &[b"ExecutionQueue".as_ref(), group.as_ref()],
+        &mango_v4::id(),
+    )
+    .0
 }
 
 #[derive(Default)]
@@ -395,7 +399,9 @@ impl ClientInstruction for ExecutionQueueEnqueueLiquidityInstruction {
             accounts: accounts.to_account_metas(None),
             data,
         };
-        instruction.accounts.extend(self.remaining_accounts.iter().cloned());
+        instruction
+            .accounts
+            .extend(self.remaining_accounts.iter().cloned());
         (accounts, instruction)
     }
 
@@ -466,7 +472,9 @@ impl ClientInstruction for ExecutionQueueExecuteInstruction {
             accounts: accounts.to_account_metas(None),
             data,
         };
-        instruction.accounts.extend(self.remaining_accounts.iter().cloned());
+        instruction
+            .accounts
+            .extend(self.remaining_accounts.iter().cloned());
         (accounts, instruction)
     }
 

@@ -243,6 +243,7 @@ impl ExecutionQueue {
         self.header.next_sequence_to_execute =
             self.header.next_sequence_to_execute.saturating_add(1);
         self.header.gap_observed_slot = 0;
+        self.normalize_empty_ctm_head();
     }
 
     /// Scan forward from next_sequence_to_execute for the first pending CTM item
@@ -296,6 +297,20 @@ impl ExecutionQueue {
             } else {
                 break;
             }
+        }
+        self.normalize_empty_ctm_head();
+    }
+
+    /// When the CTM ring becomes empty, every sequence up to max_seen_sequence has
+    /// already been resolved (executed, failed, skipped, or administratively dropped).
+    /// Advance the head beyond that resolved range so the queue cannot remain empty
+    /// while still pointing at a stale skipped gap.
+    pub fn normalize_empty_ctm_head(&mut self) {
+        if self.header.ctm_count == 0
+            && self.header.max_seen_sequence >= self.header.next_sequence_to_execute
+        {
+            self.header.next_sequence_to_execute = self.header.max_seen_sequence.saturating_add(1);
+            self.header.gap_observed_slot = 0;
         }
     }
 
@@ -535,13 +550,22 @@ mod tests {
             .push_liquidity(pending_liquidity_item(7, QueueItemKind::LiquidityDeposit))
             .unwrap();
 
-        assert_eq!(queue.header.total_count, queue.header.ctm_count + queue.header.liquidity_count);
+        assert_eq!(
+            queue.header.total_count,
+            queue.header.ctm_count + queue.header.liquidity_count
+        );
 
         queue.clear_current_ctm_head_and_advance();
-        assert_eq!(queue.header.total_count, queue.header.ctm_count + queue.header.liquidity_count);
+        assert_eq!(
+            queue.header.total_count,
+            queue.header.ctm_count + queue.header.liquidity_count
+        );
 
         queue.pop_liquidity_head().unwrap();
-        assert_eq!(queue.header.total_count, queue.header.ctm_count + queue.header.liquidity_count);
+        assert_eq!(
+            queue.header.total_count,
+            queue.header.ctm_count + queue.header.liquidity_count
+        );
 
         queue.clear_current_ctm_head_and_advance();
         assert_eq!(queue.header.total_count, 0);
@@ -579,10 +603,7 @@ mod tests {
         // Window is [0, 1024). Sequence 1023 should be accepted.
         queue.header.next_sequence_to_execute = 0;
         queue
-            .push_ctm(pending_ctm_item(
-                EXECUTION_QUEUE_CTM_CAPACITY as u64 - 1,
-                1,
-            ))
+            .push_ctm(pending_ctm_item(EXECUTION_QUEUE_CTM_CAPACITY as u64 - 1, 1))
             .unwrap();
         assert_eq!(queue.header.ctm_count, 1);
     }
@@ -603,9 +624,7 @@ mod tests {
             .unwrap();
         assert_eq!(queue.header.ctm_count, 1);
         assert_eq!(
-            queue
-                .ctm_item(EXECUTION_QUEUE_CTM_CAPACITY as u64)
-                .sequence,
+            queue.ctm_item(EXECUTION_QUEUE_CTM_CAPACITY as u64).sequence,
             EXECUTION_QUEUE_CTM_CAPACITY as u64
         );
     }
@@ -634,7 +653,9 @@ mod tests {
         let mut queue = test_queue();
         // Push 1024 items
         for i in 0..EXECUTION_QUEUE_CTM_CAPACITY as u64 {
-            queue.push_ctm(pending_ctm_item(i, (i % 256) as u8)).unwrap();
+            queue
+                .push_ctm(pending_ctm_item(i, (i % 256) as u8))
+                .unwrap();
         }
         assert_eq!(queue.header.ctm_count, EXECUTION_QUEUE_CTM_CAPACITY as u32);
         assert_eq!(
@@ -786,6 +807,22 @@ mod tests {
     }
 
     #[test]
+    fn clear_ctm_item_at_last_pending_item_advances_past_resolved_gap() {
+        let mut queue = test_queue();
+        queue.push_ctm(pending_ctm_item(2971, 1)).unwrap();
+        queue.header.next_sequence_to_execute = 2970;
+        queue.header.max_seen_sequence = 2971;
+        queue.header.gap_observed_slot = 42;
+
+        queue.clear_ctm_item_at(2971);
+
+        assert_eq!(queue.header.ctm_count, 0);
+        assert_eq!(queue.header.total_count, 0);
+        assert_eq!(queue.header.next_sequence_to_execute, 2972);
+        assert_eq!(queue.header.gap_observed_slot, 0);
+    }
+
+    #[test]
     fn find_matching_ctm_item_at_max_scan_boundary() {
         let mut queue = test_queue();
         // Place items at seq 0 and seq 5
@@ -868,9 +905,7 @@ mod tests {
         assert!(queue.can_enqueue_ctm_sequence(u64::MAX - 5));
         assert!(queue.can_enqueue_ctm_sequence(u64::MAX - 1));
         assert!(!queue.can_enqueue_ctm_sequence(u64::MAX)); // saturating edge
-        queue
-            .push_ctm(pending_ctm_item(u64::MAX - 5, 1))
-            .unwrap();
+        queue.push_ctm(pending_ctm_item(u64::MAX - 5, 1)).unwrap();
         assert_eq!(queue.header.ctm_count, 1);
     }
 

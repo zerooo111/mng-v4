@@ -22,3 +22,4 @@ err-txs
 .localnet.bak.*
 .devnet
 third-party
+.screen

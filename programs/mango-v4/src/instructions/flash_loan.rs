@@ -73,7 +73,7 @@ pub fn flash_loan_begin<'key, 'accounts, 'remaining, 'info>(
         require_keys_eq!(bank.vault, *vault_ai.key);
 
         require_msg!(
-            !seen_token_indexes.contains(&bank.token_index),
+            !seen_token_indexes.contains(&{ bank.token_index }),
             "each loan must be for a unique token_index"
         );
         seen_token_indexes.push(bank.token_index);
@@ -443,14 +443,14 @@ pub fn flash_loan_end<'key, 'accounts, 'remaining, 'info>(
         };
 
         let loan_origination_fee = loan * bank.loan_origination_fee_rate;
-        bank.collected_fees_native += loan_origination_fee;
+        bank.collected_fees_native = { bank.collected_fees_native } + loan_origination_fee;
 
         let swap_fee = if change.amount < 0 && flash_loan_type == FlashLoanType::Swap {
             -change.amount * I80F48::from_num(max_swap_fee_rate)
         } else {
             I80F48::ZERO
         };
-        bank.collected_fees_native += swap_fee;
+        bank.collected_fees_native = { bank.collected_fees_native } + swap_fee;
 
         let change_amount = change.amount - loan_origination_fee - swap_fee;
         let native_after_change = native + change_amount;

@@ -269,7 +269,7 @@ export type UserBalances = {
 
 export type MarginSummaryPlaceholder = {
   status: 'placeholder';
-  source: 'queue-replay';
+  source: 'queue-replay' | 'onchain-sync';
 };
 
 export type MarginSummaryEmpty = {
@@ -632,6 +632,66 @@ export class ContinuumStateEngine {
   private lastSeenSlot = 0n;
   private cachedConfirmed: { revision: number; snapshot: EngineSnapshot } | null = null;
   private cachedOptimistic: { revision: number; snapshot: EngineSnapshot } | null = null;
+
+  /**
+   * Baseline positions seeded from on-chain confirmed state at startup.
+   * These are added to the trade-derived position deltas in buildSnapshot(),
+   * so that the harness starts from the correct on-chain positions rather
+   * than from zero. Key: `${owner}:${market}`.
+   */
+  private readonly baselinePositions = new Map<
+    string,
+    { basePositionLots: bigint; quotePositionNative: bigint }
+  >();
+  private readonly baselineOrders = new Map<string, InternalOrder>();
+  private baselineConfirmedSeq = new Map<string, bigint>();
+  private baselineBootstrapped = false;
+
+  /**
+   * Bootstrap the engine from an on-chain confirmed snapshot.
+   * Call this once at startup, before any intents are ingested.
+   * Sets baseline positions and confirmed watermarks so the harness
+   * starts in sync with on-chain state.
+   */
+  bootstrapFromOnchainSnapshot(snapshot: EngineSnapshot): void {
+    if (this.baselineBootstrapped) {
+      return; // Only bootstrap once
+    }
+    this.baselineBootstrapped = true;
+    for (const [owner, userState] of Object.entries(snapshot.users)) {
+      for (const pm of userState.per_market) {
+        const key = `${owner}:${pm.market}`;
+        this.baselinePositions.set(key, {
+          basePositionLots: BigInt(pm.base_position_lots),
+          quotePositionNative: BigInt(pm.quote_position_native),
+        });
+      }
+    }
+    for (const [market, marketState] of Object.entries(snapshot.markets)) {
+      this.baselineConfirmedSeq.set(
+        market,
+        BigInt(marketState.watermarks.confirmed_seq),
+      );
+      for (const order of marketState.open_orders) {
+        this.baselineOrders.set(order.order_id, {
+          order_id: order.order_id,
+          owner: order.owner,
+          mango_account: order.mango_account,
+          market: order.market,
+          side: order.side,
+          price_lots: BigInt(order.price_lots),
+          base_lots: BigInt(order.base_lots),
+          quote_lots: BigInt(order.quote_lots),
+          client_order_id: BigInt(order.client_order_id),
+          sequence: BigInt(order.sequence),
+          expiry_timestamp: BigInt(order.expiry_timestamp),
+        });
+      }
+    }
+    this.revision++;
+    this.cachedConfirmed = null;
+    this.cachedOptimistic = null;
+  }
 
   subscribe(listener: (event: HarnessEvent) => void): () => void {
     this.listeners.add(listener);
@@ -1102,6 +1162,20 @@ export class ContinuumStateEngine {
         });
       }
     }
+    // Ensure baseline-bootstrapped owners are included even if they have
+    // no intents yet (e.g., maker/taker from on-chain bootstrap).
+    if (this.baselineBootstrapped) {
+      for (const key of this.baselinePositions.keys()) {
+        const owner = key.split(':')[0];
+        if (!projection.users.has(owner)) {
+          projection.users.set(owner, {
+            owner,
+            mango_accounts: new Set(),
+            orders: new Set(),
+          });
+        }
+      }
+    }
     for (const [owner, user] of projection.users.entries()) {
       const orders = Array.from(user.orders)
         .map((orderId) =>
@@ -1149,6 +1223,24 @@ export class ContinuumStateEngine {
           current.basePositionLots += pos.basePositionLots;
           current.quotePositionNative += pos.quotePositionNative;
           perMarketMap.set(market, current);
+        }
+      }
+
+      // Add on-chain baseline positions (seeded at startup via bootstrapFromOnchainSnapshot)
+      if (this.baselineBootstrapped) {
+        for (const [key, baseline] of this.baselinePositions.entries()) {
+          const [bOwner, bMarket] = key.split(':');
+          if (bOwner !== owner) continue;
+          const current = perMarketMap.get(bMarket) || {
+            openBid: 0n,
+            openAsk: 0n,
+            quoteReserved: 0n,
+            basePositionLots: 0n,
+            quotePositionNative: 0n,
+          };
+          current.basePositionLots += baseline.basePositionLots;
+          current.quotePositionNative += baseline.quotePositionNative;
+          perMarketMap.set(bMarket, current);
         }
       }
 
@@ -1206,7 +1298,27 @@ export class ContinuumStateEngine {
       last_slot: this.lastSeenSlot,
     };
 
-    const intents = this.listIntents();
+    if (this.baselineBootstrapped) {
+      for (const market of this.baselineConfirmedSeq.keys()) {
+        this.getOrCreateMarket(projection, market);
+      }
+      for (const order of this.baselineOrders.values()) {
+        const market = this.getOrCreateMarket(projection, order.market);
+        const user = this.getOrCreateUser(projection, order.owner);
+        const cloned = { ...order };
+        market.orders.set(cloned.order_id, cloned);
+        user.mango_accounts.add(cloned.mango_account);
+        user.orders.add(cloned.order_id);
+        this.accumulateDepth(market, cloned.side, cloned.price_lots, cloned.base_lots);
+      }
+    }
+
+    const baselineSeqForMarket = (market: string): bigint =>
+      this.baselineBootstrapped ? this.baselineConfirmedSeq.get(market) || 0n : 0n;
+
+    const intents = this.listIntents().filter(
+      (intent) => intent.sequence > baselineSeqForMarket(intent.market),
+    );
     const confirmed = intents
       .filter((it) => it.processed_status === QueueProcessStatus.Executed)
       .sort(orderIntentsDeterministically);
@@ -1258,12 +1370,18 @@ export class ContinuumStateEngine {
 
     for (const market of projection.markets.values()) {
       const marketIntents = intents.filter((it) => it.market === market.market);
-      const optimisticSeq = maxBigintFrom(
+      const baselineSeq = baselineSeqForMarket(market.market);
+      const optimisticSeq = maxBigint(
+        baselineSeq,
+        maxBigintFrom(
         marketIntents
           .filter((it) => it.kind === QueueItemKindHarness.CtmWrapped)
           .map((it) => it.sequence),
+        ),
       );
-      const confirmedSeq = maxBigintFrom(
+      const confirmedSeq = maxBigint(
+        baselineSeq,
+        maxBigintFrom(
         marketIntents
           .filter(
             (it) =>
@@ -1271,6 +1389,7 @@ export class ContinuumStateEngine {
               it.processed_status === QueueProcessStatus.Executed,
           )
           .map((it) => it.sequence),
+        ),
       );
       market.optimistic_seq = optimisticSeq;
       market.confirmed_seq = confirmedSeq;
@@ -1369,17 +1488,27 @@ export class ContinuumStateEngine {
       payload.max_quote_lots < 0n ? -payload.max_quote_lots : payload.max_quote_lots;
 
     const orderType = payload.order_type;
-    const isPostOnly =
-      orderType === PERP_ORDER_TYPE_POST_ONLY ||
-      orderType === PERP_ORDER_TYPE_POST_ONLY_SLIDE;
+    const isPostOnly = orderType === PERP_ORDER_TYPE_POST_ONLY;
+    const isPostOnlySlide = orderType === PERP_ORDER_TYPE_POST_ONLY_SLIDE;
     const isImmediateOnly =
       orderType === PERP_ORDER_TYPE_IOC || orderType === PERP_ORDER_TYPE_MARKET;
-    const canTake = !isPostOnly;
-    const canRest = !isImmediateOnly && !isPostOnly;
+    const canTake = !isPostOnly && !isPostOnlySlide;
+    const canRest = !isImmediateOnly;
 
-    const opposing = this.findCrossingOrders(market, side, payload.price_lots);
+    let effectivePriceLots = payload.price_lots;
+    const opposing = this.findCrossingOrders(market, side, effectivePriceLots);
     if (isPostOnly && opposing.length > 0) {
       return;
+    }
+    if (isPostOnlySlide && opposing.length > 0) {
+      const bestOtherPrice = opposing[0].price_lots;
+      effectivePriceLots =
+        side === 'bid'
+          ? minBigint(effectivePriceLots, bestOtherPrice - 1n)
+          : maxBigint(effectivePriceLots, bestOtherPrice + 1n);
+      if (effectivePriceLots <= 0n) {
+        return;
+      }
     }
 
     let quoteConsumed = 0n;
@@ -1458,7 +1587,7 @@ export class ContinuumStateEngine {
       return;
     }
 
-    const restQuoteLots = payload.price_lots * remainingBaseLots;
+    const restQuoteLots = effectivePriceLots * remainingBaseLots;
     const orderId = `${intent.group}:${intent.market}:${intent.sequence.toString()}:${payload.client_order_id.toString()}`;
     const order: InternalOrder = {
       order_id: orderId,
@@ -1466,7 +1595,7 @@ export class ContinuumStateEngine {
       mango_account: intent.mango_account,
       market: intent.market,
       side,
-      price_lots: payload.price_lots,
+      price_lots: effectivePriceLots,
       base_lots: remainingBaseLots,
       quote_lots: restQuoteLots > 0n ? restQuoteLots : 0n,
       client_order_id: payload.client_order_id,
@@ -1475,7 +1604,7 @@ export class ContinuumStateEngine {
     };
     market.orders.set(orderId, order);
     takerUser.orders.add(orderId);
-    this.accumulateDepth(market, side, payload.price_lots, remainingBaseLots);
+    this.accumulateDepth(market, side, effectivePriceLots, remainingBaseLots);
   }
 
   private findCrossingOrders(

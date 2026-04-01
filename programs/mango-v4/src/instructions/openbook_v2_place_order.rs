@@ -498,7 +498,8 @@ pub fn apply_settle_changes(
         received_fees = before_oo
             .native_rebates()
             .saturating_sub(after_oo.native_rebates());
-        quote_bank.collected_fees_native += I80F48::from(received_fees);
+        quote_bank.collected_fees_native =
+            { quote_bank.collected_fees_native } + I80F48::from(received_fees);
 
         // Credit the buyback_fees at the current value of the quote token.
         if let Some(quote_oracle_ai) = quote_oracle {
@@ -575,8 +576,12 @@ fn update_bank_potential_tokens(
     quote_bank: &mut Bank,
     oo: &OpenOrdersSlim,
 ) {
-    assert_eq!(openbook_orders.base_token_index, base_bank.token_index);
-    assert_eq!(openbook_orders.quote_token_index, quote_bank.token_index);
+    assert_eq!({ openbook_orders.base_token_index }, {
+        base_bank.token_index
+    });
+    assert_eq!({ openbook_orders.quote_token_index }, {
+        quote_bank.token_index
+    });
 
     // Potential tokens are all tokens on the side, plus reserved on the other side
     // converted at favorable price. This creates an overestimation of the potential
@@ -658,6 +663,9 @@ fn cpi_place_order<'info>(
             order_type,
             peg_limit,
         } => todo!(),
+        openbook_v2::state::OrderParams::FillOrKill { price_lots } => {
+            OpenbookV2OrderType::ImmediateOrCancel
+        }
     };
 
     let args = openbook_v2::PlaceOrderArgs {

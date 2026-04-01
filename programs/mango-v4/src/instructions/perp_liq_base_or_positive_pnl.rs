@@ -569,8 +569,8 @@ pub(crate) fn liquidation_action(
     // liq a short: base_transfer > 0, quote_transfer_base < 0, base_fee_factor > 1
     //   and -q_t_liqor >= q_t_liqee (both sides negative; we take more from the liqee than we give to the liqor)
     let platform_fee = (-quote_transfer_liqor - quote_transfer_liqee).max(I80F48::ZERO);
-    perp_market.fees_accrued += platform_fee;
-    perp_market.accrued_liquidation_fees += platform_fee;
+    perp_market.fees_accrued = { perp_market.fees_accrued } + platform_fee;
+    perp_market.accrued_liquidation_fees = { perp_market.accrued_liquidation_fees } + platform_fee;
 
     //
     // Let the liqor take over positive pnl until the account health is positive,

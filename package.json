@@ -107,6 +107,5 @@
     "**/cross-fetch/node-fetch": "npm:@blockworks-foundation/node-fetch@2.6.11",
     "**/@blockworks-foundation/mangolana/node-fetch": "npm:@blockworks-foundation/node-fetch@2.6.11"
   },
-  "license": "MIT",
-  "packageManager": "yarn@4.3.1"
+  "license": "MIT"
 }

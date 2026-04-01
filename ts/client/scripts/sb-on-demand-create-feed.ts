@@ -19,7 +19,7 @@ import {
   OracleJob,
   PullFeed,
   Queue,
-  SB_ON_DEMAND_PID,
+  ON_DEMAND_MAINNET_PID,
 } from '@switchboard-xyz/on-demand';
 import fs from 'fs';
 import {
@@ -328,7 +328,7 @@ const LSTExactOut = (
 };
 
 async function setupSwitchboard(userProvider: AnchorProvider) {
-  const idl = await Anchor30Program.fetchIdl(SB_ON_DEMAND_PID, userProvider);
+  const idl = await Anchor30Program.fetchIdl(ON_DEMAND_MAINNET_PID, userProvider);
   const sbOnDemandProgram = new Anchor30Program(idl!, userProvider);
   let queue = new PublicKey('A43DyUGA7s8eXPxqEjJY6EBu1KKbNgfxF8h17VAHn13w');
   if (CLUSTER == 'devnet') {

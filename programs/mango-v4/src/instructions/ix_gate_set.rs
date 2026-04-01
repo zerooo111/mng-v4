@@ -6,7 +6,7 @@ use crate::{error::MangoError, state::*};
 pub fn ix_gate_set(ctx: Context<IxGateSet>, ix_gate: u128) -> Result<()> {
     let mut group = ctx.accounts.group.load_mut()?;
 
-    msg!("old  {:?}, new {:?}", group.ix_gate, ix_gate);
+    msg!("old  {:?}, new {:?}", { group.ix_gate }, ix_gate);
 
     let mut require_group_admin = false;
     for i in 0..128 {

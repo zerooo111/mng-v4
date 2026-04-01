@@ -83,8 +83,10 @@ const RELAYER_PRIORITIZATION_FEE = Number(
   process.env.CTM_RELAYER_PRIORITIZATION_FEE ?? '0',
 );
 const PROGRAM_ID_OVERRIDE = process.env.CTM_RELAYER_PROGRAM_ID;
+// Default to serialized sequence assignment so failed submits do not burn
+// sequence numbers and create artificial queue gaps.
 const RELAYER_SERIALIZE_SUBMITS =
-  (process.env.CTM_RELAYER_SERIALIZE_SUBMITS || 'false') === 'true';
+  (process.env.CTM_RELAYER_SERIALIZE_SUBMITS || 'true') === 'true';
 const RELAYER_CONFIRM_IN_BACKGROUND =
   (process.env.CTM_RELAYER_CONFIRM_IN_BACKGROUND || 'false') === 'true';
 const RELAYER_BLOCKHASH_CACHE_MS = Number(

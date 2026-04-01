@@ -1,5 +1,9 @@
 import { AnchorProvider, BN, Wallet } from '@coral-xyz/anchor';
 import {
+  createAssociatedTokenAccountIdempotent,
+  mintTo,
+} from '@solana/spl-token';
+import {
   AccountMeta,
   Cluster,
   Commitment,
@@ -63,14 +67,14 @@ process.on('unhandledRejection', (err) => {
 type BotSpec = {
   name: string;
   keypairPath: string;
-  mangoAccount: string;
+  mangoAccount?: string;
   side: PerpOrderSide;
 };
 
 type BotSpecWire = {
   name: string;
   keypairPath: string;
-  mangoAccount: string;
+  mangoAccount?: string;
   side: 'bid' | 'ask' | 'buy' | 'sell';
 };
 
@@ -93,6 +97,7 @@ type E2EConfig = {
   executionQueue: string;
   perpMarketIndex: number;
   solMint?: string;
+  usdcMint?: string;
   maker?: {
     keypairPath?: string;
     mangoAccount?: string;
@@ -118,10 +123,13 @@ const COMMITMENT: Commitment =
   (process.env.QUOTER_COMMITMENT as Commitment) || 'confirmed';
 const INTERVAL_MS = Number(process.env.QUOTER_INTERVAL_MS || '2000');
 const PRICE_RANGE_BPS = Number(process.env.QUOTER_PRICE_RANGE_BPS || '200');
-const BID_OVERLAP_BPS = Number(process.env.QUOTER_BID_OVERLAP_BPS || '50');
+const QUOTER_BID_MIN_BPS = Number(process.env.QUOTER_BID_MIN_BPS || '-200');
+const QUOTER_BID_MAX_BPS = Number(process.env.QUOTER_BID_MAX_BPS || '-50');
+const QUOTER_ASK_MIN_BPS = Number(process.env.QUOTER_ASK_MIN_BPS || '50');
+const QUOTER_ASK_MAX_BPS = Number(process.env.QUOTER_ASK_MAX_BPS || '200');
 const SIZE_MIN_SOL = Number(process.env.QUOTER_SIZE_MIN_SOL || '1');
 const SIZE_MAX_SOL = Number(process.env.QUOTER_SIZE_MAX_SOL || '3');
-const ORDER_EXPIRY_SECS = Number(process.env.QUOTER_ORDER_EXPIRY_SECS || '120');
+const ORDER_EXPIRY_SECS = Number(process.env.QUOTER_ORDER_EXPIRY_SECS || '60');
 const CLOSE_POSITION_PROBABILITY_BPS = Number(
   process.env.QUOTER_CLOSE_POSITION_PROBABILITY_BPS || '1000',
 );
@@ -129,7 +137,7 @@ const MIN_EXECUTE_SLOT_OFFSET = BigInt(
   process.env.QUOTER_MIN_EXECUTE_SLOT_OFFSET || '1',
 );
 const CANCEL_BEFORE_PLACE =
-  (process.env.QUOTER_CANCEL_BEFORE_PLACE || 'true') === 'true';
+  (process.env.QUOTER_CANCEL_BEFORE_PLACE || 'false') === 'true';
 const CANCEL_MODE = (process.env.QUOTER_CANCEL_MODE || 'all').toLowerCase();
 const CANCEL_EVERY_TICKS = Number(process.env.QUOTER_CANCEL_EVERY_TICKS || '1');
 const CANCEL_LIMIT = Number(process.env.QUOTER_CANCEL_LIMIT || '255');
@@ -143,12 +151,16 @@ const COINGECKO_ASSET_ID =
   process.env.QUOTER_COINGECKO_ASSET_ID || 'solana';
 const COINGECKO_VS_CURRENCY =
   process.env.QUOTER_COINGECKO_VS_CURRENCY || 'usd';
+const COINGECKO_API_KEY = process.env.QUOTER_COINGECKO_API_KEY || '';
 const COINGECKO_TIMEOUT_MS = Number(
   process.env.QUOTER_COINGECKO_TIMEOUT_MS || '1500',
 );
 const COINGECKO_REFRESH_MS = Number(
   process.env.QUOTER_COINGECKO_REFRESH_MS || '10000',
 );
+const FIXED_REFERENCE_PRICE = process.env.QUOTER_FIXED_REFERENCE_PRICE
+  ? Number(process.env.QUOTER_FIXED_REFERENCE_PRICE)
+  : 0;
 const BOTS_JSON_PATH = process.env.QUOTER_BOTS_JSON_PATH || '';
 const BOTS_JSON = process.env.QUOTER_BOTS_JSON || '';
 const PARALLEL_BOT_EXECUTION =
@@ -181,6 +193,24 @@ const RELAYER_METRICS_URL =
   process.env.QUOTER_RELAYER_METRICS_URL || 'http://127.0.0.1:9093/metrics';
 const MAX_TICKS = Number(process.env.QUOTER_MAX_TICKS || '0');
 const MAX_RUNTIME_MS = Number(process.env.QUOTER_MAX_RUNTIME_MS || '0');
+const HARNESS_URL =
+  process.env.QUOTER_HARNESS_URL ||
+  process.env.CONTINUUM_HARNESS_URL ||
+  'http://127.0.0.1:9091';
+const MIN_SOL_BALANCE_LAMPORTS = Number(
+  process.env.QUOTER_MIN_SOL_BALANCE_LAMPORTS || `${0.05 * 1e9}`,
+);
+const STARTUP_ENSURE_FUNDED =
+  (process.env.QUOTER_STARTUP_ENSURE_FUNDED || 'true') === 'true';
+const BOT_ACCOUNT_NUM_START = Number(
+  process.env.QUOTER_BOT_ACCOUNT_NUM_START || '100',
+);
+const STARTUP_DEPOSIT_UI_AMOUNT = Number(
+  process.env.QUOTER_STARTUP_DEPOSIT_UI_AMOUNT || '1000',
+);
+const STARTUP_FUNDING_RPC_URL =
+  process.env.QUOTER_STARTUP_FUNDING_RPC_URL ||
+  'https://api.devnet.solana.com';
 
 function startupDebug(msg: string): void {
   if (!DEBUG_STARTUP) {
@@ -195,6 +225,346 @@ function readKeypair(rawPathOrJson: string): Keypair {
     ? fs.readFileSync(maybeFile, 'utf-8')
     : rawPathOrJson;
   return Keypair.fromSecretKey(Uint8Array.from(JSON.parse(raw)));
+}
+
+/**
+ * Ensure a bot has sufficient SOL for tx fees and USDC margin deposited.
+ * On startup:
+ *  1. Check SOL balance — if below threshold, transfer from payer (not faucet)
+ *  2. Check mango account exists on-chain — if missing, request creation via harness
+ *  3. Request USDC airdrop-deposit via harness if account has no margin
+ *
+ * This makes bots self-bootstrapping on fresh deployments.
+ */
+async function ensureBotFunded(
+  connection: Connection,
+  botKeypair: Keypair,
+  mangoAccountPk: PublicKey,
+  botName: string,
+  payerKeypair: Keypair | null,
+  client: MangoClient,
+  group: Awaited<ReturnType<MangoClient['getGroup']>>,
+  usdcMintPk: PublicKey | null,
+  cluster: Cluster,
+  programId: PublicKey,
+): Promise<void> {
+  if (!STARTUP_ENSURE_FUNDED) return;
+
+  // ── 1. SOL balance check — transfer from payer only if shortage ──────
+  const solBalance = await connection.getBalance(botKeypair.publicKey);
+  console.log(`[${botName}] SOL balance: ${(solBalance / 1e9).toFixed(4)} SOL`);
+  if (solBalance < MIN_SOL_BALANCE_LAMPORTS) {
+    if (payerKeypair && !payerKeypair.publicKey.equals(botKeypair.publicKey)) {
+      const transferAmount = 0.5 * 1e9; // 0.5 SOL
+      console.log(
+        `[${botName}] SOL below threshold (${(MIN_SOL_BALANCE_LAMPORTS / 1e9).toFixed(3)} SOL), transferring ${transferAmount / 1e9} SOL from payer...`,
+      );
+      try {
+        const { SystemProgram, Transaction, sendAndConfirmTransaction } =
+          await import('@solana/web3.js');
+        const tx = new Transaction().add(
+          SystemProgram.transfer({
+            fromPubkey: payerKeypair.publicKey,
+            toPubkey: botKeypair.publicKey,
+            lamports: transferAmount,
+          }),
+        );
+        const sig = await sendAndConfirmTransaction(connection, tx, [payerKeypair], {
+          commitment: 'confirmed',
+        });
+        console.log(`[${botName}] SOL transfer confirmed: ${sig}`);
+      } catch (err: any) {
+        console.warn(`[${botName}] SOL transfer from payer failed: ${err.message || err}`);
+        // Fallback: try devnet faucet
+        try {
+          const devnetConn = new Connection('https://api.devnet.solana.com', 'confirmed');
+          const sig = await devnetConn.requestAirdrop(botKeypair.publicKey, 1e9);
+          for (let i = 0; i < 20; i++) {
+            const st = await devnetConn.getSignatureStatus(sig);
+            if (st?.value?.confirmationStatus === 'confirmed' || st?.value?.confirmationStatus === 'finalized') break;
+            await new Promise((r) => setTimeout(r, 1000));
+          }
+          console.log(`[${botName}] devnet faucet airdrop confirmed: ${sig}`);
+        } catch (e2: any) {
+          console.warn(`[${botName}] devnet faucet also failed: ${e2.message || e2}`);
+        }
+      }
+    } else {
+      console.warn(`[${botName}] SOL below threshold but no payer keypair available for transfer`);
+    }
+  }
+
+  // ── 2. Mango account existence check ─────────────────────────────────
+  let mangoAccountExists = false;
+  try {
+    const acctInfo = await connection.getAccountInfo(mangoAccountPk);
+    mangoAccountExists = acctInfo !== null && acctInfo.data.length > 0;
+    if (!mangoAccountExists) {
+      console.log(`[${botName}] mango account ${mangoAccountPk.toBase58()} not found on-chain`);
+    } else {
+      console.log(`[${botName}] mango account verified on-chain (${acctInfo!.data.length} bytes)`);
+    }
+  } catch (err: any) {
+    console.warn(`[${botName}] mango account check failed: ${err.message || err}`);
+  }
+
+  const loadEquity = async (): Promise<number> => {
+    try {
+      const mangoAccount = await client.getMangoAccount(mangoAccountPk);
+      return mangoAccount.getEquity(group).toNumber();
+    } catch (err: any) {
+      console.warn(`[${botName}] equity check failed: ${err.message || err}`);
+      return 0;
+    }
+  };
+
+  const directMintAndDeposit = async (): Promise<void> => {
+    if (!payerKeypair || !usdcMintPk) {
+      throw new Error('direct mint/deposit requires payer keypair and usdc mint');
+    }
+    const fundingConnection = new Connection(
+      STARTUP_FUNDING_RPC_URL,
+      AnchorProvider.defaultOptions(),
+    );
+    const fundingProvider = new AnchorProvider(
+      fundingConnection,
+      new Wallet(botKeypair),
+      AnchorProvider.defaultOptions(),
+    );
+    const fundingClient = await MangoClient.connect(
+      fundingProvider,
+      cluster,
+      programId,
+      { idsSource: 'get-program-accounts' },
+    );
+    const fundingGroup = await fundingClient.getGroup(group.publicKey);
+    const fundingAccount = await fundingClient.getMangoAccount(mangoAccountPk);
+    console.log(
+      `[${botName}] funding via direct mint + tokenDeposit ui_amount=${STARTUP_DEPOSIT_UI_AMOUNT}`,
+    );
+    const botUsdcAta = await createAssociatedTokenAccountIdempotent(
+      fundingConnection,
+      payerKeypair,
+      usdcMintPk,
+      botKeypair.publicKey,
+    );
+    await mintTo(
+      fundingConnection,
+      payerKeypair,
+      usdcMintPk,
+      botUsdcAta,
+      payerKeypair,
+      BigInt(Math.round(STARTUP_DEPOSIT_UI_AMOUNT * 1_000_000)),
+    );
+    await fundingClient.tokenDeposit(
+      fundingGroup,
+      fundingAccount,
+      usdcMintPk,
+      STARTUP_DEPOSIT_UI_AMOUNT,
+    );
+  };
+
+  const waitForPositiveEquity = async (timeoutMs: number): Promise<number> => {
+    const startedAt = Date.now();
+    let lastEquity = 0;
+    while (Date.now() - startedAt < timeoutMs) {
+      lastEquity = await loadEquity();
+      if (lastEquity > 0) {
+        return lastEquity;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+    }
+    return lastEquity;
+  };
+
+  const currentEquity = await loadEquity();
+  console.log(`[${botName}] mango equity before funding: ${currentEquity}`);
+
+  // ── 3. Harness airdrop-deposit (creates account + mints USDC + deposits) ──
+  // Treat funding as required if equity is still zero.
+  if (!mangoAccountExists || currentEquity <= 0) {
+    let funded = false;
+    if (payerKeypair && usdcMintPk) {
+      try {
+        await directMintAndDeposit();
+        funded = true;
+      } catch (err: any) {
+        console.warn(`[${botName}] direct mint/deposit failed, falling back to harness: ${err.message || err}`);
+      }
+    }
+    if (!funded) {
+      console.log(`[${botName}] requesting harness airdrop-deposit for ${mangoAccountPk.toBase58()}...`);
+      await callHarnessAirdropDeposit(botKeypair.publicKey, botName, 30_000, mangoAccountPk);
+    }
+    const fundedEquity = await waitForPositiveEquity(30_000);
+    if (fundedEquity <= 0) {
+      throw new Error(
+        `[${botName}] funding did not land on-chain for ${mangoAccountPk.toBase58()} after harness airdrop-deposit`,
+      );
+    }
+    console.log(`[${botName}] mango equity after funding: ${fundedEquity}`);
+  }
+}
+
+async function callHarnessAirdropDeposit(
+  ownerPk: PublicKey,
+  botName: string,
+  timeoutMs = 30_000,
+  mangoAccountPk?: PublicKey,
+): Promise<void> {
+  const url = `${HARNESS_URL}/airdrop-deposit`;
+  const body = JSON.stringify({
+    owner: ownerPk.toBase58(),
+    ...(mangoAccountPk ? { mango_account: mangoAccountPk.toBase58() } : {}),
+  });
+  console.log(`[${botName}] POST ${url} (timeout=${timeoutMs}ms)`);
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const resp = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body,
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (!resp.ok) {
+        const text = await resp.text().catch(() => '');
+        throw new Error(`harness returned ${resp.status}: ${text}`);
+      }
+      const result = await resp.json().catch(() => ({}));
+      console.log(`[${botName}] airdrop-deposit result:`, JSON.stringify(result));
+      return;
+    } catch (err: any) {
+      if (attempt < 2) {
+        console.warn(`[${botName}] airdrop-deposit attempt ${attempt} failed, retrying: ${err.message || err}`);
+        await new Promise((r) => setTimeout(r, 2000));
+      } else {
+        throw err;
+      }
+    }
+  }
+}
+
+async function resolveOrCreateBotMangoAccount(params: {
+  spec: BotSpec;
+  botIndex: number;
+  keypair: Keypair;
+  client: MangoClient;
+  group: Awaited<ReturnType<MangoClient['getGroup']>>;
+  executionQueuePk: PublicKey;
+  payerKeypair: Keypair | null;
+  cluster: Cluster;
+  connection: Connection;
+  programId: PublicKey;
+}): Promise<Awaited<ReturnType<MangoClient['getMangoAccount']>>> {
+  const accountNum = BOT_ACCOUNT_NUM_START + params.botIndex;
+
+  const loadConfiguredAccount = async () => {
+    if (!params.spec.mangoAccount) {
+      return null;
+    }
+    try {
+      const account = await params.client.getMangoAccount(
+        new PublicKey(params.spec.mangoAccount),
+      );
+      if (!account.owner.equals(params.keypair.publicKey)) {
+        throw new Error('owner mismatch');
+      }
+      if (!account.group.equals(params.group.publicKey)) {
+        throw new Error('group mismatch');
+      }
+      console.log(
+        `[${params.spec.name}] using configured mango account ${account.publicKey.toBase58()} (account_num=${account.accountNum})`,
+      );
+      return account;
+    } catch (err: any) {
+      console.warn(
+        `[${params.spec.name}] configured mango account ${params.spec.mangoAccount} unusable, falling back: ${err.message || err}`,
+      );
+      return null;
+    }
+  };
+
+  const configured = await loadConfiguredAccount();
+  if (configured) {
+    await params.client.editMangoAccount(
+      params.group,
+      configured,
+      undefined,
+      params.executionQueuePk,
+    );
+    return configured;
+  }
+
+  const existing = await params.client.getMangoAccountForOwner(
+    params.group,
+    params.keypair.publicKey,
+    accountNum,
+  );
+  if (existing) {
+    console.log(
+      `[${params.spec.name}] found existing mango account ${existing.publicKey.toBase58()} for account_num=${accountNum}`,
+    );
+    await params.client.editMangoAccount(
+      params.group,
+      existing,
+      undefined,
+      params.executionQueuePk,
+    );
+    return existing;
+  }
+
+  if (!params.payerKeypair) {
+    throw new Error(
+      `[${params.spec.name}] missing payer keypair; cannot auto-create mango account ${accountNum}`,
+    );
+  }
+
+  console.log(
+    `[${params.spec.name}] creating mango account for owner ${params.keypair.publicKey.toBase58()} with account_num=${accountNum}`,
+  );
+  const payerProvider = new AnchorProvider(
+    params.connection,
+    new Wallet(params.payerKeypair),
+    AnchorProvider.defaultOptions(),
+  );
+  const payerClient = await MangoClient.connect(
+    payerProvider,
+    params.cluster,
+    params.programId,
+    { idsSource: 'get-program-accounts' },
+  );
+  const ix = await payerClient.program.methods
+    .accountCreate(accountNum, 8, 4, 4, 32, params.spec.name.slice(0, 32))
+    .accounts({
+      group: params.group.publicKey,
+      owner: params.keypair.publicKey,
+      payer: payerClient.walletPk,
+    })
+    .instruction();
+  await payerClient.sendAndConfirmTransactionForGroup(params.group, [ix], {
+    additionalSigners: [params.keypair],
+  });
+  const created = await params.client.getMangoAccountForOwner(
+    params.group,
+    params.keypair.publicKey,
+    accountNum,
+  );
+  if (!created) {
+    throw new Error(
+      `[${params.spec.name}] mango account create transaction confirmed but account not found for account_num=${accountNum}`,
+    );
+  }
+  await params.client.editMangoAccount(
+    params.group,
+    created,
+    undefined,
+    params.executionQueuePk,
+  );
+  console.log(
+    `[${params.spec.name}] created mango account ${created.publicKey.toBase58()} for account_num=${accountNum}`,
+  );
+  return created;
 }
 
 function sideFromString(input: string): PerpOrderSide {
@@ -273,8 +643,8 @@ function randomQuotePrice(
 ): number {
   const offsetBps =
     side === PerpOrderSide.bid
-      ? randomFloat(-PRICE_RANGE_BPS, BID_OVERLAP_BPS)
-      : randomFloat(0, PRICE_RANGE_BPS);
+      ? randomFloat(QUOTER_BID_MIN_BPS, QUOTER_BID_MAX_BPS)
+      : randomFloat(QUOTER_ASK_MIN_BPS, QUOTER_ASK_MAX_BPS);
   const multiplier = 1 + offsetBps / 10_000;
   return Number((referencePrice * multiplier).toFixed(4));
 }
@@ -294,6 +664,8 @@ function shouldAttemptClosePosition(): boolean {
 }
 
 function orderExpiryTimestampSec(nowMs: number): number {
+  // 0 means no expiry — pass 0 to the on-chain program
+  if (ORDER_EXPIRY_SECS === 0) return 0;
   return Math.floor(nowMs / 1000) + ORDER_EXPIRY_SECS;
 }
 
@@ -533,7 +905,18 @@ async function fetchCoinGeckoReferencePriceUi(): Promise<number> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), COINGECKO_TIMEOUT_MS);
   try {
-    const res = await fetch(url, { signal: controller.signal });
+    const headers: Record<string, string> = {};
+    if (COINGECKO_API_KEY) {
+      if (base.includes('pro-api.coingecko.com')) {
+        headers['x-cg-pro-api-key'] = COINGECKO_API_KEY;
+      } else {
+        headers['x-cg-demo-api-key'] = COINGECKO_API_KEY;
+      }
+    }
+    const res = await fetch(url, {
+      signal: controller.signal,
+      headers,
+    });
     if (!res.ok) {
       throw new Error(`coingecko non-200 status ${res.status}`);
     }
@@ -559,14 +942,25 @@ async function main(): Promise<void> {
   if (PRICE_RANGE_BPS <= 0 || PRICE_RANGE_BPS > 1000) {
     throw new Error('QUOTER_PRICE_RANGE_BPS must be in (0, 1000]');
   }
-  if (!Number.isFinite(BID_OVERLAP_BPS) || BID_OVERLAP_BPS < 0 || BID_OVERLAP_BPS > 500) {
-    throw new Error('QUOTER_BID_OVERLAP_BPS must be in [0, 500]');
+  if (
+    !Number.isFinite(QUOTER_BID_MIN_BPS) ||
+    !Number.isFinite(QUOTER_BID_MAX_BPS) ||
+    !Number.isFinite(QUOTER_ASK_MIN_BPS) ||
+    !Number.isFinite(QUOTER_ASK_MAX_BPS)
+  ) {
+    throw new Error('quote band bps values must be finite');
+  }
+  if (QUOTER_BID_MIN_BPS >= QUOTER_BID_MAX_BPS) {
+    throw new Error('QUOTER_BID_MIN_BPS must be < QUOTER_BID_MAX_BPS');
+  }
+  if (QUOTER_ASK_MIN_BPS >= QUOTER_ASK_MAX_BPS) {
+    throw new Error('QUOTER_ASK_MIN_BPS must be < QUOTER_ASK_MAX_BPS');
   }
   if (SIZE_MIN_SOL <= 0 || SIZE_MAX_SOL < SIZE_MIN_SOL) {
     throw new Error('invalid QUOTER_SIZE_MIN_SOL / QUOTER_SIZE_MAX_SOL');
   }
-  if (!Number.isInteger(ORDER_EXPIRY_SECS) || ORDER_EXPIRY_SECS <= 0) {
-    throw new Error('QUOTER_ORDER_EXPIRY_SECS must be an integer > 0');
+  if (!Number.isInteger(ORDER_EXPIRY_SECS) || ORDER_EXPIRY_SECS < 0) {
+    throw new Error('QUOTER_ORDER_EXPIRY_SECS must be an integer >= 0 (0 = no expiry)');
   }
   if (
     !Number.isFinite(CLOSE_POSITION_PROBABILITY_BPS) ||
@@ -619,8 +1013,9 @@ async function main(): Promise<void> {
   const executionQueuePk = new PublicKey(config.executionQueue);
   const marketIndex = config.perpMarketIndex as PerpMarketIndex;
   const solMintPk = config.solMint ? new PublicKey(config.solMint) : null;
+  const usdcMintPk = config.usdcMint ? new PublicKey(config.usdcMint) : null;
 
-  const wsEndpoint = CLUSTER_WS_URL_OVERRIDE || deriveWsEndpoint(clusterUrl) || undefined;
+  const wsEndpoint = CLUSTER_WS_URL_OVERRIDE || undefined;
   const connection = new Connection(clusterUrl, {
     ...AnchorProvider.defaultOptions(),
     commitment: COMMITMENT,
@@ -630,9 +1025,28 @@ async function main(): Promise<void> {
   const botSpecs = loadBotSpecs(config);
   startupDebug(`bot-specs-loaded count=${botSpecs.length}`);
 
+  // Load payer keypair for SOL transfers to underfunded bots
+  const payerKeypairPath =
+    process.env.MB_PAYER_KEYPAIR ||
+    process.env.CTM_RELAYER_PAYER_KEYPAIR ||
+    '';
+  let payerKeypair: Keypair | null = null;
+  if (payerKeypairPath) {
+    try {
+      payerKeypair = readKeypair(payerKeypairPath);
+      startupDebug(`payer-keypair-loaded pk=${payerKeypair.publicKey.toBase58()}`);
+    } catch (err: any) {
+      console.warn(`failed to load payer keypair: ${err.message}`);
+    }
+  }
+
   const bots: BotRuntime[] = [];
   let sharedGroup: Awaited<ReturnType<MangoClient['getGroup']>> | null = null;
-  for (const spec of botSpecs) {
+  for (const [botIndex, spec] of botSpecs.entries()) {
+    // Stagger bot init to avoid RPC rate limits (429)
+    if (botIndex > 0) {
+      await new Promise((r) => setTimeout(r, 2000));
+    }
     const keypair = readKeypair(spec.keypairPath);
     const provider = new AnchorProvider(
       connection,
@@ -647,8 +1061,34 @@ async function main(): Promise<void> {
       sharedGroup = await client.getGroup(groupPk);
       startupDebug('group-loaded');
     }
-    const mangoAccountPk = new PublicKey(spec.mangoAccount);
-    const mangoAccount = await client.getMangoAccount(mangoAccountPk);
+    const mangoAccount = await resolveOrCreateBotMangoAccount({
+      spec,
+      botIndex,
+      keypair,
+      client,
+      group: sharedGroup,
+      executionQueuePk,
+      payerKeypair,
+      cluster,
+      connection,
+      programId: new PublicKey(config.programId),
+    });
+    const mangoAccountPk = mangoAccount.publicKey;
+
+    // Ensure the bot has SOL for fees and USDC margin deposited
+    await ensureBotFunded(
+      connection,
+      keypair,
+      mangoAccountPk,
+      spec.name,
+      payerKeypair,
+      client,
+      sharedGroup,
+      usdcMintPk,
+      cluster,
+      new PublicKey(config.programId),
+    );
+
     startupDebug(`mango-account-loaded bot=${spec.name}`);
     bots.push({
       name: spec.name,
@@ -694,7 +1134,8 @@ async function main(): Promise<void> {
       relayerAddr,
       intervalMs: INTERVAL_MS,
       priceRangeBps: PRICE_RANGE_BPS,
-      bidOverlapBps: BID_OVERLAP_BPS,
+      bidBandBps: [QUOTER_BID_MIN_BPS, QUOTER_BID_MAX_BPS],
+      askBandBps: [QUOTER_ASK_MIN_BPS, QUOTER_ASK_MAX_BPS],
       orderExpirySecs: ORDER_EXPIRY_SECS,
       closePositionProbabilityBps: CLOSE_POSITION_PROBABILITY_BPS,
       sizeMinSol: SIZE_MIN_SOL,
@@ -740,6 +1181,8 @@ async function main(): Promise<void> {
   let cachedCoinGeckoTsMs = 0;
   const inFlight = new Set<Promise<void>>();
 
+  let backoffUntilMs = 0;
+
   const handleTickError = (err: unknown) => {
     tickErrorCount += 1;
     const errText = err instanceof Error ? err.message : `${err}`;
@@ -750,6 +1193,23 @@ async function main(): Promise<void> {
         // no-op
       }
       relayerClient = buildRelayerClient();
+    }
+    // Back off 10s on rate limit or backpressure
+    if (
+      errText.includes('429') ||
+      errText.includes('Too Many') ||
+      errText.includes('RESOURCE_EXHAUSTED') ||
+      errText.includes('backpressure')
+    ) {
+      backoffUntilMs = Date.now() + 10_000;
+      console.error(
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          msg: 'quote tick rate-limited, backing off 10s',
+          error: errText.slice(0, 200),
+        }),
+      );
+      return;
     }
     console.error(
       JSON.stringify({
@@ -800,7 +1260,8 @@ async function main(): Promise<void> {
         orderLimit: ORDER_LIMIT,
         botDispatchMode: BOT_DISPATCH_MODE,
         priceRangeBps: PRICE_RANGE_BPS,
-        bidOverlapBps: BID_OVERLAP_BPS,
+        bidBandBps: [QUOTER_BID_MIN_BPS, QUOTER_BID_MAX_BPS],
+        askBandBps: [QUOTER_ASK_MIN_BPS, QUOTER_ASK_MAX_BPS],
         minExecuteSlotOffset: MIN_EXECUTE_SLOT_OFFSET.toString(),
         orderExpirySecs: ORDER_EXPIRY_SECS,
         closePositionProbabilityBps: CLOSE_POSITION_PROBABILITY_BPS,
@@ -822,6 +1283,11 @@ async function main(): Promise<void> {
   };
 
   while (running) {
+    // Rate-limit backoff: skip tick if recently rate-limited
+    if (backoffUntilMs > Date.now()) {
+      await new Promise((r) => setTimeout(r, Math.min(1000, backoffUntilMs - Date.now())));
+      continue;
+    }
     if (MAX_TICKS > 0 && ticks >= MAX_TICKS) {
       stopReason = 'max_ticks';
       break;
@@ -850,7 +1316,11 @@ async function main(): Promise<void> {
         );
       }
       let referencePrice: number;
-      let referenceSource: 'coingecko' | 'onchain-fallback' = 'coingecko';
+      let referenceSource: 'coingecko' | 'onchain-fallback' | 'fixed' = 'coingecko';
+      if (FIXED_REFERENCE_PRICE > 0) {
+        referencePrice = FIXED_REFERENCE_PRICE;
+        referenceSource = 'fixed';
+      } else {
       const nowMs = Date.now();
       const shouldRefreshCoinGecko =
         cachedCoinGeckoPriceUi === null ||
@@ -899,6 +1369,7 @@ async function main(): Promise<void> {
           referencePrice = cachedCoinGeckoPriceUi;
         }
       }
+      } // end FIXED_REFERENCE_PRICE else
       const minExecuteSlot =
         BigInt(await connection.getSlot(COMMITMENT)) + MIN_EXECUTE_SLOT_OFFSET;
       const botsForTick = selectBotsForTick(bots, currentTick);
@@ -994,7 +1465,7 @@ async function main(): Promise<void> {
           clientOrderId,
           orderType: closePlan
             ? PerpOrderType.immediateOrCancel
-            : PerpOrderType.limit,
+            : PerpOrderType.postOnlySlide,
           selfTradeBehavior: PerpSelfTradeBehavior.decrementTake,
           reduceOnly: !!closePlan,
           expiryTimestamp: orderExpiryTimestampSec(nowMs),

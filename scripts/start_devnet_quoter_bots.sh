@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MNG_DIR="${ROOT_DIR}/mng-v4"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MNG_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+ROOT_DIR="$(cd "${MNG_DIR}/.." && pwd)"
 RUN_DIR="${MNG_DIR}/.devnet/run"
 LOG_DIR="${MNG_DIR}/.devnet/logs"
 PID_DIR="${RUN_DIR}/pids"
-SCREEN_DIR="${SCREEN_DIR:-${ROOT_DIR}/.screen}"
+SCREEN_DIR="${SCREEN_DIR:-${MNG_DIR}/.screen}"
 USE_SCREEN="${USE_SCREEN:-true}"
 SUPERVISOR_SCRIPT="${ROOT_DIR}/scripts/service_supervisor.sh"
 
@@ -19,16 +20,66 @@ QUOTER_LOG_FILE="${LOG_DIR}/quoter.log"
 QUOTER_SESSION_NAME="${QUOTER_SESSION_NAME:-stagin4-devnet-quoter}"
 
 QUOTER_BOT_COUNT="${QUOTER_BOT_COUNT:-4}"
-QUOTER_INTERVAL_MS="${QUOTER_INTERVAL_MS:-2000}"
+QUOTER_INTERVAL_MS="${QUOTER_INTERVAL_MS:-500}"
 QUOTER_PRICE_RANGE_BPS="${QUOTER_PRICE_RANGE_BPS:-200}"
 QUOTER_COINGECKO_ASSET_ID="${QUOTER_COINGECKO_ASSET_ID:-solana}"
 QUOTER_COINGECKO_VS_CURRENCY="${QUOTER_COINGECKO_VS_CURRENCY:-usd}"
+QUOTER_COINGECKO_API_KEY="${QUOTER_COINGECKO_API_KEY:-}"
 QUOTER_CANCEL_BEFORE_PLACE="${QUOTER_CANCEL_BEFORE_PLACE:-false}"
 QUOTER_BOT_DISPATCH_MODE="${QUOTER_BOT_DISPATCH_MODE:-round-robin}"
 QUOTER_LOG_EACH_ORDER="${QUOTER_LOG_EACH_ORDER:-true}"
-QUOTER_ORDER_EXPIRY_SECS="${QUOTER_ORDER_EXPIRY_SECS:-30}"
+QUOTER_ORDER_EXPIRY_SECS="${QUOTER_ORDER_EXPIRY_SECS:-60}"
 QUOTER_CLOSE_POSITION_PROBABILITY_BPS="${QUOTER_CLOSE_POSITION_PROBABILITY_BPS:-1000}"
 SUPERVISOR_RESTART_DELAY_SECS="${SUPERVISOR_RESTART_DELAY_SECS:-2}"
+CLUSTER_WS_URL_OVERRIDE="${CLUSTER_WS_URL_OVERRIDE:-${MB_CLUSTER_WS_URL:-}}"
+
+usage() {
+  cat <<'EOF'
+usage: start_devnet_quoter_bots.sh [start|stop|restart|status] [--rpc-provider default|helius|triton]
+
+Options:
+  --rpc-provider <name>   Label the selected provider in logs/env.
+  --cluster-url <url>     Override HTTP RPC URL.
+  --cluster-ws-url <url>  Override websocket RPC URL.
+  --help                  Show this help.
+EOF
+}
+
+ACTION="start"
+if [[ $# -gt 0 ]]; then
+  case "$1" in
+    start|stop|restart|status)
+      ACTION="$1"
+      shift
+      ;;
+  esac
+fi
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --rpc-provider)
+      RPC_PROVIDER="$2"
+      shift 2
+      ;;
+    --cluster-url|--solana-url)
+      CLUSTER_URL_OVERRIDE="$2"
+      shift 2
+      ;;
+    --cluster-ws-url)
+      CLUSTER_WS_URL_OVERRIDE="$2"
+      shift 2
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "unknown argument: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
 
 mkdir -p "${RUN_DIR}" "${LOG_DIR}" "${PID_DIR}"
 if [[ "${USE_SCREEN}" == "true" ]]; then
@@ -147,7 +198,7 @@ start_quoter() {
     relayer_addr="127.0.0.1:9090"
   fi
 
-  log "starting quoter bots=${QUOTER_BOT_COUNT} intervalMs=${QUOTER_INTERVAL_MS} dispatch=${QUOTER_BOT_DISPATCH_MODE}"
+  log "starting quoter bots=${QUOTER_BOT_COUNT} intervalMs=${QUOTER_INTERVAL_MS} dispatch=${QUOTER_BOT_DISPATCH_MODE} provider=${RPC_PROVIDER:-default}"
   if [[ "${USE_SCREEN}" == "true" ]]; then
     local quoted_workdir quoted_logfile
     quoted_workdir="$(printf '%q' "${MNG_DIR}")"
@@ -158,11 +209,14 @@ start_quoter() {
         QUOTER_CONFIG_PATH=$(printf '%q' "${E2E_CONFIG_PATH}") \
         QUOTER_BOTS_JSON_PATH=$(printf '%q' "${QUOTER_ACTIVE_BOTS_PATH}") \
         CLUSTER_URL_OVERRIDE=$(printf '%q' "${cluster_url}") \
+        CLUSTER_WS_URL_OVERRIDE=$(printf '%q' "${CLUSTER_WS_URL_OVERRIDE}") \
         CTM_RELAYER_ADDR=$(printf '%q' "${relayer_addr}") \
+        RPC_PROVIDER=$(printf '%q' "${RPC_PROVIDER:-default}") \
         QUOTER_INTERVAL_MS=$(printf '%q' "${QUOTER_INTERVAL_MS}") \
         QUOTER_PRICE_RANGE_BPS=$(printf '%q' "${QUOTER_PRICE_RANGE_BPS}") \
         QUOTER_COINGECKO_ASSET_ID=$(printf '%q' "${QUOTER_COINGECKO_ASSET_ID}") \
         QUOTER_COINGECKO_VS_CURRENCY=$(printf '%q' "${QUOTER_COINGECKO_VS_CURRENCY}") \
+        QUOTER_COINGECKO_API_KEY=$(printf '%q' "${QUOTER_COINGECKO_API_KEY}") \
         QUOTER_CANCEL_BEFORE_PLACE=$(printf '%q' "${QUOTER_CANCEL_BEFORE_PLACE}") \
         QUOTER_BOT_DISPATCH_MODE=$(printf '%q' "${QUOTER_BOT_DISPATCH_MODE}") \
         QUOTER_LOG_EACH_ORDER=$(printf '%q' "${QUOTER_LOG_EACH_ORDER}") \
@@ -179,11 +233,14 @@ start_quoter() {
         QUOTER_CONFIG_PATH="${E2E_CONFIG_PATH}" \
         QUOTER_BOTS_JSON_PATH="${QUOTER_ACTIVE_BOTS_PATH}" \
         CLUSTER_URL_OVERRIDE="${cluster_url}" \
+        CLUSTER_WS_URL_OVERRIDE="${CLUSTER_WS_URL_OVERRIDE}" \
         CTM_RELAYER_ADDR="${relayer_addr}" \
+        RPC_PROVIDER="${RPC_PROVIDER:-default}" \
         QUOTER_INTERVAL_MS="${QUOTER_INTERVAL_MS}" \
         QUOTER_PRICE_RANGE_BPS="${QUOTER_PRICE_RANGE_BPS}" \
         QUOTER_COINGECKO_ASSET_ID="${QUOTER_COINGECKO_ASSET_ID}" \
         QUOTER_COINGECKO_VS_CURRENCY="${QUOTER_COINGECKO_VS_CURRENCY}" \
+        QUOTER_COINGECKO_API_KEY="${QUOTER_COINGECKO_API_KEY}" \
         QUOTER_CANCEL_BEFORE_PLACE="${QUOTER_CANCEL_BEFORE_PLACE}" \
         QUOTER_BOT_DISPATCH_MODE="${QUOTER_BOT_DISPATCH_MODE}" \
         QUOTER_LOG_EACH_ORDER="${QUOTER_LOG_EACH_ORDER}" \
@@ -206,7 +263,7 @@ status_quoter() {
   fi
 }
 
-case "${1:-start}" in
+case "${ACTION}" in
   start)
     start_quoter
     ;;

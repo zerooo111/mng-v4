@@ -174,10 +174,8 @@ pub enum EventType {
     Liquidate,
 }
 
-#[derive(
-    Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable, AnchorSerialize, AnchorDeserialize,
-)]
-#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C, packed)]
 pub struct FillEvent {
     pub event_type: u8,
     pub taker_side: u8, // Side, from the taker's POV

@@ -75,8 +75,8 @@ pub fn fixed_price_lots(price_data: u64) -> i64 {
 /// Each InnerNode has exactly two children, which are either InnerNodes themselves,
 /// or LeafNodes. The children share the top `prefix_len` bits of `key`. The left
 /// child has a 0 in the next bit, and the right a 1.
-#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable, AnchorSerialize, AnchorDeserialize)]
-#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C, packed)]
 pub struct InnerNode {
     pub tag: u8, // NodeTag
     pub padding: [u8; 3],
@@ -131,18 +131,8 @@ impl InnerNode {
 }
 
 /// LeafNodes represent an order in the binary tree
-#[derive(
-    Debug,
-    Copy,
-    Clone,
-    PartialEq,
-    Eq,
-    bytemuck::Pod,
-    bytemuck::Zeroable,
-    AnchorSerialize,
-    AnchorDeserialize,
-)]
-#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C, packed)]
 pub struct LeafNode {
     /// NodeTag
     pub tag: u8,
@@ -247,7 +237,7 @@ impl LeafNode {
 }
 
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
+#[repr(C, packed)]
 pub struct FreeNode {
     pub(crate) tag: u8, // NodeTag
     pub(crate) padding: [u8; 3],
@@ -259,6 +249,7 @@ pub struct FreeNode {
 const_assert_eq!(size_of::<FreeNode>(), NODE_SIZE);
 const_assert_eq!(size_of::<FreeNode>() % 8, 0);
 
+#[repr(C, packed)]
 #[zero_copy]
 pub struct AnyNode {
     pub tag: u8,
@@ -271,7 +262,7 @@ const_assert_eq!(size_of::<AnyNode>() % 8, 0);
 const_assert_eq!(size_of::<AnyNode>(), size_of::<InnerNode>());
 const_assert_eq!(size_of::<AnyNode>(), size_of::<LeafNode>());
 const_assert_eq!(size_of::<AnyNode>(), size_of::<FreeNode>());
-const_assert_eq!(align_of::<AnyNode>(), 8);
+const_assert_eq!(align_of::<AnyNode>(), 1);
 const_assert_eq!(align_of::<AnyNode>(), align_of::<InnerNode>());
 const_assert_eq!(align_of::<AnyNode>(), align_of::<LeafNode>());
 const_assert_eq!(align_of::<AnyNode>(), align_of::<FreeNode>());

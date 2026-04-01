@@ -128,10 +128,15 @@ fn full_ctm_ring_then_drain_all() {
     with_large_stack(|| {
         let mut queue = test_queue();
         for i in 0..EXECUTION_QUEUE_CTM_CAPACITY as u64 {
-            queue.push_ctm(pending_ctm_item(i, (i % 256) as u8)).unwrap();
+            queue
+                .push_ctm(pending_ctm_item(i, (i % 256) as u8))
+                .unwrap();
         }
         assert_eq!(queue.header.ctm_count, EXECUTION_QUEUE_CTM_CAPACITY as u32);
-        assert_eq!(queue.header.total_count, EXECUTION_QUEUE_CTM_CAPACITY as u32);
+        assert_eq!(
+            queue.header.total_count,
+            EXECUTION_QUEUE_CTM_CAPACITY as u32
+        );
 
         let result = queue.push_ctm(pending_ctm_item(EXECUTION_QUEUE_CTM_CAPACITY as u64, 1));
         assert!(result.is_err());
@@ -366,7 +371,7 @@ fn sequence_overflow_u64_max() {
         assert!(queue.can_enqueue_ctm_sequence(u64::MAX - 5));
         assert!(queue.can_enqueue_ctm_sequence(u64::MAX - 1));
         assert!(!queue.can_enqueue_ctm_sequence(u64::MAX)); // saturating edge
-        // Push at u64::MAX - 5 should not panic
+                                                            // Push at u64::MAX - 5 should not panic
         queue.push_ctm(pending_ctm_item(u64::MAX - 5, 1)).unwrap();
         assert_eq!(queue.header.ctm_count, 1);
     });
@@ -429,13 +434,22 @@ fn mixed_ctm_and_liquidity_operations_preserve_header_totals() {
             .push_liquidity(pending_liquidity_item(7, QueueItemKind::LiquidityDeposit))
             .unwrap();
 
-        assert_eq!(queue.header.total_count, queue.header.ctm_count + queue.header.liquidity_count);
+        assert_eq!(
+            queue.header.total_count,
+            queue.header.ctm_count + queue.header.liquidity_count
+        );
 
         queue.clear_current_ctm_head_and_advance();
-        assert_eq!(queue.header.total_count, queue.header.ctm_count + queue.header.liquidity_count);
+        assert_eq!(
+            queue.header.total_count,
+            queue.header.ctm_count + queue.header.liquidity_count
+        );
 
         queue.pop_liquidity_head().unwrap();
-        assert_eq!(queue.header.total_count, queue.header.ctm_count + queue.header.liquidity_count);
+        assert_eq!(
+            queue.header.total_count,
+            queue.header.ctm_count + queue.header.liquidity_count
+        );
 
         queue.clear_current_ctm_head_and_advance();
         assert_eq!(queue.header.total_count, 0);

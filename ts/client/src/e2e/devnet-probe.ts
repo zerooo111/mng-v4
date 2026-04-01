@@ -9,7 +9,7 @@ import {
 } from '../executionQueueLayout';
 
 const RPC = 'https://api.devnet.solana.com';
-const PROGRAM_ID = new PublicKey('7ftfLAYEtDrz8xjhaqa6wUYMrjrmbZ3tjw7J7Rb3QA37');
+const PROGRAM_ID = new PublicKey('4CGsiGHZXSnweudEcN235xkLz4twT2DJB35hS7t89cUm');
 const GROUP = new PublicKey('42ZYDpNAUM8NZgmuQHwrUXsEWb98AkjJfJHYFFoCZpCi');
 const EXEC_QUEUE = new PublicKey('2Bs3tGdMs4PQV98qFLXaafSi8AJWH55eT2WwN8ZKJMkn');
 

@@ -2,10 +2,10 @@
 exclude = ["programs/margin-trade"]
 
 [programs.localnet]
-mango_v4 = "7ftfLAYEtDrz8xjhaqa6wUYMrjrmbZ3tjw7J7Rb3QA37"
+mango_v4 = "4CGsiGHZXSnweudEcN235xkLz4twT2DJB35hS7t89cUm"
 
 [programs.devnet]
-mango_v4 = "4MangoMjqJ2firMokCjjGgoK8d4MXcrgL7XJaL3w6fVg"
+mango_v4 = "4CGsiGHZXSnweudEcN235xkLz4twT2DJB35hS7t89cUm"
 
 [features]
 seeds = true

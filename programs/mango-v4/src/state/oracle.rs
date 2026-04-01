@@ -149,6 +149,7 @@ impl OracleState {
     }
 }
 
+#[repr(C, packed)]
 #[account(zero_copy)]
 pub struct StubOracle {
     // ABI: Clients rely on this being at offset 8
@@ -321,8 +322,18 @@ fn validate_clmm_against_fallback<T: KeyedAccountReader>(
             let stub = fallback.load::<StubOracle>()?;
             OracleState {
                 price: stub.price,
-                last_update_slot: if stub.last_update_slot == 0 { u64::MAX } else { stub.last_update_slot },
-                deviation: if stub.deviation == 0 { I80F48::MIN } else { stub.deviation },
+                last_update_slot: if stub.last_update_slot == 0 {
+                    u64::MAX
+                } else {
+                    stub.last_update_slot
+                },
+                deviation: if { stub.deviation } == 0 {
+                    I80F48::MIN
+                } else {
+                    {
+                        stub.deviation
+                    }
+                },
                 oracle_type: OracleType::Stub,
             }
         }
@@ -359,11 +370,13 @@ fn oracle_state_unchecked_inner<T: KeyedAccountReader>(
     Ok(match oracle_type {
         OracleType::Stub => {
             let stub = oracle_info.load::<StubOracle>()?;
-            let deviation = if stub.deviation == 0 {
+            let deviation = if { stub.deviation } == 0 {
                 // allows the confidence check to pass even for negative prices
                 I80F48::MIN
             } else {
-                stub.deviation
+                {
+                    stub.deviation
+                }
             };
             let last_update_slot = if stub.last_update_slot == 0 {
                 // ensure staleness checks will never fail
@@ -385,7 +398,12 @@ fn oracle_state_unchecked_inner<T: KeyedAccountReader>(
             let quote_oracle_state = whirlpool.quote_state_unchecked(acc_infos)?;
             let price = clmm_price * quote_oracle_state.price;
             // H-7 fix: Cross-validate CLMM price against fallback to prevent manipulation
-            let deviation = validate_clmm_against_fallback(price, quote_oracle_state.deviation, acc_infos, base_decimals)?;
+            let deviation = validate_clmm_against_fallback(
+                price,
+                quote_oracle_state.deviation,
+                acc_infos,
+                base_decimals,
+            )?;
             OracleState {
                 price,
                 last_update_slot: quote_oracle_state.last_update_slot,
@@ -399,7 +417,12 @@ fn oracle_state_unchecked_inner<T: KeyedAccountReader>(
             let quote_oracle_state = whirlpool.quote_state_unchecked(acc_infos)?;
             let price = clmm_price * quote_oracle_state.price;
             // H-7 fix: Cross-validate CLMM price against fallback to prevent manipulation
-            let deviation = validate_clmm_against_fallback(price, quote_oracle_state.deviation, acc_infos, base_decimals)?;
+            let deviation = validate_clmm_against_fallback(
+                price,
+                quote_oracle_state.deviation,
+                acc_infos,
+                base_decimals,
+            )?;
             OracleState {
                 price,
                 last_update_slot: quote_oracle_state.last_update_slot,

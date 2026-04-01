@@ -256,8 +256,42 @@ function symbolToCanonicalMint(symbol: string, usdcMint: PublicKey | null): stri
 }
 
 async function getFreshGroup(onchain: OnchainContext | null): Promise<HarnessGroup | null> {
-  if (!onchain?.mangoClient || !onchain.groupPk) {
+  if (!onchain?.groupPk) {
     return null;
+  }
+
+  if (!onchain.mangoClient) {
+    try {
+      const provider = new AnchorProvider(
+        onchain.connection,
+        new Wallet(Keypair.generate()),
+        AnchorProvider.defaultOptions(),
+      );
+      onchain.mangoClient = await MangoClient.connect(provider, CLUSTER, onchain.programId, {
+        idsSource: 'get-program-accounts',
+      });
+      onchain.cachedGroup = await onchain.mangoClient.getGroup(onchain.groupPk);
+      await onchain.cachedGroup.reloadAll(onchain.mangoClient);
+      onchain.cachedGroupFetchedAtMs = Date.now();
+      if (!onchain.usdcMint) {
+        try {
+          onchain.usdcMint = onchain.cachedGroup.getFirstBankForPerpSettlement().mint;
+        } catch {
+          // Leave unset when the settlement bank cannot be resolved.
+        }
+      }
+      console.log(
+        `Onchain read context recovered: group=${onchain.groupPk.toBase58()}, usdc_mint=${onchain.usdcMint?.toBase58() || 'unresolved'}`,
+      );
+    } catch (err) {
+      console.warn(`onchain read context recovery failed: ${err}`);
+      onchain.mangoClient = null;
+      onchain.cachedGroup = null;
+      onchain.cachedGroupFetchedAtMs = 0;
+      onchain.cachedMarketMetadata = null;
+      onchain.cachedMarketMetadataFetchedAtMs = 0;
+      return null;
+    }
   }
 
   if (
@@ -334,6 +368,17 @@ async function getMarketMetadataMap(
   onchain.cachedMarketMetadata = metadata;
   onchain.cachedMarketMetadataFetchedAtMs = Date.now();
   return metadata;
+}
+
+async function getMarketMetadataMapSafe(
+  onchain: OnchainContext | null,
+): Promise<Record<string, HarnessMarketMetadata>> {
+  try {
+    return await getMarketMetadataMap(onchain);
+  } catch (err) {
+    console.warn(`market metadata fetch failed: ${err}`);
+    return onchain?.cachedMarketMetadata || {};
+  }
 }
 
 function emptyUserState(owner: string): UserState {
@@ -1269,6 +1314,7 @@ async function buildAirdropContext(
   if (!HARNESS_ENABLE_AIRDROP) {
     return null;
   }
+  await getFreshGroup(onchain);
   if (!onchain.usdcMint || !HARNESS_AIRDROP_KEYPAIR.length) {
     console.warn(
       'airdrop endpoint disabled: unable to resolve USDC mint or faucet keypair',
@@ -1821,6 +1867,183 @@ async function processDepositContextRequest(
   };
 }
 
+async function buildLaneForOwner(
+  ownerRaw: string,
+  onchain: OnchainContext | null,
+): Promise<{
+  ok: boolean;
+  owner: string;
+  mango_account: string;
+  lane: {
+    name: string;
+    remainingAccounts: Array<{ pubkey: string; isWritable: boolean; isSigner: boolean }>;
+  };
+  accounts_hash: string;
+}> {
+  if (!onchain?.mangoClient || !onchain.groupPk) {
+    throw new Error('lane registration unavailable: group/client not configured');
+  }
+  const owner = new PublicKey(ownerRaw);
+  const group = await getFreshGroup(onchain);
+  if (!group) {
+    throw new Error('lane registration unavailable: group could not be loaded');
+  }
+
+  // Resolve Mango account
+  const ownerAccounts = await onchain.mangoClient.getMangoAccountsForOwner(group, owner);
+  const mangoAccount = ownerAccounts[0];
+  if (!mangoAccount) {
+    throw new Error(`no Mango account found for owner ${ownerRaw}`);
+  }
+
+  // Get first perp market
+  const perpMarkets = Array.from(group.perpMarketsMapByMarketIndex.values());
+  if (!perpMarkets.length) {
+    throw new Error('no perp markets configured');
+  }
+  const perpMarket = perpMarkets[0];
+
+  const executionQueuePk = new PublicKey(
+    process.env.EXECUTION_QUEUE_PK ||
+      process.env.CONTINUUM_HARNESS_EXECUTION_QUEUE_PK ||
+      '',
+  );
+
+  // Build remaining_accounts in the EXACT order the frontend/relayer uses.
+  // This must match what remapLaneAccountsForOwner produces.
+  const remainingAccounts = [
+    { pubkey: group.publicKey, isSigner: false, isWritable: false },
+    { pubkey: mangoAccount.publicKey, isSigner: false, isWritable: true },
+    { pubkey: owner, isSigner: false, isWritable: false },
+    { pubkey: perpMarket.publicKey, isSigner: false, isWritable: true },
+    { pubkey: perpMarket.bids, isSigner: false, isWritable: true },
+    { pubkey: perpMarket.asks, isSigner: false, isWritable: true },
+    { pubkey: perpMarket.eventQueue, isSigner: false, isWritable: true },
+    { pubkey: perpMarket.oracle, isSigner: false, isWritable: false },
+  ];
+
+  // Check if there are additional health accounts from the lane config
+  // by reading the static lane file and matching the account count
+  const laneConfigPath = process.env.EXECUTION_QUEUE_CRANK_LANES_JSON_PATH || '';
+  if (laneConfigPath && fs.existsSync(laneConfigPath)) {
+    try {
+      const staticLanes = JSON.parse(fs.readFileSync(laneConfigPath, 'utf-8'));
+      const templateLane = staticLanes.find(
+        (l: { name?: string; remainingAccounts: unknown[] }) =>
+          l.remainingAccounts.length > remainingAccounts.length &&
+          (l.name || '').includes('place'),
+      );
+      if (templateLane) {
+        // Append any extra accounts from the template that aren't user-specific
+        const knownPubkeys = new Set(remainingAccounts.map((a) => a.pubkey.toString()));
+        for (let i = remainingAccounts.length; i < templateLane.remainingAccounts.length; i++) {
+          const ta = templateLane.remainingAccounts[i];
+          if (!knownPubkeys.has(ta.pubkey)) {
+            remainingAccounts.push({
+              pubkey: new PublicKey(ta.pubkey),
+              isSigner: ta.isSigner ?? false,
+              isWritable: ta.isWritable ?? false,
+            });
+          } else {
+            // Shared account — keep same flags as template
+            remainingAccounts.push({
+              pubkey: new PublicKey(ta.pubkey),
+              isSigner: ta.isSigner ?? false,
+              isWritable: ta.isWritable ?? false,
+            });
+          }
+        }
+      }
+    } catch {
+      // ignore lane config read failures
+    }
+  }
+
+  // Compute accounts hash the same way the relayer does
+  const accountsForHash = remainingAccounts.map((a) => ({
+    pubkey: a.pubkey instanceof PublicKey ? a.pubkey : new PublicKey(a.pubkey),
+    isSigner: a.isSigner,
+    isWritable: a.isWritable,
+  }));
+
+  // Merge runtime flags with fixed accounts (group=writable, queue=writable, sysvar=readonly)
+  const fixedAccounts = [
+    { pubkey: group.publicKey, isSigner: false, isWritable: true },
+    { pubkey: executionQueuePk, isSigner: false, isWritable: true },
+    { pubkey: new PublicKey('Sysvar1nstructions1111111111111111111111111'), isSigner: false, isWritable: false },
+  ];
+  const merged = new Map<string, { isSigner: boolean; isWritable: boolean }>();
+  for (const a of [...fixedAccounts, ...accountsForHash]) {
+    const key = a.pubkey.toBase58();
+    const existing = merged.get(key);
+    if (existing) {
+      existing.isSigner = existing.isSigner || a.isSigner;
+      existing.isWritable = existing.isWritable || a.isWritable;
+    } else {
+      merged.set(key, { isSigner: a.isSigner, isWritable: a.isWritable });
+    }
+  }
+  const effectiveAccounts = accountsForHash.map((a) => {
+    const key = a.pubkey.toBase58();
+    const flags = merged.get(key)!;
+    return { pubkey: a.pubkey, isSigner: flags.isSigner, isWritable: flags.isWritable };
+  });
+
+  const hashData = Buffer.concat(
+    effectiveAccounts.map((a) =>
+      Buffer.concat([
+        a.pubkey.toBuffer(),
+        Buffer.from([a.isSigner ? 1 : 0, a.isWritable ? 1 : 0]),
+      ]),
+    ),
+  );
+  const accountsHash = createHash('sha256').update(hashData).digest('hex');
+
+  // Write to lane cache if path is configured
+  const laneCachePath = process.env.EXECUTION_QUEUE_LANE_CACHE_PATH || '';
+  const laneName = `registered-${owner.toBase58().slice(0, 12)}`;
+  if (laneCachePath) {
+    let cache: Array<{
+      name: string;
+      user_owner: string;
+      remainingAccounts: Array<{ pubkey: string; isWritable: boolean; isSigner: boolean }>;
+    }> = [];
+    try {
+      if (fs.existsSync(laneCachePath)) {
+        cache = JSON.parse(fs.readFileSync(laneCachePath, 'utf-8'));
+      }
+    } catch {
+      cache = [];
+    }
+    cache = cache.filter((l) => l.user_owner !== ownerRaw);
+    cache.push({
+      name: laneName,
+      user_owner: ownerRaw,
+      remainingAccounts: remainingAccounts.map((a) => ({
+        pubkey: (a.pubkey instanceof PublicKey ? a.pubkey : new PublicKey(a.pubkey)).toBase58(),
+        isWritable: a.isWritable,
+        isSigner: a.isSigner,
+      })),
+    });
+    fs.writeFileSync(laneCachePath, JSON.stringify(cache, null, 2));
+  }
+
+  return {
+    ok: true,
+    owner: owner.toBase58(),
+    mango_account: mangoAccount.publicKey.toBase58(),
+    lane: {
+      name: laneName,
+      remainingAccounts: remainingAccounts.map((a) => ({
+        pubkey: (a.pubkey instanceof PublicKey ? a.pubkey : new PublicKey(a.pubkey)).toBase58(),
+        isWritable: a.isWritable,
+        isSigner: a.isSigner,
+      })),
+    },
+    accounts_hash: accountsHash,
+  };
+}
+
 function buildHttpServer(
   onchain: OnchainContext | null,
   airdrop: AirdropContext | null,
@@ -1832,7 +2055,7 @@ function buildHttpServer(
       const method = req.method || 'GET';
 
       if (method === 'GET' && url.pathname === '/healthz') {
-        const marketMetadata = await getMarketMetadataMap(onchain);
+        const marketMetadata = await getMarketMetadataMapSafe(onchain);
         writeJson(res, 200, {
           ok: true,
           ...statsSnapshot(),
@@ -1883,6 +2106,22 @@ function buildHttpServer(
           optimistic_generated_ts_ms: optimistic.generated_ts_ms,
           confirmed_generated_ts_ms: confirmed.generated_ts_ms,
         });
+        return;
+      }
+
+      if (method === 'POST' && url.pathname === '/admin/register-lane') {
+        try {
+          const body = JSON.parse(await readBody(req));
+          const ownerPk = body.owner;
+          if (!ownerPk) {
+            writeJson(res, 400, { error: 'owner is required' });
+            return;
+          }
+          const result = await buildLaneForOwner(ownerPk, onchain);
+          writeJson(res, 200, result);
+        } catch (err: any) {
+          writeJson(res, 500, { error: err?.message || `${err}` });
+        }
         return;
       }
 
@@ -1991,9 +2230,10 @@ function buildHttpServer(
         const market = decodeURIComponent(url.pathname.slice('/state/markets/'.length));
         const view = parseView(url);
         const snapshot = getSnapshotForView(view, onchainSync);
-        const marketMetadata = await getMarketMetadataMap(onchain);
+        const responseView = snapshot.view;
+        const marketMetadata = await getMarketMetadataMapSafe(onchain);
         writeJson(res, 200, {
-          view,
+          view: responseView,
           metadata: marketMetadata[market] || null,
           data:
             snapshot.markets[market] || {
@@ -2014,7 +2254,9 @@ function buildHttpServer(
       if (method === 'GET' && url.pathname.startsWith('/state/users/')) {
         const owner = decodeURIComponent(url.pathname.slice('/state/users/'.length));
         const view = parseView(url);
-        const baseUserState = getUserStateForView(owner, view, onchainSync);
+        const snapshot = getSnapshotForView(view, onchainSync);
+        const responseView = snapshot.view;
+        const baseUserState = snapshot.users[owner] || emptyUserState(owner);
         const includeOnchain =
           (url.searchParams.get('onchain') || 'true').toLowerCase() !== 'false';
         const data = includeOnchain
@@ -2022,11 +2264,11 @@ function buildHttpServer(
               owner,
               baseUserState,
               onchain,
-              view,
+              responseView,
             )
           : baseUserState;
         writeJson(res, 200, {
-          view,
+          view: responseView,
           data,
         });
         return;
@@ -2037,9 +2279,11 @@ function buildHttpServer(
           url.pathname.slice('/state/balances/'.length),
         );
         const view = parseView(url);
+        const snapshot = getSnapshotForView(view, onchainSync);
+        const responseView = snapshot.view;
         const baseBalances = getBalancesForUserState(
-          getUserStateForView(owner, view, onchainSync),
-          view,
+          snapshot.users[owner] || emptyUserState(owner),
+          responseView,
         );
         const includeOnchain =
           (url.searchParams.get('onchain') || 'true').toLowerCase() !== 'false';
@@ -2048,11 +2292,11 @@ function buildHttpServer(
               owner,
               baseBalances,
               onchain,
-              view,
+              responseView,
             )
           : baseBalances;
         writeJson(res, 200, {
-          view,
+          view: responseView,
           data,
         });
         return;
@@ -2063,12 +2307,13 @@ function buildHttpServer(
         const view = parseView(url);
         const owner = url.searchParams.get('owner');
         const snapshot = getSnapshotForView(view, onchainSync);
+        const responseView = snapshot.view;
         const data =
           snapshot.markets[market]?.open_orders.filter((order) => {
             return !owner || order.owner === owner;
           }) || [];
         writeJson(res, 200, {
-          view,
+          view: responseView,
           market,
           owner,
           data,
@@ -2129,7 +2374,8 @@ function buildHttpServer(
         const view = parseView(url);
         const market = url.searchParams.get('market');
         const snapshot = getSnapshotForView(view, onchainSync);
-        const marketMetadata = await getMarketMetadataMap(onchain);
+        const responseView = snapshot.view;
+        const marketMetadata = await getMarketMetadataMapSafe(onchain);
         if (!market) {
           writeJson(res, 200, {
             ...snapshot,
@@ -2145,7 +2391,7 @@ function buildHttpServer(
           }),
         );
         writeJson(res, 200, {
-          view,
+          view: responseView,
           generated_ts_ms: snapshot.generated_ts_ms,
           market: marketState,
           market_metadata: marketMetadata[market] || null,
@@ -2196,6 +2442,30 @@ async function main(): Promise<void> {
   replayEventLogIfPresent();
   await maybeBackfillProgramLogs(connection, programId);
   const onchain = await buildOnchainContext(connection, programId);
+
+  // ── Bootstrap engine from on-chain confirmed state ──────────────────
+  // Seeds baseline positions so the harness starts in sync with on-chain
+  // rather than from zero. This is critical for accuracy after restarts.
+  if (onchain.groupPk && onchain.mangoClient) {
+    console.log('Bootstrapping engine from on-chain confirmed state...');
+    try {
+      const onchainSnapshot = await buildOnchainConfirmedSnapshot(onchain);
+      if (onchainSnapshot) {
+        engine.bootstrapFromOnchainSnapshot(onchainSnapshot);
+        const userCount = Object.keys(onchainSnapshot.users).length;
+        const marketCount = Object.keys(onchainSnapshot.markets).length;
+        console.log(
+          `On-chain bootstrap complete: ${userCount} users, ${marketCount} markets`,
+        );
+      } else {
+        console.warn('On-chain bootstrap returned null snapshot — starting from zero');
+      }
+    } catch (err) {
+      console.warn(`On-chain bootstrap failed (starting from zero): ${err}`);
+    }
+  }
+  // ────────────────────────────────────────────────────────────────────
+
   const airdrop = await buildAirdropContext(onchain);
   const onchainSync: OnchainSyncState = {
     snapshot: null,

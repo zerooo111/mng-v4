@@ -230,8 +230,9 @@ pub(crate) fn liquidation_action(
     let asset_transfer_from_liqee = asset_transfer_base * fee_factor_total;
 
     let asset_liquidation_fee = asset_transfer_from_liqee - asset_transfer_to_liqor;
-    asset_bank.collected_fees_native += asset_liquidation_fee;
-    asset_bank.collected_liquidation_fees += asset_liquidation_fee;
+    asset_bank.collected_fees_native = { asset_bank.collected_fees_native } + asset_liquidation_fee;
+    asset_bank.collected_liquidation_fees =
+        { asset_bank.collected_liquidation_fees } + asset_liquidation_fee;
 
     // During liquidation, we mustn't leave small positive balances in the liqee. Those
     // could break bankruptcy-detection. Thus we dust them even if the token position
