@@ -5538,6 +5538,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rust-harness"
+version = "0.1.0"
+dependencies = [
+ "anchor-lang 0.28.0",
+ "base64 0.21.7",
+ "bytemuck",
+ "fixed",
+ "mango-v4",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "rustc-demangle"
 version = "0.1.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"

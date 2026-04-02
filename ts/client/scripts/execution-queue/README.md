@@ -240,16 +240,26 @@ yarn continuum-state-harness
 ### Key Endpoints
 
 - `POST /ingest/relay-intent`
+- `GET /state/markets?markets=<id,id>&view=optimistic|confirmed&depth=10&book=summary|full`
 - `GET /state/markets/:market?view=optimistic|confirmed`
 - `GET /state/users/:owner?view=optimistic|confirmed`
 - `GET /state/balances/:owner?view=optimistic|confirmed`
 - `GET /state/orders/:market?owner=<pubkey>&view=optimistic|confirmed`
+- `GET /state/trades?market=<id>&owner=<pubkey>&view=optimistic|confirmed&limit=200`
 - `GET /state/trades/:market?view=optimistic|confirmed&limit=200`
+- `GET /state/trades/summary?market=<id>&owner=<pubkey>&view=optimistic|confirmed`
 - `GET /state/candles/:market?view=optimistic|confirmed&resolution_sec=60&limit=200`
 - `GET /state/queue/:market`
 - `GET /state/full?market=<id>&view=optimistic|confirmed`
 - `GET /state/stream` (SSE)
+- `GET /state/stream/trades?market=<id>&view=optimistic|confirmed&backfill_n=50` (SSE)
+- `GET /state/stream/frontend?owner=<pubkey>&mango_account=<pubkey>&market=<id>&include=positions,trades,open_orders,account_metrics,market_metrics,trade_summary,orderbook_summary,orderbook` (SSE)
 - `GET /healthz`, `GET /metrics`, `GET /diagnostics/divergence`
+
+Frontend stream notes:
+- owner slices stream live `positions`, `trades`, and `open_orders`
+- `account_metrics` is currently a stub payload with `status: "stub"` and `source: "pending-subtree"`
+- owner positions are currently emitted as `positions_scope: "owner_aggregate"`
 
 ### Verification (Phase 5)
 

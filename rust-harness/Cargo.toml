@@ -1,0 +1,18 @@
+[package]
+name = "rust-harness"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "rust_harness"
+path = "src/lib.rs"
+
+[dependencies]
+anchor-lang = { workspace = true }
+base64 = "0.21"
+bytemuck = { version = "^1.7.2", features = ["min_const_generics"] }
+fixed = { workspace = true }
+mango-v4 = { path = "../programs/mango-v4", default-features = false, features = ["client", "enable-gpl"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"

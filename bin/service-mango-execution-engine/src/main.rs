@@ -1131,6 +1131,9 @@ impl SequenceStore {
 struct Engine {
     config: Arc<Config>,
     rpc: Arc<RpcClient>,
+    /// Optional secondary RPC for dual-send (fire-and-forget) to increase
+    /// tx landing probability across multiple providers.
+    secondary_rpc: Option<Arc<RpcClient>>,
     blockhashes: Arc<BlockhashManager>,
     sequences: Arc<SequenceStore>,
     metrics: Arc<Metrics>,
@@ -1248,10 +1251,14 @@ impl Engine {
             .fetch_harness_readiness(harness_base_url)
             .await
             .map_err(|err| format!("{err:#}"));
-        *self.harness_readiness.lock().await = Some(CachedHarnessReadiness {
-            checked_at_ms: now_ms,
-            result: refreshed.clone(),
-        });
+        // Only cache successful results — errors should be retried immediately
+        // instead of poisoning the cache for the entire cache_ms window.
+        if refreshed.is_ok() {
+            *self.harness_readiness.lock().await = Some(CachedHarnessReadiness {
+                checked_at_ms: now_ms,
+                result: refreshed.clone(),
+            });
+        }
         self.evaluate_harness_readiness(market, refreshed)
     }
 
@@ -2583,10 +2590,25 @@ impl Engine {
             && pending_snapshot.len() < self.config.executor_max_pending_txs
             && now_ms.saturating_sub(latest_same_head_send_ms)
                 >= self.config.executor_same_head_send_interval_ms;
-        if !pending_snapshot.is_empty() && !can_pipeline_same_head {
+        // Only suppress if we've hit the per-head pipeline cap AND the total
+        // pending count is high.  Previously this blocked ALL sends when the
+        // current head had pending txs, idling the cranker even when it could
+        // be targeting a new head.  Now we allow sending as long as the global
+        // pending budget has room — enabling back-to-back txs for consecutive
+        // heads without waiting for confirmations.
+        if same_head_pending_count >= self.config.executor_pipeline_max_per_head
+            && pending_snapshot.len() >= self.config.executor_max_pending_txs
+        {
             self.metrics
                 .execute_send_suppressed_pending
                 .fetch_add(1, Ordering::Relaxed);
+            return Ok(ExecuteLoopOutcome::Busy);
+        }
+        if same_head_pending_count >= self.config.executor_pipeline_max_per_head {
+            // Hit per-head cap but global budget has room — the head may have
+            // already advanced by the time the next inspect fires.  Re-inspect
+            // immediately instead of sleeping.
+            executor.last_inspect_ms.store(0, Ordering::Relaxed);
             return Ok(ExecuteLoopOutcome::Busy);
         }
 
@@ -2706,7 +2728,7 @@ impl Engine {
                     let mut seen: std::collections::HashSet<[u8; 32]> =
                         matched.iter().map(|l| l.hash).collect();
                     for lane in &lanes {
-                        if seen.len() >= 2 {
+                        if seen.len() >= 5 {
                             break;
                         }
                         if seen.contains(&lane.hash) {
@@ -2857,45 +2879,38 @@ impl Engine {
             .execute_targeted
             .fetch_add(1, Ordering::Relaxed);
 
-        let send_result = if eligible_lanes.len() > 1 {
+        let (tx, send_cfg) = if eligible_lanes.len() > 1 {
             match self
                 .build_execute_multi_tx(&eligible_lanes, executor, head.next_sequence)
                 .await
             {
-                Ok((tx, send_cfg)) => self
-                    .rpc
-                    .send_transaction_with_config(&tx, send_cfg)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("{e}")),
+                Ok(built) => built,
                 Err(err) => {
-                    // Multi-lane build failed (likely too many accounts), fallback to single
                     warn!("executor multi-lane build failed, falling back to single: {err:?}");
-                    match self
-                        .build_execute_tx(&eligible_lanes[0], executor, head.next_sequence)
-                        .await
-                    {
-                        Ok((tx, send_cfg)) => self
-                            .rpc
-                            .send_transaction_with_config(&tx, send_cfg)
-                            .await
-                            .map_err(|e| anyhow::anyhow!("{e}")),
-                        Err(err) => Err(err),
-                    }
+                    self.build_execute_tx(&eligible_lanes[0], executor, head.next_sequence)
+                        .await?
                 }
             }
         } else {
-            match self
-                .build_execute_tx(&eligible_lanes[0], executor, head.next_sequence)
-                .await
-            {
-                Ok((tx, send_cfg)) => self
-                    .rpc
-                    .send_transaction_with_config(&tx, send_cfg)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("{e}")),
-                Err(err) => Err(err),
-            }
+            self.build_execute_tx(&eligible_lanes[0], executor, head.next_sequence)
+                .await?
         };
+
+        // Dual-send: fire-and-forget to secondary RPC for higher landing probability
+        if let Some(secondary) = &self.secondary_rpc {
+            let tx_clone = tx.clone();
+            let cfg_clone = send_cfg;
+            let sec = secondary.clone();
+            tokio::spawn(async move {
+                let _ = sec.send_transaction_with_config(&tx_clone, cfg_clone).await;
+            });
+        }
+
+        let send_result = self
+            .rpc
+            .send_transaction_with_config(&tx, send_cfg)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"));
 
         match send_result {
             Ok(signature) => {
@@ -4143,9 +4158,18 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+    let secondary_rpc = std::env::var("CTM_RELAYER_SECONDARY_RPC_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(|url| {
+            info!("secondary RPC enabled: {}", &url[..url.len().min(60)]);
+            Arc::new(RpcClient::new_with_commitment(url, CommitmentConfig::confirmed()))
+        });
+
     let engine = Arc::new(Engine {
         config: config.clone(),
         rpc,
+        secondary_rpc,
         blockhashes,
         sequences,
         metrics: metrics.clone(),

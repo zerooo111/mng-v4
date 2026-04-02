@@ -24,6 +24,7 @@ import {
   ContinuumStateEngine,
   EngineSnapshot,
   HarnessEvent,
+  MarketTrade,
   OpenOrderSummary,
   QueueView,
   RelayIntentAcceptedEvent,
@@ -181,6 +182,135 @@ type OnchainSyncState = {
   drift: ReconciliationSnapshot | null;
   last_error: string | null;
 };
+
+type OrderbookLevelView = {
+  price_lots: string;
+  base_lots: string;
+  price_ui: number | null;
+  qty_ui: number | null;
+};
+
+type OrderbookSummaryView = {
+  depth: number;
+  bids: OrderbookLevelView[];
+  asks: OrderbookLevelView[];
+};
+
+type MarketTradeSummary = {
+  market: string;
+  view: QueueView;
+  window_ms: number;
+  trade_count: number;
+  last_trade_ts_ms: number | null;
+  last_price_lots: string | null;
+  last_price_ui: number | null;
+  open_price_lots: string | null;
+  open_price_ui: number | null;
+  high_price_lots: string | null;
+  high_price_ui: number | null;
+  low_price_lots: string | null;
+  low_price_ui: number | null;
+  change_24h_pct: number | null;
+  volume_base_lots: string;
+  volume_quote_lots: string;
+  volume_base_ui: number | null;
+  volume_quote_ui: number | null;
+};
+
+type MarketRuntimeMetrics = {
+  market: string;
+  oracle_price_ui: number | null;
+  mark_price_ui: number | null;
+  funding_rate_daily_pct: number | null;
+  funding_rate_hourly_pct: number | null;
+  open_interest_base_lots: string | null;
+  open_interest_base_ui: number | null;
+  best_bid_ui: number | null;
+  best_ask_ui: number | null;
+  updated_ts_ms: number;
+};
+
+type MarketListItem = {
+  market: string;
+  view: QueueView;
+  metadata: HarnessMarketMetadata | null;
+  data: EngineSnapshot['markets'][string];
+  orderbook_summary: OrderbookSummaryView;
+  trade_summary: MarketTradeSummary;
+  metrics: MarketRuntimeMetrics | null;
+};
+
+type StubbedAccountMetrics = {
+  status: 'stub';
+  source: 'pending-subtree';
+  updated_ts_ms: number;
+  fields: {
+    margin_used: null;
+    health_init: null;
+    health_maint: null;
+    pnl_realized: null;
+    pnl_unrealized: null;
+    equity: null;
+    liquidation_price_by_market: null;
+  };
+};
+
+type FrontendOwnerSlice = {
+  owner: string;
+  mango_account: string | null;
+  view: QueueView;
+  positions_scope: 'owner_aggregate';
+  positions: UserState['per_market'];
+  open_orders: OpenOrderSummary[];
+  trades: MarketTrade[];
+  account_metrics: StubbedAccountMetrics;
+};
+
+type FrontendMarketSlice = {
+  market: string;
+  view: QueueView;
+  metadata: HarnessMarketMetadata | null;
+  metrics: MarketRuntimeMetrics | null;
+  trade_summary: MarketTradeSummary;
+  orderbook_summary: OrderbookSummaryView;
+  orderbook: EngineSnapshot['markets'][string] | null;
+};
+
+type TradeStreamSubscriber = {
+  id: string;
+  res: ServerResponse;
+  view: QueueView;
+  market: string | null;
+  backfillLimit: number;
+};
+
+type FrontendStreamSubscriber = {
+  id: string;
+  res: ServerResponse;
+  view: QueueView;
+  owner: string | null;
+  mangoAccount: string | null;
+  market: string | null;
+  depth: number;
+  tradesLimit: number;
+  include: Set<string>;
+  orderbookMode: 'summary' | 'full';
+  ownerSignature: string | null;
+  marketSignature: string | null;
+};
+
+const TRADE_SUMMARY_WINDOW_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_STREAM_BACKFILL = 50;
+const DEFAULT_FRONTEND_TRADES_LIMIT = 50;
+const DEFAULT_ORDERBOOK_DEPTH = 10;
+const tradeStreamSubscribers = new Map<string, TradeStreamSubscriber>();
+const frontendStreamSubscribers = new Map<string, FrontendStreamSubscriber>();
+const tradeStreamCursors = new Map<string, string | null>();
+const marketRuntimeMetricsCache = new Map<
+  string,
+  { fetchedAtMs: number; data: MarketRuntimeMetrics | null }
+>();
+let nextStreamSubscriberSeq = 1;
 
 function ensureDirForFile(filePath: string): void {
   fs.mkdirSync(path.dirname(path.resolve(filePath)), { recursive: true });
@@ -440,6 +570,501 @@ function getBalancesForUserState(
   };
 }
 
+function nextStreamSubscriberId(): string {
+  const id = nextStreamSubscriberSeq;
+  nextStreamSubscriberSeq += 1;
+  return `${id}`;
+}
+
+function parseNonNegativeInteger(
+  raw: string | null,
+  fallback: number,
+  {
+    min = 0,
+    max,
+  }: { min?: number; max?: number } = {},
+): number {
+  const parsed = raw === null ? fallback : Number(raw);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+  let next = Math.floor(parsed);
+  if (next < min) {
+    next = min;
+  }
+  if (max !== undefined && next > max) {
+    next = max;
+  }
+  return next;
+}
+
+function parseCommaSeparatedList(raw: string | null): string[] | null {
+  if (!raw) {
+    return null;
+  }
+  const items = raw
+    .split(',')
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+  return items.length ? items : null;
+}
+
+function parseIncludeSet(
+  url: URL,
+  defaults: string[],
+): Set<string> {
+  return new Set(parseCommaSeparatedList(url.searchParams.get('include')) || defaults);
+}
+
+function emptyMarketState(market: string): EngineSnapshot['markets'][string] {
+  return {
+    market,
+    bids: [],
+    asks: [],
+    open_orders: [],
+    watermarks: {
+      optimistic_seq: '0',
+      confirmed_seq: '0',
+      last_slot: '0',
+    },
+  };
+}
+
+function maybeToBigInt(raw: string | null | undefined): bigint | null {
+  if (!raw || !raw.length) {
+    return null;
+  }
+  try {
+    return BigInt(raw);
+  } catch {
+    return null;
+  }
+}
+
+function priceLotsToUi(
+  priceLots: string | null,
+  metadata: HarnessMarketMetadata | null,
+): number | null {
+  if (!priceLots || !metadata) {
+    return null;
+  }
+  const priceLotsBig = maybeToBigInt(priceLots);
+  const baseLotSize = maybeToBigInt(metadata.base_lot_size);
+  const quoteLotSize = maybeToBigInt(metadata.quote_lot_size);
+  if (priceLotsBig === null || baseLotSize === null || quoteLotSize === null || baseLotSize === 0n) {
+    return null;
+  }
+  const scalar =
+    Number(quoteLotSize) * Math.pow(10, metadata.base_decimals) /
+    (Number(baseLotSize) * Math.pow(10, metadata.quote_decimals));
+  return Number(priceLotsBig) * scalar;
+}
+
+function baseLotsToUi(
+  baseLots: string | null,
+  metadata: HarnessMarketMetadata | null,
+): number | null {
+  if (!baseLots || !metadata) {
+    return null;
+  }
+  const baseLotsBig = maybeToBigInt(baseLots);
+  const baseLotSize = maybeToBigInt(metadata.base_lot_size);
+  if (baseLotsBig === null || baseLotSize === null) {
+    return null;
+  }
+  return (Number(baseLotsBig) * Number(baseLotSize)) / Math.pow(10, metadata.base_decimals);
+}
+
+function quoteLotsToUi(
+  quoteLots: string | null,
+  metadata: HarnessMarketMetadata | null,
+): number | null {
+  if (!quoteLots || !metadata) {
+    return null;
+  }
+  const quoteLotsBig = maybeToBigInt(quoteLots);
+  const quoteLotSize = maybeToBigInt(metadata.quote_lot_size);
+  if (quoteLotsBig === null || quoteLotSize === null) {
+    return null;
+  }
+  return (Number(quoteLotsBig) * Number(quoteLotSize)) / Math.pow(10, metadata.quote_decimals);
+}
+
+function buildOrderbookLevels(
+  levels: Array<{ price_lots: string; base_lots: string }>,
+  metadata: HarnessMarketMetadata | null,
+  depth: number,
+): OrderbookLevelView[] {
+  return levels.slice(0, depth).map((level) => ({
+    price_lots: level.price_lots,
+    base_lots: level.base_lots,
+    price_ui: priceLotsToUi(level.price_lots, metadata),
+    qty_ui: baseLotsToUi(level.base_lots, metadata),
+  }));
+}
+
+function buildOrderbookSummary(
+  marketState: EngineSnapshot['markets'][string] | null,
+  metadata: HarnessMarketMetadata | null,
+  depth: number,
+): OrderbookSummaryView {
+  const safeDepth = Math.max(1, depth);
+  return {
+    depth: safeDepth,
+    bids: buildOrderbookLevels(marketState?.bids || [], metadata, safeDepth),
+    asks: buildOrderbookLevels(marketState?.asks || [], metadata, safeDepth),
+  };
+}
+
+function buildTradeSummary(
+  market: string,
+  view: QueueView,
+  trades: MarketTrade[],
+  metadata: HarnessMarketMetadata | null,
+  windowMs = TRADE_SUMMARY_WINDOW_MS,
+): MarketTradeSummary {
+  const now = Date.now();
+  const windowTrades = trades.filter((trade) => trade.ts_ms >= now - windowMs);
+  const sourceTrades = windowTrades.length ? windowTrades : trades;
+  const lastTrade = trades[trades.length - 1] || null;
+  const openTrade = sourceTrades[0] || null;
+  let highPrice: bigint | null = null;
+  let lowPrice: bigint | null = null;
+  let volumeBaseLots = 0n;
+  let volumeQuoteLots = 0n;
+
+  for (const trade of sourceTrades) {
+    const priceLots = BigInt(trade.price_lots);
+    if (highPrice === null || priceLots > highPrice) {
+      highPrice = priceLots;
+    }
+    if (lowPrice === null || priceLots < lowPrice) {
+      lowPrice = priceLots;
+    }
+    volumeBaseLots += BigInt(trade.base_lots);
+    volumeQuoteLots += BigInt(trade.quote_lots);
+  }
+
+  const openPriceLots = openTrade?.price_lots || null;
+  const lastPriceLots = lastTrade?.price_lots || null;
+  const openPriceUi = priceLotsToUi(openPriceLots, metadata);
+  const lastPriceUi = priceLotsToUi(lastPriceLots, metadata);
+  const change24hPct =
+    openPriceUi !== null && lastPriceUi !== null && openPriceUi !== 0
+      ? ((lastPriceUi - openPriceUi) / openPriceUi) * 100
+      : null;
+
+  return {
+    market,
+    view,
+    window_ms: windowMs,
+    trade_count: sourceTrades.length,
+    last_trade_ts_ms: lastTrade?.ts_ms || null,
+    last_price_lots: lastPriceLots,
+    last_price_ui: lastPriceUi,
+    open_price_lots: openPriceLots,
+    open_price_ui: openPriceUi,
+    high_price_lots: highPrice?.toString() || null,
+    high_price_ui: priceLotsToUi(highPrice?.toString() || null, metadata),
+    low_price_lots: lowPrice?.toString() || null,
+    low_price_ui: priceLotsToUi(lowPrice?.toString() || null, metadata),
+    change_24h_pct: change24hPct,
+    volume_base_lots: volumeBaseLots.toString(),
+    volume_quote_lots: volumeQuoteLots.toString(),
+    volume_base_ui: baseLotsToUi(volumeBaseLots.toString(), metadata),
+    volume_quote_ui: quoteLotsToUi(volumeQuoteLots.toString(), metadata),
+  };
+}
+
+function buildStubbedAccountMetrics(): StubbedAccountMetrics {
+  return {
+    status: 'stub',
+    source: 'pending-subtree',
+    updated_ts_ms: 0,
+    fields: {
+      margin_used: null,
+      health_init: null,
+      health_maint: null,
+      pnl_realized: null,
+      pnl_unrealized: null,
+      equity: null,
+      liquidation_price_by_market: null,
+    },
+  };
+}
+
+function getImpactPriceUiFromLevels(
+  levels: Array<{ price_lots: string; base_lots: string }>,
+  impactBaseLots: BN,
+  metadata: HarnessMarketMetadata | null,
+): number | null {
+  let accumulated = 0n;
+  const target = BigInt(impactBaseLots.toString());
+  for (const level of levels) {
+    accumulated += BigInt(level.base_lots);
+    if (accumulated >= target) {
+      return priceLotsToUi(level.price_lots, metadata);
+    }
+  }
+  return null;
+}
+
+function computeFundingRateDailyPct(
+  oraclePriceUi: number | null,
+  bidImpactUi: number | null,
+  askImpactUi: number | null,
+  minFunding: number,
+  maxFunding: number,
+): number | null {
+  if (oraclePriceUi === null || oraclePriceUi === 0) {
+    return null;
+  }
+  let funding: number;
+  if (bidImpactUi !== null && askImpactUi !== null) {
+    const bookPrice = (bidImpactUi + askImpactUi) / 2;
+    funding = Math.min(Math.max(bookPrice / oraclePriceUi - 1, minFunding), maxFunding);
+  } else if (bidImpactUi !== null) {
+    funding = maxFunding;
+  } else if (askImpactUi !== null) {
+    funding = minFunding;
+  } else {
+    funding = 0;
+  }
+  return funding * 100;
+}
+
+async function getMarketRuntimeMetrics(
+  market: string,
+  marketState: EngineSnapshot['markets'][string] | null,
+  metadata: HarnessMarketMetadata | null,
+  onchain: OnchainContext | null,
+): Promise<MarketRuntimeMetrics | null> {
+  const cached = marketRuntimeMetricsCache.get(market);
+  if (cached && Date.now() - cached.fetchedAtMs < HARNESS_ONCHAIN_CACHE_TTL_MS) {
+    return cached.data;
+  }
+
+  const group = await getFreshGroup(onchain);
+  if (!group) {
+    marketRuntimeMetricsCache.set(market, { fetchedAtMs: Date.now(), data: null });
+    return null;
+  }
+
+  const marketIndex = Number(market);
+  if (!Number.isInteger(marketIndex)) {
+    marketRuntimeMetricsCache.set(market, { fetchedAtMs: Date.now(), data: null });
+    return null;
+  }
+
+  const perpMarket = group.perpMarketsMapByMarketIndex.get(marketIndex as never);
+  if (!perpMarket) {
+    marketRuntimeMetricsCache.set(market, { fetchedAtMs: Date.now(), data: null });
+    return null;
+  }
+
+  const bestBidUi = priceLotsToUi(marketState?.bids?.[0]?.price_lots || null, metadata);
+  const bestAskUi = priceLotsToUi(marketState?.asks?.[0]?.price_lots || null, metadata);
+  const bidImpactUi = getImpactPriceUiFromLevels(
+    marketState?.bids || [],
+    perpMarket.impactQuantity,
+    metadata,
+  );
+  const askImpactUi = getImpactPriceUiFromLevels(
+    marketState?.asks || [],
+    perpMarket.impactQuantity,
+    metadata,
+  );
+  let oraclePriceUi: number | null = null;
+  try {
+    oraclePriceUi = Number.isFinite(perpMarket.uiPrice) ? perpMarket.uiPrice : null;
+  } catch {
+    oraclePriceUi = null;
+  }
+  const markPriceUi =
+    bestBidUi !== null && bestAskUi !== null
+      ? (bestBidUi + bestAskUi) / 2
+      : oraclePriceUi;
+  const fundingRateDailyPct = computeFundingRateDailyPct(
+    oraclePriceUi,
+    bidImpactUi,
+    askImpactUi,
+    perpMarket.minFunding.toNumber(),
+    perpMarket.maxFunding.toNumber(),
+  );
+  const data: MarketRuntimeMetrics = {
+    market,
+    oracle_price_ui: oraclePriceUi,
+    mark_price_ui: markPriceUi,
+    funding_rate_daily_pct: fundingRateDailyPct,
+    funding_rate_hourly_pct:
+      fundingRateDailyPct === null ? null : fundingRateDailyPct / 24,
+    open_interest_base_lots: perpMarket.openInterest.toString(),
+    open_interest_base_ui: perpMarket.baseLotsToUi(perpMarket.openInterest),
+    best_bid_ui: bestBidUi,
+    best_ask_ui: bestAskUi,
+    updated_ts_ms: Date.now(),
+  };
+  marketRuntimeMetricsCache.set(market, { fetchedAtMs: data.updated_ts_ms, data });
+  return data;
+}
+
+function resolveOwnerFromSnapshot(
+  snapshot: EngineSnapshot,
+  owner: string | null,
+  mangoAccount: string | null,
+): string | null {
+  if (owner) {
+    return owner;
+  }
+  if (!mangoAccount) {
+    return null;
+  }
+  for (const [candidateOwner, user] of Object.entries(snapshot.users)) {
+    if (user.mango_accounts.includes(mangoAccount)) {
+      return candidateOwner;
+    }
+  }
+  return null;
+}
+
+async function buildFrontendOwnerSlice(
+  snapshot: EngineSnapshot,
+  owner: string,
+  mangoAccount: string | null,
+  market: string | null,
+  view: QueueView,
+  tradesLimit: number,
+): Promise<FrontendOwnerSlice> {
+  const userState = snapshot.users[owner] || emptyUserState(owner);
+  return {
+    owner,
+    mango_account: mangoAccount,
+    view,
+    positions_scope: 'owner_aggregate',
+    positions: userState.per_market.filter((position) => {
+      return !market || position.market === market;
+    }),
+    open_orders: userState.open_orders.filter((order) => {
+      return (!market || order.market === market) && (!mangoAccount || order.mango_account === mangoAccount);
+    }),
+    trades: engine.getTradesFiltered({
+      view,
+      owner,
+      market,
+      limit: tradesLimit,
+    }),
+    account_metrics: buildStubbedAccountMetrics(),
+  };
+}
+
+async function buildFrontendMarketSlice(
+  market: string,
+  marketState: EngineSnapshot['markets'][string] | null,
+  metadata: HarnessMarketMetadata | null,
+  onchain: OnchainContext | null,
+  view: QueueView,
+  depth: number,
+  orderbookMode: 'summary' | 'full',
+): Promise<FrontendMarketSlice> {
+  const data = marketState || emptyMarketState(market);
+  return {
+    market,
+    view,
+    metadata,
+    metrics: await getMarketRuntimeMetrics(market, data, metadata, onchain),
+    trade_summary: buildTradeSummary(
+      market,
+      view,
+      engine.getTrades(market, view, 5000),
+      metadata,
+    ),
+    orderbook_summary: buildOrderbookSummary(data, metadata, depth),
+    orderbook: orderbookMode === 'full' ? data : null,
+  };
+}
+
+async function buildMarketListItems(
+  snapshot: EngineSnapshot,
+  onchain: OnchainContext | null,
+  view: QueueView,
+  marketsFilter: string[] | null,
+  depth: number,
+  includeFullBook: boolean,
+): Promise<MarketListItem[]> {
+  const metadataMap = await getMarketMetadataMapSafe(onchain);
+  const marketIds = new Set<string>([
+    ...Object.keys(snapshot.markets),
+    ...Object.keys(metadataMap),
+    ...(marketsFilter || []),
+  ]);
+  const selectedMarkets = Array.from(marketIds)
+    .filter((market) => !marketsFilter || marketsFilter.includes(market))
+    .sort((a, b) => Number(a) - Number(b));
+
+  return await Promise.all(
+    selectedMarkets.map(async (market) => {
+      const metadata = metadataMap[market] || null;
+      const data = snapshot.markets[market] || emptyMarketState(market);
+      return {
+        market,
+        view,
+        metadata,
+        data: includeFullBook ? data : {
+          ...data,
+          bids: [],
+          asks: [],
+        },
+        orderbook_summary: buildOrderbookSummary(data, metadata, depth),
+        trade_summary: buildTradeSummary(
+          market,
+          view,
+          engine.getTrades(market, view, 5000),
+          metadata,
+        ),
+        metrics: await getMarketRuntimeMetrics(market, data, metadata, onchain),
+      };
+    }),
+  );
+}
+
+function buildTradeSummaryCollection(
+  view: QueueView,
+  metadataMap: Record<string, HarnessMarketMetadata>,
+  market: string | null,
+  owner: string | null,
+): MarketTradeSummary[] {
+  if (market) {
+    return [
+      buildTradeSummary(
+        market,
+        view,
+        engine.getTradesFiltered({ view, market, owner, limit: 5000 }),
+        metadataMap[market] || null,
+      ),
+    ];
+  }
+
+  const candidateMarkets = new Set<string>([
+    ...Object.keys(metadataMap),
+    ...Object.keys(engine.getSnapshot(view).markets),
+  ]);
+  return Array.from(candidateMarkets)
+    .sort((a, b) => Number(a) - Number(b))
+    .map((marketId) =>
+      buildTradeSummary(
+        marketId,
+        view,
+        engine.getTradesFiltered({
+          view,
+          market: marketId,
+          owner,
+          limit: 5000,
+        }),
+        metadataMap[marketId] || null,
+      ),
+    );
+}
+
 function aggregateDepth(
   levels: Array<{ price_lots: string; base_lots: string }>,
 ): Map<string, bigint> {
@@ -620,13 +1245,11 @@ function checkRelayIngestAuth(req: IncomingMessage): boolean {
 }
 
 function statsSnapshot() {
-  const intents = engine.listIntents();
-  const divergences = engine.listDivergences(1000000).length;
   const optimistic = engine.getSnapshot('optimistic');
   return {
     mode: HARNESS_MODE,
-    intents_total: intents.length,
-    divergences_total: divergences,
+    intents_total: engine.listIntents().length,
+    divergences_total: engine.listDivergences(100).length,
     markets_total: Object.keys(optimistic.markets).length,
     users_total: Object.keys(optimistic.users).length,
     queue_views_total: Object.keys(optimistic.queue).length,
@@ -2044,6 +2667,220 @@ async function buildLaneForOwner(
   };
 }
 
+function initializeSse(res: ServerResponse): void {
+  res.statusCode = 200;
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders?.();
+}
+
+function tradeCursorKey(view: QueueView, market: string | null): string {
+  return `${view}:${market || '*'}`;
+}
+
+function primeTradeCursor(view: QueueView, market: string | null): void {
+  const key = tradeCursorKey(view, market);
+  if (tradeStreamCursors.has(key)) {
+    return;
+  }
+  const trades = market
+    ? engine.getTrades(market, view, 5000)
+    : engine.getAllTrades(view, 5000);
+  tradeStreamCursors.set(key, trades[trades.length - 1]?.trade_id || null);
+}
+
+function pullTradeDelta(view: QueueView, market: string | null): MarketTrade[] {
+  const key = tradeCursorKey(view, market);
+  const trades = market
+    ? engine.getTrades(market, view, 5000)
+    : engine.getAllTrades(view, 5000);
+  const previousLastTradeId = tradeStreamCursors.get(key);
+  const nextLastTradeId = trades[trades.length - 1]?.trade_id || null;
+  tradeStreamCursors.set(key, nextLastTradeId);
+  if (previousLastTradeId === undefined) {
+    return [];
+  }
+  if (!previousLastTradeId) {
+    return trades;
+  }
+  const idx = trades.findIndex((trade) => trade.trade_id === previousLastTradeId);
+  if (idx >= 0) {
+    return trades.slice(idx + 1);
+  }
+  return trades.length ? trades.slice(-1) : [];
+}
+
+function dropTradeCursorIfUnused(
+  view: QueueView,
+  market: string | null,
+): void {
+  for (const subscriber of tradeStreamSubscribers.values()) {
+    if (subscriber.view === view && subscriber.market === market) {
+      return;
+    }
+  }
+  tradeStreamCursors.delete(tradeCursorKey(view, market));
+}
+
+function deriveEventContext(event: HarnessEvent): {
+  market: string | null;
+  owner: string | null;
+  mangoAccount: string | null;
+} {
+  if (event.event_type === 'relay_intent_accepted') {
+    return {
+      market: event.market,
+      owner: event.user_owner,
+      mangoAccount: event.mango_account,
+    };
+  }
+  if (event.event_type === 'queue_item_enqueued' || event.event_type === 'queue_item_processed') {
+    const intent = engine.findIntent(event.group, event.sequence, event.kind);
+    return {
+      market: intent?.market || null,
+      owner: intent?.user_owner || null,
+      mangoAccount: intent?.mango_account || null,
+    };
+  }
+  return {
+    market: null,
+    owner: null,
+    mangoAccount: null,
+  };
+}
+
+async function buildFrontendSnapshotPayload(
+  subscriber: FrontendStreamSubscriber,
+  onchain: OnchainContext | null,
+  onchainSync: OnchainSyncState,
+): Promise<{
+  owner: FrontendOwnerSlice | null;
+  market: FrontendMarketSlice | null;
+}> {
+  const snapshot = getSnapshotForView(subscriber.view, onchainSync);
+  const metadataMap = await getMarketMetadataMapSafe(onchain);
+  const resolvedOwner = resolveOwnerFromSnapshot(
+    snapshot,
+    subscriber.owner,
+    subscriber.mangoAccount,
+  );
+
+  return {
+    owner:
+      resolvedOwner &&
+      (subscriber.include.has('positions') ||
+        subscriber.include.has('open_orders') ||
+        subscriber.include.has('trades') ||
+        subscriber.include.has('account_metrics'))
+        ? await buildFrontendOwnerSlice(
+            snapshot,
+            resolvedOwner,
+            subscriber.mangoAccount,
+            subscriber.market,
+            subscriber.view,
+            subscriber.tradesLimit,
+          )
+        : null,
+    market:
+      subscriber.market &&
+      (subscriber.include.has('market_metrics') ||
+        subscriber.include.has('trade_summary') ||
+        subscriber.include.has('orderbook') ||
+        subscriber.include.has('orderbook_summary'))
+        ? await buildFrontendMarketSlice(
+            subscriber.market,
+            snapshot.markets[subscriber.market] || emptyMarketState(subscriber.market),
+            metadataMap[subscriber.market] || null,
+            onchain,
+            subscriber.view,
+            subscriber.depth,
+            subscriber.orderbookMode,
+          )
+        : null,
+  };
+}
+
+async function notifyTradeStreamSubscribers(event: HarnessEvent): Promise<void> {
+  if (!tradeStreamSubscribers.size) {
+    return;
+  }
+  const context = deriveEventContext(event);
+  const deltaByKey = new Map<string, MarketTrade[]>();
+  for (const subscriber of tradeStreamSubscribers.values()) {
+    if (subscriber.market && context.market && subscriber.market !== context.market) {
+      continue;
+    }
+    const key = tradeCursorKey(subscriber.view, subscriber.market);
+    if (!deltaByKey.has(key)) {
+      deltaByKey.set(key, pullTradeDelta(subscriber.view, subscriber.market));
+    }
+    for (const trade of deltaByKey.get(key) || []) {
+      writeSseEvent(subscriber.res, 'trade', trade);
+    }
+  }
+}
+
+async function notifyFrontendSubscribers(
+  onchain: OnchainContext | null,
+  onchainSync: OnchainSyncState,
+  options: {
+    owner?: string | null;
+    mangoAccount?: string | null;
+    market?: string | null;
+    forceAll?: boolean;
+  } = {},
+): Promise<void> {
+  if (!frontendStreamSubscribers.size) {
+    return;
+  }
+
+  for (const subscriber of frontendStreamSubscribers.values()) {
+    const shouldConsiderOwner =
+      options.forceAll ||
+      (!!options.owner &&
+        (!subscriber.owner || subscriber.owner === options.owner)) ||
+      (!!options.mangoAccount &&
+        (!subscriber.mangoAccount ||
+          subscriber.mangoAccount === options.mangoAccount));
+    const shouldConsiderMarket =
+      options.forceAll ||
+      (!!options.market &&
+        (!subscriber.market || subscriber.market === options.market));
+    if (!options.forceAll && !shouldConsiderOwner && !shouldConsiderMarket) {
+      continue;
+    }
+
+    const payload = await buildFrontendSnapshotPayload(subscriber, onchain, onchainSync);
+    if (payload.owner) {
+      const nextSignature = JSON.stringify(payload.owner);
+      if (subscriber.ownerSignature !== nextSignature) {
+        subscriber.ownerSignature = nextSignature;
+        writeSseEvent(subscriber.res, 'account_update', payload.owner);
+      }
+    }
+    if (payload.market) {
+      const nextSignature = JSON.stringify(payload.market);
+      if (subscriber.marketSignature !== nextSignature) {
+        subscriber.marketSignature = nextSignature;
+        writeSseEvent(subscriber.res, 'market_update', payload.market);
+      }
+    }
+  }
+}
+
+function writeHeartbeatToAllStreams(): void {
+  for (const client of sseClients) {
+    client.write(`: heartbeat ${Date.now()}\n\n`);
+  }
+  for (const subscriber of tradeStreamSubscribers.values()) {
+    subscriber.res.write(`: heartbeat ${Date.now()}\n\n`);
+  }
+  for (const subscriber of frontendStreamSubscribers.values()) {
+    subscriber.res.write(`: heartbeat ${Date.now()}\n\n`);
+  }
+}
+
 function buildHttpServer(
   onchain: OnchainContext | null,
   airdrop: AirdropContext | null,
@@ -2055,12 +2892,17 @@ function buildHttpServer(
       const method = req.method || 'GET';
 
       if (method === 'GET' && url.pathname === '/healthz') {
-        const marketMetadata = await getMarketMetadataMapSafe(onchain);
+        // Use cached metadata count from optimistic state — no RPC calls.
+        // The expensive getMarketMetadataMapSafe() was causing 8s+ latency
+        // on /healthz which blocked the relayer's per-intent health gate.
+        const cachedMetadataCount = onchain?.cachedMarketMetadata
+          ? Object.keys(onchain.cachedMarketMetadata).length
+          : 0;
         writeJson(res, 200, {
           ok: true,
           ...statsSnapshot(),
           onchain_read_enabled: !!onchain?.groupPk && !!onchain?.mangoClient,
-          market_metadata_total: Object.keys(marketMetadata).length,
+          market_metadata_total: cachedMetadataCount,
           airdrop_enabled: !!airdrop,
           airdrop_deposit_enabled: !!airdrop?.groupPk && !!airdrop?.mangoClient,
           reconcile_interval_ms: Math.max(1000, HARNESS_RECONCILE_INTERVAL_MS),
@@ -2200,12 +3042,121 @@ function buildHttpServer(
         return;
       }
 
+      if (method === 'GET' && url.pathname === '/state/stream/trades') {
+        const market = url.searchParams.get('market');
+        const view = parseView(url);
+        const backfillLimit = parseNonNegativeInteger(
+          url.searchParams.get('backfill_n'),
+          DEFAULT_STREAM_BACKFILL,
+          { min: 0, max: 1000 },
+        );
+        initializeSse(res);
+        const subscriber: TradeStreamSubscriber = {
+          id: nextStreamSubscriberId(),
+          res,
+          view,
+          market,
+          backfillLimit,
+        };
+        tradeStreamSubscribers.set(subscriber.id, subscriber);
+        writeSseEvent(res, 'connected', {
+          ts_ms: Date.now(),
+          mode: HARNESS_MODE,
+          view,
+          market,
+        });
+        writeSseEvent(res, 'snapshot', {
+          view,
+          market,
+          data: engine.getTradesFiltered({
+            view,
+            market,
+            limit: backfillLimit,
+          }),
+        });
+        primeTradeCursor(view, market);
+        req.on('close', () => {
+          tradeStreamSubscribers.delete(subscriber.id);
+          dropTradeCursorIfUnused(subscriber.view, subscriber.market);
+        });
+        return;
+      }
+
+      if (method === 'GET' && url.pathname === '/state/stream/frontend') {
+        const owner = url.searchParams.get('owner');
+        const mangoAccount = url.searchParams.get('mango_account');
+        const market = url.searchParams.get('market');
+        if (!owner && !mangoAccount && !market) {
+          writeJson(res, 400, {
+            error: 'frontend stream requires at least one of owner, mango_account, or market',
+          });
+          return;
+        }
+        const view = parseView(url);
+        const depth = parseNonNegativeInteger(
+          url.searchParams.get('depth'),
+          DEFAULT_ORDERBOOK_DEPTH,
+          { min: 1, max: 500 },
+        );
+        const tradesLimit = parseNonNegativeInteger(
+          url.searchParams.get('trades_limit'),
+          DEFAULT_FRONTEND_TRADES_LIMIT,
+          { min: 0, max: 1000 },
+        );
+        const orderbookMode =
+          (url.searchParams.get('orderbook') || 'summary').toLowerCase() === 'full'
+            ? 'full'
+            : 'summary';
+        const defaultIncludes = [
+          ...(owner || mangoAccount
+            ? ['positions', 'open_orders', 'trades', 'account_metrics']
+            : []),
+          ...(market ? ['market_metrics', 'trade_summary', 'orderbook_summary'] : []),
+        ];
+        if (market && orderbookMode === 'full') {
+          defaultIncludes.push('orderbook');
+        }
+        const include = parseIncludeSet(url, defaultIncludes);
+        initializeSse(res);
+        const subscriber: FrontendStreamSubscriber = {
+          id: nextStreamSubscriberId(),
+          res,
+          view,
+          owner,
+          mangoAccount,
+          market,
+          depth,
+          tradesLimit,
+          include,
+          orderbookMode,
+          ownerSignature: null,
+          marketSignature: null,
+        };
+        frontendStreamSubscribers.set(subscriber.id, subscriber);
+        const payload = await buildFrontendSnapshotPayload(subscriber, onchain, onchainSync);
+        subscriber.ownerSignature = payload.owner ? JSON.stringify(payload.owner) : null;
+        subscriber.marketSignature = payload.market ? JSON.stringify(payload.market) : null;
+        writeSseEvent(res, 'connected', {
+          ts_ms: Date.now(),
+          mode: HARNESS_MODE,
+          view,
+          owner,
+          mango_account: mangoAccount,
+          market,
+        });
+        writeSseEvent(res, 'snapshot', {
+          view,
+          owner: payload.owner,
+          market: payload.market,
+        });
+        req.on('close', () => {
+          frontendStreamSubscribers.delete(subscriber.id);
+        });
+        return;
+      }
+
       if (method === 'GET' && url.pathname === '/state/stream') {
-        res.statusCode = 200;
-        res.setHeader('Content-Type', 'text/event-stream');
-        res.setHeader('Cache-Control', 'no-cache');
-        res.setHeader('Connection', 'keep-alive');
-        res.flushHeaders?.();
+        initializeSse(res);
 
         sseClients.add(res);
         writeSseEvent(res, 'connected', {
@@ -2226,27 +3177,64 @@ function buildHttpServer(
         return;
       }
 
+      if (method === 'GET' && url.pathname === '/state/markets') {
+        const view = parseView(url);
+        const snapshot = getSnapshotForView(view, onchainSync);
+        const responseView = snapshot.view;
+        const depth = parseNonNegativeInteger(
+          url.searchParams.get('depth'),
+          DEFAULT_ORDERBOOK_DEPTH,
+          { min: 1, max: 500 },
+        );
+        const marketsFilter = parseCommaSeparatedList(url.searchParams.get('markets'));
+        const includeFullBook =
+          (url.searchParams.get('book') || 'summary').toLowerCase() === 'full';
+        writeJson(res, 200, {
+          view: responseView,
+          items: await buildMarketListItems(
+            snapshot,
+            onchain,
+            responseView,
+            marketsFilter,
+            depth,
+            includeFullBook,
+          ),
+        });
+        return;
+      }
+
       if (method === 'GET' && url.pathname.startsWith('/state/markets/')) {
         const market = decodeURIComponent(url.pathname.slice('/state/markets/'.length));
         const view = parseView(url);
         const snapshot = getSnapshotForView(view, onchainSync);
         const responseView = snapshot.view;
         const marketMetadata = await getMarketMetadataMapSafe(onchain);
+        const data = snapshot.markets[market] || emptyMarketState(market);
         writeJson(res, 200, {
           view: responseView,
           metadata: marketMetadata[market] || null,
-          data:
-            snapshot.markets[market] || {
-              market,
-              bids: [],
-              asks: [],
-              open_orders: [],
-              watermarks: {
-                optimistic_seq: '0',
-                confirmed_seq: '0',
-                last_slot: '0',
-              },
-            },
+          orderbook_summary: buildOrderbookSummary(
+            data,
+            marketMetadata[market] || null,
+            parseNonNegativeInteger(
+              url.searchParams.get('depth'),
+              DEFAULT_ORDERBOOK_DEPTH,
+              { min: 1, max: 500 },
+            ),
+          ),
+          trade_summary: buildTradeSummary(
+            market,
+            responseView,
+            engine.getTrades(market, responseView, 5000),
+            marketMetadata[market] || null,
+          ),
+          metrics: await getMarketRuntimeMetrics(
+            market,
+            data,
+            marketMetadata[market] || null,
+            onchain,
+          ),
+          data,
         });
         return;
       }
@@ -2321,18 +3309,61 @@ function buildHttpServer(
         return;
       }
 
-      if (method === 'GET' && url.pathname.startsWith('/state/trades/')) {
-        const market = decodeURIComponent(url.pathname.slice('/state/trades/'.length));
+      if (method === 'GET' && url.pathname === '/state/trades/summary') {
         const view = parseView(url);
-        const limit = Number(url.searchParams.get('limit') || '200');
+        const market = url.searchParams.get('market');
+        const owner = url.searchParams.get('owner');
+        const marketMetadata = await getMarketMetadataMapSafe(onchain);
+        const items = buildTradeSummaryCollection(view, marketMetadata, market, owner);
+        writeJson(res, 200, market
+          ? {
+              view,
+              market,
+              owner,
+              data: items[0] || buildTradeSummary(market, view, [], marketMetadata[market] || null),
+            }
+          : {
+              view,
+              market: null,
+              owner,
+              items,
+            });
+        return;
+      }
+
+      if (method === 'GET' && url.pathname === '/state/trades') {
+        const view = parseView(url);
+        const market = url.searchParams.get('market');
+        const owner = url.searchParams.get('owner');
+        const limit = parseNonNegativeInteger(url.searchParams.get('limit'), 200, {
+          min: 0,
+          max: 5000,
+        });
         writeJson(res, 200, {
           view,
           market,
-          data: engine.getTrades(
-            market,
+          owner,
+          data: engine.getTradesFiltered({
             view,
-            Number.isFinite(limit) ? Math.max(0, Math.floor(limit)) : 200,
-          ),
+            market,
+            owner,
+            limit,
+          }),
+        });
+        return;
+      }
+
+      if (method === 'GET' && url.pathname.startsWith('/state/trades/')) {
+        const market = decodeURIComponent(url.pathname.slice('/state/trades/'.length));
+        const view = parseView(url);
+        const limit = parseNonNegativeInteger(url.searchParams.get('limit'), 200, {
+          min: 0,
+          max: 5000,
+        });
+        writeJson(res, 200, {
+          view,
+          market,
+          data: engine.getTrades(market, view, limit),
         });
         return;
       }
@@ -2476,6 +3507,20 @@ async function main(): Promise<void> {
   engine.subscribe((event) => {
     appendEventLog(event);
     broadcastEvent(event);
+    const context = deriveEventContext(event);
+    if (context.market) {
+      marketRuntimeMetricsCache.delete(context.market);
+    }
+    void notifyTradeStreamSubscribers(event).catch((err) => {
+      console.warn(`trade stream notify failed: ${err}`);
+    });
+    void notifyFrontendSubscribers(onchain, onchainSync, {
+      owner: context.owner,
+      mangoAccount: context.mangoAccount,
+      market: context.market,
+    }).catch((err) => {
+      console.warn(`frontend stream notify failed: ${err}`);
+    });
   });
 
   await connection.onLogs(
@@ -2490,9 +3535,7 @@ async function main(): Promise<void> {
   const { host, port } = parseBindAddress(HARNESS_BIND_ADDR);
 
   setInterval(() => {
-    for (const client of sseClients) {
-      client.write(`: heartbeat ${Date.now()}\n\n`);
-    }
+    writeHeartbeatToAllStreams();
   }, 15000);
 
   setInterval(() => {
@@ -2505,15 +3548,36 @@ async function main(): Promise<void> {
   });
 
   setInterval(() => {
-    runOnchainReconciliation(onchain, onchainSync).catch((err) => {
-      onchainSync.last_error = `${err}`;
-      console.warn(`onchain reconciliation failed: ${err}`);
-    });
+    runOnchainReconciliation(onchain, onchainSync)
+      .then(() => {
+        onchainSync.last_error = null;
+        marketRuntimeMetricsCache.clear();
+        return notifyFrontendSubscribers(onchain, onchainSync, { forceAll: true });
+      })
+      .catch((err) => {
+        onchainSync.last_error = `${err}`;
+        console.warn(`onchain reconciliation failed: ${err}`);
+      });
   }, Math.max(1000, HARNESS_RECONCILE_INTERVAL_MS));
-  runOnchainReconciliation(onchain, onchainSync).catch((err) => {
-    onchainSync.last_error = `${err}`;
-    console.warn(`initial onchain reconciliation failed: ${err}`);
-  });
+  runOnchainReconciliation(onchain, onchainSync)
+    .then(() => {
+      onchainSync.last_error = null;
+      marketRuntimeMetricsCache.clear();
+      return notifyFrontendSubscribers(onchain, onchainSync, { forceAll: true });
+    })
+    .catch((err) => {
+      onchainSync.last_error = `${err}`;
+      console.warn(`initial onchain reconciliation failed: ${err}`);
+    });
+
+  setInterval(() => {
+    marketRuntimeMetricsCache.clear();
+    void notifyFrontendSubscribers(onchain, onchainSync, { forceAll: true }).catch(
+      (err) => {
+        console.warn(`frontend market refresh failed: ${err}`);
+      },
+    );
+  }, Math.max(1000, HARNESS_ONCHAIN_CACHE_TTL_MS));
 
   server.listen(port, host, () => {
     console.log(

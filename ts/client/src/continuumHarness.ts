@@ -622,6 +622,14 @@ type InternalProjection = {
   last_slot: bigint;
 };
 
+type DerivedViewCache = {
+  revision: number;
+  snapshot: EngineSnapshot;
+  tradesByMarket: Map<string, MarketTrade[]>;
+  tradesByOwner: Map<string, MarketTrade[]>;
+  allTrades: MarketTrade[];
+};
+
 export class ContinuumStateEngine {
   private readonly intentsByKey = new Map<string, CanonicalIntent>();
   private readonly processedEventIds = new Set<string>();
@@ -630,8 +638,8 @@ export class ContinuumStateEngine {
   private readonly listeners = new Set<(event: HarnessEvent) => void>();
   private revision = 0;
   private lastSeenSlot = 0n;
-  private cachedConfirmed: { revision: number; snapshot: EngineSnapshot } | null = null;
-  private cachedOptimistic: { revision: number; snapshot: EngineSnapshot } | null = null;
+  private cachedConfirmed: DerivedViewCache | null = null;
+  private cachedOptimistic: DerivedViewCache | null = null;
 
   /**
    * Baseline positions seeded from on-chain confirmed state at startup.
@@ -723,6 +731,14 @@ export class ContinuumStateEngine {
       }
       return a.accepted_ts_ms - b.accepted_ts_ms;
     });
+  }
+
+  findIntent(
+    group: string,
+    sequence: string | bigint,
+    kind: string | number,
+  ): CanonicalIntent | null {
+    return this.intentsByKey.get(queueItemKey(group, sequence, kind)) || null;
   }
 
   ingestRelayIntent(event: RelayIntentAcceptedEvent): void {
@@ -948,28 +964,38 @@ export class ContinuumStateEngine {
     view: QueueView,
     limit = 200,
   ): MarketTrade[] {
-    const projection = this.buildProjection(view);
-    const state = projection.markets.get(market);
-    if (!state) {
-      return [];
-    }
+    const cache = this.getDerivedView(view);
     const capped = Math.max(0, limit);
-    return state.trades
-      .slice(Math.max(0, state.trades.length - capped))
-      .map((trade) => ({
-        trade_id: trade.trade_id,
-        market: trade.market,
-        price_lots: trade.price_lots.toString(),
-        base_lots: trade.base_lots.toString(),
-        quote_lots: trade.quote_lots.toString(),
-        taker_side: trade.taker_side,
-        maker_owner: trade.maker_owner,
-        taker_owner: trade.taker_owner,
-        maker_order_id: trade.maker_order_id,
-        taker_sequence: trade.taker_sequence.toString(),
-        ts_ms: trade.ts_ms,
-        view,
-      }));
+    const trades = cache.tradesByMarket.get(market) || [];
+    return trades.slice(Math.max(0, trades.length - capped));
+  }
+
+  getAllTrades(view: QueueView, limit = 200): MarketTrade[] {
+    const cache = this.getDerivedView(view);
+    const capped = Math.max(0, limit);
+    return cache.allTrades.slice(Math.max(0, cache.allTrades.length - capped));
+  }
+
+  getTradesFiltered(params: {
+    market?: string | null;
+    owner?: string | null;
+    view: QueueView;
+    limit?: number;
+  }): MarketTrade[] {
+    const cache = this.getDerivedView(params.view);
+    const capped = Math.max(0, params.limit ?? 200);
+    let trades: MarketTrade[];
+    if (params.owner) {
+      trades = cache.tradesByOwner.get(params.owner) || [];
+      if (params.market) {
+        trades = trades.filter((trade) => trade.market === params.market);
+      }
+    } else if (params.market) {
+      trades = cache.tradesByMarket.get(params.market) || [];
+    } else {
+      trades = cache.allTrades;
+    }
+    return trades.slice(Math.max(0, trades.length - capped));
   }
 
   getCandles(
@@ -1033,22 +1059,79 @@ export class ContinuumStateEngine {
   }
 
   getSnapshot(view: QueueView): EngineSnapshot {
-    const cached = view === 'confirmed' ? this.cachedConfirmed : this.cachedOptimistic;
-    if (cached && cached.revision === this.revision) {
-      return cached.snapshot;
-    }
-
-    const snapshot = this.buildSnapshot(view);
-    if (view === 'confirmed') {
-      this.cachedConfirmed = { revision: this.revision, snapshot };
-    } else {
-      this.cachedOptimistic = { revision: this.revision, snapshot };
-    }
-    return snapshot;
+    return this.getDerivedView(view).snapshot;
   }
 
-  private buildSnapshot(view: QueueView): EngineSnapshot {
+  private getDerivedView(view: QueueView): DerivedViewCache {
+    const cached = view === 'confirmed' ? this.cachedConfirmed : this.cachedOptimistic;
+    if (cached && cached.revision === this.revision) {
+      return cached;
+    }
+    const next = this.buildDerivedView(view);
+    if (view === 'confirmed') {
+      this.cachedConfirmed = next;
+    } else {
+      this.cachedOptimistic = next;
+    }
+    return next;
+  }
+
+  private buildDerivedView(view: QueueView): DerivedViewCache {
     const projection = this.buildProjection(view);
+    const snapshot = this.buildSnapshot(view, projection);
+    const tradesByMarket = new Map<string, MarketTrade[]>();
+    const tradesByOwner = new Map<string, MarketTrade[]>();
+    const allTrades: MarketTrade[] = [];
+
+    for (const market of projection.markets.values()) {
+      const marketTrades = market.trades
+        .map((trade) => ({
+          trade_id: trade.trade_id,
+          market: trade.market,
+          price_lots: trade.price_lots.toString(),
+          base_lots: trade.base_lots.toString(),
+          quote_lots: trade.quote_lots.toString(),
+          taker_side: trade.taker_side,
+          maker_owner: trade.maker_owner,
+          taker_owner: trade.taker_owner,
+          maker_order_id: trade.maker_order_id,
+          taker_sequence: trade.taker_sequence.toString(),
+          ts_ms: trade.ts_ms,
+          view,
+        }))
+        .sort(compareTradesChronologically);
+      tradesByMarket.set(market.market, marketTrades);
+      allTrades.push(...marketTrades);
+      for (const trade of marketTrades) {
+        const makerTrades = tradesByOwner.get(trade.maker_owner) || [];
+        makerTrades.push(trade);
+        tradesByOwner.set(trade.maker_owner, makerTrades);
+        if (trade.taker_owner !== trade.maker_owner) {
+          const takerTrades = tradesByOwner.get(trade.taker_owner) || [];
+          takerTrades.push(trade);
+          tradesByOwner.set(trade.taker_owner, takerTrades);
+        }
+      }
+    }
+
+    allTrades.sort(compareTradesChronologically);
+    for (const ownerTrades of tradesByOwner.values()) {
+      ownerTrades.sort(compareTradesChronologically);
+    }
+
+    return {
+      revision: this.revision,
+      snapshot,
+      tradesByMarket,
+      tradesByOwner,
+      allTrades,
+    };
+  }
+
+  private buildSnapshot(
+    view: QueueView,
+    projection: InternalProjection,
+  ): EngineSnapshot {
     const positionByOwner = new Map<
       string,
       Map<string, { basePositionLots: bigint; quotePositionNative: bigint }>
@@ -1845,6 +1928,16 @@ function maxBigintFrom(values: bigint[]): bigint {
     }
   }
   return out;
+}
+
+function compareTradesChronologically(a: MarketTrade, b: MarketTrade): number {
+  if (a.ts_ms !== b.ts_ms) {
+    return a.ts_ms - b.ts_ms;
+  }
+  if (a.market !== b.market) {
+    return a.market.localeCompare(b.market);
+  }
+  return a.trade_id.localeCompare(b.trade_id);
 }
 
 function orderIntentsDeterministically(a: CanonicalIntent, b: CanonicalIntent): number {

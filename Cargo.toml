@@ -3,6 +3,7 @@ members = [
     "bin/*",
     "programs/mango-v4",
     "lib/*",
+    "rust-harness",
 ]
 
 [workspace.dependencies]

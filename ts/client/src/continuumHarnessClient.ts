@@ -35,10 +35,162 @@ export type HarnessLiveness = {
   ts_ms: number;
 };
 
+export type HarnessMarketMetadata = {
+  market_index: number;
+  name: string;
+  base_symbol: string;
+  quote_symbol: string;
+  base_mint: string;
+  quote_mint: string;
+  perp_market: string;
+  oracle: string;
+  bids: string;
+  asks: string;
+  event_queue: string;
+  base_decimals: number;
+  quote_decimals: number;
+  base_lot_size: string;
+  quote_lot_size: string;
+  open_interest: string;
+};
+
+export type OrderbookLevelView = {
+  price_lots: string;
+  base_lots: string;
+  price_ui: number | null;
+  qty_ui: number | null;
+};
+
+export type OrderbookSummaryView = {
+  depth: number;
+  bids: OrderbookLevelView[];
+  asks: OrderbookLevelView[];
+};
+
+export type MarketTradeSummary = {
+  market: string;
+  view: QueueView;
+  window_ms: number;
+  trade_count: number;
+  last_trade_ts_ms: number | null;
+  last_price_lots: string | null;
+  last_price_ui: number | null;
+  open_price_lots: string | null;
+  open_price_ui: number | null;
+  high_price_lots: string | null;
+  high_price_ui: number | null;
+  low_price_lots: string | null;
+  low_price_ui: number | null;
+  change_24h_pct: number | null;
+  volume_base_lots: string;
+  volume_quote_lots: string;
+  volume_base_ui: number | null;
+  volume_quote_ui: number | null;
+};
+
+export type MarketRuntimeMetrics = {
+  market: string;
+  oracle_price_ui: number | null;
+  mark_price_ui: number | null;
+  funding_rate_daily_pct: number | null;
+  funding_rate_hourly_pct: number | null;
+  open_interest_base_lots: string | null;
+  open_interest_base_ui: number | null;
+  best_bid_ui: number | null;
+  best_ask_ui: number | null;
+  updated_ts_ms: number;
+};
+
+export type MarketListItem = {
+  market: string;
+  view: QueueView;
+  metadata: HarnessMarketMetadata | null;
+  data: MarketState;
+  orderbook_summary: OrderbookSummaryView;
+  trade_summary: MarketTradeSummary;
+  metrics: MarketRuntimeMetrics | null;
+};
+
+export type StubbedAccountMetrics = {
+  status: 'stub';
+  source: 'pending-subtree';
+  updated_ts_ms: number;
+  fields: {
+    margin_used: null;
+    health_init: null;
+    health_maint: null;
+    pnl_realized: null;
+    pnl_unrealized: null;
+    equity: null;
+    liquidation_price_by_market: null;
+  };
+};
+
+export type FrontendOwnerSlice = {
+  owner: string;
+  mango_account: string | null;
+  view: QueueView;
+  positions_scope: 'owner_aggregate';
+  positions: UserState['per_market'];
+  open_orders: MarketState['open_orders'];
+  trades: MarketTrade[];
+  account_metrics: StubbedAccountMetrics;
+};
+
+export type FrontendMarketSlice = {
+  market: string;
+  view: QueueView;
+  metadata: HarnessMarketMetadata | null;
+  metrics: MarketRuntimeMetrics | null;
+  trade_summary: MarketTradeSummary;
+  orderbook_summary: OrderbookSummaryView;
+  orderbook: MarketState | null;
+};
+
+export type HarnessMarketStateResponse = {
+  view: QueueView;
+  metadata: HarnessMarketMetadata | null;
+  orderbook_summary: OrderbookSummaryView;
+  trade_summary: MarketTradeSummary;
+  metrics: MarketRuntimeMetrics | null;
+  data: MarketState;
+};
+
+export type HarnessMarketsResponse = {
+  view: QueueView;
+  items: MarketListItem[];
+};
+
+export type HarnessTradesResponse = {
+  view: QueueView;
+  market: string | null;
+  owner: string | null;
+  data: MarketTrade[];
+};
+
+export type HarnessTradeSummaryResponse =
+  | {
+      view: QueueView;
+      market: string;
+      owner: string | null;
+      data: MarketTradeSummary;
+    }
+  | {
+      view: QueueView;
+      market: null;
+      owner: string | null;
+      items: MarketTradeSummary[];
+    };
+
+export type HarnessStateFull = EngineSnapshot & {
+  market_metadata?: Record<string, HarnessMarketMetadata | null>;
+};
+
 export type HarnessStateFullMarket = {
   view: QueueView;
   generated_ts_ms: number;
   market: MarketState | null;
+  market_metadata?: HarnessMarketMetadata | null;
   queue: QueueState | null;
   users: Record<string, UserState>;
 };
@@ -100,7 +252,17 @@ function normalizeBaseUrl(baseUrl: string): string {
   return baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl;
 }
 
-function withQuery(path: string, query: Record<string, string | undefined>): string {
+function toBase58(value?: PublicKey | string | null): string | undefined {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  return value instanceof PublicKey ? value.toBase58() : value;
+}
+
+function withQuery(
+  path: string,
+  query: Record<string, string | undefined | null>,
+): string {
   const params = new URLSearchParams();
   for (const [key, value] of Object.entries(query)) {
     if (value !== undefined && value !== null) {
@@ -167,16 +329,62 @@ export class ContinuumHarnessClient {
     return await this.request<HarnessLiveness>('GET', '/livez');
   }
 
-  async getMarketState(market: string | number, view: QueueView = 'optimistic'): Promise<MarketState> {
-    const response = await this.request<{ view: QueueView; data: MarketState }>(
+  async getMarkets(params?: {
+    markets?: Array<string | number>;
+    view?: QueueView;
+    depth?: number;
+    book?: 'summary' | 'full';
+  }): Promise<MarketListItem[]> {
+    const response = await this.request<HarnessMarketsResponse>(
       'GET',
-      withQuery(`/state/markets/${encodeURIComponent(String(market))}`, { view }),
+      withQuery('/state/markets', {
+        view: params?.view || 'optimistic',
+        depth:
+          params?.depth !== undefined
+            ? Math.max(1, Math.floor(params.depth)).toString()
+            : undefined,
+        book: params?.book,
+        markets:
+          params?.markets && params.markets.length
+            ? params.markets.map((market) => String(market)).join(',')
+            : undefined,
+      }),
     );
+    return response.items;
+  }
+
+  async getMarketStateDetails(
+    market: string | number,
+    params?: {
+      view?: QueueView;
+      depth?: number;
+    },
+  ): Promise<HarnessMarketStateResponse> {
+    return await this.request<HarnessMarketStateResponse>(
+      'GET',
+      withQuery(`/state/markets/${encodeURIComponent(String(market))}`, {
+        view: params?.view || 'optimistic',
+        depth:
+          params?.depth !== undefined
+            ? Math.max(1, Math.floor(params.depth)).toString()
+            : undefined,
+      }),
+    );
+  }
+
+  async getMarketState(
+    market: string | number,
+    view: QueueView = 'optimistic',
+  ): Promise<MarketState> {
+    const response = await this.getMarketStateDetails(market, { view });
     return response.data;
   }
 
-  async getUserState(owner: PublicKey | string, view: QueueView = 'optimistic'): Promise<UserState> {
-    const ownerPk = owner instanceof PublicKey ? owner.toBase58() : owner;
+  async getUserState(
+    owner: PublicKey | string,
+    view: QueueView = 'optimistic',
+  ): Promise<UserState> {
+    const ownerPk = toBase58(owner)!;
     const response = await this.request<{ view: QueueView; data: UserState }>(
       'GET',
       withQuery(`/state/users/${encodeURIComponent(ownerPk)}`, { view }),
@@ -189,8 +397,7 @@ export class ContinuumHarnessClient {
     owner?: PublicKey | string;
     view?: QueueView;
   }) {
-    const owner =
-      params.owner instanceof PublicKey ? params.owner.toBase58() : params.owner;
+    const owner = toBase58(params.owner);
     const response = await this.request<{
       view: QueueView;
       market: string;
@@ -218,10 +425,32 @@ export class ContinuumHarnessClient {
     owner: PublicKey | string,
     view: QueueView = 'optimistic',
   ): Promise<UserBalances> {
-    const ownerPk = owner instanceof PublicKey ? owner.toBase58() : owner;
+    const ownerPk = toBase58(owner)!;
     const response = await this.request<{ view: QueueView; data: UserBalances }>(
       'GET',
       withQuery(`/state/balances/${encodeURIComponent(ownerPk)}`, { view }),
+    );
+    return response.data;
+  }
+
+  async queryTrades(params: {
+    market?: string | number;
+    owner?: PublicKey | string;
+    view?: QueueView;
+    limit?: number;
+  }): Promise<MarketTrade[]> {
+    const response = await this.request<HarnessTradesResponse>(
+      'GET',
+      withQuery('/state/trades', {
+        view: params.view || 'optimistic',
+        market:
+          params.market !== undefined ? String(params.market) : undefined,
+        owner: toBase58(params.owner),
+        limit:
+          params.limit !== undefined
+            ? Math.max(0, Math.floor(params.limit)).toString()
+            : undefined,
+      }),
     );
     return response.data;
   }
@@ -244,6 +473,36 @@ export class ContinuumHarnessClient {
       }),
     );
     return response.data;
+  }
+
+  async getTradeSummary(params: {
+    market: string | number;
+    owner?: PublicKey | string;
+    view?: QueueView;
+  }): Promise<MarketTradeSummary> {
+    const response = await this.request<Extract<HarnessTradeSummaryResponse, { data: MarketTradeSummary }>>(
+      'GET',
+      withQuery('/state/trades/summary', {
+        view: params.view || 'optimistic',
+        market: String(params.market),
+        owner: toBase58(params.owner),
+      }),
+    );
+    return response.data;
+  }
+
+  async listTradeSummaries(params?: {
+    owner?: PublicKey | string;
+    view?: QueueView;
+  }): Promise<MarketTradeSummary[]> {
+    const response = await this.request<Extract<HarnessTradeSummaryResponse, { items: MarketTradeSummary[] }>>(
+      'GET',
+      withQuery('/state/trades/summary', {
+        view: params?.view || 'optimistic',
+        owner: toBase58(params?.owner),
+      }),
+    );
+    return response.items;
   }
 
   async getCandles(params: {
@@ -272,8 +531,8 @@ export class ContinuumHarnessClient {
     return response.data;
   }
 
-  async getFullState(view: QueueView = 'optimistic'): Promise<EngineSnapshot> {
-    return await this.request<EngineSnapshot>(
+  async getFullState(view: QueueView = 'optimistic'): Promise<HarnessStateFull> {
+    return await this.request<HarnessStateFull>(
       'GET',
       withQuery('/state/full', { view }),
     );

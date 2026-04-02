@@ -161,6 +161,7 @@ const COINGECKO_REFRESH_MS = Number(
 const FIXED_REFERENCE_PRICE = process.env.QUOTER_FIXED_REFERENCE_PRICE
   ? Number(process.env.QUOTER_FIXED_REFERENCE_PRICE)
   : 0;
+const USE_LIMIT_ORDER = (process.env.QUOTER_USE_LIMIT_ORDER || 'false') === 'true';
 const BOTS_JSON_PATH = process.env.QUOTER_BOTS_JSON_PATH || '';
 const BOTS_JSON = process.env.QUOTER_BOTS_JSON || '';
 const PARALLEL_BOT_EXECUTION =
@@ -1194,12 +1195,14 @@ async function main(): Promise<void> {
       }
       relayerClient = buildRelayerClient();
     }
-    // Back off 10s on rate limit or backpressure
+    // Back off on rate limit, backpressure, or connection issues
     if (
       errText.includes('429') ||
       errText.includes('Too Many') ||
       errText.includes('RESOURCE_EXHAUSTED') ||
-      errText.includes('backpressure')
+      errText.includes('backpressure') ||
+      errText.includes('Connection dropped') ||
+      errText.includes('UNAVAILABLE')
     ) {
       backoffUntilMs = Date.now() + 10_000;
       console.error(
@@ -1465,7 +1468,9 @@ async function main(): Promise<void> {
           clientOrderId,
           orderType: closePlan
             ? PerpOrderType.immediateOrCancel
-            : PerpOrderType.postOnlySlide,
+            : USE_LIMIT_ORDER
+              ? PerpOrderType.limit
+              : PerpOrderType.postOnlySlide,
           selfTradeBehavior: PerpSelfTradeBehavior.decrementTake,
           reduceOnly: !!closePlan,
           expiryTimestamp: orderExpiryTimestampSec(nowMs),
