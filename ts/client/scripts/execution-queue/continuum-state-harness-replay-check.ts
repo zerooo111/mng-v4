@@ -4,7 +4,7 @@ import path from 'path';
 import {
   ContinuumStateEngine,
   HarnessEvent,
-} from '../../src/continuumHarness';
+} from '../../src/continuumHarnessTsEngine';
 
 dotenv.config();
 

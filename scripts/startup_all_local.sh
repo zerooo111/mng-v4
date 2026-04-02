@@ -42,10 +42,13 @@ CTM_RELAYER_CTM_KEYPAIR="${CTM_RELAYER_CTM_KEYPAIR:-${MB_PAYER_KEYPAIR}}"
 CTM_RELAYER_IMPL="${CTM_RELAYER_IMPL:-rust}"
 CTM_EXECUTION_ENGINE_HTTP_BIND_ADDR="${CTM_EXECUTION_ENGINE_HTTP_BIND_ADDR:-127.0.0.1:9093}"
 EXECUTION_QUEUE_ENGINE_ENABLED="${EXECUTION_QUEUE_ENGINE_ENABLED:-true}"
+HARNESS_BACKEND="${HARNESS_BACKEND:-rust-backend}"
 HARNESS_MODE="${HARNESS_MODE:-$([[ "${STACK_CLUSTER}" == "devnet" ]] && echo devnet || echo local)}"
 HARNESS_ENABLE_AIRDROP="${HARNESS_ENABLE_AIRDROP:-false}"
 HARNESS_AIRDROP_DEPOSIT_UI_AMOUNT="${HARNESS_AIRDROP_DEPOSIT_UI_AMOUNT:-1000}"
 HARNESS_AIRDROP_AUTO_CREATE_MANGO_ACCOUNT="${HARNESS_AIRDROP_AUTO_CREATE_MANGO_ACCOUNT:-false}"
+HARNESS_RUST_PROFILE="${HARNESS_RUST_PROFILE:-release}"
+HARNESS_RUST_AUTO_BUILD="${HARNESS_RUST_AUTO_BUILD:-true}"
 
 REQUIRED_SOLANA_VERSION="${REQUIRED_SOLANA_VERSION:-1.16.7}"
 SOLANA_116_BIN_DIR="${SOLANA_116_BIN_DIR:-/home/ec2-user/.local/solana-1.16.7-release/bin}"
@@ -100,6 +103,29 @@ fi
 
 log() {
   echo "[startup] $*"
+}
+
+prepare_harness_backend() {
+  if [[ "${HARNESS_BACKEND}" != "rust-backend" ]]; then
+    return 0
+  fi
+
+  local cargo_args=(
+    node
+    "${MNG_DIR}/scripts/build-rust-harness-native.js"
+    --build
+    --profile
+    "${HARNESS_RUST_PROFILE}"
+  )
+
+  log "Preparing Rust harness backend (${HARNESS_RUST_PROFILE})"
+  if ! (
+    cd "${MNG_DIR}" &&
+    "${cargo_args[@]}"
+  ) >"${LOG_DIR}/continuum-harness-native-build.log" 2>&1; then
+    echo "Rust harness build failed; see ${LOG_DIR}/continuum-harness-native-build.log" >&2
+    return 1
+  fi
 }
 
 derive_ws_url() {
@@ -606,6 +632,8 @@ start_harness_and_relayer() {
     buffer_pk="${queue_pk}"
   fi
 
+  prepare_harness_backend
+
   start_detached_service \
     "harness" \
     "${HARNESS_PID_FILE}" \
@@ -618,6 +646,7 @@ start_harness_and_relayer() {
     CLUSTER_OVERRIDE=devnet \
     CLUSTER_URL_OVERRIDE="${SOLANA_URL}" \
     CONTINUUM_HARNESS_BIND_ADDR=127.0.0.1:9091 \
+    CONTINUUM_HARNESS_BACKEND="${HARNESS_BACKEND}" \
     CONTINUUM_HARNESS_MODE="${HARNESS_MODE}" \
     CONTINUUM_HARNESS_PROGRAM_ID="${PROGRAM_ID_EFFECTIVE}" \
     CONTINUUM_HARNESS_EVENT_LOG_PATH="${CONTINUUM_EVENT_LOG_PATH}" \
@@ -627,6 +656,8 @@ start_harness_and_relayer() {
     CONTINUUM_HARNESS_GROUP_PK="${group_pk}" \
     CONTINUUM_HARNESS_AIRDROP_DEPOSIT_UI_AMOUNT="${HARNESS_AIRDROP_DEPOSIT_UI_AMOUNT}" \
     CONTINUUM_HARNESS_AIRDROP_AUTO_CREATE_MANGO_ACCOUNT="${HARNESS_AIRDROP_AUTO_CREATE_MANGO_ACCOUNT}" \
+    CONTINUUM_HARNESS_RUST_PROFILE="${HARNESS_RUST_PROFILE}" \
+    CONTINUUM_HARNESS_RUST_AUTO_BUILD="${HARNESS_RUST_AUTO_BUILD}" \
     ./node_modules/.bin/ts-node ts/client/scripts/execution-queue/continuum-state-harness.ts
   wait_for_http_or_fail \
     "harness" \
@@ -843,6 +874,7 @@ status_all() {
     echo "validator: $(pid_is_running "${VALIDATOR_PID_FILE}" && echo running || echo stopped)"
   fi
   echo "harness:   $(pid_is_running "${HARNESS_PID_FILE}" && echo running || echo stopped)"
+  echo "backend:   ${HARNESS_BACKEND}"
   echo "relayer:   $(pid_is_running "${RELAYER_PID_FILE}" && echo running || echo stopped)"
   echo "bridge:    $(pid_is_running "${BRIDGE_PID_FILE}" && echo running || echo stopped)"
   echo "frontend:  $(pid_is_running "${FRONTEND_PID_FILE}" && echo running || echo stopped)"

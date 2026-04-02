@@ -51,6 +51,8 @@ pub enum HarnessError {
     InvalidPubkey { field: &'static str, value: String },
     #[error("invalid integer for {field}: {value}")]
     InvalidInteger { field: &'static str, value: String },
+    #[error("invalid fixed-point for {field}: {value}")]
+    InvalidFixedPoint { field: &'static str, value: String },
     #[error("duplicate order id {order_id} on market {market_index}")]
     DuplicateOrderId { market_index: u16, order_id: u128 },
     #[error(transparent)]

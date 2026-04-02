@@ -256,12 +256,106 @@ pub struct UserBalances {
     pub view: QueueView,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenBankSyncState {
+    pub token_index: u64,
+    pub mint: String,
+    pub deposit_index: String,
+    pub borrow_index: String,
+    pub oracle_price: String,
+    pub stable_price: String,
+    pub maint_asset_weight: String,
+    pub init_asset_weight: String,
+    pub init_scaled_asset_weight: String,
+    pub maint_liab_weight: String,
+    pub init_liab_weight: String,
+    pub init_scaled_liab_weight: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PerpMarketSyncState {
+    pub market: String,
+    pub market_index: u64,
+    pub settle_token_index: u64,
+    pub oracle_price: String,
+    pub stable_price: String,
+    pub base_lot_size: String,
+    pub quote_lot_size: String,
+    pub maint_base_asset_weight: String,
+    pub init_base_asset_weight: String,
+    pub maint_base_liab_weight: String,
+    pub init_base_liab_weight: String,
+    pub maint_overall_asset_weight: String,
+    pub init_overall_asset_weight: String,
+    pub long_funding: String,
+    pub short_funding: String,
+    pub maker_fee: String,
+    pub taker_fee: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountTokenPositionState {
+    pub token_index: u64,
+    pub indexed_position: String,
+    pub native_balance: String,
+    pub previous_index: String,
+    pub cumulative_deposit_interest: String,
+    pub cumulative_borrow_interest: String,
+    pub in_use_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountPerpPositionState {
+    pub market_index: u64,
+    pub settle_pnl_limit_window: u64,
+    pub settle_pnl_limit_settled_in_current_window_native: String,
+    pub base_position_lots: String,
+    pub quote_position_native: String,
+    pub quote_running_native: String,
+    pub long_settled_funding: String,
+    pub short_settled_funding: String,
+    pub open_bid_base_lots: String,
+    pub open_ask_base_lots: String,
+    pub taker_base_lots: String,
+    pub taker_quote_lots: String,
+    pub cumulative_long_funding: String,
+    pub cumulative_short_funding: String,
+    pub maker_volume: String,
+    pub taker_volume: String,
+    pub perp_spot_transfers: String,
+    pub avg_entry_price_per_base_lot: String,
+    pub oneshot_settle_pnl_allowance: String,
+    pub recurring_settle_pnl_allowance: String,
+    pub realized_pnl_for_position_native: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountProjectedState {
+    pub owner: String,
+    pub mango_account: String,
+    pub net_deposits: String,
+    #[serde(default)]
+    pub open_orders: Vec<OpenOrderSummary>,
+    #[serde(default)]
+    pub token_positions: Vec<AccountTokenPositionState>,
+    #[serde(default)]
+    pub perp_positions: Vec<AccountPerpPositionState>,
+    #[serde(default)]
+    pub unsupported_exposures: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EngineSnapshot {
     pub view: QueueView,
     pub markets: HashMap<String, MarketState>,
     pub users: HashMap<String, UserState>,
     pub queue: HashMap<String, QueueState>,
+    #[serde(default)]
+    pub accounts: HashMap<String, AccountProjectedState>,
+    #[serde(default)]
+    pub perp_markets: HashMap<String, PerpMarketSyncState>,
+    #[serde(default)]
+    pub token_banks: HashMap<String, TokenBankSyncState>,
     pub generated_ts_ms: u64,
 }
 

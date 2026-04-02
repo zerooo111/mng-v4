@@ -1,6 +1,7 @@
 use std::{
     cell::RefCell,
     collections::{BTreeMap, HashMap},
+    str::FromStr,
 };
 
 use anchor_lang::{prelude::Pubkey, AnchorSerialize};
@@ -11,7 +12,7 @@ use mango_v4::{
     state::{
         BookSide, BookSideOrderTree, EventQueue, EventType, FillEvent, Group, LeafNode,
         MangoAccount, MangoAccountValue, Orderbook, OutEvent, PerpMarket, PerpMarketIndex,
-        PostOrderType, Side,
+        PostOrderType, Side, TokenIndex,
     },
 };
 
@@ -23,16 +24,40 @@ use crate::{
 #[derive(Debug, Clone, Copy)]
 pub struct MarketConfig {
     pub oracle_price: f64,
+    pub stable_price: f64,
     pub base_lot_size: i64,
     pub quote_lot_size: i64,
+    pub settle_token_index: TokenIndex,
+    pub maint_base_asset_weight: I80F48,
+    pub init_base_asset_weight: I80F48,
+    pub maint_base_liab_weight: I80F48,
+    pub init_base_liab_weight: I80F48,
+    pub maint_overall_asset_weight: I80F48,
+    pub init_overall_asset_weight: I80F48,
+    pub long_funding: I80F48,
+    pub short_funding: I80F48,
+    pub maker_fee: I80F48,
+    pub taker_fee: I80F48,
 }
 
 impl Default for MarketConfig {
     fn default() -> Self {
         Self {
             oracle_price: 1.0,
+            stable_price: 1.0,
             base_lot_size: 1,
             quote_lot_size: 1,
+            settle_token_index: 0,
+            maint_base_asset_weight: I80F48::ONE,
+            init_base_asset_weight: I80F48::ONE,
+            maint_base_liab_weight: I80F48::ONE,
+            init_base_liab_weight: I80F48::ONE,
+            maint_overall_asset_weight: I80F48::ONE,
+            init_overall_asset_weight: I80F48::ONE,
+            long_funding: I80F48::ZERO,
+            short_funding: I80F48::ZERO,
+            maker_fee: I80F48::ZERO,
+            taker_fee: I80F48::ZERO,
         }
     }
 }
@@ -82,12 +107,26 @@ pub struct OpenOrderSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PerpPositionSnapshot {
     pub market_index: PerpMarketIndex,
+    pub settle_pnl_limit_window: u64,
+    pub settle_pnl_limit_settled_in_current_window_native: String,
     pub base_position_lots: i64,
     pub quote_position_native: String,
+    pub quote_running_native: String,
+    pub long_settled_funding: String,
+    pub short_settled_funding: String,
     pub open_bid_base_lots: i64,
     pub open_ask_base_lots: i64,
     pub taker_base_lots: i64,
     pub taker_quote_lots: i64,
+    pub cumulative_long_funding: String,
+    pub cumulative_short_funding: String,
+    pub maker_volume: String,
+    pub taker_volume: String,
+    pub perp_spot_transfers: String,
+    pub avg_entry_price_per_base_lot: String,
+    pub oneshot_settle_pnl_allowance: String,
+    pub recurring_settle_pnl_allowance: String,
+    pub realized_pnl_for_position_native: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,11 +221,7 @@ impl HarnessEngine {
         let mut market = PerpMarket::default_for_tests();
         market.group = self.group_key;
         market.perp_market_index = market_index;
-        market.base_lot_size = config.base_lot_size;
-        market.quote_lot_size = config.quote_lot_size;
-        market.maker_fee = I80F48::ZERO;
-        market.taker_fee = I80F48::ZERO;
-        market.fee_penalty = 0.0;
+        apply_market_config(&mut market, &config);
 
         let bids = RefCell::new(BookSide::zeroed());
         let asks = RefCell::new(BookSide::zeroed());
@@ -208,6 +243,25 @@ impl HarnessEngine {
                 event_queue: EventQueue::zeroed(),
             },
         );
+        Ok(())
+    }
+
+    pub fn configure_market(
+        &mut self,
+        market_index: PerpMarketIndex,
+        config: MarketConfig,
+    ) -> Result<()> {
+        if !self.markets.contains_key(&market_index) {
+            self.register_market(market_index, config)?;
+            return Ok(());
+        }
+
+        let market_state = self
+            .markets
+            .get_mut(&market_index)
+            .ok_or(HarnessError::UnknownMarket(market_index))?;
+        apply_market_config(&mut market_state.market, &config);
+        market_state.oracle_price = I80F48::from_num(config.oracle_price);
         Ok(())
     }
 
@@ -244,6 +298,22 @@ impl HarnessEngine {
 
     pub fn has_market(&self, market_index: PerpMarketIndex) -> bool {
         self.markets.contains_key(&market_index)
+    }
+
+    pub fn market_oracle_price_lots(&self, market_index: PerpMarketIndex) -> Result<String> {
+        let market = self
+            .markets
+            .get(&market_index)
+            .ok_or(HarnessError::UnknownMarket(market_index))?;
+        Ok(market.oracle_price.to_string())
+    }
+
+    pub fn market_quote_lot_size(&self, market_index: PerpMarketIndex) -> Result<i64> {
+        let market = self
+            .markets
+            .get(&market_index)
+            .ok_or(HarnessError::UnknownMarket(market_index))?;
+        Ok(market.market.quote_lot_size)
     }
 
     pub fn open_orders_snapshot_for_market(
@@ -331,6 +401,89 @@ impl HarnessEngine {
             .market
             .seq_num
             .max(restored_order_sequence(side, order_id));
+        Ok(())
+    }
+
+    pub fn import_perp_position_state(
+        &mut self,
+        mango_account: Pubkey,
+        owner: Pubkey,
+        market_index: PerpMarketIndex,
+        settle_token_index: TokenIndex,
+        state: &crate::AccountPerpPositionState,
+    ) -> Result<()> {
+        if !self.has_market(market_index) {
+            self.register_market(
+                market_index,
+                MarketConfig {
+                    settle_token_index,
+                    ..MarketConfig::default()
+                },
+            )?;
+        }
+        self.ensure_account(mango_account, owner)?;
+
+        let market_state = self
+            .markets
+            .get_mut(&market_index)
+            .ok_or(HarnessError::UnknownMarket(market_index))?;
+        market_state.market.settle_token_index = settle_token_index;
+        let account_state = self
+            .accounts
+            .get_mut(&mango_account)
+            .ok_or(HarnessError::UnknownAccount(mango_account))?;
+
+        let account = &mut account_state.account;
+        let (position, _) = account.ensure_perp_position(market_index, settle_token_index)?;
+        let previous_base = position.base_position_lots();
+
+        position.settle_pnl_limit_window = state.settle_pnl_limit_window as u32;
+        position.settle_pnl_limit_settled_in_current_window_native = parse_i64_field(
+            "settle_pnl_limit_settled_in_current_window_native",
+            &state.settle_pnl_limit_settled_in_current_window_native,
+        )?;
+        position.base_position_lots =
+            parse_i64_field("base_position_lots", &state.base_position_lots)?;
+        position.quote_position_native =
+            parse_i80f48_field("quote_position_native", &state.quote_position_native)?;
+        position.quote_running_native =
+            parse_i64_field("quote_running_native", &state.quote_running_native)?;
+        position.long_settled_funding =
+            parse_i80f48_field("long_settled_funding", &state.long_settled_funding)?;
+        position.short_settled_funding =
+            parse_i80f48_field("short_settled_funding", &state.short_settled_funding)?;
+        position.bids_base_lots = parse_i64_field("open_bid_base_lots", &state.open_bid_base_lots)?;
+        position.asks_base_lots = parse_i64_field("open_ask_base_lots", &state.open_ask_base_lots)?;
+        position.taker_base_lots = parse_i64_field("taker_base_lots", &state.taker_base_lots)?;
+        position.taker_quote_lots = parse_i64_field("taker_quote_lots", &state.taker_quote_lots)?;
+        position.cumulative_long_funding =
+            parse_f64_field("cumulative_long_funding", &state.cumulative_long_funding)?;
+        position.cumulative_short_funding =
+            parse_f64_field("cumulative_short_funding", &state.cumulative_short_funding)?;
+        position.maker_volume = parse_u64_field("maker_volume", &state.maker_volume)?;
+        position.taker_volume = parse_u64_field("taker_volume", &state.taker_volume)?;
+        position.perp_spot_transfers =
+            parse_i64_field("perp_spot_transfers", &state.perp_spot_transfers)?;
+        position.avg_entry_price_per_base_lot = parse_f64_field(
+            "avg_entry_price_per_base_lot",
+            &state.avg_entry_price_per_base_lot,
+        )?;
+        position.oneshot_settle_pnl_allowance = parse_i80f48_field(
+            "oneshot_settle_pnl_allowance",
+            &state.oneshot_settle_pnl_allowance,
+        )?;
+        position.recurring_settle_pnl_allowance = parse_i64_field(
+            "recurring_settle_pnl_allowance",
+            &state.recurring_settle_pnl_allowance,
+        )?;
+        position.realized_pnl_for_position_native = parse_i80f48_field(
+            "realized_pnl_for_position_native",
+            &state.realized_pnl_for_position_native,
+        )?;
+
+        market_state.market.open_interest = market_state.market.open_interest
+            + position.base_position_lots.abs()
+            - previous_base.abs();
         Ok(())
     }
 
@@ -588,18 +741,50 @@ impl HarnessEngine {
             .filter(|position| position.is_active())
             .map(|position| {
                 let market_index = position.market_index;
+                let settle_pnl_limit_window = position.settle_pnl_limit_window as u64;
+                let settle_pnl_limit_settled_in_current_window_native =
+                    position.settle_pnl_limit_settled_in_current_window_native;
+                let base_position_lots = position.base_position_lots();
+                let quote_position_native = position.quote_position_native().to_string();
+                let quote_running_native = position.quote_running_native;
+                let long_settled_funding = position.long_settled_funding;
+                let short_settled_funding = position.short_settled_funding;
                 let open_bid_base_lots = position.bids_base_lots;
                 let open_ask_base_lots = position.asks_base_lots;
                 let taker_base_lots = position.taker_base_lots;
                 let taker_quote_lots = position.taker_quote_lots;
+                let cumulative_long_funding = position.cumulative_long_funding;
+                let cumulative_short_funding = position.cumulative_short_funding;
+                let maker_volume = position.maker_volume;
+                let taker_volume = position.taker_volume;
+                let perp_spot_transfers = position.perp_spot_transfers;
+                let avg_entry_price_per_base_lot = position.avg_entry_price_per_base_lot;
+                let oneshot_settle_pnl_allowance = position.oneshot_settle_pnl_allowance;
+                let recurring_settle_pnl_allowance = position.recurring_settle_pnl_allowance;
+                let realized_pnl_for_position_native = position.realized_pnl_for_position_native;
                 PerpPositionSnapshot {
                     market_index,
-                    base_position_lots: position.base_position_lots(),
-                    quote_position_native: position.quote_position_native().to_string(),
+                    settle_pnl_limit_window,
+                    settle_pnl_limit_settled_in_current_window_native:
+                        settle_pnl_limit_settled_in_current_window_native.to_string(),
+                    base_position_lots,
+                    quote_position_native,
+                    quote_running_native: quote_running_native.to_string(),
+                    long_settled_funding: long_settled_funding.to_string(),
+                    short_settled_funding: short_settled_funding.to_string(),
                     open_bid_base_lots,
                     open_ask_base_lots,
                     taker_base_lots,
                     taker_quote_lots,
+                    cumulative_long_funding: cumulative_long_funding.to_string(),
+                    cumulative_short_funding: cumulative_short_funding.to_string(),
+                    maker_volume: maker_volume.to_string(),
+                    taker_volume: taker_volume.to_string(),
+                    perp_spot_transfers: perp_spot_transfers.to_string(),
+                    avg_entry_price_per_base_lot: avg_entry_price_per_base_lot.to_string(),
+                    oneshot_settle_pnl_allowance: oneshot_settle_pnl_allowance.to_string(),
+                    recurring_settle_pnl_allowance: recurring_settle_pnl_allowance.to_string(),
+                    realized_pnl_for_position_native: realized_pnl_for_position_native.to_string(),
                 }
             })
             .collect();
@@ -738,8 +923,12 @@ impl HarnessEngine {
                             return Err(HarnessError::UnknownAccount(taker));
                         }
 
-                        let mut maker_state = accounts.remove(&maker).unwrap();
-                        let mut taker_state = accounts.remove(&taker).unwrap();
+                        let mut maker_state = accounts
+                            .remove(&maker)
+                            .ok_or(HarnessError::UnknownAccount(maker))?;
+                        let mut taker_state = accounts
+                            .remove(&taker)
+                            .ok_or(HarnessError::UnknownAccount(taker))?;
 
                         maker_state.account.borrow_mut().execute_perp_maker(
                             market_index,
@@ -889,8 +1078,27 @@ fn new_account_value(owner: Pubkey, group_key: Pubkey) -> Result<MangoAccountVal
     let mut template = MangoAccount::default_for_tests();
     template.owner = owner;
     template.group = group_key;
+    template.perp_open_orders = vec![Default::default(); 64];
     let bytes = template.try_to_vec()?;
     Ok(MangoAccountValue::from_bytes(&bytes)?)
+}
+
+fn apply_market_config(market: &mut PerpMarket, config: &MarketConfig) {
+    market.settle_token_index = config.settle_token_index;
+    market.base_lot_size = config.base_lot_size;
+    market.quote_lot_size = config.quote_lot_size;
+    market.maint_base_asset_weight = config.maint_base_asset_weight;
+    market.init_base_asset_weight = config.init_base_asset_weight;
+    market.maint_base_liab_weight = config.maint_base_liab_weight;
+    market.init_base_liab_weight = config.init_base_liab_weight;
+    market.maint_overall_asset_weight = config.maint_overall_asset_weight;
+    market.init_overall_asset_weight = config.init_overall_asset_weight;
+    market.long_funding = config.long_funding;
+    market.short_funding = config.short_funding;
+    market.maker_fee = config.maker_fee;
+    market.taker_fee = config.taker_fee;
+    market.stable_price_model.stable_price = config.stable_price;
+    market.fee_penalty = 0.0;
 }
 
 fn count_open_orders(account: &MangoAccountValue, market_index: PerpMarketIndex) -> usize {
@@ -916,6 +1124,40 @@ fn restored_order_sequence(side: Side, order_id: u128) -> u64 {
         Side::Bid => !low,
         Side::Ask => low,
     }
+}
+
+fn parse_i80f48_field(field: &'static str, value: &str) -> Result<I80F48> {
+    I80F48::from_str(value).map_err(|_| HarnessError::InvalidFixedPoint {
+        field,
+        value: value.to_string(),
+    })
+}
+
+fn parse_i64_field(field: &'static str, value: &str) -> Result<i64> {
+    value
+        .parse::<i64>()
+        .map_err(|_| HarnessError::InvalidInteger {
+            field,
+            value: value.to_string(),
+        })
+}
+
+fn parse_u64_field(field: &'static str, value: &str) -> Result<u64> {
+    value
+        .parse::<u64>()
+        .map_err(|_| HarnessError::InvalidInteger {
+            field,
+            value: value.to_string(),
+        })
+}
+
+fn parse_f64_field(field: &'static str, value: &str) -> Result<f64> {
+    value
+        .parse::<f64>()
+        .map_err(|_| HarnessError::InvalidFixedPoint {
+            field,
+            value: value.to_string(),
+        })
 }
 
 #[cfg(test)]
@@ -1158,6 +1400,77 @@ mod tests {
 
             let account = engine.account_snapshot(mango_account, 501).unwrap();
             assert!(account.open_orders.is_empty());
+        });
+    }
+
+    #[test]
+    fn prunes_expired_orders_and_frees_account_slots() {
+        run_with_large_stack(|| {
+            let mut engine = HarnessEngine::new();
+            let market_index = 23;
+            let owner = Pubkey::new_unique();
+            let mango_account = Pubkey::new_unique();
+            let now_ts = 10_000u64;
+            let expired_ts = now_ts - 10;
+
+            engine
+                .register_market(
+                    market_index,
+                    MarketConfig {
+                        oracle_price: 100.0,
+                        ..MarketConfig::default()
+                    },
+                )
+                .unwrap();
+            engine.ensure_account(mango_account, owner).unwrap();
+
+            for sequence in 0..64u64 {
+                let order_id = ((100u128) << 64) | (!(sequence + 1) as u128);
+                engine
+                    .import_open_order(
+                        market_index,
+                        mango_account,
+                        Side::Bid,
+                        order_id,
+                        sequence + 1,
+                        100,
+                        1,
+                        expired_ts,
+                    )
+                    .unwrap();
+            }
+
+            assert_eq!(engine.prune_expired_orders(now_ts).unwrap(), 64);
+            assert!(engine
+                .account_snapshot(mango_account, now_ts)
+                .unwrap()
+                .open_orders
+                .is_empty());
+
+            let payload = encode_place_order(
+                Side::Bid,
+                100,
+                1,
+                100,
+                9_999,
+                PlaceOrderType::Limit,
+                SelfTradeBehavior::DecrementTake,
+                false,
+                0,
+                10,
+            );
+            let result = engine
+                .execute_queue_payload(market_index, mango_account, &payload, now_ts)
+                .unwrap();
+            assert!(result.posted_order_id.is_some());
+            assert_eq!(
+                engine
+                    .account_snapshot(mango_account, now_ts)
+                    .unwrap()
+                    .open_orders
+                    .len(),
+                1
+            );
         });
     }
 }

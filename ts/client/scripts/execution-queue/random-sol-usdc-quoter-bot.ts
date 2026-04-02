@@ -1195,20 +1195,29 @@ async function main(): Promise<void> {
       }
       relayerClient = buildRelayerClient();
     }
-    // Back off on rate limit, backpressure, or connection issues
+    // Only back off on actual backpressure (queue full).
+    // Connection dropped / UNAVAILABLE are transient relayer issues
+    // (usually from harness health gate) — retry immediately.
     if (
-      errText.includes('429') ||
-      errText.includes('Too Many') ||
       errText.includes('RESOURCE_EXHAUSTED') ||
-      errText.includes('backpressure') ||
-      errText.includes('Connection dropped') ||
-      errText.includes('UNAVAILABLE')
+      errText.includes('backpressure')
     ) {
+      backoffUntilMs = Date.now() + 3_000;
+      console.error(
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          msg: 'queue backpressure, backing off 3s',
+          error: errText.slice(0, 200),
+        }),
+      );
+      return;
+    }
+    if (errText.includes('429') || errText.includes('Too Many')) {
       backoffUntilMs = Date.now() + 10_000;
       console.error(
         JSON.stringify({
           ts: new Date().toISOString(),
-          msg: 'quote tick rate-limited, backing off 10s',
+          msg: 'RPC 429, backing off 10s',
           error: errText.slice(0, 200),
         }),
       );

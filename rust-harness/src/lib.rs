@@ -1,5 +1,7 @@
 mod engine;
 mod error;
+mod logging;
+mod node;
 mod payload;
 mod replay;
 mod types;
@@ -16,8 +18,10 @@ pub use payload::{
 };
 pub use replay::ContinuumStateEngine;
 pub use types::{
+    AccountPerpPositionState, AccountProjectedState, AccountTokenPositionState,
     CanonicalIntentState, DivergenceEvent, EngineSnapshot, MarginSummary, MarginSummaryAccount,
     MarginSummaryEmpty, MarginSummaryOk, MarginSummaryPlaceholder, MarketCandle, MarketState,
-    MarketTrade, OpenOrderSummary, QueueItemEnqueuedEvent, QueueItemProcessedEvent, QueueState,
-    QueueView, RelayIntentAcceptedEvent, UserBalances, UserState,
+    MarketTrade, OpenOrderSummary, PerpMarketSyncState, QueueItemEnqueuedEvent,
+    QueueItemProcessedEvent, QueueState, QueueView, RelayIntentAcceptedEvent, TokenBankSyncState,
+    UserBalances, UserState,
 };

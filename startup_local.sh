@@ -38,9 +38,12 @@ CTM_RELAYER_IMPL="${CTM_RELAYER_IMPL:-rust}"
 CTM_EXECUTION_ENGINE_HTTP_BIND_ADDR="${CTM_EXECUTION_ENGINE_HTTP_BIND_ADDR:-127.0.0.1:9093}"
 EXECUTION_QUEUE_ENGINE_ENABLED="${EXECUTION_QUEUE_ENGINE_ENABLED:-true}"
 HARNESS_BIND_ADDR="${HARNESS_BIND_ADDR:-127.0.0.1:9091}"
+HARNESS_BACKEND="${HARNESS_BACKEND:-rust-backend}"
 HARNESS_MODE="${HARNESS_MODE:-$([[ "${STACK_CLUSTER}" == "devnet" ]] && echo devnet || echo local)}"
 HARNESS_ENABLE_AIRDROP="${HARNESS_ENABLE_AIRDROP:-false}"
 HARNESS_AIRDROP_DEPOSIT_UI_AMOUNT="${HARNESS_AIRDROP_DEPOSIT_UI_AMOUNT:-1000}"
+HARNESS_RUST_PROFILE="${HARNESS_RUST_PROFILE:-release}"
+HARNESS_RUST_AUTO_BUILD="${HARNESS_RUST_AUTO_BUILD:-true}"
 RESET_VALIDATOR="${RESET_VALIDATOR:-1}"
 BUILD_SBF="${BUILD_SBF:-0}"
 SKIP_BOOTSTRAP="${SKIP_BOOTSTRAP:-0}"
@@ -299,11 +302,13 @@ start_harness() {
     return 0
   fi
   ensure_port_free_or_owned "${harness_port}" "${HARNESS_PID_FILE}"
+  prepare_harness_backend
   setsid env \
     STACK_CLUSTER="${STACK_CLUSTER}" \
     CLUSTER_OVERRIDE=devnet \
     CLUSTER_URL_OVERRIDE="${SOLANA_URL}" \
     CONTINUUM_HARNESS_BIND_ADDR="${HARNESS_BIND_ADDR}" \
+    CONTINUUM_HARNESS_BACKEND="${HARNESS_BACKEND}" \
     CONTINUUM_HARNESS_MODE="${HARNESS_MODE}" \
     CONTINUUM_HARNESS_PROGRAM_ID="${PROGRAM_ID}" \
     CONTINUUM_HARNESS_EVENT_LOG_PATH="${CONTINUUM_EVENT_LOG_PATH}" \
@@ -312,11 +317,33 @@ start_harness() {
     CONTINUUM_HARNESS_AIRDROP_KEYPAIR="${MB_PAYER_KEYPAIR}" \
     CONTINUUM_HARNESS_GROUP_PK="${group_pk}" \
     CONTINUUM_HARNESS_AIRDROP_DEPOSIT_UI_AMOUNT="${HARNESS_AIRDROP_DEPOSIT_UI_AMOUNT}" \
+    CONTINUUM_HARNESS_RUST_PROFILE="${HARNESS_RUST_PROFILE}" \
+    CONTINUUM_HARNESS_RUST_AUTO_BUILD="${HARNESS_RUST_AUTO_BUILD}" \
     ./node_modules/.bin/ts-node ts/client/scripts/execution-queue/continuum-state-harness.ts \
     >"${LOG_DIR}/continuum-harness.log" 2>&1 < /dev/null &
   echo $! >"${HARNESS_PID_FILE}"
   wait_for_port_listen "${harness_port}"
   wait_for_harness_health "http://${HARNESS_BIND_ADDR}/healthz"
+}
+
+prepare_harness_backend() {
+  if [[ "${HARNESS_BACKEND}" != "rust-backend" ]]; then
+    return 0
+  fi
+
+  local cargo_args=(
+    node
+    "${ROOT_DIR}/scripts/build-rust-harness-native.js"
+    --build
+    --profile
+    "${HARNESS_RUST_PROFILE}"
+  )
+
+  echo "Preparing Rust harness backend (${HARNESS_RUST_PROFILE})"
+  if ! "${cargo_args[@]}" >"${LOG_DIR}/continuum-harness-native-build.log" 2>&1; then
+    echo "Rust harness build failed; see ${LOG_DIR}/continuum-harness-native-build.log" >&2
+    return 1
+  fi
 }
 
 start_relayer() {
@@ -526,6 +553,7 @@ start_all() {
   echo "  rpc:           ${SOLANA_URL}"
   echo "  relayer grpc:  ${CTM_RELAYER_BIND_ADDR}"
   echo "  harness http:  ${HARNESS_BIND_ADDR}"
+  echo "  harness impl:  ${HARNESS_BACKEND}"
   echo "  e2e config:    ${E2E_OUTPUT_CONFIG_PATH}"
   echo "  logs dir:      ${LOG_DIR}"
   echo "  keypairs dir:  ${KEYPAIRS_DIR}"
@@ -566,6 +594,7 @@ status_all() {
       echo "${names[$i]}: stopped"
     fi
   done
+  echo "harness backend: ${HARNESS_BACKEND}"
   echo "rpc health:"
   curl -s "${SOLANA_URL}" \
     -H 'Content-Type: application/json' \

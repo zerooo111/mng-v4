@@ -4,7 +4,7 @@ import {
   ContinuumStateEngine,
   QueueProcessStatus,
   decodeQueuePayload,
-} from './continuumHarness';
+} from './continuumHarnessTsEngine';
 import {
   QueuePlaceOrderType,
   QueueSelfTradeBehavior,

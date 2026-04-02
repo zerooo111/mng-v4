@@ -1,6 +1,9 @@
 import { PublicKey } from '@solana/web3.js';
+import { HarnessBackendKind } from './continuumHarnessBackend';
 import {
+  AccountProjectedState,
   EngineSnapshot,
+  MarginSummaryAccount,
   MarketCandle,
   MarketTrade,
   MarketState,
@@ -19,6 +22,7 @@ export type HarnessApiError = {
 export type HarnessHealth = {
   ok: boolean;
   mode: string;
+  backend?: HarnessBackendKind;
   intents_total: number;
   divergences_total: number;
   markets_total: number;
@@ -126,6 +130,38 @@ export type StubbedAccountMetrics = {
   };
 };
 
+export type FrontendAccountMetrics =
+  | StubbedAccountMetrics
+  | {
+      status: 'empty' | 'ok';
+      source:
+        | 'onchain-mango-health'
+        | 'rust-replay-perp-token-health'
+        | 'rust-replay-perp-token-health-partial';
+      updated_ts_ms: number;
+      account_count: number;
+      mango_account: string | null;
+      totals: {
+        equity_native_quote: string;
+        pnl_native_quote: string;
+        assets_native_quote: string;
+        liabs_native_quote: string;
+        init_health_native_quote: string;
+        maint_health_native_quote: string;
+        margin_usage_fraction: number;
+      };
+      accounts: MarginSummaryAccount[];
+      fields: {
+        margin_used: number;
+        health_init: string;
+        health_maint: string;
+        pnl_realized: null;
+        pnl_unrealized: string;
+        equity: string;
+        liquidation_price_by_market: null;
+      };
+    };
+
 export type FrontendOwnerSlice = {
   owner: string;
   mango_account: string | null;
@@ -134,7 +170,7 @@ export type FrontendOwnerSlice = {
   positions: UserState['per_market'];
   open_orders: MarketState['open_orders'];
   trades: MarketTrade[];
-  account_metrics: StubbedAccountMetrics;
+  account_metrics: FrontendAccountMetrics;
 };
 
 export type FrontendMarketSlice = {
@@ -193,6 +229,7 @@ export type HarnessStateFullMarket = {
   market_metadata?: HarnessMarketMetadata | null;
   queue: QueueState | null;
   users: Record<string, UserState>;
+  accounts?: Record<string, AccountProjectedState>;
 };
 
 export type RelayIntentAcceptedRequest = {

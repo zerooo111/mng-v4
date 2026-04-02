@@ -22,7 +22,9 @@ export {
 } from './clientIxParamBuilder';
 export * from './constants';
 export * from './continuumHarness';
+export * from './continuumHarnessBackend';
 export * from './continuumHarnessClient';
+export * from './continuumHarnessRustBackend';
 export * from './error';
 export * from './executionQueue';
 export * from './executionQueueLayout';

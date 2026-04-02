@@ -20,6 +20,7 @@ Safety defaults now in effect:
 ```bash
 PRELOAD_PROGRAM_IN_VALIDATOR=0 \
 RESET_VALIDATOR=1 \
+HARNESS_BACKEND=rust-backend \
 EXECUTION_QUEUE_ENGINE_ENABLED=false \
 ./startup_local.sh restart
 ```
@@ -28,6 +29,7 @@ Devnet:
 
 ```bash
 STACK_CLUSTER=devnet \
+HARNESS_BACKEND=rust-backend \
 PROGRAM_ID=9nNhSkcxYFujiydpuuhVttUYBqYJQmxCzjrBofBvmutF \
 ./startup_local.sh restart
 ```
@@ -66,6 +68,7 @@ Important:
 - `EXECUTION_QUEUE_ENGINE_ENABLED=true` is now the default local mode and enables the embedded Rust executor.
 - Set `EXECUTION_QUEUE_ENGINE_ENABLED=false` only when you intentionally want the external TS cranker.
 - `CTM_RELAYER_IMPL=rust` is now the default startup mode. Set `CTM_RELAYER_IMPL=ts` only if you need the legacy TS relayer path.
+- `HARNESS_BACKEND=rust-backend` is now the intended startup mode for the continuum harness. Set `HARNESS_BACKEND=ts-backend` only for fallback or debugging.
 - In `STACK_CLUSTER=devnet`, runtime config defaults move from `.localnet/run` to `.devnet/run`.
 - Maker/taker now come from `keypairs/execution-queue-maker.json` and `keypairs/execution-queue-taker.json`.
 
@@ -230,12 +233,21 @@ Reads relay-ingested intents and on-chain queue events, then exposes optimistic 
 ```bash
 CONTINUUM_HARNESS_BIND_ADDR=0.0.0.0:9091 \
 CONTINUUM_HARNESS_MODE=local \
+CONTINUUM_HARNESS_BACKEND=rust-backend \
 CONTINUUM_HARNESS_EVENT_LOG_PATH=/tmp/continuum-harness-events.jsonl \
 CONTINUUM_HARNESS_PROGRAM_ID=<optional-program-id-override> \
 CLUSTER_OVERRIDE=devnet \
 CLUSTER_URL_OVERRIDE=http://127.0.0.1:8899 \
 yarn continuum-state-harness
 ```
+
+Rust backend notes:
+- `startup_local.sh` and `scripts/startup_all_local.sh` now default the harness to `rust-backend`
+- they also prebuild `rust-harness` before launch and pass `CONTINUUM_HARNESS_BACKEND`, `CONTINUUM_HARNESS_RUST_PROFILE`, and `CONTINUUM_HARNESS_RUST_AUTO_BUILD`
+- use `npm run build:rust-harness-native` to produce `target/release/rust_harness.node`
+- the loader now expects a real `.node` artifact and will call `scripts/build-rust-harness-native.js` to build/copy it into place if needed
+- set `CONTINUUM_HARNESS_BACKEND=ts-backend` only if you intentionally want the legacy TS replay engine
+- optional overrides: `CONTINUUM_HARNESS_RUST_PROFILE`, `CONTINUUM_HARNESS_RUST_NATIVE_PATH`, `CONTINUUM_HARNESS_RUST_AUTO_BUILD`
 
 ### Key Endpoints
 
@@ -258,7 +270,7 @@ yarn continuum-state-harness
 
 Frontend stream notes:
 - owner slices stream live `positions`, `trades`, and `open_orders`
-- `account_metrics` is currently a stub payload with `status: "stub"` and `source: "pending-subtree"`
+- `account_metrics` now reflects backend health/margin data when available
 - owner positions are currently emitted as `positions_scope: "owner_aggregate"`
 
 ### Verification (Phase 5)
