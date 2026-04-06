@@ -3088,6 +3088,11 @@ async function buildOnchainQueueSnapshot(
   };
 }
 
+/** Yield to the event loop so HTTP/SSE handlers can run between heavy RPC calls. */
+function yieldToEventLoop(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
 async function buildOnchainConfirmedSnapshot(
   onchain: OnchainContext | null,
 ): Promise<{
@@ -3099,9 +3104,12 @@ async function buildOnchainConfirmedSnapshot(
     return null;
   }
 
+  await yieldToEventLoop();
   const replayConfirmed = engine.getSnapshot('confirmed');
   const onchainQueue = await buildOnchainQueueSnapshot(onchain);
+  await yieldToEventLoop();
   const allAccounts = await onchain.mangoClient.getAllMangoAccounts(group);
+  await yieldToEventLoop();
   const ownerByMangoAccount = new Map<string, string>();
   const ownerAccountsMap = new Map<
     string,
@@ -3182,7 +3190,9 @@ async function buildOnchainConfirmedSnapshot(
     return created;
   };
 
-  for (const account of allAccounts) {
+  for (let _ai = 0; _ai < allAccounts.length; _ai++) {
+    if (_ai > 0 && _ai % 10 === 0) await yieldToEventLoop();
+    const account = allAccounts[_ai];
     const mangoAccount = account.publicKey.toBase58();
     const owner = account.owner.toBase58();
     ownerByMangoAccount.set(mangoAccount, owner);
@@ -3288,10 +3298,12 @@ async function buildOnchainConfirmedSnapshot(
       maker_fee: perpMarket.makerFee.toString(),
       taker_fee: perpMarket.takerFee.toString(),
     };
+    await yieldToEventLoop();
     const [bidsBook, asksBook] = await Promise.all([
       perpMarket.loadBids(onchain.mangoClient, true),
       perpMarket.loadAsks(onchain.mangoClient, true),
     ]);
+    await yieldToEventLoop();
     const bids = new Map<string, bigint>();
     const asks = new Map<string, bigint>();
     const openOrders: OpenOrderSummary[] = [];
