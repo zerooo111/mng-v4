@@ -50,6 +50,8 @@ pub struct QueueItemProcessedEvent {
     pub status: u8,
     pub slot: String,
     pub tx_signature: String,
+    #[serde(default)]
+    pub processed_unix_ts: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -391,6 +393,10 @@ pub struct CanonicalIntentState {
     pub enqueued_slot: Option<String>,
     #[serde(default)]
     pub processed_slot: Option<String>,
+    #[serde(default)]
+    pub processed_ts_ms: Option<u64>,
+    #[serde(default)]
+    pub processed_unix_ts: Option<u64>,
     #[serde(default)]
     pub processed_status: Option<u8>,
     #[serde(default)]

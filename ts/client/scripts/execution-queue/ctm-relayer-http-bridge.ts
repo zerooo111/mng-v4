@@ -4,6 +4,7 @@ import fs from 'fs';
 import * as dotenv from 'dotenv';
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
+import axios from 'axios';
 import { Pool } from 'pg';
 import { runtimeConfigPath } from './scriptEnv';
 
@@ -47,8 +48,20 @@ type SubmitIntentHttpBody = {
   user_signature_b64: string;
 };
 
+type DepositContextResponse = {
+  mango_account?: string;
+  mango_account_exists?: boolean;
+};
+
 const BRIDGE_BIND_ADDR = process.env.CTM_RELAYER_HTTP_BIND_ADDR || '127.0.0.1:9092';
 const RELAYER_GRPC_ADDR = process.env.CTM_RELAYER_ADDR || '127.0.0.1:9090';
+const HARNESS_BASE_URL = (
+  process.env.CTM_RELAYER_HARNESS_BASE_URL ||
+  process.env.CONTINUUM_HARNESS_BASE_URL ||
+  (process.env.CONTINUUM_HARNESS_BIND_ADDR
+    ? `http://${process.env.CONTINUUM_HARNESS_BIND_ADDR}`
+    : 'http://127.0.0.1:9091')
+).replace(/\/+$/, '');
 const E2E_CONFIG_PATH =
   process.env.E2E_CONFIG_PATH ||
   process.env.E2E_OUTPUT_CONFIG_PATH ||
@@ -145,6 +158,44 @@ function loadRuntimeConfig(): {
   };
 
   return { e2eConfig, lanes, ownerToMangoAccount, defaults };
+}
+
+function remapLaneAccountsForOwner(params: {
+  laneAccounts: LaneAccountMeta[];
+  owner: string;
+  ownerMangoAccount: string | null;
+  ownerToMangoAccount: Record<string, string>;
+  defaultMangoAccount: string | null;
+}): LaneAccountMeta[] {
+  if (!params.owner || !params.ownerMangoAccount) {
+    return params.laneAccounts;
+  }
+
+  const knownOwners = new Set(
+    Object.keys(params.ownerToMangoAccount).filter((value) => value.length > 0),
+  );
+  const knownMangoAccounts = new Set(
+    Object.values(params.ownerToMangoAccount).filter((value) => value.length > 0),
+  );
+  if (params.defaultMangoAccount) {
+    knownMangoAccounts.add(params.defaultMangoAccount);
+  }
+
+  return params.laneAccounts.map((account) => {
+    if (knownMangoAccounts.has(account.pubkey)) {
+      return {
+        ...account,
+        pubkey: params.ownerMangoAccount as string,
+      };
+    }
+    if (knownOwners.has(account.pubkey)) {
+      return {
+        ...account,
+        pubkey: params.owner,
+      };
+    }
+    return account;
+  });
 }
 
 function createRelayerClient() {
@@ -332,9 +383,39 @@ async function fetchCandles(
   ]);
 }
 
+async function resolveOwnerMangoAccount(owner: string): Promise<string | null> {
+  if (!owner) {
+    return null;
+  }
+
+  try {
+    const { data } = await axios.get<DepositContextResponse>(
+      `${HARNESS_BASE_URL}/state/deposit-context/${encodeURIComponent(owner)}`,
+      { timeout: 5_000 },
+    );
+    if (data?.mango_account && data.mango_account_exists !== false) {
+      return data.mango_account;
+    }
+  } catch (err: any) {
+    console.warn(
+      JSON.stringify(
+        {
+          msg: 'relay-config owner resolution failed',
+          owner,
+          harness_base_url: HARNESS_BASE_URL,
+          error: err?.message || String(err),
+        },
+        null,
+        2,
+      ),
+    );
+  }
+
+  return null;
+}
+
 async function main(): Promise<void> {
   const relayerClient = createRelayerClient();
-  const runtime = loadRuntimeConfig();
   let tsdbPool: Pool | null =
     TSDB_ENABLED
       ? new Pool({
@@ -383,6 +464,7 @@ async function main(): Promise<void> {
 
     const url = new URL(req.url, 'http://localhost');
     const pathname = url.pathname;
+    const runtime = loadRuntimeConfig();
 
     if (req.method === 'GET' && pathname === '/healthz') {
       json(res, 200, {
@@ -397,23 +479,49 @@ async function main(): Promise<void> {
 
     if (req.method === 'GET' && pathname === '/relay/config') {
       const owner = url.searchParams.get('owner') || '';
-      const mangoAccount =
-        (owner && runtime.ownerToMangoAccount[owner]) || runtime.defaults.mangoAccount;
+      if (!owner) {
+        json(res, 400, { error: 'owner is required' });
+        return;
+      }
+
+      const ownerToMangoAccount = { ...runtime.ownerToMangoAccount };
+      let mangoAccount =
+        (owner && ownerToMangoAccount[owner]) || runtime.defaults.mangoAccount;
+
+      // Resolve the caller's Mango account from the harness so browser clients
+      // are not limited to the static maker/taker accounts baked into E2E config.
+      if (owner && !ownerToMangoAccount[owner]) {
+        const resolvedMangoAccount = await resolveOwnerMangoAccount(owner);
+        if (resolvedMangoAccount) {
+          ownerToMangoAccount[owner] = resolvedMangoAccount;
+          mangoAccount = resolvedMangoAccount;
+        } else {
+          mangoAccount = null;
+        }
+      }
+
+      const lanes = runtime.lanes.map((lane) => ({
+        name: lane.name,
+        remaining_accounts: remapLaneAccountsForOwner({
+          laneAccounts: lane.remainingAccounts,
+          owner,
+          ownerMangoAccount: mangoAccount,
+          ownerToMangoAccount,
+          defaultMangoAccount: runtime.defaults.mangoAccount,
+        }).map((account) => ({
+          pubkey: account.pubkey,
+          is_signer: !!account.isSigner,
+          is_writable: !!account.isWritable,
+        })),
+      }));
 
       json(res, 200, {
         group: runtime.defaults.group,
         execution_queue: runtime.defaults.executionQueue,
         market: runtime.defaults.market,
         mango_account: mangoAccount,
-        owner_to_mango_account: runtime.ownerToMangoAccount,
-        lanes: runtime.lanes.map((lane) => ({
-          name: lane.name,
-          remaining_accounts: lane.remainingAccounts.map((m) => ({
-            pubkey: m.pubkey,
-            is_signer: !!m.isSigner,
-            is_writable: !!m.isWritable,
-          })),
-        })),
+        owner_to_mango_account: ownerToMangoAccount,
+        lanes,
       });
       return;
     }

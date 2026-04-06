@@ -89,6 +89,18 @@ type BotRuntime = {
   lastPlacedClientOrderId: number | null;
 };
 
+type ExternalReferencePriceSource = 'coingecko' | 'coinbase' | 'binance';
+
+type ReferencePriceSource =
+  | ExternalReferencePriceSource
+  | 'onchain-fallback'
+  | 'fixed';
+
+type ReferencePriceResult = {
+  price: number;
+  source: ExternalReferencePriceSource;
+};
+
 type E2EConfig = {
   cluster: Cluster;
   clusterUrl: string;
@@ -158,6 +170,13 @@ const COINGECKO_TIMEOUT_MS = Number(
 const COINGECKO_REFRESH_MS = Number(
   process.env.QUOTER_COINGECKO_REFRESH_MS || '10000',
 );
+const COINBASE_API_BASE =
+  process.env.QUOTER_COINBASE_API_BASE || 'https://api.exchange.coinbase.com';
+const COINBASE_PRODUCT_ID =
+  process.env.QUOTER_COINBASE_PRODUCT_ID || 'SOL-USD';
+const BINANCE_API_BASE =
+  process.env.QUOTER_BINANCE_API_BASE || 'https://api.binance.com';
+const BINANCE_SYMBOL = process.env.QUOTER_BINANCE_SYMBOL || 'SOLUSDT';
 const FIXED_REFERENCE_PRICE = process.env.QUOTER_FIXED_REFERENCE_PRICE
   ? Number(process.env.QUOTER_FIXED_REFERENCE_PRICE)
   : 0;
@@ -932,6 +951,88 @@ async function fetchCoinGeckoReferencePriceUi(): Promise<number> {
   }
 }
 
+async function fetchCoinbaseReferencePriceUi(): Promise<number> {
+  const base = COINBASE_API_BASE.endsWith('/')
+    ? COINBASE_API_BASE.slice(0, -1)
+    : COINBASE_API_BASE;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), COINGECKO_TIMEOUT_MS);
+  try {
+    const res = await fetch(
+      `${base}/products/${encodeURIComponent(COINBASE_PRODUCT_ID)}/ticker`,
+      {
+        signal: controller.signal,
+      },
+    );
+    if (!res.ok) {
+      throw new Error(`coinbase non-200 status ${res.status}`);
+    }
+    const parsed = (await res.json()) as { price?: string | number };
+    const value = Number(parsed?.price);
+    if (!Number.isFinite(value) || value <= 0) {
+      throw new Error('coinbase returned invalid price');
+    }
+    return value;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchBinanceReferencePriceUi(): Promise<number> {
+  const base = BINANCE_API_BASE.endsWith('/')
+    ? BINANCE_API_BASE.slice(0, -1)
+    : BINANCE_API_BASE;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), COINGECKO_TIMEOUT_MS);
+  try {
+    const query = new URLSearchParams({
+      symbol: BINANCE_SYMBOL,
+    });
+    const res = await fetch(`${base}/api/v3/ticker/price?${query.toString()}`, {
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      throw new Error(`binance non-200 status ${res.status}`);
+    }
+    const parsed = (await res.json()) as { price?: string | number };
+    const value = Number(parsed?.price);
+    if (!Number.isFinite(value) || value <= 0) {
+      throw new Error('binance returned invalid price');
+    }
+    return value;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchExternalReferencePriceUi(): Promise<ReferencePriceResult> {
+  try {
+    return {
+      price: await fetchCoinGeckoReferencePriceUi(),
+      source: 'coingecko',
+    };
+  } catch (coingeckoErr) {
+    try {
+      return {
+        price: await fetchCoinbaseReferencePriceUi(),
+        source: 'coinbase',
+      };
+    } catch (coinbaseErr) {
+      try {
+        return {
+          price: await fetchBinanceReferencePriceUi(),
+          source: 'binance',
+        };
+      } catch (binanceErr) {
+        throw new AggregateError(
+          [coingeckoErr, coinbaseErr, binanceErr],
+          'all external reference price providers failed',
+        );
+      }
+    }
+  }
+}
+
 async function main(): Promise<void> {
   startupDebug('main-enter');
   if (!Number.isFinite(MIN_INTERVAL_MS) || MIN_INTERVAL_MS <= 0) {
@@ -1142,10 +1243,24 @@ async function main(): Promise<void> {
       sizeMinSol: SIZE_MIN_SOL,
       sizeMaxSol: SIZE_MAX_SOL,
       referencePrice: {
-        provider: 'coingecko',
-        assetId: COINGECKO_ASSET_ID,
-        vsCurrency: COINGECKO_VS_CURRENCY,
-        apiBase: COINGECKO_API_BASE,
+        providers: [
+          {
+            provider: 'coingecko',
+            assetId: COINGECKO_ASSET_ID,
+            vsCurrency: COINGECKO_VS_CURRENCY,
+            apiBase: COINGECKO_API_BASE,
+          },
+          {
+            provider: 'coinbase',
+            productId: COINBASE_PRODUCT_ID,
+            apiBase: COINBASE_API_BASE,
+          },
+          {
+            provider: 'binance',
+            symbol: BINANCE_SYMBOL,
+            apiBase: BINANCE_API_BASE,
+          },
+        ],
         refreshMs: COINGECKO_REFRESH_MS,
       },
       parallelBotExecution: PARALLEL_BOT_EXECUTION,
@@ -1178,8 +1293,9 @@ async function main(): Promise<void> {
   let lastStatsPlaceIntents = 0;
   let lastStatsIntentCount = 0;
   let stopReason = 'signal';
-  let cachedCoinGeckoPriceUi: number | null = null;
-  let cachedCoinGeckoTsMs = 0;
+  let cachedReferencePriceUi: number | null = null;
+  let cachedReferencePriceSource: ExternalReferencePriceSource | null = null;
+  let cachedReferenceTsMs = 0;
   const inFlight = new Set<Promise<void>>();
 
   let backoffUntilMs = 0;
@@ -1328,28 +1444,32 @@ async function main(): Promise<void> {
         );
       }
       let referencePrice: number;
-      let referenceSource: 'coingecko' | 'onchain-fallback' | 'fixed' = 'coingecko';
+      let referenceSource: ReferencePriceSource = 'coingecko';
       if (FIXED_REFERENCE_PRICE > 0) {
         referencePrice = FIXED_REFERENCE_PRICE;
         referenceSource = 'fixed';
       } else {
       const nowMs = Date.now();
-      const shouldRefreshCoinGecko =
-        cachedCoinGeckoPriceUi === null ||
-        nowMs - cachedCoinGeckoTsMs >= COINGECKO_REFRESH_MS;
-      if (shouldRefreshCoinGecko) {
+      const shouldRefreshReference =
+        cachedReferencePriceUi === null ||
+        nowMs - cachedReferenceTsMs >= COINGECKO_REFRESH_MS;
+      if (shouldRefreshReference) {
         try {
-          const fetched = await fetchCoinGeckoReferencePriceUi();
-          cachedCoinGeckoPriceUi = fetched;
-          cachedCoinGeckoTsMs = nowMs;
-          referencePrice = fetched;
+          const fetched = await fetchExternalReferencePriceUi();
+          cachedReferencePriceUi = fetched.price;
+          cachedReferencePriceSource = fetched.source;
+          cachedReferenceTsMs = nowMs;
+          referencePrice = fetched.price;
+          referenceSource = fetched.source;
         } catch (e) {
-          if (cachedCoinGeckoPriceUi !== null) {
-            referencePrice = cachedCoinGeckoPriceUi;
+          if (cachedReferencePriceUi !== null && cachedReferencePriceSource) {
+            referencePrice = cachedReferencePriceUi;
+            referenceSource = cachedReferencePriceSource;
             console.warn(
               JSON.stringify({
                 ts: new Date().toISOString(),
-                msg: 'coingecko price fetch failed; using cached coingecko price',
+                msg: 'external price fetch failed; using cached reference price',
+                cachedSource: cachedReferencePriceSource,
                 error: e instanceof Error ? e.message : `${e}`,
               }),
             );
@@ -1363,14 +1483,14 @@ async function main(): Promise<void> {
             console.warn(
               JSON.stringify({
                 ts: new Date().toISOString(),
-                msg: 'coingecko price fetch failed; using onchain fallback',
+                msg: 'external price fetch failed; using onchain fallback',
                 error: e instanceof Error ? e.message : `${e}`,
               }),
             );
           }
         }
       } else {
-        if (cachedCoinGeckoPriceUi === null) {
+        if (cachedReferencePriceUi === null || cachedReferencePriceSource === null) {
           referencePrice = getOnchainReferencePriceUi({
             group: bots[0].group,
             marketIndex,
@@ -1378,7 +1498,8 @@ async function main(): Promise<void> {
           });
           referenceSource = 'onchain-fallback';
         } else {
-          referencePrice = cachedCoinGeckoPriceUi;
+          referencePrice = cachedReferencePriceUi;
+          referenceSource = cachedReferencePriceSource;
         }
       }
       } // end FIXED_REFERENCE_PRICE else

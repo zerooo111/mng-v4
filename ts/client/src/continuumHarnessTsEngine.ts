@@ -70,6 +70,7 @@ export type QueueItemProcessedEvent = {
   status: number;
   slot: string;
   tx_signature: string;
+  processed_unix_ts?: number | null;
 };
 
 export type DivergenceEvent = {
@@ -161,6 +162,8 @@ export type CanonicalIntent = {
   accepted_ts_ms: number;
   enqueued_slot: bigint | null;
   processed_slot: bigint | null;
+  processed_ts_ms: number | null;
+  processed_unix_ts: number | null;
   processed_status: QueueProcessStatus | null;
   processed_tx_signature: string | null;
 };
@@ -860,6 +863,8 @@ export class ContinuumStateEngine {
       accepted_ts_ms: event.ts_ms || Date.now(),
       enqueued_slot: existing?.enqueued_slot || null,
       processed_slot: existing?.processed_slot || null,
+      processed_ts_ms: existing?.processed_ts_ms || null,
+      processed_unix_ts: existing?.processed_unix_ts || null,
       processed_status: existing?.processed_status || null,
       processed_tx_signature: existing?.processed_tx_signature || null,
     };
@@ -938,6 +943,9 @@ export class ContinuumStateEngine {
         accepted_ts_ms: event.ts_ms || Date.now(),
         enqueued_slot: null,
         processed_slot: slot,
+        processed_ts_ms: event.ts_ms || Date.now(),
+        processed_unix_ts:
+          event.processed_unix_ts ?? Math.floor((event.ts_ms || Date.now()) / 1000),
         processed_status: event.status as QueueProcessStatus,
         processed_tx_signature: event.tx_signature,
       };
@@ -955,10 +963,14 @@ export class ContinuumStateEngine {
         previous_status: intent.processed_status.toString(),
         incoming_status: event.status.toString(),
       });
+      return;
     }
 
     intent.processed_status = event.status as QueueProcessStatus;
     intent.processed_slot = slot;
+    intent.processed_ts_ms = event.ts_ms || Date.now();
+    intent.processed_unix_ts =
+      event.processed_unix_ts ?? Math.floor((event.ts_ms || Date.now()) / 1000);
     intent.processed_tx_signature = event.tx_signature;
 
     this.revision += 1;
@@ -1494,9 +1506,24 @@ export class ContinuumStateEngine {
 
     const baselineSeqForMarket = (market: string): bigint =>
       this.baselineBootstrapped ? this.baselineConfirmedSeq.get(market) || 0n : 0n;
+    const maxBaselineSeq = (() => {
+      if (!this.baselineBootstrapped) {
+        return 0n;
+      }
+      let maxSeq = 0n;
+      for (const seq of this.baselineConfirmedSeq.values()) {
+        if (seq > maxSeq) {
+          maxSeq = seq;
+        }
+      }
+      return maxSeq;
+    })();
 
     const intents = this.listIntents().filter(
-      (intent) => intent.sequence > baselineSeqForMarket(intent.market),
+      (intent) =>
+        intent.market === 'unknown'
+          ? !this.baselineBootstrapped || intent.sequence > maxBaselineSeq
+          : intent.sequence > baselineSeqForMarket(intent.market),
     );
     const confirmed = intents
       .filter((it) => it.processed_status === QueueProcessStatus.Executed)
@@ -1654,7 +1681,11 @@ export class ContinuumStateEngine {
     market: InternalMarket,
     takerUser: InternalUser,
   ): void {
-    const nowTs = BigInt(Math.floor(intent.accepted_ts_ms / 1000));
+    const executionTsMs = intent.processed_ts_ms ?? intent.accepted_ts_ms;
+    const nowTs = BigInt(
+      intent.processed_unix_ts ?? Math.floor(executionTsMs / 1000),
+    );
+    const executionUnixTsMs = Number(nowTs) * 1000;
     this.pruneExpiredOrdersForMarket(market, projection, nowTs);
 
     const side: 'bid' | 'ask' = payload.side === 0 ? 'bid' : 'ask';
@@ -1734,7 +1765,7 @@ export class ContinuumStateEngine {
             taker_owner: intent.user_owner,
             maker_order_id: makerOrder.order_id,
             taker_sequence: intent.sequence,
-            ts_ms: intent.accepted_ts_ms,
+            ts_ms: executionUnixTsMs,
           });
           break;
         }
@@ -1753,7 +1784,7 @@ export class ContinuumStateEngine {
           taker_owner: intent.user_owner,
           maker_order_id: makerOrder.order_id,
           taker_sequence: intent.sequence,
-          ts_ms: intent.accepted_ts_ms,
+          ts_ms: executionUnixTsMs,
         });
       }
     }

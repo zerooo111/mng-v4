@@ -1012,7 +1012,7 @@ impl HarnessEngine {
 
         {
             let bids = market_state.bids.borrow();
-            for item in bids.iter_valid(now_ts, oracle_price_lots) {
+            for item in bids.iter_all_including_invalid(now_ts, oracle_price_lots) {
                 let mango_account = item.node.owner;
                 let owner = self
                     .accounts
@@ -1038,7 +1038,7 @@ impl HarnessEngine {
 
         {
             let asks = market_state.asks.borrow();
-            for item in asks.iter_valid(now_ts, oracle_price_lots) {
+            for item in asks.iter_all_including_invalid(now_ts, oracle_price_lots) {
                 let mango_account = item.node.owner;
                 let owner = self
                     .accounts
@@ -1471,6 +1471,54 @@ mod tests {
                     .len(),
                 1
             );
+        });
+    }
+
+    #[test]
+    fn snapshot_retains_lazy_expired_orders_until_pruned() {
+        run_with_large_stack(|| {
+            let mut engine = HarnessEngine::new();
+            let market_index = 24;
+            let owner = Pubkey::new_unique();
+            let mango_account = Pubkey::new_unique();
+            let now_ts = 10_000u64;
+            let expired_ts = now_ts - 10;
+            let order_id = ((100u128) << 64) | (!1u64 as u128);
+
+            engine
+                .register_market(
+                    market_index,
+                    MarketConfig {
+                        oracle_price: 100.0,
+                        ..MarketConfig::default()
+                    },
+                )
+                .unwrap();
+            engine.ensure_account(mango_account, owner).unwrap();
+            engine
+                .import_open_order(
+                    market_index,
+                    mango_account,
+                    Side::Bid,
+                    order_id,
+                    1,
+                    100,
+                    1,
+                    expired_ts,
+                )
+                .unwrap();
+
+            let pre_prune_book = engine.orderbook_snapshot(market_index, now_ts).unwrap();
+            assert_eq!(pre_prune_book.bids.len(), 1);
+            let pre_prune_account = engine.account_snapshot(mango_account, now_ts).unwrap();
+            assert_eq!(pre_prune_account.open_orders.len(), 1);
+
+            assert_eq!(engine.prune_expired_orders(now_ts).unwrap(), 1);
+
+            let post_prune_book = engine.orderbook_snapshot(market_index, now_ts).unwrap();
+            assert!(post_prune_book.bids.is_empty());
+            let post_prune_account = engine.account_snapshot(mango_account, now_ts).unwrap();
+            assert!(post_prune_account.open_orders.is_empty());
         });
     }
 }

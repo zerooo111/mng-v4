@@ -26,11 +26,14 @@ import {
   HarnessEvent,
   MarginSummary,
   MarginSummaryAccount,
+  MarketState,
   MarketTrade,
   OpenOrderSummary,
+  QueueState,
   QueueView,
   RelayIntentAcceptedEvent,
   UserState,
+  decodeQueuePayload,
   decodeQueueAnchorEvent,
   parseProgramDataLogLine,
 } from '../../src/continuumHarness';
@@ -43,6 +46,10 @@ import {
 import { MangoClient } from '../../src/client';
 import { HealthType } from '../../src/accounts/mangoAccount';
 import { HealthCache } from '../../src/accounts/healthCache';
+import {
+  decodeExecutionQueueHeader,
+  decodeExecutionQueuePendingItems,
+} from '../../src/executionQueueLayout';
 import { I80F48, ZERO_I80F48 } from '../../src/numbers/I80F48';
 
 dotenv.config();
@@ -58,6 +65,8 @@ const HARNESS_MODE = process.env.CONTINUUM_HARNESS_MODE || 'local';
 const HARNESS_BACKEND: HarnessBackendKind = parseHarnessBackendKind(
   process.env.CONTINUUM_HARNESS_BACKEND,
 );
+const HARNESS_PROCESS_STARTED_TS_MS = Date.now();
+const HARNESS_INSTANCE_ID = `${process.pid}-${HARNESS_PROCESS_STARTED_TS_MS}`;
 const HARNESS_EVENT_LOG_PATH =
   process.env.CONTINUUM_HARNESS_EVENT_LOG_PATH ||
   '/tmp/continuum-harness-events.jsonl';
@@ -123,6 +132,13 @@ const HARNESS_ONCHAIN_CACHE_TTL_MS = Number(
 const HARNESS_RECONCILE_INTERVAL_MS = Number(
   process.env.CONTINUUM_HARNESS_RECONCILE_INTERVAL_MS || '10000',
 );
+const HARNESS_DIRECT_ONCHAIN_REBASE_DEBOUNCE_MS = Number(
+  process.env.CONTINUUM_HARNESS_DIRECT_ONCHAIN_REBASE_DEBOUNCE_MS || '750',
+);
+const HARNESS_QUEUE_SYNC_DEBOUNCE_MS = Number(
+  process.env.CONTINUUM_HARNESS_QUEUE_SYNC_DEBOUNCE_MS || '250',
+);
+const HARNESS_PROGRAM_LOG_BLOCK_TIME_CACHE_LIMIT = 4096;
 const HARNESS_EVENT_LOG_MAX_BYTES = Number(
   process.env.CONTINUUM_HARNESS_EVENT_LOG_MAX_BYTES || '134217728',
 );
@@ -140,6 +156,12 @@ const HARNESS_RUNTIME_LATENCY_LOG_PATH =
   `${HARNESS_EVENT_LOG_PATH}.latency.jsonl`;
 const HARNESS_RUNTIME_LATENCY_LOG_MAX_BYTES = Number(
   process.env.CONTINUUM_HARNESS_RUNTIME_LATENCY_LOG_MAX_BYTES || '33554432',
+);
+const HARNESS_DISCREPANCY_LOG_PATH =
+  process.env.CONTINUUM_HARNESS_DISCREPANCY_LOG_PATH ||
+  `${HARNESS_EVENT_LOG_PATH}.discrepancies.jsonl`;
+const HARNESS_DISCREPANCY_LOG_MAX_BYTES = Number(
+  process.env.CONTINUUM_HARNESS_DISCREPANCY_LOG_MAX_BYTES || '33554432',
 );
 const HARNESS_RUNTIME_LATENCY_HISTORY_LIMIT = Number(
   process.env.CONTINUUM_HARNESS_RUNTIME_LATENCY_HISTORY_LIMIT || '500',
@@ -190,6 +212,7 @@ let totalRuntimeErrors = 0;
 let fatalStartupError: RuntimeErrorEntry | null = null;
 const runtimeErrors: RuntimeErrorEntry[] = [];
 let nextRuntimeLatencySeq = 1;
+let nextDiscrepancySeq = 1;
 let totalLatencySamples = 0;
 let totalSlowLatencySamples = 0;
 let totalLatencyErrorSamples = 0;
@@ -232,6 +255,7 @@ type OnchainContext = {
   mangoClient: MangoClient | null;
   usdcMint: PublicKey | null;
   programId: PublicKey;
+  executionQueuePk: PublicKey | null;
   cachedGroup: HarnessGroup | null;
   cachedGroupFetchedAtMs: number;
   cachedMarketMetadata: Record<string, HarnessMarketMetadata> | null;
@@ -272,11 +296,37 @@ type ReconciliationSnapshot = {
   markets: Record<string, ReconciliationMarketDrift>;
 };
 
+type OnchainQueuePendingItem = {
+  market: string;
+  sequence: string;
+  kind: number;
+  min_execute_slot: string;
+  section: 'ctm' | 'liquidity';
+};
+
+type OnchainQueueSnapshot = {
+  generated_ts_ms: number;
+  observed_slot: number;
+  next_sequence: string;
+  max_seen_sequence: string;
+  total_count: number;
+  items: OnchainQueuePendingItem[];
+};
+
 type OnchainSyncState = {
   snapshot: EngineSnapshot | null;
   drift: ReconciliationSnapshot | null;
+  queue: OnchainQueueSnapshot | null;
   last_error: string | null;
 };
+
+type DecodedQueueLogEvent = NonNullable<
+  ReturnType<typeof decodeQueueAnchorEvent>
+>;
+
+const programLogBlockTimeCache = new Map<number, number | null>();
+const programLogBlockTimeInflight = new Map<number, Promise<number | null>>();
+let programLogHandlingQueue: Promise<void> = Promise.resolve();
 
 type RuntimeErrorEntry = {
   id: number;
@@ -307,6 +357,13 @@ type RuntimeLatencyAggregate = {
   max_ms: number;
   last_ms: number;
   last_ts_ms: number;
+};
+
+type DiscrepancyLogEntry = {
+  id: number;
+  ts_ms: number;
+  reason: 'onchain_reconciliation_drift';
+  snapshot: ReconciliationSnapshot;
 };
 
 type EventLoopLagSnapshot = {
@@ -490,6 +547,12 @@ const marketRuntimeMetricsCache = new Map<
   { fetchedAtMs: number; data: MarketRuntimeMetrics | null }
 >();
 let nextStreamSubscriberSeq = 1;
+let directOnchainRebaseTimer: NodeJS.Timeout | null = null;
+let directOnchainRebaseInFlight: Promise<void> | null = null;
+let directOnchainRebasePending = false;
+let queueSyncTimer: NodeJS.Timeout | null = null;
+let queueSyncInFlight: Promise<void> | null = null;
+let queueSyncPending = false;
 
 function ensureDirForFile(filePath: string): void {
   fs.mkdirSync(path.dirname(path.resolve(filePath)), { recursive: true });
@@ -624,6 +687,45 @@ function getRecentRuntimeErrors(
     Math.min(limit, HARNESS_RUNTIME_ERROR_HISTORY_LIMIT),
   );
   return runtimeErrors.slice(Math.max(0, runtimeErrors.length - safeLimit));
+}
+
+function marketHasReconciliationDrift(
+  market: ReconciliationMarketDrift,
+): boolean {
+  return (
+    market.replay_open_orders !== market.onchain_open_orders ||
+    market.replay_best_bid !== market.onchain_best_bid ||
+    market.replay_best_ask !== market.onchain_best_ask ||
+    market.bid_base_lots_abs_diff !== '0' ||
+    market.ask_base_lots_abs_diff !== '0'
+  );
+}
+
+function trimReconciliationSnapshotToDrift(
+  snapshot: ReconciliationSnapshot,
+): ReconciliationSnapshot {
+  return {
+    ...snapshot,
+    markets: Object.fromEntries(
+      Object.entries(snapshot.markets).filter(([, market]) =>
+        marketHasReconciliationDrift(market),
+      ),
+    ),
+  };
+}
+
+function recordDiscrepancy(entry: DiscrepancyLogEntry): void {
+  try {
+    appendLineWithRotation(
+      HARNESS_DISCREPANCY_LOG_PATH,
+      `${JSON.stringify(entry)}\n`,
+      HARNESS_DISCREPANCY_LOG_MAX_BYTES,
+    );
+  } catch (err) {
+    recordRuntimeError('append_discrepancy_log', err, {
+      reason: entry.reason,
+    });
+  }
 }
 
 function recordLatencySample(
@@ -1275,14 +1377,146 @@ function emptyUserState(owner: string): UserState {
   };
 }
 
+function emptyQueueState(market: string): QueueState {
+  return {
+    market,
+    pending_count: 0,
+    processed_count: 0,
+    failed_count: 0,
+    skipped_count: 0,
+    last_processed_sequence: '0',
+    lag_slots: '0',
+    unmatched_processed_count: 0,
+  };
+}
+
+function baseSnapshotForView(view: QueueView): EngineSnapshot {
+  return engine.getSnapshot(view);
+}
+
+function buildQueueViewForSnapshot(
+  view: QueueView,
+  snapshot: EngineSnapshot,
+  onchainSync: OnchainSyncState,
+): Record<string, QueueState> {
+  const queueSnapshot = onchainSync.queue;
+  if (!queueSnapshot) {
+    return snapshot.queue;
+  }
+
+  const observedSlot = BigInt(queueSnapshot.observed_slot);
+  const nextSequence = maybeToBigInt(queueSnapshot.next_sequence) || 0n;
+  const byMarket = new Map<
+    string,
+    {
+      sequences: Set<string>;
+      pendingCount: number;
+      minPendingExecuteSlot: bigint | null;
+    }
+  >();
+  const ensureAggregate = (market: string) => {
+    const existing = byMarket.get(market);
+    if (existing) {
+      return existing;
+    }
+    const created = {
+      sequences: new Set<string>(),
+      pendingCount: 0,
+      minPendingExecuteSlot: null as bigint | null,
+    };
+    byMarket.set(market, created);
+    return created;
+  };
+
+  for (const item of queueSnapshot.items) {
+    const aggregate = ensureAggregate(item.market);
+    aggregate.sequences.add(item.sequence);
+    aggregate.pendingCount += 1;
+    const minExecuteSlot = maybeToBigInt(item.min_execute_slot);
+    if (minExecuteSlot !== null) {
+      aggregate.minPendingExecuteSlot =
+        aggregate.minPendingExecuteSlot === null
+          ? minExecuteSlot
+          : aggregate.minPendingExecuteSlot < minExecuteSlot
+            ? aggregate.minPendingExecuteSlot
+            : minExecuteSlot;
+    }
+  }
+
+  if (view === 'optimistic') {
+    for (const intent of engine.listIntents()) {
+      const kind = Number(intent.kind);
+      const processedStatus =
+        intent.processed_status === null || intent.processed_status === undefined
+          ? null
+          : Number(intent.processed_status);
+      if (kind !== 0 || processedStatus !== null) {
+        continue;
+      }
+      const market = intent.market || 'unknown';
+      const sequence = maybeToBigInt(String(intent.sequence));
+      if (sequence === null || sequence < nextSequence) {
+        continue;
+      }
+      const aggregate = ensureAggregate(market);
+      const sequenceKey = sequence.toString();
+      if (aggregate.sequences.has(sequenceKey)) {
+        continue;
+      }
+      aggregate.sequences.add(sequenceKey);
+      aggregate.pendingCount += 1;
+      const minExecuteSlot = maybeToBigInt(String(intent.min_execute_slot));
+      if (minExecuteSlot !== null) {
+        aggregate.minPendingExecuteSlot =
+          aggregate.minPendingExecuteSlot === null
+            ? minExecuteSlot
+            : aggregate.minPendingExecuteSlot < minExecuteSlot
+              ? aggregate.minPendingExecuteSlot
+              : minExecuteSlot;
+      }
+    }
+  }
+
+  const merged: Record<string, QueueState> = {};
+  const markets = new Set<string>([
+    ...Object.keys(snapshot.queue || {}),
+    ...Array.from(byMarket.keys()),
+  ]);
+  const lastProcessedSequence =
+    nextSequence > 0n ? (nextSequence - 1n).toString() : '0';
+  for (const market of markets) {
+    const base = snapshot.queue?.[market] || emptyQueueState(market);
+    const aggregate = byMarket.get(market);
+    const minPendingExecuteSlot = aggregate?.minPendingExecuteSlot || null;
+    const lagSlots =
+      minPendingExecuteSlot !== null && observedSlot > minPendingExecuteSlot
+        ? observedSlot - minPendingExecuteSlot
+        : 0n;
+    merged[market] = {
+      ...base,
+      market,
+      pending_count: aggregate?.pendingCount || 0,
+      last_processed_sequence: lastProcessedSequence,
+      lag_slots: lagSlots.toString(),
+    };
+  }
+
+  return merged;
+}
+
 function getSnapshotForView(
   view: QueueView,
   onchainSync: OnchainSyncState,
 ): EngineSnapshot {
-  if (view === 'confirmed' && onchainSync.snapshot) {
-    return onchainSync.snapshot;
+  const snapshot = baseSnapshotForView(view);
+  const queue = buildQueueViewForSnapshot(view, snapshot, onchainSync);
+  if (queue === snapshot.queue) {
+    return snapshot;
   }
-  return engine.getSnapshot(view);
+  return {
+    ...snapshot,
+    queue,
+  };
 }
 
 function getUserStateForView(
@@ -1290,10 +1524,7 @@ function getUserStateForView(
   view: QueueView,
   onchainSync: OnchainSyncState,
 ): UserState {
-  if (view === 'confirmed' && onchainSync.snapshot) {
-    return onchainSync.snapshot.users[owner] || emptyUserState(owner);
-  }
-  return engine.getUserState(owner, view);
+  return getSnapshotForView(view, onchainSync).users[owner] || emptyUserState(owner);
 }
 
 function getMarketStateForView(
@@ -1301,10 +1532,7 @@ function getMarketStateForView(
   view: QueueView,
   onchainSync: OnchainSyncState,
 ): MarketState {
-  if (view === 'confirmed' && onchainSync.snapshot) {
-    return onchainSync.snapshot.markets[market] || emptyMarketState(market);
-  }
-  return engine.getMarketState(market, view);
+  return getSnapshotForView(view, onchainSync).markets[market] || emptyMarketState(market);
 }
 
 function getBalancesForUserState(user: UserState, view: QueueView) {
@@ -1336,13 +1564,10 @@ function getBalancesForView(
   view: QueueView,
   onchainSync: OnchainSyncState,
 ) {
-  if (view === 'confirmed' && onchainSync.snapshot) {
-    return getBalancesForUserState(
-      getUserStateForView(owner, view, onchainSync),
-      view,
-    );
-  }
-  return engine.getBalances(owner, view);
+  return getBalancesForUserState(
+    getUserStateForView(owner, view, onchainSync),
+    view,
+  );
 }
 
 function nextStreamSubscriberId(): string {
@@ -2274,6 +2499,11 @@ function statsSnapshot() {
   return {
     mode: HARNESS_MODE,
     backend: HARNESS_BACKEND,
+    instance_id: HARNESS_INSTANCE_ID,
+    pid: process.pid,
+    bind_addr: HARNESS_BIND_ADDR,
+    process_started_ts_ms: HARNESS_PROCESS_STARTED_TS_MS,
+    cwd: process.cwd(),
     intents_total: intentsTotal,
     divergences_total: divergencesTotal,
     markets_total: optimisticMarkets,
@@ -2792,15 +3022,85 @@ async function enrichOwnerStateWithOnchain(
   }
 }
 
+async function resolveExecutionQueuePk(
+  onchain: OnchainContext | null,
+): Promise<PublicKey | null> {
+  if (!onchain) {
+    return null;
+  }
+  if (onchain.executionQueuePk) {
+    return onchain.executionQueuePk;
+  }
+  const group = await getFreshGroup(onchain);
+  if (!group) {
+    return null;
+  }
+  const [executionQueuePk] = PublicKey.findProgramAddressSync(
+    [Buffer.from('ExecutionQueue'), group.publicKey.toBuffer()],
+    onchain.programId,
+  );
+  onchain.executionQueuePk = executionQueuePk;
+  return executionQueuePk;
+}
+
+async function buildOnchainQueueSnapshot(
+  onchain: OnchainContext | null,
+): Promise<OnchainQueueSnapshot | null> {
+  const executionQueuePk = await resolveExecutionQueuePk(onchain);
+  if (!executionQueuePk || !onchain?.groupPk) {
+    return null;
+  }
+
+  const queueAccount = await onchain.connection.getAccountInfoAndContext(
+    executionQueuePk,
+    HARNESS_COMMITMENT,
+  );
+  if (!queueAccount.value?.data) {
+    return null;
+  }
+
+  const data = Buffer.from(queueAccount.value.data);
+  const header = decodeExecutionQueueHeader(data);
+  const group = onchain.groupPk.toBase58();
+  const items = decodeExecutionQueuePendingItems(data).map((item) => {
+    const intent =
+      item.section === 'ctm'
+        ? engine.findIntent(group, item.sequence.toString(), item.kind)
+        : null;
+    return {
+      market:
+        intent?.market ||
+        (item.section === 'liquidity' ? 'liquidity' : 'unknown'),
+      sequence: item.sequence.toString(),
+      kind: item.kind,
+      min_execute_slot: item.minExecuteSlot.toString(),
+      section: item.section,
+    } satisfies OnchainQueuePendingItem;
+  });
+
+  return {
+    generated_ts_ms: Date.now(),
+    observed_slot: queueAccount.context.slot,
+    next_sequence: header.nextSequence.toString(),
+    max_seen_sequence: header.maxSeenSequence.toString(),
+    total_count: header.totalCount,
+    items,
+  };
+}
+
 async function buildOnchainConfirmedSnapshot(
   onchain: OnchainContext | null,
-): Promise<EngineSnapshot | null> {
+): Promise<{
+  snapshot: EngineSnapshot;
+  queue: OnchainQueueSnapshot | null;
+} | null> {
   const group = await getFreshGroup(onchain);
   if (!group || !onchain?.mangoClient) {
     return null;
   }
 
   const replayConfirmed = engine.getSnapshot('confirmed');
+  const onchainQueue = await buildOnchainQueueSnapshot(onchain);
   const allAccounts = await onchain.mangoClient.getAllMangoAccounts(group);
   const ownerByMangoAccount = new Map<string, string>();
   const ownerAccountsMap = new Map<
@@ -3027,6 +3327,7 @@ async function buildOnchainConfirmedSnapshot(
         expiry_timestamp: expiryTimestamp,
         status: 'open',
       } satisfies OpenOrderSummary;
+      openOrders.push(orderSummary);
       user.open_orders.push(orderSummary);
       accountStates[mangoAccount]?.open_orders.push(orderSummary);
       const agg = ensureUserMarket(owner, market);
@@ -3148,14 +3449,28 @@ async function buildOnchainConfirmedSnapshot(
   }
 
   return {
-    view: 'confirmed',
-    markets,
-    users: userStates,
-    queue: replayConfirmed.queue,
-    accounts: accountStates,
-    perp_markets: perpMarkets,
-    token_banks: tokenBanks,
-    generated_ts_ms: Date.now(),
+    snapshot: {
+      view: 'confirmed',
+      markets,
+      users: userStates,
+      queue: onchainQueue
+        ? buildQueueViewForSnapshot(
+            'confirmed',
+            replayConfirmed,
+            {
+              snapshot: null,
+              drift: null,
+              queue: onchainQueue,
+              last_error: null,
+            },
+          )
+        : replayConfirmed.queue,
+      accounts: accountStates,
+      perp_markets: perpMarkets,
+      token_banks: tokenBanks,
+      generated_ts_ms: Date.now(),
+    },
+    queue: onchainQueue,
   };
 }
 
@@ -3163,16 +3478,18 @@ async function runOnchainReconciliation(
   onchain: OnchainContext | null,
   onchainSync: OnchainSyncState,
 ): Promise<void> {
-  const onchainSnapshot = await buildOnchainConfirmedSnapshot(onchain);
-  if (!onchainSnapshot) {
+  const onchainState = await buildOnchainConfirmedSnapshot(onchain);
+  if (!onchainState) {
     return;
   }
+  const onchainSnapshot = onchainState.snapshot;
   const replaySnapshot = engine.getSnapshot('confirmed');
   const drift = buildReconciliationSnapshot(replaySnapshot, onchainSnapshot);
   if (HARNESS_BACKEND === 'rust-backend') {
     engine.bootstrapFromOnchainSnapshot(onchainSnapshot);
   }
   onchainSync.snapshot = onchainSnapshot;
+  onchainSync.queue = onchainState.queue;
   onchainSync.drift = drift;
   onchainSync.last_error = null;
 
@@ -3198,8 +3515,121 @@ async function runOnchainReconciliation(
           markets_with_drift: `${drift.totals.markets_with_drift}`,
         },
       );
+      recordDiscrepancy({
+        id: nextDiscrepancySeq++,
+        ts_ms: drift.ts_ms,
+        reason: 'onchain_reconciliation_drift',
+        snapshot: trimReconciliationSnapshotToDrift(drift),
+      });
     }
   }
+}
+
+async function refreshOnchainConfirmedState(
+  onchain: OnchainContext | null,
+  onchainSync: OnchainSyncState,
+): Promise<void> {
+  const onchainState = await buildOnchainConfirmedSnapshot(onchain);
+  if (!onchainState) {
+    return;
+  }
+  if (HARNESS_BACKEND === 'rust-backend') {
+    engine.bootstrapFromOnchainSnapshot(onchainState.snapshot);
+  }
+  onchainSync.snapshot = onchainState.snapshot;
+  onchainSync.queue = onchainState.queue;
+  onchainSync.last_error = null;
+}
+
+async function refreshOnchainQueueState(
+  onchain: OnchainContext | null,
+  onchainSync: OnchainSyncState,
+): Promise<void> {
+  onchainSync.queue = await buildOnchainQueueSnapshot(onchain);
+}
+
+function scheduleDirectOnchainRebase(
+  onchain: OnchainContext | null,
+  onchainSync: OnchainSyncState,
+  context: Record<string, string>,
+): void {
+  if (!onchain?.mangoClient || !onchain.groupPk) {
+    return;
+  }
+  if (directOnchainRebaseTimer) {
+    clearTimeout(directOnchainRebaseTimer);
+  }
+  directOnchainRebasePending = true;
+  directOnchainRebaseTimer = setTimeout(() => {
+    directOnchainRebaseTimer = null;
+    if (directOnchainRebaseInFlight) {
+      directOnchainRebasePending = true;
+      return;
+    }
+    directOnchainRebasePending = false;
+    directOnchainRebaseInFlight = measureAsync(
+      'onchain_direct_rebase',
+      async () => {
+        await refreshOnchainConfirmedState(onchain, onchainSync);
+        marketRuntimeMetricsCache.clear();
+        scheduleFrontendStreamNotification(onchain, onchainSync, {
+          forceAll: true,
+        });
+      },
+      context,
+    )
+      .catch((err) => {
+        onchainSync.last_error = `${err}`;
+        recordRuntimeError('onchain_direct_rebase', err, context);
+      })
+      .finally(() => {
+        directOnchainRebaseInFlight = null;
+        if (directOnchainRebasePending) {
+          scheduleDirectOnchainRebase(onchain, onchainSync, context);
+        }
+      });
+  }, HARNESS_DIRECT_ONCHAIN_REBASE_DEBOUNCE_MS);
+}
+
+function scheduleQueueSync(
+  onchain: OnchainContext | null,
+  onchainSync: OnchainSyncState,
+  context: Record<string, string>,
+): void {
+  if (!onchain?.groupPk) {
+    return;
+  }
+  if (queueSyncTimer) {
+    clearTimeout(queueSyncTimer);
+  }
+  queueSyncPending = true;
+  queueSyncTimer = setTimeout(() => {
+    queueSyncTimer = null;
+    if (queueSyncInFlight) {
+      queueSyncPending = true;
+      return;
+    }
+    queueSyncPending = false;
+    queueSyncInFlight = measureAsync(
+      'onchain_queue_sync',
+      async () => {
+        await refreshOnchainQueueState(onchain, onchainSync);
+        scheduleFrontendStreamNotification(onchain, onchainSync, {
+          forceAll: true,
+        });
+      },
+      context,
+    )
+      .catch((err) => {
+        recordRuntimeError('onchain_queue_sync', err, context);
+      })
+      .finally(() => {
+        queueSyncInFlight = null;
+        if (queueSyncPending) {
+          scheduleQueueSync(onchain, onchainSync, context);
+        }
+      });
+  }, HARNESS_QUEUE_SYNC_DEBOUNCE_MS);
 }
 
 async function buildAirdropContext(
@@ -3252,6 +3682,15 @@ async function buildOnchainContext(
   let usdcMint: PublicKey | null = HARNESS_USDC_MINT.length
     ? new PublicKey(HARNESS_USDC_MINT)
     : null;
+  let executionQueuePk: PublicKey | null =
+    process.env.CONTINUUM_HARNESS_EXECUTION_QUEUE_PK ||
+    process.env.EXECUTION_QUEUE_PK
+      ? new PublicKey(
+          process.env.CONTINUUM_HARNESS_EXECUTION_QUEUE_PK ||
+            process.env.EXECUTION_QUEUE_PK ||
+            '',
+        )
+      : null;
 
   if (groupPk) {
     try {
@@ -3268,12 +3707,27 @@ async function buildOnchainContext(
       if (!usdcMint) {
         usdcMint = cachedGroup.getFirstBankForPerpSettlement().mint;
       }
+      if (!executionQueuePk) {
+        [executionQueuePk] = PublicKey.findProgramAddressSync(
+          [Buffer.from('ExecutionQueue'), cachedGroup.publicKey.toBuffer()],
+          programId,
+        );
+      }
     } catch (err) {
       console.warn(
         `onchain read context disabled: failed to initialize group/mango client (${err})`,
       );
       mangoClient = null;
       cachedGroup = null;
+      executionQueuePk =
+        process.env.CONTINUUM_HARNESS_EXECUTION_QUEUE_PK ||
+        process.env.EXECUTION_QUEUE_PK
+          ? new PublicKey(
+              process.env.CONTINUUM_HARNESS_EXECUTION_QUEUE_PK ||
+                process.env.EXECUTION_QUEUE_PK ||
+                '',
+            )
+          : null;
       usdcMint = HARNESS_USDC_MINT.length
         ? new PublicKey(HARNESS_USDC_MINT)
         : null;
@@ -3286,6 +3740,7 @@ async function buildOnchainContext(
     mangoClient,
     usdcMint,
     programId,
+    executionQueuePk,
     cachedGroup,
     cachedGroupFetchedAtMs: cachedGroup ? Date.now() : 0,
     cachedMarketMetadata: null,
@@ -3321,18 +3776,93 @@ async function maybeBackfillProgramLogs(
     if (!tx?.meta?.logMessages) {
       continue;
     }
-    handleProgramLogs(
+    await handleProgramLogs(
+      connection,
       {
         err: tx.meta.err,
         logs: tx.meta.logMessages,
         signature: sig.signature,
       },
       tx.slot,
+      undefined,
+      undefined,
+      tx.blockTime ?? null,
     );
   }
 }
 
-function handleProgramLogs(logs: Logs, slot: number): void {
+function rememberProgramLogUnixTs(
+  slot: number,
+  unixTs: number | null,
+): number | null {
+  if (programLogBlockTimeCache.has(slot)) {
+    programLogBlockTimeCache.delete(slot);
+  }
+  programLogBlockTimeCache.set(slot, unixTs);
+  while (
+    programLogBlockTimeCache.size > HARNESS_PROGRAM_LOG_BLOCK_TIME_CACHE_LIMIT
+  ) {
+    const oldest = programLogBlockTimeCache.keys().next().value;
+    if (oldest === undefined) {
+      break;
+    }
+    programLogBlockTimeCache.delete(oldest);
+  }
+  return unixTs;
+}
+
+async function resolveProgramLogUnixTs(
+  connection: Connection,
+  slot: number,
+  signature: string,
+  preloadedUnixTs?: number | null,
+): Promise<number | null> {
+  if (typeof preloadedUnixTs === 'number') {
+    return rememberProgramLogUnixTs(slot, preloadedUnixTs);
+  }
+  if (programLogBlockTimeCache.has(slot)) {
+    return programLogBlockTimeCache.get(slot) ?? null;
+  }
+
+  let inflight = programLogBlockTimeInflight.get(slot);
+  if (!inflight) {
+    inflight = (async () => {
+      try {
+        const blockTime = await connection.getBlockTime(slot);
+        if (typeof blockTime === 'number') {
+          return rememberProgramLogUnixTs(slot, blockTime);
+        }
+        const txCommitment =
+          HARNESS_COMMITMENT === 'finalized' ? 'finalized' : 'confirmed';
+        const tx = await connection.getTransaction(signature, {
+          commitment: txCommitment,
+          maxSupportedTransactionVersion: 0,
+        });
+        return rememberProgramLogUnixTs(slot, tx?.blockTime ?? null);
+      } finally {
+        programLogBlockTimeInflight.delete(slot);
+      }
+    })();
+    programLogBlockTimeInflight.set(slot, inflight);
+  }
+
+  return inflight;
+}
+
+async function handleProgramLogs(
+  connection: Connection,
+  logs: Logs,
+  slot: number,
+  onchain?: OnchainContext | null,
+  onchainSync?: OnchainSyncState,
+  preloadedUnixTs?: number | null,
+): Promise<void> {
+  if (logs.err) {
+    return;
+  }
+
+  const decodedEvents: DecodedQueueLogEvent[] = [];
+  let sawUnsupportedQueueMutation = false;
   for (const line of logs.logs) {
     const raw = parseProgramDataLogLine(line);
     if (!raw) {
@@ -3342,7 +3872,23 @@ function handleProgramLogs(logs: Logs, slot: number): void {
     if (!decoded) {
       continue;
     }
+    decodedEvents.push(decoded);
+    if (decoded.kind !== 0) {
+      sawUnsupportedQueueMutation = true;
+    }
+  }
 
+  const sawQueueEvent = decodedEvents.length > 0;
+  const processedUnixTs = sawQueueEvent
+    ? await resolveProgramLogUnixTs(
+        connection,
+        slot,
+        logs.signature,
+        preloadedUnixTs,
+      )
+    : null;
+
+  for (const decoded of decodedEvents) {
     try {
       if (decoded.type === 'QueueItemEnqueued') {
         engine.ingestQueueEnqueued({
@@ -3365,6 +3911,7 @@ function handleProgramLogs(logs: Logs, slot: number): void {
           status: decoded.status,
           slot: slot.toString(),
           tx_signature: logs.signature,
+          processed_unix_ts: processedUnixTs,
         });
       }
     } catch (err) {
@@ -3372,6 +3919,29 @@ function handleProgramLogs(logs: Logs, slot: number): void {
         slot,
         signature: logs.signature,
         decoded_type: decoded.type,
+      });
+    }
+  }
+
+  if (onchain && onchainSync) {
+    if (sawQueueEvent) {
+      scheduleQueueSync(onchain, onchainSync, {
+        slot: `${slot}`,
+        signature: logs.signature,
+        reason: 'queue_event',
+      });
+      if (sawUnsupportedQueueMutation) {
+        scheduleDirectOnchainRebase(onchain, onchainSync, {
+          slot: `${slot}`,
+          signature: logs.signature,
+          reason: 'unsupported_queue_mutation',
+        });
+      }
+    } else if (!logs.err) {
+      scheduleDirectOnchainRebase(onchain, onchainSync, {
+        slot: `${slot}`,
+        signature: logs.signature,
+        reason: 'direct_program_write',
       });
     }
   }
@@ -5083,11 +5653,9 @@ function buildHttpServer(
           responseView,
           onchainSync,
         );
-        const defaultOnchainMode =
-          HARNESS_BACKEND === 'rust-backend' ? 'false' : 'true';
         const includeOnchain =
           (
-            url.searchParams.get('onchain') || defaultOnchainMode
+            url.searchParams.get('onchain') || 'true'
           ).toLowerCase() !== 'false';
         const data = includeOnchain
           ? await enrichOwnerStateWithOnchain(
@@ -5116,11 +5684,9 @@ function buildHttpServer(
           responseView,
           onchainSync,
         );
-        const defaultOnchainMode =
-          HARNESS_BACKEND === 'rust-backend' ? 'false' : 'true';
         const includeOnchain =
           (
-            url.searchParams.get('onchain') || defaultOnchainMode
+            url.searchParams.get('onchain') || 'true'
           ).toLowerCase() !== 'false';
         const data = includeOnchain
           ? await enrichOwnerStateWithOnchain(
@@ -5143,17 +5709,11 @@ function buildHttpServer(
         );
         const view = parseView(url);
         const owner = url.searchParams.get('owner');
-        const responseView =
-          view === 'confirmed' && onchainSync.snapshot
-            ? onchainSync.snapshot.view
-            : view;
-        const data =
-          responseView === 'confirmed' && onchainSync.snapshot
-            ? (
-                getMarketStateForView(market, responseView, onchainSync)
-                  .open_orders || []
-              ).filter((order) => !owner || order.owner === owner)
-            : engine.getOrders(market, owner, responseView);
+        const responseView = view;
+        const data = (
+          getMarketStateForView(market, responseView, onchainSync).open_orders ||
+          []
+        ).filter((order) => !owner || order.owner === owner);
         writeJson(res, 200, {
           view: responseView,
           market,
@@ -5280,9 +5840,12 @@ function buildHttpServer(
         const market = decodeURIComponent(
           url.pathname.slice('/state/queue/'.length),
         );
+        const view = parseView(url);
+        const snapshot = getSnapshotForView(view, onchainSync);
         writeJson(res, 200, {
+          view,
           market,
-          data: engine.getQueueState(market),
+          data: snapshot.queue[market] || emptyQueueState(market),
         });
         return;
       }
@@ -5477,6 +6040,9 @@ async function main(): Promise<void> {
     await createContinuumHarnessBackend(HARNESS_BACKEND),
   );
   console.log(`Continuum harness backend: ${HARNESS_BACKEND}`);
+  console.log(
+    `Continuum harness instance: id=${HARNESS_INSTANCE_ID}, pid=${process.pid}, cwd=${process.cwd()}, bind=${HARNESS_BIND_ADDR}`,
+  );
 
   const connection = new Connection(
     CLUSTER_URL,
@@ -5494,6 +6060,12 @@ async function main(): Promise<void> {
     'startup.build_onchain_context',
     async () => await buildOnchainContext(connection, programId),
   );
+  let bootstrappedOnchainState:
+    | {
+        snapshot: EngineSnapshot;
+        queue: OnchainQueueSnapshot | null;
+      }
+    | null = null;
 
   // ── Bootstrap engine from on-chain confirmed state ──────────────────
   // Seeds baseline positions so the harness starts in sync with on-chain
@@ -5501,16 +6073,20 @@ async function main(): Promise<void> {
   if (onchain.groupPk && onchain.mangoClient) {
     console.log('Bootstrapping engine from on-chain confirmed state...');
     try {
-      const onchainSnapshot = await measureAsync(
+      bootstrappedOnchainState = await measureAsync(
         'startup.build_onchain_confirmed_snapshot',
         async () => await buildOnchainConfirmedSnapshot(onchain),
       );
-      if (onchainSnapshot) {
+      if (bootstrappedOnchainState) {
         measureSync('startup.bootstrap_from_onchain_snapshot', () => {
-          engine.bootstrapFromOnchainSnapshot(onchainSnapshot);
+          engine.bootstrapFromOnchainSnapshot(bootstrappedOnchainState.snapshot);
         });
-        const userCount = Object.keys(onchainSnapshot.users).length;
-        const marketCount = Object.keys(onchainSnapshot.markets).length;
+        const userCount = Object.keys(
+          bootstrappedOnchainState.snapshot.users,
+        ).length;
+        const marketCount = Object.keys(
+          bootstrappedOnchainState.snapshot.markets,
+        ).length;
         console.log(
           `On-chain bootstrap complete: ${userCount} users, ${marketCount} markets`,
         );
@@ -5527,8 +6103,9 @@ async function main(): Promise<void> {
 
   const airdrop = await buildAirdropContext(onchain);
   const onchainSync: OnchainSyncState = {
-    snapshot: null,
+    snapshot: bootstrappedOnchainState?.snapshot || null,
     drift: null,
+    queue: bootstrappedOnchainState?.queue || null,
     last_error: null,
   };
 
@@ -5556,14 +6133,16 @@ async function main(): Promise<void> {
   await connection.onLogs(
     programId,
     (logs, ctx) => {
-      try {
-        handleProgramLogs(logs, ctx.slot);
-      } catch (err) {
-        recordRuntimeError('connection_on_logs', err, {
-          slot: ctx.slot,
-          signature: logs.signature,
-        });
-      }
+      programLogHandlingQueue = programLogHandlingQueue.then(async () => {
+        try {
+          await handleProgramLogs(connection, logs, ctx.slot, onchain, onchainSync);
+        } catch (err) {
+          recordRuntimeError('connection_on_logs', err, {
+            slot: ctx.slot,
+            signature: logs.signature,
+          });
+        }
+      });
     },
     HARNESS_COMMITMENT,
   );

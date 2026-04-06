@@ -52,6 +52,8 @@ export type DecodedExecutionQueueHeadItem = DecodedExecutionQueueHeader & {
   payload: Buffer;
 };
 
+export type DecodedExecutionQueuePendingItem = DecodedExecutionQueueHeadItem;
+
 function decodeItem(
   data: Buffer,
   offset: number,
@@ -225,4 +227,51 @@ export function decodeExecutionQueueHeadItem(
     return null;
   }
   return liqItem;
+}
+
+export function decodeExecutionQueuePendingItems(
+  data: Buffer,
+): DecodedExecutionQueuePendingItem[] {
+  const header = decodeExecutionQueueHeader(data);
+  const items: DecodedExecutionQueuePendingItem[] = [];
+
+  for (let physicalIndex = 0; physicalIndex < EXECUTION_QUEUE_LAYOUT.ctmCapacity; physicalIndex += 1) {
+    const offset =
+      EXECUTION_QUEUE_LAYOUT.ctmItemsOffset +
+      physicalIndex * EXECUTION_QUEUE_LAYOUT.itemSize;
+    const item = decodeItem(data, offset, 'ctm', header);
+    if (
+      !item ||
+      item.status !== EXECUTION_QUEUE_LAYOUT.pendingStatus ||
+      item.kind !== EXECUTION_QUEUE_LAYOUT.ctmWrappedKind ||
+      item.sequence < header.nextSequence ||
+      item.sequence > header.maxSeenSequence
+    ) {
+      continue;
+    }
+    items.push(item);
+  }
+
+  for (let logicalIndex = 0; logicalIndex < header.liquidityCount; logicalIndex += 1) {
+    const offset = executionQueueItemOffset(data, header.liquidityHead, logicalIndex);
+    if (offset === null) {
+      continue;
+    }
+    const item = decodeItem(data, offset, 'liquidity', header);
+    if (!item || item.status !== EXECUTION_QUEUE_LAYOUT.pendingStatus) {
+      continue;
+    }
+    items.push(item);
+  }
+
+  items.sort((a, b) => {
+    if (a.sequence === b.sequence) {
+      if (a.section === b.section) {
+        return a.physicalIndex - b.physicalIndex;
+      }
+      return a.section === 'ctm' ? -1 : 1;
+    }
+    return a.sequence < b.sequence ? -1 : 1;
+  });
+  return items;
 }

@@ -23,6 +23,11 @@ export type HarnessHealth = {
   ok: boolean;
   mode: string;
   backend?: HarnessBackendKind;
+  instance_id?: string;
+  pid?: number;
+  bind_addr?: string;
+  process_started_ts_ms?: number;
+  cwd?: string;
   intents_total: number;
   divergences_total: number;
   markets_total: number;

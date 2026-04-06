@@ -69,6 +69,8 @@ struct CanonicalIntent {
     accepted_ts_ms: u64,
     enqueued_slot: Option<u64>,
     processed_slot: Option<u64>,
+    processed_ts_ms: Option<u64>,
+    processed_unix_ts: Option<u64>,
     processed_status: Option<u8>,
     processed_tx_signature: Option<String>,
 }
@@ -499,6 +501,8 @@ impl ContinuumStateEngine {
             accepted_ts_ms: event.ts_ms,
             enqueued_slot: existing.as_ref().and_then(|it| it.enqueued_slot),
             processed_slot: existing.as_ref().and_then(|it| it.processed_slot),
+            processed_ts_ms: existing.as_ref().and_then(|it| it.processed_ts_ms),
+            processed_unix_ts: existing.as_ref().and_then(|it| it.processed_unix_ts),
             processed_status: existing.as_ref().and_then(|it| it.processed_status),
             processed_tx_signature: existing
                 .as_ref()
@@ -590,24 +594,37 @@ impl ContinuumStateEngine {
         }
 
         let key = queue_item_key(&event.group, sequence, event.kind);
-        if let Some(intent) = self.intents_by_key.get_mut(&key) {
-            let previous_status = intent.processed_status;
+        if let Some(previous_status) = self
+            .intents_by_key
+            .get(&key)
+            .and_then(|intent| intent.processed_status)
+            .filter(|status| *status != event.status)
+        {
+            self.emit_divergence(
+                "processed_status_changed",
+                &key,
+                HashMap::from([
+                    ("previous_status".to_string(), previous_status.to_string()),
+                    ("incoming_status".to_string(), event.status.to_string()),
+                ]),
+            );
 
+            if matches!(
+                previous_status,
+                QUEUE_PROCESS_EXECUTED | QUEUE_PROCESS_FAILED | QUEUE_PROCESS_SKIPPED
+            ) {
+                self.enforce_retention_limits();
+                self.touch();
+                return Ok(());
+            }
+        }
+
+        if let Some(intent) = self.intents_by_key.get_mut(&key) {
             intent.processed_status = Some(event.status);
             intent.processed_slot = Some(slot);
+            intent.processed_ts_ms = Some(event.ts_ms);
+            intent.processed_unix_ts = event.processed_unix_ts.or(Some(event.ts_ms / 1_000));
             intent.processed_tx_signature = Some(event.tx_signature);
-            let _ = intent;
-            if let Some(previous_status) = previous_status.filter(|status| *status != event.status)
-            {
-                self.emit_divergence(
-                    "processed_status_changed",
-                    &key,
-                    HashMap::from([
-                        ("previous_status".to_string(), previous_status.to_string()),
-                        ("incoming_status".to_string(), event.status.to_string()),
-                    ]),
-                );
-            }
         } else {
             self.emit_divergence(
                 "processed_without_relay_intent",
@@ -642,6 +659,8 @@ impl ContinuumStateEngine {
                     accepted_ts_ms: event.ts_ms,
                     enqueued_slot: None,
                     processed_slot: Some(slot),
+                    processed_ts_ms: Some(event.ts_ms),
+                    processed_unix_ts: event.processed_unix_ts.or(Some(event.ts_ms / 1_000)),
                     processed_status: Some(event.status),
                     processed_tx_signature: Some(event.tx_signature),
                 },
@@ -706,6 +725,8 @@ impl ContinuumStateEngine {
                 accepted_ts_ms: intent.accepted_ts_ms,
                 enqueued_slot: intent.enqueued_slot.map(|slot| slot.to_string()),
                 processed_slot: intent.processed_slot.map(|slot| slot.to_string()),
+                processed_ts_ms: intent.processed_ts_ms,
+                processed_unix_ts: intent.processed_unix_ts,
                 processed_status: intent.processed_status,
                 processed_tx_signature: intent.processed_tx_signature,
             })
@@ -1057,11 +1078,9 @@ impl ContinuumStateEngine {
         let now_ts_ms = now_ts_ms();
         let now_ts = now_ts_ms / 1_000;
         let projection_started = Instant::now();
-        let mut projection = self.build_projection(view, now_ts)?;
+        let projection = self.build_projection(view, now_ts)?;
         let projection_elapsed = projection_started.elapsed();
-        let prune_started = Instant::now();
-        projection.engine.prune_expired_orders(now_ts)?;
-        let prune_elapsed = prune_started.elapsed();
+        let prune_elapsed = std::time::Duration::default();
         let snapshot_started = Instant::now();
         let snapshot = self.snapshot_from_projection(view, &projection, now_ts_ms, now_ts)?;
         let snapshot_elapsed = snapshot_started.elapsed();
@@ -1225,7 +1244,10 @@ impl ContinuumStateEngine {
             .copied()
             .filter(|intent| intent.processed_status == Some(QUEUE_PROCESS_EXECUTED))
         {
-            self.apply_intent(intent, &mut projection, intent.accepted_ts_ms / 1_000)?;
+            let execution_ts = intent
+                .processed_unix_ts
+                .unwrap_or_else(|| intent.processed_ts_ms.unwrap_or(intent.accepted_ts_ms) / 1_000);
+            self.apply_intent(intent, &mut projection, execution_ts)?;
             let queue = projection
                 .queue
                 .entry(intent.market.clone())
@@ -1263,16 +1285,53 @@ impl ContinuumStateEngine {
         }
 
         if view == QueueView::Optimistic {
-            for intent in intents
-                .iter()
-                .copied()
-                .filter(|intent| intent.processed_status.is_none())
-            {
-                self.apply_intent(intent, &mut projection, current_now_ts)?;
-            }
+            self.apply_optimistic_pending_ctm_queue(&intents, &mut projection, current_now_ts)?;
         }
 
         Ok(projection)
+    }
+
+    fn apply_optimistic_pending_ctm_queue(
+        &self,
+        intents: &[&CanonicalIntent],
+        projection: &mut Projection,
+        simulation_now_ts: u64,
+    ) -> Result<()> {
+        let mut pending_by_group = BTreeMap::<String, BTreeMap<u64, &CanonicalIntent>>::new();
+        for intent in intents
+            .iter()
+            .copied()
+            .filter(|intent| intent.kind == QUEUE_ITEM_KIND_CTM_WRAPPED)
+        {
+            pending_by_group
+                .entry(intent.group.clone())
+                .or_default()
+                .insert(intent.sequence, intent);
+        }
+
+        for (_group, intents_by_sequence) in pending_by_group {
+            let Some(mut next_sequence) =
+                self.optimistic_ctm_start_sequence(&intents_by_sequence)
+            else {
+                continue;
+            };
+            while let Some(intent) = intents_by_sequence.get(&next_sequence).copied() {
+                match intent.processed_status {
+                    Some(QUEUE_PROCESS_EXECUTED | QUEUE_PROCESS_FAILED | QUEUE_PROCESS_SKIPPED) => {}
+                    Some(_) => {}
+                    None => {
+                        if projection.last_slot != 0 && projection.last_slot < intent.min_execute_slot
+                        {
+                            break;
+                        }
+                        let _ = self.apply_intent(intent, projection, simulation_now_ts);
+                    }
+                }
+                next_sequence = next_sequence.saturating_add(1);
+            }
+        }
+
+        Ok(())
     }
 
     fn apply_intent(
@@ -1392,7 +1451,10 @@ impl ContinuumStateEngine {
                 taker_owner,
                 maker_order_id: fill.maker_order_id.to_string(),
                 taker_sequence: intent.sequence,
-                ts_ms: intent.accepted_ts_ms,
+                ts_ms: intent
+                    .processed_unix_ts
+                    .map(|ts| ts.saturating_mul(1_000))
+                    .unwrap_or_else(|| intent.processed_ts_ms.unwrap_or(intent.accepted_ts_ms)),
             });
         }
         if market_trades.len() > MAX_TRADE_HISTORY {
@@ -2026,13 +2088,22 @@ impl ContinuumStateEngine {
     }
 
     fn prune_rebased_intents(&mut self) {
+        let max_baseline_seq = if self.baseline_bootstrapped {
+            self.baseline_next_ctm_sequence().saturating_sub(1)
+        } else {
+            0
+        };
         self.intents_by_key.retain(|_, intent| {
-            let baseline_seq = self
-                .baseline_confirmed_seq
-                .get(&intent.market)
-                .copied()
-                .unwrap_or(0);
-            intent.market == "unknown" || intent.sequence > baseline_seq
+            if intent.market == "unknown" {
+                !self.baseline_bootstrapped || intent.sequence > max_baseline_seq
+            } else {
+                let baseline_seq = self
+                    .baseline_confirmed_seq
+                    .get(&intent.market)
+                    .copied()
+                    .unwrap_or(0);
+                intent.sequence > baseline_seq
+            }
         });
     }
 
@@ -2171,8 +2242,29 @@ impl ContinuumStateEngine {
             .values()
             .filter(|intent| intent.sequence > self.baseline_seq_for_market(&intent.market))
             .collect();
-        intents.sort_by(order_intents_deterministically);
+        intents.sort_by(order_intents_by_queue_semantics);
         intents
+    }
+
+    fn baseline_next_ctm_sequence(&self) -> u64 {
+        self.baseline_confirmed_seq
+            .values()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
+            .max(1)
+    }
+
+    fn optimistic_ctm_start_sequence(
+        &self,
+        intents_by_sequence: &BTreeMap<u64, &CanonicalIntent>,
+    ) -> Option<u64> {
+        if self.baseline_bootstrapped {
+            Some(self.baseline_next_ctm_sequence())
+        } else {
+            intents_by_sequence.keys().next().copied()
+        }
     }
 
     fn baseline_seq_for_market(&self, market: &str) -> u64 {
@@ -2671,10 +2763,9 @@ fn self_trade_behavior_code(self_trade_behavior: SelfTradeBehavior) -> u8 {
     self_trade_behavior as u8
 }
 
-fn order_intents_deterministically(a: &&CanonicalIntent, b: &&CanonicalIntent) -> Ordering {
+fn order_intents_by_queue_semantics(a: &&CanonicalIntent, b: &&CanonicalIntent) -> Ordering {
     a.group
         .cmp(&b.group)
-        .then_with(|| compare_market_strings(&a.market, &b.market))
         .then_with(|| a.kind.cmp(&b.kind))
         .then_with(|| {
             if a.kind == QUEUE_ITEM_KIND_CTM_WRAPPED && b.kind == QUEUE_ITEM_KIND_CTM_WRAPPED {
@@ -2684,6 +2775,7 @@ fn order_intents_deterministically(a: &&CanonicalIntent, b: &&CanonicalIntent) -
             }
         })
         .then_with(|| a.accepted_ts_ms.cmp(&b.accepted_ts_ms))
+        .then_with(|| compare_market_strings(&a.market, &b.market))
         .then_with(|| a.key.cmp(&b.key))
 }
 
@@ -2787,6 +2879,23 @@ mod tests {
             .unwrap();
     }
 
+    fn bootstrap_market(engine: &mut ContinuumStateEngine, market: &str, last_slot: u64) {
+        let mut markets = HashMap::new();
+        markets.insert(market.to_string(), empty_market_state(market, last_slot));
+        engine
+            .bootstrap_from_onchain_snapshot(EngineSnapshot {
+                view: QueueView::Confirmed,
+                markets,
+                users: HashMap::new(),
+                queue: HashMap::new(),
+                accounts: HashMap::new(),
+                perp_markets: HashMap::new(),
+                token_banks: HashMap::new(),
+                generated_ts_ms: 0,
+            })
+            .unwrap();
+    }
+
     #[test]
     fn builds_optimistic_and_confirmed_views_from_relay_and_processed_events() {
         run_with_large_stack(|| {
@@ -2854,6 +2963,7 @@ mod tests {
                     status: QUEUE_PROCESS_EXECUTED,
                     slot: "20".to_string(),
                     tx_signature: "tx-exec-1".to_string(),
+                    processed_unix_ts: None,
                 })
                 .unwrap();
             assert_eq!(
@@ -2893,6 +3003,7 @@ mod tests {
                     status: QUEUE_PROCESS_EXECUTED,
                     slot: "21".to_string(),
                     tx_signature: "tx-exec-2".to_string(),
+                    processed_unix_ts: None,
                 })
                 .unwrap();
 
@@ -2976,6 +3087,7 @@ mod tests {
                     status: QUEUE_PROCESS_EXECUTED,
                     slot: "10".to_string(),
                     tx_signature: "c".to_string(),
+                    processed_unix_ts: None,
                 },
                 QueueItemProcessedEvent {
                     event_type: "queue_item_processed".to_string(),
@@ -2986,6 +3098,7 @@ mod tests {
                     status: QUEUE_PROCESS_EXECUTED,
                     slot: "11".to_string(),
                     tx_signature: "d".to_string(),
+                    processed_unix_ts: None,
                 },
             ] {
                 ordered.ingest_queue_processed(event).unwrap();
@@ -3020,6 +3133,7 @@ mod tests {
                     status: QUEUE_PROCESS_EXECUTED,
                     slot: "11".to_string(),
                     tx_signature: "d".to_string(),
+                    processed_unix_ts: None,
                 })
                 .unwrap();
             out_of_order
@@ -3050,6 +3164,7 @@ mod tests {
                     status: QUEUE_PROCESS_EXECUTED,
                     slot: "10".to_string(),
                     tx_signature: "c".to_string(),
+                    processed_unix_ts: None,
                 })
                 .unwrap();
 
@@ -3078,6 +3193,7 @@ mod tests {
                     status: QUEUE_PROCESS_FAILED,
                     slot: "123".to_string(),
                     tx_signature: "unknown-processed".to_string(),
+                    processed_unix_ts: None,
                 })
                 .unwrap();
 
@@ -3174,6 +3290,7 @@ mod tests {
                     status: QUEUE_PROCESS_EXECUTED,
                     slot: "10".to_string(),
                     tx_signature: "mk-exec".to_string(),
+                    processed_unix_ts: None,
                 })
                 .unwrap();
             engine
@@ -3186,6 +3303,7 @@ mod tests {
                     status: QUEUE_PROCESS_EXECUTED,
                     slot: "11".to_string(),
                     tx_signature: "tk-exec".to_string(),
+                    processed_unix_ts: None,
                 })
                 .unwrap();
 
@@ -3261,6 +3379,7 @@ mod tests {
                 status: QUEUE_PROCESS_SKIPPED,
                 slot: "33".to_string(),
                 tx_signature: "skip-5".to_string(),
+                processed_unix_ts: None,
             };
             engine.ingest_queue_processed(processed.clone()).unwrap();
             engine.ingest_queue_processed(processed).unwrap();
@@ -3337,6 +3456,7 @@ mod tests {
                     status: QUEUE_PROCESS_FAILED,
                     slot: "55".to_string(),
                     tx_signature: "failed-9".to_string(),
+                    processed_unix_ts: None,
                 })
                 .unwrap();
 
@@ -3395,6 +3515,7 @@ mod tests {
                     status: QUEUE_PROCESS_FAILED,
                     slot: "41".to_string(),
                     tx_signature: "failed-8".to_string(),
+                    processed_unix_ts: None,
                 })
                 .unwrap();
             engine
@@ -3407,6 +3528,7 @@ mod tests {
                     status: QUEUE_PROCESS_EXECUTED,
                     slot: "42".to_string(),
                     tx_signature: "executed-8".to_string(),
+                    processed_unix_ts: None,
                 })
                 .unwrap();
 
@@ -3417,6 +3539,122 @@ mod tests {
                 .collect();
             assert_eq!(divergences.len(), 1);
             assert_eq!(divergences[0].key, format!("{}:8:0", group));
+            let intent = engine.find_intent(&group, "8", 0).unwrap().unwrap();
+            assert_eq!(intent.processed_status, Some(QUEUE_PROCESS_FAILED));
+            assert_eq!(intent.processed_tx_signature.as_deref(), Some("failed-8"));
+        });
+    }
+
+    #[test]
+    fn prunes_unknown_processed_placeholders_once_bootstrap_catches_up() {
+        run_with_large_stack(|| {
+            let mut engine = ContinuumStateEngine::new();
+            let group = key();
+
+            engine
+                .ingest_queue_processed(QueueItemProcessedEvent {
+                    event_type: "queue_item_processed".to_string(),
+                    ts_ms: 1,
+                    group,
+                    sequence: "5".to_string(),
+                    kind: 0,
+                    status: QUEUE_PROCESS_FAILED,
+                    slot: "11".to_string(),
+                    tx_signature: "failed-5".to_string(),
+                    processed_unix_ts: None,
+                })
+                .unwrap();
+
+            let mut markets = HashMap::new();
+            let mut market = empty_market_state("0", 20);
+            market.watermarks = MarketWatermarks {
+                optimistic_seq: "5".to_string(),
+                confirmed_seq: "5".to_string(),
+                last_slot: "20".to_string(),
+            };
+            markets.insert("0".to_string(), market);
+            engine
+                .bootstrap_from_onchain_snapshot(EngineSnapshot {
+                    view: QueueView::Confirmed,
+                    markets,
+                    users: HashMap::new(),
+                    queue: HashMap::new(),
+                    accounts: HashMap::new(),
+                    perp_markets: HashMap::new(),
+                    token_banks: HashMap::new(),
+                    generated_ts_ms: 0,
+                })
+                .unwrap();
+
+            assert!(engine.list_intents().is_empty());
+        });
+    }
+
+    #[test]
+    fn confirmed_replay_uses_onchain_execution_second_for_expiry() {
+        run_with_large_stack(|| {
+            let mut engine = ContinuumStateEngine::new();
+            let group = key();
+            let execution_queue = key();
+            let owner = key();
+            let mango_account = key();
+            let market = "31".to_string();
+
+            bootstrap_market(&mut engine, &market, 100);
+
+            engine
+                .ingest_relay_intent(RelayIntentAcceptedEvent {
+                    event_type: "relay_intent_accepted".to_string(),
+                    ts_ms: 99_000,
+                    group: group.clone(),
+                    execution_queue,
+                    market: market.clone(),
+                    sequence: "1".to_string(),
+                    kind: 0,
+                    payload_b64: place_order_payload(
+                        Side::Bid,
+                        785,
+                        14_170,
+                        13_915_931,
+                        42,
+                        PlaceOrderType::Limit,
+                        SelfTradeBehavior::DecrementTake,
+                        false,
+                        101,
+                        20,
+                    ),
+                    remaining_accounts: Vec::new(),
+                    min_execute_slot: "1".to_string(),
+                    expires_at_slot: "0".to_string(),
+                    user_owner: owner,
+                    mango_account,
+                    enqueue_tx_signature: "tx-expiry-boundary".to_string(),
+                })
+                .unwrap();
+
+            engine
+                .ingest_queue_processed(QueueItemProcessedEvent {
+                    event_type: "queue_item_processed".to_string(),
+                    ts_ms: 102_500,
+                    group: group.clone(),
+                    sequence: "1".to_string(),
+                    kind: 0,
+                    status: QUEUE_PROCESS_EXECUTED,
+                    slot: "10".to_string(),
+                    tx_signature: "tx-expiry-executed".to_string(),
+                    processed_unix_ts: Some(100),
+                })
+                .unwrap();
+
+            let confirmed = engine
+                .get_market_state(&market, QueueView::Confirmed)
+                .unwrap();
+            assert_eq!(confirmed.open_orders.len(), 1);
+            assert_eq!(confirmed.open_orders[0].price_lots, "785");
+            assert_eq!(confirmed.bids[0].price_lots, "785");
+
+            let intent = engine.find_intent(&group, "1", 0).unwrap().unwrap();
+            assert_eq!(intent.processed_unix_ts, Some(100));
         });
     }
 
@@ -3473,6 +3711,188 @@ mod tests {
                 .unwrap()
                 .open_orders
                 .is_empty());
+        });
+    }
+
+    #[test]
+    fn optimistic_pending_ctm_waits_on_head_gap() {
+        run_with_large_stack(|| {
+            let mut engine = ContinuumStateEngine::new();
+            let group = key();
+            let execution_queue = key();
+            let owner = key();
+            let mango_account = key();
+            let market = "22".to_string();
+
+            bootstrap_market(&mut engine, &market, 100);
+
+            engine
+                .ingest_relay_intent(RelayIntentAcceptedEvent {
+                    event_type: "relay_intent_accepted".to_string(),
+                    ts_ms: 1,
+                    group,
+                    execution_queue,
+                    market: market.clone(),
+                    sequence: "2".to_string(),
+                    kind: 0,
+                    payload_b64: place_order_payload(
+                        Side::Bid,
+                        111,
+                        3,
+                        333,
+                        222,
+                        PlaceOrderType::Limit,
+                        SelfTradeBehavior::DecrementTake,
+                        false,
+                        0,
+                        10,
+                    ),
+                    remaining_accounts: Vec::new(),
+                    min_execute_slot: "1".to_string(),
+                    expires_at_slot: "0".to_string(),
+                    user_owner: owner,
+                    mango_account,
+                    enqueue_tx_signature: "tx-gap-head-2".to_string(),
+                })
+                .unwrap();
+
+            assert!(engine
+                .get_market_state(&market, QueueView::Optimistic)
+                .unwrap()
+                .open_orders
+                .is_empty());
+        });
+    }
+
+    #[test]
+    fn optimistic_pending_ctm_advances_past_failed_head() {
+        run_with_large_stack(|| {
+            let mut engine = ContinuumStateEngine::new();
+            let group = key();
+            let execution_queue = key();
+            let owner = key();
+            let mango_account = key();
+            let market = "23".to_string();
+
+            bootstrap_market(&mut engine, &market, 100);
+
+            engine
+                .ingest_relay_intent(RelayIntentAcceptedEvent {
+                    event_type: "relay_intent_accepted".to_string(),
+                    ts_ms: 2,
+                    group: group.clone(),
+                    execution_queue,
+                    market: market.clone(),
+                    sequence: "2".to_string(),
+                    kind: 0,
+                    payload_b64: place_order_payload(
+                        Side::Ask,
+                        77,
+                        4,
+                        308,
+                        333,
+                        PlaceOrderType::Limit,
+                        SelfTradeBehavior::DecrementTake,
+                        false,
+                        0,
+                        10,
+                    ),
+                    remaining_accounts: Vec::new(),
+                    min_execute_slot: "1".to_string(),
+                    expires_at_slot: "0".to_string(),
+                    user_owner: owner,
+                    mango_account,
+                    enqueue_tx_signature: "tx-after-failed-head".to_string(),
+                })
+                .unwrap();
+            engine
+                .ingest_queue_processed(QueueItemProcessedEvent {
+                    event_type: "queue_item_processed".to_string(),
+                    ts_ms: 3,
+                    group,
+                    sequence: "1".to_string(),
+                    kind: 0,
+                    status: QUEUE_PROCESS_FAILED,
+                    slot: "100".to_string(),
+                    tx_signature: "tx-failed-head".to_string(),
+                    processed_unix_ts: None,
+                })
+                .unwrap();
+
+            let optimistic = engine
+                .get_market_state(&market, QueueView::Optimistic)
+                .unwrap();
+            assert_eq!(optimistic.open_orders.len(), 1);
+            assert_eq!(optimistic.open_orders[0].client_order_id, "333");
+        });
+    }
+
+    #[test]
+    fn optimistic_pending_ctm_waits_for_min_execute_slot() {
+        run_with_large_stack(|| {
+            let mut engine = ContinuumStateEngine::new();
+            let group = key();
+            let execution_queue = key();
+            let owner = key();
+            let mango_account = key();
+            let market = "24".to_string();
+
+            bootstrap_market(&mut engine, &market, 49);
+
+            engine
+                .ingest_relay_intent(RelayIntentAcceptedEvent {
+                    event_type: "relay_intent_accepted".to_string(),
+                    ts_ms: 1,
+                    group: group.clone(),
+                    execution_queue,
+                    market: market.clone(),
+                    sequence: "1".to_string(),
+                    kind: 0,
+                    payload_b64: place_order_payload(
+                        Side::Bid,
+                        88,
+                        5,
+                        440,
+                        444,
+                        PlaceOrderType::Limit,
+                        SelfTradeBehavior::DecrementTake,
+                        false,
+                        0,
+                        10,
+                    ),
+                    remaining_accounts: Vec::new(),
+                    min_execute_slot: "50".to_string(),
+                    expires_at_slot: "0".to_string(),
+                    user_owner: owner,
+                    mango_account,
+                    enqueue_tx_signature: "tx-slot-gated".to_string(),
+                })
+                .unwrap();
+
+            assert!(engine
+                .get_market_state(&market, QueueView::Optimistic)
+                .unwrap()
+                .open_orders
+                .is_empty());
+
+            engine
+                .ingest_queue_enqueued(QueueItemEnqueuedEvent {
+                    event_type: "queue_item_enqueued".to_string(),
+                    ts_ms: 2,
+                    group,
+                    sequence: "1".to_string(),
+                    kind: 0,
+                    min_execute_slot: "50".to_string(),
+                    slot: "50".to_string(),
+                    tx_signature: "enqueue-slot-50".to_string(),
+                })
+                .unwrap();
+
+            let optimistic = engine
+                .get_market_state(&market, QueueView::Optimistic)
+                .unwrap();
+            assert_eq!(optimistic.open_orders.len(), 1);
+            assert_eq!(optimistic.open_orders[0].client_order_id, "444");
         });
     }
 
@@ -3877,6 +4297,7 @@ mod tests {
                         status: QUEUE_PROCESS_FAILED,
                         slot: sequence.to_string(),
                         tx_signature: format!("tx-{sequence}"),
+                        processed_unix_ts: None,
                     })
                     .unwrap();
             }
@@ -3943,7 +4364,7 @@ mod tests {
                     watermarks: crate::types::MarketWatermarks {
                         optimistic_seq: "64".to_string(),
                         confirmed_seq: "64".to_string(),
-                        last_slot: "99".to_string(),
+                        last_slot: "100".to_string(),
                     },
                 },
             );
