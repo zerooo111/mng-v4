@@ -356,13 +356,17 @@ This is the file to consult first when a bot says:
 - `GET /state/full?market=<id>&view=optimistic|confirmed`
 - `GET /state/stream` (SSE)
 - `GET /state/stream/trades?market=<id>&view=optimistic|confirmed&backfill_n=50` (SSE)
-- `GET /state/stream/frontend?owner=<pubkey>&mango_account=<pubkey>&market=<id>&include=positions,trades,open_orders,account_metrics,market_metrics,trade_summary,orderbook_summary,orderbook` (SSE)
+- `GET /state/stream/frontend?owner=<pubkey>&mango_account=<pubkey>&market=<id>&include=positions,trades,open_orders,account_metrics,market_metrics,trade_summary,orderbook_summary,orderbook,pre_confirm,validated_local` (SSE)
 - `GET /healthz`, `GET /metrics`, `GET /diagnostics/divergence`
 
 Frontend stream notes:
 - owner slices stream live `positions`, `trades`, and `open_orders`
 - `account_metrics` now reflects backend health/margin data when available
 - owner positions are currently emitted as `positions_scope: "owner_aggregate"`
+- optimistic frontend streams now default to `pre_confirm`, a lightweight SSE event emitted directly on `relay_intent_accepted` before the heavier snapshot/account/market refresh path
+- `pre_confirm` is intended for sub-2ms UX updates and carries the accepted intent key plus a minimal decoded order preview; exact snapshot reconciliation still arrives later through `account_update` / `market_update`
+- frontend streams now also default to `validated_local`, a sequencer-tick-driven confirmation event emitted when the harness marks the intent locally executed before on-chain log delivery
+- `validated_local` carries the confirmed local owner/market state slices for the affected intent and is intended for the sub-10ms confirmation tier; on-chain logs still act as the correctness and reconciliation backstop
 
 ### Verification (Phase 5)
 

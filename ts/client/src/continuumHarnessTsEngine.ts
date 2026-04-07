@@ -32,6 +32,8 @@ export enum QueuePayloadVariantHarness {
   LiquidityWithdraw = 6,
 }
 
+const SEQUENCER_TICK_PROCESSED_SIGNATURE_PREFIX = 'sequencer-tick:';
+
 export type QueueView = 'optimistic' | 'confirmed';
 
 export type AccountMetaWire = {
@@ -196,6 +198,22 @@ export type CanonicalIntent = {
   processed_unix_ts: number | null;
   processed_status: QueueProcessStatus | null;
   processed_tx_signature: string | null;
+};
+
+export type ValidatedLocalPayload = {
+  tracking_key: string;
+  request_id: string;
+  group: string;
+  execution_queue: string;
+  market: string;
+  sequence: string;
+  kind: number;
+  owner: string;
+  mango_account: string;
+  validation_status: 'executed' | 'failed';
+  validation_error: string | null;
+  owner_state: UserState | null;
+  market_state: MarketState | null;
 };
 
 export type OpenOrderSummary = {
@@ -523,6 +541,29 @@ export function statusToString(status: number): string {
 
 function processedStatusReason(status: number): string {
   return `queue_item_processed:${statusToString(status)}`;
+}
+
+function isSequencerLocalProcessedSignature(signature: string | null | undefined): boolean {
+  return (
+    typeof signature === 'string' &&
+    signature.startsWith(SEQUENCER_TICK_PROCESSED_SIGNATURE_PREFIX)
+  );
+}
+
+function shouldPromoteProcessedSignature(
+  existing: string | null | undefined,
+  incoming: string,
+): boolean {
+  if (!existing) {
+    return true;
+  }
+  if (existing === incoming) {
+    return false;
+  }
+  return (
+    isSequencerLocalProcessedSignature(existing) &&
+    !isSequencerLocalProcessedSignature(incoming)
+  );
 }
 
 export function parseProgramDataLogLine(line: string): Buffer | null {
@@ -866,6 +907,33 @@ export class ContinuumStateEngine {
     return this.intentsByKey.get(queueItemKey(group, sequence, kind)) || null;
   }
 
+  getValidatedLocalPayload(
+    group: string,
+    sequence: string | bigint,
+    kind: string | number,
+  ): ValidatedLocalPayload | null {
+    const intent = this.findIntent(group, sequence, kind);
+    if (!intent || !intent.payload_b64 || intent.market === 'unknown') {
+      return null;
+    }
+    const snapshot = this.getSnapshot('confirmed');
+    return {
+      tracking_key: intent.key,
+      request_id: intent.request_id,
+      group: intent.group,
+      execution_queue: intent.execution_queue,
+      market: intent.market,
+      sequence: intent.sequence.toString(),
+      kind: intent.kind,
+      owner: intent.user_owner,
+      mango_account: intent.mango_account,
+      validation_status: 'executed',
+      validation_error: null,
+      owner_state: snapshot.users[intent.user_owner] || null,
+      market_state: snapshot.markets[intent.market] || null,
+    };
+  }
+
   ingestRelayIntentStatus(event: RelayIntentStatusEvent): void {
     this.revision += 1;
     this.emitEvent(event);
@@ -945,18 +1013,44 @@ export class ContinuumStateEngine {
   }
 
   ingestQueueProcessed(event: QueueItemProcessedEvent): void {
-    const id = `${event.tx_signature}:${event.group}:${event.sequence}:${event.kind}:${event.status}`;
-    if (this.processedEventIds.has(id)) {
-      return;
-    }
-    this.processedEventIds.add(id);
-
     const key = queueItemKey(event.group, event.sequence, event.kind);
     const intent = this.intentsByKey.get(key);
     const slot = BigInt(event.slot || '0');
     if (slot > this.lastSeenSlot) {
       this.lastSeenSlot = slot;
     }
+
+    if (intent && intent.processed_status === event.status) {
+      let touched = slot > (intent.processed_slot || 0n);
+      if (slot > (intent.processed_slot || 0n)) {
+        intent.processed_slot = slot;
+      }
+      if (shouldPromoteProcessedSignature(intent.processed_tx_signature, event.tx_signature)) {
+        intent.processed_tx_signature = event.tx_signature;
+        touched = true;
+      }
+      const nextProcessedTsMs = event.ts_ms || Date.now();
+      if ((intent.processed_ts_ms || 0) < nextProcessedTsMs) {
+        intent.processed_ts_ms = nextProcessedTsMs;
+        touched = true;
+      }
+      const nextProcessedUnixTs =
+        event.processed_unix_ts ?? Math.floor(nextProcessedTsMs / 1000);
+      if ((intent.processed_unix_ts || 0) < nextProcessedUnixTs) {
+        intent.processed_unix_ts = nextProcessedUnixTs;
+        touched = true;
+      }
+      if (touched) {
+        this.revision += 1;
+      }
+      return;
+    }
+
+    const id = `${event.tx_signature}:${event.group}:${event.sequence}:${event.kind}:${event.status}`;
+    if (this.processedEventIds.has(id)) {
+      return;
+    }
+    this.processedEventIds.add(id);
 
     if (!intent) {
       this.emitDivergence('processed_without_relay_intent', key, {

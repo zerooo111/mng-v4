@@ -7,6 +7,7 @@ export type ContinuumHarnessBackend = Pick<
   ContinuumStateEngine,
   | 'bootstrapFromOnchainSnapshot'
   | 'findIntent'
+  | 'getValidatedLocalPayload'
   | 'getAllTrades'
   | 'getBalances'
   | 'getCandles'
@@ -150,6 +151,7 @@ function assertValidBackend(
   for (const method of [
     'bootstrapFromOnchainSnapshot',
     'findIntent',
+    'getValidatedLocalPayload',
     'getAllTrades',
     'getBalances',
     'getCandles',

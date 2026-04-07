@@ -402,3 +402,23 @@ pub struct CanonicalIntentState {
     #[serde(default)]
     pub processed_tx_signature: Option<String>,
 }
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ValidatedLocalPayload {
+    pub tracking_key: String,
+    pub request_id: String,
+    pub group: String,
+    pub execution_queue: String,
+    pub market: String,
+    pub sequence: String,
+    pub kind: u8,
+    pub owner: String,
+    pub mango_account: String,
+    pub validation_status: String,
+    #[serde(default)]
+    pub validation_error: Option<String>,
+    #[serde(default)]
+    pub owner_state: Option<UserState>,
+    #[serde(default)]
+    pub market_state: Option<MarketState>,
+}

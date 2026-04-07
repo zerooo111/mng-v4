@@ -23,5 +23,5 @@ pub use types::{
     MarginSummaryEmpty, MarginSummaryOk, MarginSummaryPlaceholder, MarketCandle, MarketState,
     MarketTrade, OpenOrderSummary, PerpMarketSyncState, QueueItemEnqueuedEvent,
     QueueItemProcessedEvent, QueueState, QueueView, RelayIntentAcceptedEvent, TokenBankSyncState,
-    UserBalances, UserState,
+    UserBalances, UserState, ValidatedLocalPayload,
 };

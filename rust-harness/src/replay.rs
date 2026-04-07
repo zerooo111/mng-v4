@@ -21,7 +21,7 @@ use crate::{
     HarnessError, MarginSummary, MarginSummaryAccount, MarginSummaryEmpty, MarginSummaryOk,
     MarginSummaryPlaceholder, MarketCandle, MarketConfig, MarketState, MarketTrade,
     OpenOrderSummary, QueueItemEnqueuedEvent, QueueItemProcessedEvent, QueuePayload, QueueView,
-    RelayIntentAcceptedEvent, Result, UserBalances, UserState,
+    RelayIntentAcceptedEvent, Result, UserBalances, UserState, ValidatedLocalPayload,
 };
 
 const QUEUE_ITEM_KIND_CTM_WRAPPED: u8 = 0;
@@ -46,6 +46,22 @@ const MAX_EVENT_ID_HISTORY: usize = 50_000;
 const MAX_EVENT_ID_HISTORY: usize = 64;
 const RUST_REPLAY_MARGIN_SOURCE: &str = "rust-replay-perp-token-health";
 const RUST_REPLAY_MARGIN_SOURCE_PARTIAL: &str = "rust-replay-perp-token-health-partial";
+const SEQUENCER_TICK_PROCESSED_SIGNATURE_PREFIX: &str = "sequencer-tick:";
+
+fn is_sequencer_local_processed_signature(signature: &str) -> bool {
+    signature.starts_with(SEQUENCER_TICK_PROCESSED_SIGNATURE_PREFIX)
+}
+
+fn should_promote_processed_signature(existing: Option<&str>, incoming: &str) -> bool {
+    match existing {
+        None => true,
+        Some(current) if current == incoming => false,
+        Some(current) => {
+            is_sequencer_local_processed_signature(current)
+                && !is_sequencer_local_processed_signature(incoming)
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 struct CanonicalIntent {
@@ -112,6 +128,7 @@ struct QueueAggregate {
     unmatched_processed_count: u64,
 }
 
+#[derive(Clone)]
 struct Projection {
     engine: HarnessEngine,
     active_markets: BTreeSet<String>,
@@ -132,6 +149,13 @@ struct ViewState {
 struct ViewStateCache {
     revision: u64,
     state: ViewState,
+}
+
+#[derive(Clone)]
+struct IncrementalConfirmedState {
+    projection: Projection,
+    applied_executed_keys: Vec<String>,
+    failed_executed_keys: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -330,6 +354,8 @@ pub struct ContinuumStateEngine {
     last_seen_slot: u64,
     cached_confirmed: Option<ViewStateCache>,
     cached_optimistic: Option<ViewStateCache>,
+    incremental_confirmed: Option<IncrementalConfirmedState>,
+    incremental_confirmed_dirty: bool,
     baseline_positions: BTreeMap<(String, String), BaselinePosition>,
     baseline_orders: BTreeMap<String, OpenOrderSummary>,
     baseline_margin_accounts: BTreeMap<String, MarginSummaryAccount>,
@@ -360,6 +386,8 @@ impl ContinuumStateEngine {
             last_seen_slot: 0,
             cached_confirmed: None,
             cached_optimistic: None,
+            incremental_confirmed: None,
+            incremental_confirmed_dirty: true,
             baseline_positions: BTreeMap::new(),
             baseline_orders: BTreeMap::new(),
             baseline_margin_accounts: BTreeMap::new(),
@@ -458,6 +486,7 @@ impl ContinuumStateEngine {
         self.baseline_bootstrapped = true;
         self.prune_rebased_intents();
         self.enforce_retention_limits();
+        self.invalidate_incremental_confirmed();
         self.touch();
         Ok(())
     }
@@ -528,6 +557,10 @@ impl ContinuumStateEngine {
             }
         }
 
+        if canonical.processed_status == Some(QUEUE_PROCESS_EXECUTED) {
+            self.mark_incremental_confirmed_dirty();
+        }
+
         self.intents_by_key.insert(key, canonical);
         self.enforce_retention_limits();
         self.touch();
@@ -575,6 +608,62 @@ impl ContinuumStateEngine {
     }
 
     pub fn ingest_queue_processed(&mut self, event: QueueItemProcessedEvent) -> Result<()> {
+        let sequence = parse_u64_field("sequence", &event.sequence)?;
+        let slot = parse_u64_field("slot", &event.slot)?;
+        if slot > self.last_seen_slot {
+            self.last_seen_slot = slot;
+        }
+
+        let key = queue_item_key(&event.group, sequence, event.kind);
+        let refined_existing_processed = if let Some(intent) = self.intents_by_key.get_mut(&key) {
+            if intent.processed_status == Some(event.status) {
+                let mut touched = false;
+                if intent
+                    .processed_slot
+                    .map(|existing| slot > existing)
+                    .unwrap_or(true)
+                {
+                    intent.processed_slot = Some(slot);
+                    touched = true;
+                }
+                if should_promote_processed_signature(
+                    intent.processed_tx_signature.as_deref(),
+                    &event.tx_signature,
+                ) {
+                    intent.processed_tx_signature = Some(event.tx_signature.clone());
+                    touched = true;
+                }
+                if intent
+                    .processed_ts_ms
+                    .map(|existing| event.ts_ms > existing)
+                    .unwrap_or(true)
+                {
+                    intent.processed_ts_ms = Some(event.ts_ms);
+                    touched = true;
+                }
+                let next_processed_unix_ts = event.processed_unix_ts.unwrap_or(event.ts_ms / 1_000);
+                if intent
+                    .processed_unix_ts
+                    .map(|existing| next_processed_unix_ts > existing)
+                    .unwrap_or(true)
+                {
+                    intent.processed_unix_ts = Some(next_processed_unix_ts);
+                    touched = true;
+                }
+                Some(touched)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(touched) = refined_existing_processed {
+            if touched {
+                self.touch();
+            }
+            return Ok(());
+        }
+
         let id = format!(
             "{}:{}:{}:{}:{}",
             event.tx_signature, event.group, event.sequence, event.kind, event.status
@@ -587,13 +676,6 @@ impl ContinuumStateEngine {
             return Ok(());
         }
 
-        let sequence = parse_u64_field("sequence", &event.sequence)?;
-        let slot = parse_u64_field("slot", &event.slot)?;
-        if slot > self.last_seen_slot {
-            self.last_seen_slot = slot;
-        }
-
-        let key = queue_item_key(&event.group, sequence, event.kind);
         if let Some(previous_status) = self
             .intents_by_key
             .get(&key)
@@ -764,6 +846,155 @@ impl ContinuumStateEngine {
             .map(|intent| serde_json::to_string(&intent))
             .transpose()
             .map_err(Into::into)
+    }
+
+    pub fn get_validated_local_payload(
+        &mut self,
+        group: &str,
+        sequence: impl ToString,
+        kind: u8,
+    ) -> Result<Option<ValidatedLocalPayload>> {
+        let sequence = parse_u64_field("sequence", &sequence.to_string())?;
+        let key = queue_item_key(group, sequence, kind);
+        let Some(intent) = self.intents_by_key.get(&key).cloned() else {
+            return Ok(None);
+        };
+        if intent.payload_b64.is_empty()
+            || intent.market == "unknown"
+            || intent.execution_queue == "unknown"
+            || intent.user_owner == "unknown"
+            || intent.mango_account == "unknown"
+        {
+            return Ok(None);
+        }
+
+        Ok(Some(
+            self.build_validated_local_payload_incremental(&intent)?,
+        ))
+    }
+
+    pub fn get_validated_local_payload_json(
+        &mut self,
+        group: &str,
+        sequence: impl ToString,
+        kind: u8,
+    ) -> Result<Option<String>> {
+        self.get_validated_local_payload(group, sequence, kind)?
+            .map(|payload| serde_json::to_string(&payload))
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    fn build_validated_local_payload_incremental(
+        &mut self,
+        intent: &CanonicalIntent,
+    ) -> Result<ValidatedLocalPayload> {
+        self.sync_incremental_confirmed_state()?;
+        let now_ts = now_ts_ms() / 1_000;
+        let incremental = self.incremental_confirmed.as_ref().unwrap();
+        let projection = &incremental.projection;
+        let validation_error = incremental.failed_executed_keys.get(&intent.key).cloned();
+        Ok(ValidatedLocalPayload {
+            tracking_key: intent.key.clone(),
+            request_id: intent.key.clone(),
+            group: intent.group.clone(),
+            execution_queue: intent.execution_queue.clone(),
+            market: intent.market.clone(),
+            sequence: intent.sequence.to_string(),
+            kind: intent.kind,
+            owner: intent.user_owner.clone(),
+            mango_account: intent.mango_account.clone(),
+            validation_status: if validation_error.is_some() {
+                "failed".to_string()
+            } else {
+                "executed".to_string()
+            },
+            validation_error,
+            owner_state: Some(self.build_user_state_from_projection(
+                projection,
+                &intent.user_owner,
+                now_ts,
+            )?),
+            market_state: Some(self.build_market_state_from_projection(
+                projection,
+                &intent.market,
+                now_ts,
+            )?),
+        })
+    }
+
+    fn sync_incremental_confirmed_state(&mut self) -> Result<()> {
+        let rebuild = {
+            let executed_intents = self.confirmed_executed_intents();
+            self.incremental_confirmed_dirty
+                || self
+                    .incremental_confirmed
+                    .as_ref()
+                    .map(|state| !confirmed_incremental_prefix_matches(state, &executed_intents))
+                    .unwrap_or(true)
+        };
+        if rebuild {
+            let executed_intents = self.confirmed_executed_intents();
+            self.incremental_confirmed =
+                Some(self.rebuild_incremental_confirmed_state(&executed_intents)?);
+            self.incremental_confirmed_dirty = false;
+        } else {
+            let applied_len = self
+                .incremental_confirmed
+                .as_ref()
+                .map(|state| state.applied_executed_keys.len())
+                .unwrap_or(0);
+            let tail_keys: Vec<String> = {
+                let executed_intents = self.confirmed_executed_intents();
+                executed_intents
+                    .into_iter()
+                    .skip(applied_len)
+                    .map(|intent| intent.key.clone())
+                    .collect()
+            };
+            if !tail_keys.is_empty() {
+                let mut state = self.incremental_confirmed.take().unwrap();
+                for key in tail_keys {
+                    let intent = self.intents_by_key.get(&key).ok_or_else(|| {
+                        HarnessError::InvalidInteger {
+                            field: "incremental_confirmed.key",
+                            value: key.clone(),
+                        }
+                    })?;
+                    self.apply_confirmed_execution(intent, &mut state)?;
+                    state.applied_executed_keys.push(key);
+                }
+                self.incremental_confirmed = Some(state);
+            }
+        }
+
+        if let Some(state) = self.incremental_confirmed.as_mut() {
+            state.projection.last_slot = self.last_seen_slot;
+        }
+        Ok(())
+    }
+
+    fn rebuild_incremental_confirmed_state(
+        &self,
+        executed_intents: &[&CanonicalIntent],
+    ) -> Result<IncrementalConfirmedState> {
+        let mut state = IncrementalConfirmedState {
+            projection: self.build_baseline_projection()?,
+            applied_executed_keys: Vec::with_capacity(executed_intents.len()),
+            failed_executed_keys: HashMap::new(),
+        };
+        for intent in executed_intents {
+            self.apply_confirmed_execution(intent, &mut state)?;
+            state.applied_executed_keys.push(intent.key.clone());
+        }
+        Ok(state)
+    }
+
+    fn confirmed_executed_intents(&self) -> Vec<&CanonicalIntent> {
+        self.sorted_replay_intents()
+            .into_iter()
+            .filter(|intent| intent.processed_status == Some(QUEUE_PROCESS_EXECUTED))
+            .collect()
     }
 
     pub fn get_market_state(&mut self, market: &str, view: QueueView) -> Result<MarketState> {
@@ -1103,7 +1334,7 @@ impl ContinuumStateEngine {
         })
     }
 
-    fn build_projection(&self, view: QueueView, current_now_ts: u64) -> Result<Projection> {
+    fn build_baseline_projection(&self) -> Result<Projection> {
         let mut projection = Projection {
             engine: HarnessEngine::new(),
             active_markets: BTreeSet::new(),
@@ -1237,6 +1468,16 @@ impl ContinuumStateEngine {
             }
         }
 
+        Ok(projection)
+    }
+
+    fn build_projection(&self, view: QueueView, current_now_ts: u64) -> Result<Projection> {
+        let mut confirmed_state = IncrementalConfirmedState {
+            projection: self.build_baseline_projection()?,
+            applied_executed_keys: Vec::new(),
+            failed_executed_keys: HashMap::new(),
+        };
+
         let intents = self.sorted_replay_intents();
 
         for intent in intents
@@ -1244,17 +1485,12 @@ impl ContinuumStateEngine {
             .copied()
             .filter(|intent| intent.processed_status == Some(QUEUE_PROCESS_EXECUTED))
         {
-            let execution_ts = intent
-                .processed_unix_ts
-                .unwrap_or_else(|| intent.processed_ts_ms.unwrap_or(intent.accepted_ts_ms) / 1_000);
-            self.apply_intent(intent, &mut projection, execution_ts)?;
-            let queue = projection
-                .queue
-                .entry(intent.market.clone())
-                .or_insert_with(QueueAggregate::default);
-            queue.processed_count += 1;
-            queue.last_processed_sequence = queue.last_processed_sequence.max(intent.sequence);
+            self.apply_confirmed_execution(intent, &mut confirmed_state)?;
+            confirmed_state
+                .applied_executed_keys
+                .push(intent.key.clone());
         }
+        let mut projection = confirmed_state.projection;
 
         for intent in &intents {
             let queue = projection
@@ -1317,10 +1553,12 @@ impl ContinuumStateEngine {
             };
             while let Some(intent) = intents_by_sequence.get(&next_sequence).copied() {
                 match intent.processed_status {
-                    Some(QUEUE_PROCESS_EXECUTED | QUEUE_PROCESS_FAILED | QUEUE_PROCESS_SKIPPED) => {}
+                    Some(QUEUE_PROCESS_EXECUTED | QUEUE_PROCESS_FAILED | QUEUE_PROCESS_SKIPPED) => {
+                    }
                     Some(_) => {}
                     None => {
-                        if projection.last_slot != 0 && projection.last_slot < intent.min_execute_slot
+                        if projection.last_slot != 0
+                            && projection.last_slot < intent.min_execute_slot
                         {
                             break;
                         }
@@ -1331,6 +1569,39 @@ impl ContinuumStateEngine {
             }
         }
 
+        Ok(())
+    }
+
+    fn apply_confirmed_execution(
+        &self,
+        intent: &CanonicalIntent,
+        state: &mut IncrementalConfirmedState,
+    ) -> Result<()> {
+        let execution_ts = intent
+            .processed_unix_ts
+            .unwrap_or_else(|| intent.processed_ts_ms.unwrap_or(intent.accepted_ts_ms) / 1_000);
+        let mut next_projection = state.projection.clone();
+        let validation_error =
+            match self.apply_intent(intent, &mut next_projection, execution_ts) {
+                Ok(()) => None,
+                Err(err) if is_recoverable_local_validation_error(&err) => {
+                    Some(err.to_string())
+                }
+                Err(err) => return Err(err),
+            };
+        if validation_error.is_none() {
+            state.projection = next_projection;
+            state.failed_executed_keys.remove(&intent.key);
+        } else if let Some(error) = validation_error {
+            state.failed_executed_keys.insert(intent.key.clone(), error);
+        }
+        let queue = state
+            .projection
+            .queue
+            .entry(intent.market.clone())
+            .or_insert_with(QueueAggregate::default);
+        queue.processed_count += 1;
+        queue.last_processed_sequence = queue.last_processed_sequence.max(intent.sequence);
         Ok(())
     }
 
@@ -1655,82 +1926,250 @@ impl ContinuumStateEngine {
 
         let mut projected_accounts = HashMap::new();
         for mango_account in account_keys {
-            let baseline = self.baseline_accounts.get(&mango_account);
-            let snapshot = match Pubkey::from_str(&mango_account) {
-                Ok(mango_account_pubkey) => match projection
-                    .engine
-                    .account_snapshot(mango_account_pubkey, now_ts)
-                {
-                    Ok(snapshot) => Some(snapshot),
-                    Err(HarnessError::UnknownAccount(_)) => None,
-                    Err(err) => return Err(err),
-                },
-                Err(_) => None,
-            };
-
-            if snapshot.is_none() && baseline.is_none() {
-                continue;
+            if let Some(account_state) =
+                self.build_projected_account(projection, &mango_account, None, now_ts)?
+            {
+                projected_accounts.insert(mango_account, account_state);
             }
-
-            let owner = baseline
-                .map(|state| state.owner.clone())
-                .or_else(|| snapshot.as_ref().map(|state| state.owner.to_string()))
-                .or_else(|| {
-                    projection
-                        .owner_accounts
-                        .iter()
-                        .find_map(|(owner, accounts)| {
-                            accounts.contains(&mango_account).then(|| owner.clone())
-                        })
-                })
-                .unwrap_or_else(|| "unknown".to_string());
-
-            let open_orders = snapshot
-                .as_ref()
-                .map(|snapshot| {
-                    snapshot
-                        .open_orders
-                        .iter()
-                        .cloned()
-                        .map(open_order_snapshot_to_summary)
-                        .collect()
-                })
-                .or_else(|| baseline.map(|state| state.open_orders.clone()))
-                .unwrap_or_default();
-            let perp_positions = snapshot
-                .as_ref()
-                .map(|snapshot| {
-                    snapshot
-                        .perp_positions
-                        .iter()
-                        .cloned()
-                        .map(account_perp_position_from_snapshot)
-                        .collect()
-                })
-                .or_else(|| baseline.map(|state| state.perp_positions.clone()))
-                .unwrap_or_default();
-
-            projected_accounts.insert(
-                mango_account.clone(),
-                AccountProjectedState {
-                    owner,
-                    mango_account: mango_account.clone(),
-                    net_deposits: baseline
-                        .map(|state| state.net_deposits.clone())
-                        .unwrap_or_else(|| "0".to_string()),
-                    open_orders,
-                    token_positions: baseline
-                        .map(|state| state.token_positions.clone())
-                        .unwrap_or_default(),
-                    perp_positions,
-                    unsupported_exposures: baseline
-                        .map(|state| state.unsupported_exposures.clone())
-                        .unwrap_or_default(),
-                },
-            );
         }
 
         Ok(projected_accounts)
+    }
+
+    fn build_projected_accounts_for_owner(
+        &self,
+        projection: &Projection,
+        owner: &str,
+        now_ts: u64,
+    ) -> Result<HashMap<String, AccountProjectedState>> {
+        let mut projected_accounts = HashMap::new();
+        for mango_account in self.owner_account_keys(projection, owner) {
+            if let Some(account_state) =
+                self.build_projected_account(projection, &mango_account, Some(owner), now_ts)?
+            {
+                if account_state.owner == owner {
+                    projected_accounts.insert(mango_account, account_state);
+                }
+            }
+        }
+        Ok(projected_accounts)
+    }
+
+    fn build_projected_account(
+        &self,
+        projection: &Projection,
+        mango_account: &str,
+        owner_hint: Option<&str>,
+        now_ts: u64,
+    ) -> Result<Option<AccountProjectedState>> {
+        let baseline = self.baseline_accounts.get(mango_account);
+        let snapshot = match Pubkey::from_str(mango_account) {
+            Ok(mango_account_pubkey) => match projection
+                .engine
+                .account_snapshot(mango_account_pubkey, now_ts)
+            {
+                Ok(snapshot) => Some(snapshot),
+                Err(HarnessError::UnknownAccount(_)) => None,
+                Err(err) => return Err(err),
+            },
+            Err(_) => None,
+        };
+
+        if snapshot.is_none() && baseline.is_none() {
+            return Ok(None);
+        }
+
+        let owner = baseline
+            .map(|state| state.owner.clone())
+            .or_else(|| snapshot.as_ref().map(|state| state.owner.to_string()))
+            .or_else(|| owner_hint.map(str::to_string))
+            .or_else(|| {
+                projection
+                    .owner_accounts
+                    .iter()
+                    .find_map(|(owner, accounts)| {
+                        accounts.contains(mango_account).then(|| owner.clone())
+                    })
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let open_orders = snapshot
+            .as_ref()
+            .map(|snapshot| {
+                snapshot
+                    .open_orders
+                    .iter()
+                    .cloned()
+                    .map(open_order_snapshot_to_summary)
+                    .collect()
+            })
+            .or_else(|| baseline.map(|state| state.open_orders.clone()))
+            .unwrap_or_default();
+        let perp_positions = snapshot
+            .as_ref()
+            .map(|snapshot| {
+                snapshot
+                    .perp_positions
+                    .iter()
+                    .cloned()
+                    .map(account_perp_position_from_snapshot)
+                    .collect()
+            })
+            .or_else(|| baseline.map(|state| state.perp_positions.clone()))
+            .unwrap_or_default();
+
+        Ok(Some(AccountProjectedState {
+            owner,
+            mango_account: mango_account.to_string(),
+            net_deposits: baseline
+                .map(|state| state.net_deposits.clone())
+                .unwrap_or_else(|| "0".to_string()),
+            open_orders,
+            token_positions: baseline
+                .map(|state| state.token_positions.clone())
+                .unwrap_or_default(),
+            perp_positions,
+            unsupported_exposures: baseline
+                .map(|state| state.unsupported_exposures.clone())
+                .unwrap_or_default(),
+        }))
+    }
+
+    fn owner_account_keys(&self, projection: &Projection, owner: &str) -> BTreeSet<String> {
+        let mut mango_accounts = self
+            .baseline_user_accounts
+            .get(owner)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(accounts) = projection.owner_accounts.get(owner) {
+            mango_accounts.extend(accounts.iter().cloned());
+        }
+        for (mango_account, account_state) in &self.baseline_accounts {
+            if account_state.owner == owner {
+                mango_accounts.insert(mango_account.clone());
+            }
+        }
+        mango_accounts
+    }
+
+    fn build_user_state_from_projection(
+        &self,
+        projection: &Projection,
+        owner: &str,
+        now_ts: u64,
+    ) -> Result<UserState> {
+        let mut mango_accounts = self.owner_account_keys(projection, owner);
+        let accounts = self.build_projected_accounts_for_owner(projection, owner, now_ts)?;
+        for mango_account in accounts.keys() {
+            mango_accounts.insert(mango_account.clone());
+        }
+
+        let has_baseline_positions = self
+            .baseline_positions
+            .keys()
+            .any(|(entry_owner, _)| entry_owner == owner);
+        if mango_accounts.is_empty() && accounts.is_empty() && !has_baseline_positions {
+            return Ok(empty_user_state(owner));
+        }
+
+        let mut open_orders = Vec::new();
+        let mut per_market = BTreeMap::<String, UserPerMarketAggregate>::new();
+        for mango_account in &mango_accounts {
+            if let Some(account_state) = accounts.get(mango_account) {
+                self.merge_projected_account_state(
+                    account_state,
+                    &mut open_orders,
+                    &mut per_market,
+                )?;
+            }
+        }
+
+        if self.baseline_accounts.is_empty() {
+            for ((entry_owner, market), position) in &self.baseline_positions {
+                if entry_owner != owner {
+                    continue;
+                }
+                let entry = per_market.entry(market.clone()).or_default();
+                entry.base_position_lots += position.base_position_lots as i128;
+                entry.quote_position_native += position.quote_position_native;
+            }
+        }
+
+        open_orders.sort_by(order_summary_cmp);
+        let mut per_market_vec: Vec<_> = per_market
+            .into_iter()
+            .map(|(market, aggregate)| UserPerMarketState {
+                market,
+                open_order_base_lots_bid: aggregate.open_bid.to_string(),
+                open_order_base_lots_ask: aggregate.open_ask.to_string(),
+                quote_reserved_lots: aggregate.quote_reserved.to_string(),
+                base_position_lots: aggregate.base_position_lots.to_string(),
+                quote_position_native: aggregate.quote_position_native.to_string(),
+            })
+            .collect();
+        per_market_vec.sort_by(|a, b| compare_market_strings(&a.market, &b.market));
+        let margin_summary =
+            self.build_owner_margin_summary(owner, &mango_accounts, &accounts, &projection.engine)?;
+
+        Ok(UserState {
+            owner: owner.to_string(),
+            mango_accounts: mango_accounts.into_iter().collect(),
+            open_orders,
+            per_market: per_market_vec,
+            margin_summary,
+        })
+    }
+
+    fn build_market_state_from_projection(
+        &self,
+        projection: &Projection,
+        market: &str,
+        now_ts: u64,
+    ) -> Result<MarketState> {
+        let (bids, asks, open_orders) = if let Ok(market_index) = parse_market_index(market) {
+            if projection.engine.has_market(market_index) {
+                let book = projection.engine.orderbook_snapshot(market_index, now_ts)?;
+                let orders = projection
+                    .engine
+                    .open_orders_snapshot_for_market(market_index, now_ts)?;
+                (
+                    book.bids
+                        .into_iter()
+                        .map(|level| MarketLevel {
+                            price_lots: level.price_lots.to_string(),
+                            base_lots: level.base_lots.to_string(),
+                        })
+                        .collect(),
+                    book.asks
+                        .into_iter()
+                        .map(|level| MarketLevel {
+                            price_lots: level.price_lots.to_string(),
+                            base_lots: level.base_lots.to_string(),
+                        })
+                        .collect(),
+                    orders
+                        .into_iter()
+                        .map(open_order_snapshot_to_summary)
+                        .collect(),
+                )
+            } else {
+                (Vec::new(), Vec::new(), Vec::new())
+            }
+        } else {
+            (Vec::new(), Vec::new(), Vec::new())
+        };
+        let (optimistic_seq, confirmed_seq) = self.market_watermarks(market);
+        Ok(MarketState {
+            market: market.to_string(),
+            bids,
+            asks,
+            open_orders,
+            watermarks: MarketWatermarks {
+                optimistic_seq: optimistic_seq.to_string(),
+                confirmed_seq: confirmed_seq.to_string(),
+                last_slot: projection.last_slot.to_string(),
+            },
+        })
     }
 
     fn merge_projected_account_state(
@@ -2087,12 +2526,13 @@ impl ContinuumStateEngine {
         Ok(base_native * perp_info.base_prices.oracle + perp_info.quote_current)
     }
 
-    fn prune_rebased_intents(&mut self) {
+    fn prune_rebased_intents(&mut self) -> bool {
         let max_baseline_seq = if self.baseline_bootstrapped {
             self.baseline_next_ctm_sequence().saturating_sub(1)
         } else {
             0
         };
+        let before = self.intents_by_key.len();
         self.intents_by_key.retain(|_, intent| {
             if intent.market == "unknown" {
                 !self.baseline_bootstrapped || intent.sequence > max_baseline_seq
@@ -2105,6 +2545,7 @@ impl ContinuumStateEngine {
                 intent.sequence > baseline_seq
             }
         });
+        self.intents_by_key.len() != before
     }
 
     fn track_event_id(ids: &mut HashSet<String>, order: &mut VecDeque<String>, id: String) -> bool {
@@ -2121,9 +2562,12 @@ impl ContinuumStateEngine {
     }
 
     fn enforce_retention_limits(&mut self) {
-        self.prune_rebased_intents();
+        let pruned = self.prune_rebased_intents();
         self.trim_divergences();
-        self.trim_intents();
+        let trimmed = self.trim_intents();
+        if pruned || trimmed {
+            self.mark_incremental_confirmed_dirty();
+        }
     }
 
     fn trim_divergences(&mut self) {
@@ -2133,9 +2577,9 @@ impl ContinuumStateEngine {
         }
     }
 
-    fn trim_intents(&mut self) {
+    fn trim_intents(&mut self) -> bool {
         if self.intents_by_key.len() <= MAX_INTENT_HISTORY {
-            return;
+            return false;
         }
 
         let mut candidates: Vec<_> = self
@@ -2183,7 +2627,7 @@ impl ContinuumStateEngine {
 
         let overflow = self.intents_by_key.len().saturating_sub(MAX_INTENT_HISTORY);
         if overflow == 0 {
-            return;
+            return false;
         }
 
         let mut removed = 0usize;
@@ -2210,6 +2654,7 @@ impl ContinuumStateEngine {
             );
             self.trim_divergences();
         }
+        removed > 0
     }
 
     fn market_watermarks(&self, market: &str) -> (u64, u64) {
@@ -2289,10 +2734,42 @@ impl ContinuumStateEngine {
         self.trim_divergences();
     }
 
+    fn mark_incremental_confirmed_dirty(&mut self) {
+        self.incremental_confirmed_dirty = true;
+    }
+
+    fn invalidate_incremental_confirmed(&mut self) {
+        self.incremental_confirmed = None;
+        self.incremental_confirmed_dirty = true;
+    }
+
     fn touch(&mut self) {
         self.revision = self.revision.saturating_add(1);
         self.cached_confirmed = None;
         self.cached_optimistic = None;
+    }
+}
+
+fn confirmed_incremental_prefix_matches(
+    state: &IncrementalConfirmedState,
+    intents: &[&CanonicalIntent],
+) -> bool {
+    state.applied_executed_keys.len() <= intents.len()
+        && state
+            .applied_executed_keys
+            .iter()
+            .zip(intents.iter())
+            .all(|(applied, intent)| applied == &intent.key)
+}
+
+fn is_recoverable_local_validation_error(err: &HarnessError) -> bool {
+    match err {
+        HarnessError::Anchor(_) => {
+            let message = err.to_string();
+            message.contains("no free perp order index")
+                || message.contains("programs/mango-v4/src/state/orderbook/book.rs")
+        }
+        _ => false,
     }
 }
 
@@ -2823,6 +3300,17 @@ fn now_ts_ms() -> u64 {
 mod tests {
     use super::*;
     use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+    use std::hint::black_box;
+
+    #[derive(Debug, Clone, Copy)]
+    struct BenchSummary {
+        min_ns: u128,
+        p50_ns: u128,
+        p95_ns: u128,
+        p99_ns: u128,
+        max_ns: u128,
+        mean_ns: u128,
+    }
 
     fn place_order_payload(
         side: Side,
@@ -2877,6 +3365,171 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    fn bench_percentile(sorted_samples: &[u128], numer: usize, denom: usize) -> u128 {
+        if sorted_samples.is_empty() {
+            return 0;
+        }
+        let idx = ((sorted_samples.len() - 1) * numer) / denom;
+        sorted_samples[idx]
+    }
+
+    fn summarize_bench(samples: &[u128]) -> BenchSummary {
+        let mut sorted = samples.to_vec();
+        sorted.sort_unstable();
+        let sum: u128 = sorted.iter().copied().sum();
+        BenchSummary {
+            min_ns: *sorted.first().unwrap_or(&0),
+            p50_ns: bench_percentile(&sorted, 50, 100),
+            p95_ns: bench_percentile(&sorted, 95, 100),
+            p99_ns: bench_percentile(&sorted, 99, 100),
+            max_ns: *sorted.last().unwrap_or(&0),
+            mean_ns: if sorted.is_empty() {
+                0
+            } else {
+                sum / sorted.len() as u128
+            },
+        }
+    }
+
+    fn format_duration_ns(ns: u128) -> String {
+        if ns >= 1_000_000 {
+            format!("{:.3} ms", ns as f64 / 1_000_000.0)
+        } else if ns >= 1_000 {
+            format!("{:.3} us", ns as f64 / 1_000.0)
+        } else {
+            format!("{ns} ns")
+        }
+    }
+
+    fn print_bench_summary(label: &str, summary: BenchSummary) {
+        println!(
+            "{label}: min={} p50={} p95={} p99={} max={} mean={}",
+            format_duration_ns(summary.min_ns),
+            format_duration_ns(summary.p50_ns),
+            format_duration_ns(summary.p95_ns),
+            format_duration_ns(summary.p99_ns),
+            format_duration_ns(summary.max_ns),
+            format_duration_ns(summary.mean_ns),
+        );
+    }
+
+    fn speedup(old_ns: u128, new_ns: u128) -> f64 {
+        if new_ns == 0 {
+            return f64::INFINITY;
+        }
+        old_ns as f64 / new_ns as f64
+    }
+
+    fn ingest_executed_limit_order(
+        engine: &mut ContinuumStateEngine,
+        group: &str,
+        execution_queue: &str,
+        owner: &str,
+        mango_account: &str,
+        market: &str,
+        sequence: u64,
+    ) {
+        engine
+            .ingest_relay_intent(RelayIntentAcceptedEvent {
+                event_type: "relay_intent_accepted".to_string(),
+                ts_ms: sequence * 1_000,
+                group: group.to_string(),
+                execution_queue: execution_queue.to_string(),
+                market: market.to_string(),
+                sequence: sequence.to_string(),
+                kind: 0,
+                payload_b64: place_order_payload(
+                    Side::Bid,
+                    100 + (sequence % 23) as i64,
+                    1,
+                    100 + (sequence % 23) as i64,
+                    10_000 + sequence,
+                    PlaceOrderType::Limit,
+                    SelfTradeBehavior::DecrementTake,
+                    false,
+                    0,
+                    10,
+                ),
+                remaining_accounts: Vec::new(),
+                min_execute_slot: "10".to_string(),
+                expires_at_slot: "0".to_string(),
+                user_owner: owner.to_string(),
+                mango_account: mango_account.to_string(),
+                enqueue_tx_signature: format!("bench-accepted-{sequence}"),
+            })
+            .unwrap();
+        engine
+            .ingest_queue_processed(QueueItemProcessedEvent {
+                event_type: "queue_item_processed".to_string(),
+                ts_ms: sequence * 1_000 + 1,
+                group: group.to_string(),
+                sequence: sequence.to_string(),
+                kind: 0,
+                status: QUEUE_PROCESS_EXECUTED,
+                slot: sequence.to_string(),
+                tx_signature: format!("bench-processed-{sequence}"),
+                processed_unix_ts: None,
+            })
+            .unwrap();
+    }
+
+    fn legacy_validated_local_lookup(
+        engine: &mut ContinuumStateEngine,
+        group: &str,
+        sequence: u64,
+        owner: &str,
+        market: &str,
+    ) -> ValidatedLocalPayload {
+        let intent = engine
+            .find_intent(group, sequence.to_string(), 0)
+            .unwrap()
+            .unwrap();
+        let owner_state = engine.get_user_state(owner, QueueView::Confirmed).unwrap();
+        let market_state = engine
+            .get_market_state(market, QueueView::Confirmed)
+            .unwrap();
+        ValidatedLocalPayload {
+            tracking_key: intent.key.clone(),
+            request_id: intent.key.clone(),
+            group: intent.group.clone(),
+            execution_queue: intent.execution_queue.clone(),
+            market: intent.market.clone(),
+            sequence: intent.sequence.clone(),
+            kind: intent.kind,
+            owner: intent.user_owner.clone(),
+            mango_account: intent.mango_account.clone(),
+            validation_status: "executed".to_string(),
+            validation_error: None,
+            owner_state: Some(owner_state),
+            market_state: Some(market_state),
+        }
+    }
+
+    fn legacy_validated_local_json_lookup(
+        engine: &mut ContinuumStateEngine,
+        group: &str,
+        sequence: u64,
+        owner: &str,
+        market: &str,
+    ) {
+        black_box(
+            engine
+                .find_intent_json(group, sequence.to_string(), 0)
+                .unwrap()
+                .unwrap(),
+        );
+        black_box(
+            engine
+                .get_user_state_json(owner, QueueView::Confirmed)
+                .unwrap(),
+        );
+        black_box(
+            engine
+                .get_market_state_json(market, QueueView::Confirmed)
+                .unwrap(),
+        );
     }
 
     fn bootstrap_market(engine: &mut ContinuumStateEngine, market: &str, last_slot: u64) {
@@ -4171,6 +4824,370 @@ mod tests {
                 }
                 other => panic!("expected ok margin summary, got {other:?}"),
             }
+        });
+    }
+
+    #[test]
+    fn validated_local_payload_uses_incremental_confirmed_state() {
+        run_with_large_stack(|| {
+            let mut engine = ContinuumStateEngine::new();
+            let group = key();
+            let execution_queue = key();
+            let owner = key();
+            let mango_account = key();
+            let market = "13".to_string();
+
+            for sequence in 1..=2u64 {
+                engine
+                    .ingest_relay_intent(RelayIntentAcceptedEvent {
+                        event_type: "relay_intent_accepted".to_string(),
+                        ts_ms: sequence * 1_000,
+                        group: group.clone(),
+                        execution_queue: execution_queue.clone(),
+                        market: market.clone(),
+                        sequence: sequence.to_string(),
+                        kind: 0,
+                        payload_b64: place_order_payload(
+                            Side::Bid,
+                            100 + sequence as i64,
+                            1,
+                            100 + sequence as i64,
+                            1_000 + sequence,
+                            PlaceOrderType::Limit,
+                            SelfTradeBehavior::DecrementTake,
+                            false,
+                            0,
+                            10,
+                        ),
+                        remaining_accounts: Vec::new(),
+                        min_execute_slot: "10".to_string(),
+                        expires_at_slot: "0".to_string(),
+                        user_owner: owner.clone(),
+                        mango_account: mango_account.clone(),
+                        enqueue_tx_signature: format!("tx-accepted-{sequence}"),
+                    })
+                    .unwrap();
+
+                engine
+                    .ingest_queue_processed(QueueItemProcessedEvent {
+                        event_type: "queue_item_processed".to_string(),
+                        ts_ms: sequence * 1_000 + 1,
+                        group: group.clone(),
+                        sequence: sequence.to_string(),
+                        kind: 0,
+                        status: QUEUE_PROCESS_EXECUTED,
+                        slot: sequence.to_string(),
+                        tx_signature: format!("tx-processed-{sequence}"),
+                        processed_unix_ts: None,
+                    })
+                    .unwrap();
+
+                let payload = engine
+                    .get_validated_local_payload(&group, sequence.to_string(), 0)
+                    .unwrap()
+                    .unwrap();
+                let owner_state = payload.owner_state.unwrap();
+                let market_state = payload.market_state.unwrap();
+
+                assert_eq!(owner_state.open_orders.len(), sequence as usize);
+                assert_eq!(market_state.open_orders.len(), sequence as usize);
+                assert_eq!(market_state.watermarks.confirmed_seq, sequence.to_string());
+                assert!(engine.cached_confirmed.is_none());
+                assert_eq!(
+                    engine
+                        .incremental_confirmed
+                        .as_ref()
+                        .unwrap()
+                        .applied_executed_keys
+                        .len(),
+                    sequence as usize
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn validated_local_payload_surfaces_recoverable_confirmed_replay_failures() {
+        run_with_large_stack(|| {
+            let mut engine = ContinuumStateEngine::new();
+            let group = key();
+            let execution_queue = key();
+            let market = "21".to_string();
+            let mut failed: Option<(u64, ValidatedLocalPayload)> = None;
+
+            for sequence in 1..=400u64 {
+                let owner = key();
+                let mango_account = key();
+                ingest_executed_limit_order(
+                    &mut engine,
+                    &group,
+                    &execution_queue,
+                    &owner,
+                    &mango_account,
+                    &market,
+                    sequence,
+                );
+                let payload = engine
+                    .get_validated_local_payload(&group, sequence.to_string(), 0)
+                    .unwrap()
+                    .unwrap();
+                if payload.validation_status == "failed" {
+                    failed = Some((sequence, payload));
+                    break;
+                }
+            }
+
+            let (failed_sequence, failed_payload) =
+                failed.expect("expected burst replay to hit local validation failure");
+            assert_eq!(failed_payload.validation_status, "failed");
+            assert!(failed_payload
+                .validation_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("programs/mango-v4/src/state/orderbook/book.rs"));
+            assert!(
+                failed_payload
+                    .market_state
+                    .as_ref()
+                    .unwrap()
+                    .open_orders
+                    .len()
+                    < failed_sequence as usize
+            );
+            assert_eq!(
+                engine
+                    .incremental_confirmed
+                    .as_ref()
+                    .unwrap()
+                    .failed_executed_keys
+                    .get(&queue_item_key(&group, failed_sequence, 0))
+                    .map(String::as_str),
+                failed_payload.validation_error.as_deref()
+            );
+
+            let confirmed_snapshot = engine.get_snapshot(QueueView::Confirmed).unwrap();
+            assert_eq!(
+                confirmed_snapshot
+                    .markets
+                    .get(&market)
+                    .unwrap()
+                    .open_orders
+                    .len(),
+                failed_payload.market_state.as_ref().unwrap().open_orders.len()
+            );
+
+            let second_owner = key();
+            let second_mango_account = key();
+            ingest_executed_limit_order(
+                &mut engine,
+                &group,
+                &execution_queue,
+                &second_owner,
+                &second_mango_account,
+                "22",
+                failed_sequence + 1,
+            );
+
+            let successful_payload = engine
+                .get_validated_local_payload(&group, (failed_sequence + 1).to_string(), 0)
+                .unwrap()
+                .unwrap();
+            assert_eq!(successful_payload.validation_status, "executed");
+            assert_eq!(successful_payload.validation_error, None);
+            assert_eq!(
+                successful_payload
+                    .owner_state
+                    .as_ref()
+                    .unwrap()
+                    .open_orders
+                    .len(),
+                1
+            );
+            assert_eq!(
+                successful_payload
+                    .market_state
+                    .as_ref()
+                    .unwrap()
+                    .open_orders
+                    .len(),
+                1
+            );
+            assert_eq!(
+                engine
+                    .incremental_confirmed
+                    .as_ref()
+                    .unwrap()
+                    .applied_executed_keys
+                    .len(),
+                (failed_sequence + 1) as usize
+            );
+        });
+    }
+
+    #[test]
+    #[ignore = "microbenchmark"]
+    fn benchmark_validated_local_incremental_vs_legacy_paths() {
+        run_with_large_stack(|| {
+            let owner_count = 32usize;
+            let market_count = 8usize;
+            let warmup_events = 64u64;
+            let measured_events = 512u64;
+
+            let owners: Vec<String> = (0..owner_count).map(|_| key()).collect();
+            let mango_accounts: Vec<String> = (0..owner_count).map(|_| key()).collect();
+            let markets: Vec<String> = (0..market_count).map(|i| (100 + i).to_string()).collect();
+
+            let group = key();
+            let execution_queue = key();
+            let mut legacy_typed = ContinuumStateEngine::new();
+            let mut legacy_json = ContinuumStateEngine::new();
+            let mut incremental_typed = ContinuumStateEngine::new();
+            let mut incremental_json = ContinuumStateEngine::new();
+
+            let mut legacy_typed_samples = Vec::with_capacity(measured_events as usize);
+            let mut legacy_json_samples = Vec::with_capacity(measured_events as usize);
+            let mut incremental_typed_samples = Vec::with_capacity(measured_events as usize);
+            let mut incremental_json_samples = Vec::with_capacity(measured_events as usize);
+
+            for sequence in 1..=(warmup_events + measured_events) {
+                let owner_idx = ((sequence - 1) as usize) % owner_count;
+                let market_idx = ((sequence - 1) as usize) % market_count;
+                let owner = &owners[owner_idx];
+                let mango_account = &mango_accounts[owner_idx];
+                let market = &markets[market_idx];
+
+                for engine in [
+                    &mut legacy_typed,
+                    &mut legacy_json,
+                    &mut incremental_typed,
+                    &mut incremental_json,
+                ] {
+                    ingest_executed_limit_order(
+                        engine,
+                        &group,
+                        &execution_queue,
+                        owner,
+                        mango_account,
+                        market,
+                        sequence,
+                    );
+                }
+
+                if sequence <= warmup_events {
+                    let legacy_payload = legacy_validated_local_lookup(
+                        &mut legacy_typed,
+                        &group,
+                        sequence,
+                        owner,
+                        market,
+                    );
+                    let incremental_payload = incremental_typed
+                        .get_validated_local_payload(&group, sequence.to_string(), 0)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        serde_json::to_string(&legacy_payload).unwrap(),
+                        serde_json::to_string(&incremental_payload).unwrap()
+                    );
+                    legacy_validated_local_json_lookup(
+                        &mut legacy_json,
+                        &group,
+                        sequence,
+                        owner,
+                        market,
+                    );
+                    black_box(
+                        incremental_json
+                            .get_validated_local_payload_json(&group, sequence.to_string(), 0)
+                            .unwrap()
+                            .unwrap(),
+                    );
+                    continue;
+                }
+
+                let legacy_typed_started = Instant::now();
+                let legacy_payload = legacy_validated_local_lookup(
+                    &mut legacy_typed,
+                    &group,
+                    sequence,
+                    owner,
+                    market,
+                );
+                legacy_typed_samples.push(legacy_typed_started.elapsed().as_nanos());
+
+                let incremental_typed_started = Instant::now();
+                let incremental_payload = incremental_typed
+                    .get_validated_local_payload(&group, sequence.to_string(), 0)
+                    .unwrap()
+                    .unwrap();
+                incremental_typed_samples.push(incremental_typed_started.elapsed().as_nanos());
+
+                assert_eq!(
+                    serde_json::to_string(&legacy_payload).unwrap(),
+                    serde_json::to_string(&incremental_payload).unwrap()
+                );
+
+                let legacy_json_started = Instant::now();
+                legacy_validated_local_json_lookup(
+                    &mut legacy_json,
+                    &group,
+                    sequence,
+                    owner,
+                    market,
+                );
+                legacy_json_samples.push(legacy_json_started.elapsed().as_nanos());
+
+                let incremental_json_started = Instant::now();
+                black_box(
+                    incremental_json
+                        .get_validated_local_payload_json(&group, sequence.to_string(), 0)
+                        .unwrap()
+                        .unwrap(),
+                );
+                incremental_json_samples.push(incremental_json_started.elapsed().as_nanos());
+            }
+
+            let legacy_typed_summary = summarize_bench(&legacy_typed_samples);
+            let legacy_json_summary = summarize_bench(&legacy_json_samples);
+            let incremental_typed_summary = summarize_bench(&incremental_typed_samples);
+            let incremental_json_summary = summarize_bench(&incremental_json_samples);
+
+            println!(
+                "validated_local benchmark config: warmup_events={warmup_events} measured_events={measured_events} owners={owner_count} markets={market_count}"
+            );
+            print_bench_summary("legacy_typed", legacy_typed_summary);
+            print_bench_summary("incremental_typed", incremental_typed_summary);
+            print_bench_summary("legacy_json", legacy_json_summary);
+            print_bench_summary("incremental_json", incremental_json_summary);
+            println!(
+                "typed speedup: p50={:.2}x p95={:.2}x p99={:.2}x mean={:.2}x",
+                speedup(
+                    legacy_typed_summary.p50_ns,
+                    incremental_typed_summary.p50_ns
+                ),
+                speedup(
+                    legacy_typed_summary.p95_ns,
+                    incremental_typed_summary.p95_ns
+                ),
+                speedup(
+                    legacy_typed_summary.p99_ns,
+                    incremental_typed_summary.p99_ns
+                ),
+                speedup(
+                    legacy_typed_summary.mean_ns,
+                    incremental_typed_summary.mean_ns
+                ),
+            );
+            println!(
+                "json speedup: p50={:.2}x p95={:.2}x p99={:.2}x mean={:.2}x",
+                speedup(legacy_json_summary.p50_ns, incremental_json_summary.p50_ns),
+                speedup(legacy_json_summary.p95_ns, incremental_json_summary.p95_ns),
+                speedup(legacy_json_summary.p99_ns, incremental_json_summary.p99_ns),
+                speedup(
+                    legacy_json_summary.mean_ns,
+                    incremental_json_summary.mean_ns
+                ),
+            );
         });
     }
 

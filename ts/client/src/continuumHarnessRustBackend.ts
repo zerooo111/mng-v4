@@ -7,19 +7,20 @@ import type {
   DivergenceEvent,
   EngineSnapshot,
   HarnessEvent,
-  MarketCandle,
-  MarketState,
-  MarketTrade,
-  OpenOrderSummary,
+    MarketCandle,
+    MarketState,
+    MarketTrade,
+    OpenOrderSummary,
   QueueItemEnqueuedEvent,
   QueueItemProcessedEvent,
   QueueState,
   QueueView,
-  RelayIntentAcceptedEvent,
-  RelayIntentStatusEvent,
-  UserBalances,
-  UserState,
-} from './continuumHarness';
+    RelayIntentAcceptedEvent,
+    RelayIntentStatusEvent,
+    UserBalances,
+    UserState,
+    ValidatedLocalPayload,
+  } from './continuumHarness';
 
 type NativeContinuumStateEngine = {
   bootstrapFromOnchainSnapshotJson(snapshotJson: string): void;
@@ -30,6 +31,11 @@ type NativeContinuumStateEngine = {
   listDivergencesJson(limit: number): string;
   listIntentsJson(): string;
   findIntentJson(group: string, sequence: string, kind: number): string | null;
+  getValidatedLocalPayloadJson(
+    group: string,
+    sequence: string,
+    kind: number,
+  ): string | null;
   getSnapshotJson(view: QueueView): string;
   getMarketStateJson(market: string, view: QueueView): string;
   getUserStateJson(owner: string, view: QueueView): string;
@@ -80,6 +86,19 @@ class RustContinuumStateEngine implements ContinuumHarnessBackend {
   ): CanonicalIntent | null {
     const raw = this.native.findIntentJson(group, String(sequence), Number(kind));
     return raw ? (JSON.parse(raw) as unknown as CanonicalIntent) : null;
+  }
+
+  getValidatedLocalPayload(
+    group: string,
+    sequence: string | bigint,
+    kind: string | number,
+  ): ValidatedLocalPayload | null {
+    const raw = this.native.getValidatedLocalPayloadJson(
+      group,
+      String(sequence),
+      Number(kind),
+    );
+    return raw ? (JSON.parse(raw) as ValidatedLocalPayload) : null;
   }
 
   getAllTrades(view: QueueView, limit = 200): MarketTrade[] {

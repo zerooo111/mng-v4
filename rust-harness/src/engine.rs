@@ -62,6 +62,7 @@ impl Default for MarketConfig {
     }
 }
 
+#[derive(Clone)]
 struct MarketState {
     market: PerpMarket,
     oracle_price: I80F48,
@@ -70,6 +71,7 @@ struct MarketState {
     event_queue: EventQueue,
 }
 
+#[derive(Clone)]
 struct AccountState {
     owner: Pubkey,
     account: MangoAccountValue,
@@ -177,6 +179,7 @@ pub struct ExecutionResult {
 /// - cancel all / cancel all by side
 ///
 /// Health checks, funding updates, liquidity ops, and NAPI bindings are still pending.
+#[derive(Clone)]
 pub struct HarnessEngine {
     group_key: Pubkey,
     group: Group,

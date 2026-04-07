@@ -16,6 +16,8 @@ import {
 } from '@solana/web3.js';
 import { createHash } from 'crypto';
 import * as dotenv from 'dotenv';
+import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
 import fs from 'fs';
 import http, { IncomingMessage, ServerResponse } from 'http';
 import path from 'path';
@@ -29,6 +31,8 @@ import {
   MarketState,
   MarketTrade,
   OpenOrderSummary,
+  QueueItemProcessedEvent,
+  QueuePayloadVariantHarness,
   QueueState,
   QueueView,
   RelayIntentAcceptedEvent,
@@ -206,6 +210,13 @@ const HARNESS_EVENT_LOOP_SAMPLE_INTERVAL_MS = Number(
 const HARNESS_EVENT_LOOP_LAG_WARN_MS = Number(
   process.env.CONTINUUM_HARNESS_EVENT_LOOP_LAG_WARN_MS || '50',
 );
+const HARNESS_SEQUENCER_GRPC_ADDR =
+  process.env.CONTINUUM_HARNESS_SEQUENCER_GRPC_ADDR || '';
+const HARNESS_SEQUENCER_GRPC_RECONNECT_MS = Number(
+  process.env.CONTINUUM_HARNESS_SEQUENCER_GRPC_RECONNECT_MS || '1000',
+);
+const SEQUENCER_TICK_PROCESSED_SIGNATURE_PREFIX = 'sequencer-tick:';
+const LOCAL_QUEUE_PROCESS_EXECUTED = 2;
 
 let engine!: ContinuumHarnessBackend;
 const sseClients = new Set<ServerResponse>();
@@ -327,6 +338,61 @@ type OnchainSyncState = {
 type DecodedQueueLogEvent = NonNullable<
   ReturnType<typeof decodeQueueAnchorEvent>
 >;
+
+type ContinuumSequencerIntentMetadataWire = {
+  group?: string;
+  execution_queue?: string;
+  market?: string;
+  kind?: string | number;
+  remaining_accounts?: Array<{
+    pubkey?: string;
+    is_signer?: boolean;
+    is_writable?: boolean;
+  }>;
+  min_execute_slot?: string | number;
+  expires_at_slot?: string | number;
+  user_owner?: string;
+  mango_account?: string;
+} | null;
+
+type ContinuumSequencerTransactionWire = {
+  tx_id?: string;
+  payload?: Buffer | Uint8Array | string;
+  intent_metadata?: ContinuumSequencerIntentMetadataWire;
+} | null;
+
+type ContinuumSequencerAcceptedTransactionWire = {
+  transaction?: {
+    tx_id?: string;
+    payload?: Buffer | Uint8Array | string;
+    intent_metadata?: ContinuumSequencerIntentMetadataWire;
+  } | null;
+  sequence_number?: string | number;
+  tx_hash?: string;
+  ingestion_timestamp?: string | number;
+};
+
+type ContinuumSequencerOrderedTransactionWire = {
+  transaction?: ContinuumSequencerTransactionWire;
+  sequence_number?: string | number;
+  tx_hash?: string;
+  ingestion_timestamp?: string | number;
+};
+
+type ContinuumSequencerTickWire = {
+  tick_number?: string | number;
+  transactions?: ContinuumSequencerOrderedTransactionWire[];
+  timestamp?: string | number;
+};
+
+type ContinuumSequencerClient = grpc.Client & {
+  streamAcceptedTransactions(
+    request: Record<string, never>,
+  ): grpc.ClientReadableStream<ContinuumSequencerAcceptedTransactionWire>;
+  streamTicks(
+    request: { start_tick: number },
+  ): grpc.ClientReadableStream<ContinuumSequencerTickWire>;
+};
 
 const programLogBlockTimeCache = new Map<number, number | null>();
 const programLogBlockTimeInflight = new Map<number, Promise<number | null>>();
@@ -531,6 +597,100 @@ type FrontendStreamSubscriber = {
   marketSignature: string | null;
 };
 
+type FrontendPreconfirmIntent =
+  | {
+      action: 'place_order';
+      side: 'bid' | 'ask';
+      price_lots: string;
+      max_base_lots: string;
+      max_quote_lots: string;
+      client_order_id: string;
+      order_type: number;
+      self_trade_behavior: number;
+      reduce_only: boolean;
+      expiry_timestamp: string;
+      limit: number;
+      reserve_estimate: {
+        base_lots: string | null;
+        quote_lots: string | null;
+      };
+    }
+  | {
+      action: 'cancel_order';
+      order_id: string;
+    }
+  | {
+      action: 'cancel_order_by_client_order_id';
+      client_order_id: string;
+    }
+  | {
+      action: 'cancel_all_orders';
+      limit: number;
+    }
+  | {
+      action: 'cancel_all_orders_by_side';
+      side: 'bid' | 'ask' | 'all';
+      limit: number;
+    }
+  | {
+      action: 'liquidity_deposit';
+      amount: string;
+      reduce_only: boolean;
+    }
+  | {
+      action: 'liquidity_withdraw';
+      amount: string;
+      allow_borrow: boolean;
+    }
+  | {
+      action: 'unknown';
+      payload_bytes: number;
+    };
+
+type FrontendPreconfirmEvent = {
+  phase: 'pre_confirmed';
+  source: 'sequencer_ack';
+  ts_ms: number;
+  view: 'optimistic';
+  tracking_key: string;
+  request_id: string | null;
+  group: string;
+  execution_queue: string;
+  market: string;
+  sequence: string;
+  kind: number;
+  owner: string;
+  mango_account: string;
+  enqueue_tx_signature: string;
+  min_execute_slot: string;
+  expires_at_slot: string;
+  intent: FrontendPreconfirmIntent;
+};
+
+type FrontendValidatedLocalEvent = {
+  phase: 'validated_local';
+  source: 'sequencer_tick';
+  ts_ms: number;
+  view: 'confirmed';
+  tracking_key: string;
+  request_id: string | null;
+  group: string;
+  execution_queue: string;
+  market: string;
+  sequence: string;
+  kind: number;
+  owner: string;
+  mango_account: string;
+  queue_process_status: number;
+  queue_process_status_name: string;
+  validation_status: 'executed' | 'failed';
+  validation_error: string | null;
+  tx_signature: string;
+  processed_slot: string;
+  owner_state: UserState | null;
+  market_state: MarketState | null;
+};
+
 type FrontendPayloadBuildCache = {
   snapshotsByView: Map<QueueView, EngineSnapshot>;
   metadataMapPromise: Promise<Record<string, HarnessMarketMetadata>>;
@@ -549,6 +709,14 @@ const tradeStreamCursors = new Map<string, string | null>();
 const marketRuntimeMetricsCache = new Map<
   string,
   { fetchedAtMs: number; data: MarketRuntimeMetrics | null }
+>();
+const bufferedLogWriters = new Map<
+  string,
+  {
+    lines: string[];
+    maxBytes: number;
+    flushing: boolean;
+  }
 >();
 let nextStreamSubscriberSeq = 1;
 let directOnchainRebaseTimer: NodeJS.Timeout | null = null;
@@ -636,6 +804,116 @@ function appendLineWithRotation(
 
   fs.appendFileSync(resolved, line);
   fileSizeCache.set(resolved, currentSize + lineBytes);
+}
+
+async function appendLinesWithRotationAsync(
+  filePath: string,
+  lines: string[],
+  maxBytes: number,
+): Promise<void> {
+  if (!lines.length) {
+    return;
+  }
+  const resolved = path.resolve(filePath);
+  ensureDirForFile(resolved);
+  let currentSize = fileSizeCache.get(resolved);
+  if (currentSize === undefined) {
+    try {
+      currentSize = (await fs.promises.stat(resolved)).size;
+    } catch {
+      currentSize = 0;
+    }
+  }
+
+  const batch = lines.join('');
+  const batchBytes = Buffer.byteLength(batch);
+  if (maxBytes > 0 && currentSize + batchBytes > maxBytes) {
+    const rotatedPath = `${resolved}.1`;
+    try {
+      await fs.promises.unlink(rotatedPath).catch((err: any) => {
+        if (err?.code !== 'ENOENT') {
+          throw err;
+        }
+      });
+      await fs.promises.rename(resolved, rotatedPath).catch((err: any) => {
+        if (err?.code !== 'ENOENT') {
+          throw err;
+        }
+      });
+      currentSize = 0;
+    } catch (err) {
+      const normalized = normalizeError(err);
+      console.error(
+        `[harness:log_rotate] failed to rotate ${resolved}: ${normalized.message}`,
+      );
+    }
+  }
+
+  await fs.promises.appendFile(resolved, batch);
+  fileSizeCache.set(resolved, currentSize + batchBytes);
+}
+
+function queueBufferedLogLine(
+  filePath: string,
+  line: string,
+  maxBytes: number,
+  source: string,
+): void {
+  const resolved = path.resolve(filePath);
+  const writer =
+    bufferedLogWriters.get(resolved) || {
+      lines: [],
+      maxBytes,
+      flushing: false,
+    };
+  writer.lines.push(line);
+  writer.maxBytes = maxBytes;
+  bufferedLogWriters.set(resolved, writer);
+  if (writer.flushing) {
+    return;
+  }
+  writer.flushing = true;
+  setImmediate(() => {
+    void flushBufferedLogWriter(resolved, source);
+  });
+}
+
+async function flushBufferedLogWriter(
+  filePath: string,
+  source: string,
+): Promise<void> {
+  const writer = bufferedLogWriters.get(filePath);
+  if (!writer) {
+    return;
+  }
+  while (writer.lines.length) {
+    const batch = writer.lines.splice(0, writer.lines.length);
+    const startedAt = performance.now();
+    try {
+      await appendLinesWithRotationAsync(filePath, batch, writer.maxBytes);
+      recordLatencySample('flush_buffered_log', performance.now() - startedAt, {
+        thresholdMs: HARNESS_SLOW_COMPONENT_MS,
+        context: {
+          path: filePath,
+          lines: batch.length,
+        },
+      });
+    } catch (err) {
+      recordRuntimeError(source, err, {
+        path: filePath,
+        lines: batch.length,
+      });
+    }
+  }
+  writer.flushing = false;
+  if (writer.lines.length) {
+    writer.flushing = true;
+    setImmediate(() => {
+      void flushBufferedLogWriter(filePath, source);
+    });
+    return;
+  }
+  bufferedLogWriters.delete(filePath);
 }
 
 function recordRuntimeError(
@@ -1018,6 +1296,7 @@ function summarizeBackendCallArgs(
         limit: Number(args[3] ?? 0),
       };
     case 'findIntent':
+    case 'getValidatedLocalPayload':
       return {
         group: String(args[0] ?? ''),
         sequence: String(args[1] ?? ''),
@@ -2420,10 +2699,11 @@ function appendEventLog(event: HarnessEvent): void {
     'append_event_log',
     () => {
       try {
-        appendLineWithRotation(
+        queueBufferedLogLine(
           HARNESS_EVENT_LOG_PATH,
           `${JSON.stringify(event)}\n`,
           HARNESS_EVENT_LOG_MAX_BYTES,
+          'append_event_log',
         );
       } catch (err) {
         recordRuntimeError('append_event_log', err, {
@@ -2454,10 +2734,11 @@ function appendTxnLog(event: HarnessEvent): void {
     'append_txn_log',
     () => {
       try {
-        appendLineWithRotation(
+        queueBufferedLogLine(
           HARNESS_TXN_LOG_PATH,
           `${JSON.stringify(event)}\n`,
           HARNESS_EVENT_LOG_MAX_BYTES,
+          'append_txn_log',
         );
       } catch (err) {
         recordRuntimeError('append_txn_log', err, {
@@ -2565,6 +2846,388 @@ function parseRelayIntentStatusEvent(raw: any): RelayIntentStatusEvent {
         ? null
         : String(raw.queue_process_status_name),
   };
+}
+
+function wireBytesToBuffer(value: unknown): Buffer {
+  if (Buffer.isBuffer(value)) {
+    return value;
+  }
+  if (value instanceof Uint8Array) {
+    return Buffer.from(value);
+  }
+  if (typeof value === 'string') {
+    return Buffer.from(value, 'base64');
+  }
+  return Buffer.alloc(0);
+}
+
+function microsToMs(value: unknown): number {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return Date.now();
+  }
+  return Math.floor(numeric / 1_000);
+}
+
+function hasCanonicalIntentData(intent: any): boolean {
+  return (
+    !!intent &&
+    typeof intent.payload_b64 === 'string' &&
+    intent.payload_b64.length > 0 &&
+    typeof intent.market === 'string' &&
+    intent.market.length > 0 &&
+    intent.market !== 'unknown' &&
+    typeof intent.execution_queue === 'string' &&
+    intent.execution_queue.length > 0 &&
+    intent.execution_queue !== 'unknown'
+  );
+}
+
+function loadContinuumSequencerProto(): any {
+  const protoPath = path.resolve(__dirname, 'continuum_sequencer.proto');
+  const pkgDef = protoLoader.loadSync(protoPath, {
+    keepCase: true,
+    longs: String,
+    enums: String,
+    defaults: true,
+    oneofs: true,
+  });
+  return grpc.loadPackageDefinition(pkgDef) as any;
+}
+
+function createContinuumSequencerClient(
+  address: string,
+): ContinuumSequencerClient {
+  const proto = loadContinuumSequencerProto();
+  return new proto.continuum.sequencer.v1.SequencerService(
+    address,
+    grpc.credentials.createInsecure(),
+    {
+      'grpc.keepalive_time_ms': 15000,
+      'grpc.keepalive_timeout_ms': 5000,
+      'grpc.keepalive_permit_without_calls': 1,
+    },
+  ) as ContinuumSequencerClient;
+}
+
+function sequencerWireToRelayIntentEvent(params: {
+  transaction: ContinuumSequencerTransactionWire;
+  sequenceNumber: string | number | null | undefined;
+  txHash: string | null | undefined;
+  ingestionTimestamp: string | number | null | undefined;
+  requestIdPrefix: string;
+}): RelayIntentAcceptedEvent | null {
+  const tx = params.transaction;
+  const meta = tx?.intent_metadata;
+  if (
+    !tx ||
+    !meta ||
+    !meta.group ||
+    !meta.execution_queue ||
+    !meta.market ||
+    !meta.user_owner ||
+    !meta.mango_account ||
+    params.sequenceNumber === undefined ||
+    params.sequenceNumber === null
+  ) {
+    return null;
+  }
+
+  const payload = wireBytesToBuffer(tx.payload);
+  return parseRelayIntentEvent({
+    event_type: 'relay_intent_accepted',
+    ts_ms: microsToMs(params.ingestionTimestamp),
+    request_id: `${params.requestIdPrefix}:${String(params.sequenceNumber)}:${String(
+      params.txHash || tx.tx_id || 'unknown',
+    )}`,
+    group: String(meta.group),
+    execution_queue: String(meta.execution_queue),
+    market: String(meta.market),
+    sequence: String(params.sequenceNumber),
+    kind: Number(meta.kind ?? 0),
+    payload_b64: payload.toString('base64'),
+    remaining_accounts: Array.isArray(meta.remaining_accounts)
+      ? meta.remaining_accounts.map((account) => ({
+          pubkey: String(account?.pubkey || ''),
+          is_signer: !!account?.is_signer,
+          is_writable: !!account?.is_writable,
+        }))
+      : [],
+    min_execute_slot: String(meta.min_execute_slot ?? '0'),
+    expires_at_slot: String(meta.expires_at_slot ?? '0'),
+    user_owner: String(meta.user_owner),
+    mango_account: String(meta.mango_account),
+    enqueue_tx_signature: String(
+      params.txHash || tx.tx_id || `${meta.group}:${params.sequenceNumber}`,
+    ),
+  });
+}
+
+function acceptedTransactionToRelayIntentEvent(
+  raw: ContinuumSequencerAcceptedTransactionWire,
+): RelayIntentAcceptedEvent | null {
+  return sequencerWireToRelayIntentEvent({
+    transaction: raw.transaction || null,
+    sequenceNumber: raw.sequence_number,
+    txHash: raw.tx_hash,
+    ingestionTimestamp: raw.ingestion_timestamp,
+    requestIdPrefix: 'sequencer',
+  });
+}
+
+function orderedTransactionToRelayIntentEvent(
+  tickNumber: string | number | null | undefined,
+  ordered: ContinuumSequencerOrderedTransactionWire,
+): RelayIntentAcceptedEvent | null {
+  return sequencerWireToRelayIntentEvent({
+    transaction: ordered.transaction || null,
+    sequenceNumber: ordered.sequence_number,
+    txHash: ordered.tx_hash,
+    ingestionTimestamp: ordered.ingestion_timestamp,
+    requestIdPrefix: `sequencer-tick-${String(tickNumber ?? 'unknown')}`,
+  });
+}
+
+function isSequencerLocalProcessedSignature(
+  signature: string | null | undefined,
+): boolean {
+  return (
+    typeof signature === 'string' &&
+    signature.startsWith(SEQUENCER_TICK_PROCESSED_SIGNATURE_PREFIX)
+  );
+}
+
+function orderedTransactionToQueueProcessedEvent(
+  tick: ContinuumSequencerTickWire,
+  ordered: ContinuumSequencerOrderedTransactionWire,
+): QueueItemProcessedEvent | null {
+  const meta = ordered.transaction?.intent_metadata;
+  if (
+    !meta ||
+    !meta.group ||
+    ordered.sequence_number === undefined ||
+    ordered.sequence_number === null
+  ) {
+    return null;
+  }
+  const tickNumber = String(tick.tick_number ?? 'unknown');
+  const txHash = String(
+    ordered.tx_hash ||
+      ordered.transaction?.tx_id ||
+      `${meta.group}:${String(ordered.sequence_number)}`,
+  );
+  const tsMs = microsToMs(tick.timestamp);
+  return {
+    event_type: 'queue_item_processed',
+    ts_ms: tsMs,
+    group: String(meta.group),
+    sequence: String(ordered.sequence_number),
+    kind: Number(meta.kind ?? 0),
+    status: LOCAL_QUEUE_PROCESS_EXECUTED,
+    slot: String(meta.min_execute_slot ?? '0'),
+    tx_signature: `${SEQUENCER_TICK_PROCESSED_SIGNATURE_PREFIX}${tickNumber}:${txHash}`,
+    processed_unix_ts: Math.floor(tsMs / 1_000),
+  };
+}
+
+function startContinuumSequencerAcceptedIngest(): void {
+  if (!HARNESS_SEQUENCER_GRPC_ADDR) {
+    return;
+  }
+
+  const client = createContinuumSequencerClient(HARNESS_SEQUENCER_GRPC_ADDR);
+  let reconnectTimer: NodeJS.Timeout | null = null;
+  let activeCall: grpc.ClientReadableStream<ContinuumSequencerAcceptedTransactionWire> | null =
+    null;
+
+  const scheduleReconnect = (reason: string) => {
+    if (reconnectTimer) {
+      return;
+    }
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      connect();
+    }, Math.max(100, HARNESS_SEQUENCER_GRPC_RECONNECT_MS));
+    recordRuntimeError('sequencer_accept_stream_reconnect', reason, {
+      addr: HARNESS_SEQUENCER_GRPC_ADDR,
+    });
+  };
+
+  const clearActiveCall = () => {
+    activeCall = null;
+  };
+
+  const connect = () => {
+    if (activeCall) {
+      return;
+    }
+
+    try {
+      activeCall = client.streamAcceptedTransactions({});
+    } catch (err) {
+      recordRuntimeError('sequencer_accept_stream_connect', err, {
+        addr: HARNESS_SEQUENCER_GRPC_ADDR,
+      });
+      scheduleReconnect('connect_exception');
+      return;
+    }
+
+    activeCall.on('data', (raw) => {
+      measureSync(
+        'sequencer_accept_stream_message',
+        () => {
+          const event = acceptedTransactionToRelayIntentEvent(raw);
+          if (!event) {
+            return;
+          }
+          const existing = engine.findIntent(event.group, event.sequence, event.kind);
+          if (hasCanonicalIntentData(existing)) {
+            return;
+          }
+          engine.ingestRelayIntent(event);
+        },
+        {
+          thresholdMs: HARNESS_SLOW_COMPONENT_MS,
+          context: {
+            sequence:
+              raw.sequence_number === undefined || raw.sequence_number === null
+                ? 'unknown'
+                : String(raw.sequence_number),
+            tx_hash: raw.tx_hash || 'unknown',
+          },
+        },
+      );
+    });
+
+    activeCall.on('error', (err) => {
+      clearActiveCall();
+      recordRuntimeError('sequencer_accept_stream', err, {
+        addr: HARNESS_SEQUENCER_GRPC_ADDR,
+      });
+      scheduleReconnect('error');
+    });
+
+    activeCall.on('end', () => {
+      clearActiveCall();
+      scheduleReconnect('end');
+    });
+
+    activeCall.on('close', () => {
+      clearActiveCall();
+      scheduleReconnect('close');
+    });
+  };
+
+  connect();
+}
+
+function startContinuumSequencerTickIngest(): void {
+  if (!HARNESS_SEQUENCER_GRPC_ADDR) {
+    return;
+  }
+
+  const client = createContinuumSequencerClient(HARNESS_SEQUENCER_GRPC_ADDR);
+  let reconnectTimer: NodeJS.Timeout | null = null;
+  let activeCall: grpc.ClientReadableStream<ContinuumSequencerTickWire> | null =
+    null;
+
+  const scheduleReconnect = (reason: string) => {
+    if (reconnectTimer) {
+      return;
+    }
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      connect();
+    }, Math.max(100, HARNESS_SEQUENCER_GRPC_RECONNECT_MS));
+    recordRuntimeError('sequencer_tick_stream_reconnect', reason, {
+      addr: HARNESS_SEQUENCER_GRPC_ADDR,
+    });
+  };
+
+  const clearActiveCall = () => {
+    activeCall = null;
+  };
+
+  const connect = () => {
+    if (activeCall) {
+      return;
+    }
+
+    try {
+      activeCall = client.streamTicks({ start_tick: 0 });
+    } catch (err) {
+      recordRuntimeError('sequencer_tick_stream_connect', err, {
+        addr: HARNESS_SEQUENCER_GRPC_ADDR,
+      });
+      scheduleReconnect('connect_exception');
+      return;
+    }
+
+    activeCall.on('data', (tick) => {
+      measureSync(
+        'sequencer_tick_stream_message',
+        () => {
+          for (const ordered of tick.transactions || []) {
+            const acceptedEvent = orderedTransactionToRelayIntentEvent(
+              tick.tick_number,
+              ordered,
+            );
+            if (acceptedEvent) {
+              const existing = engine.findIntent(
+                acceptedEvent.group,
+                acceptedEvent.sequence,
+                acceptedEvent.kind,
+              );
+              if (!hasCanonicalIntentData(existing)) {
+                engine.ingestRelayIntent(acceptedEvent);
+              }
+            }
+
+            const processedEvent = orderedTransactionToQueueProcessedEvent(
+              tick,
+              ordered,
+            );
+            if (!processedEvent) {
+              continue;
+            }
+            engine.ingestQueueProcessed(processedEvent);
+          }
+        },
+        {
+          thresholdMs: HARNESS_SLOW_COMPONENT_MS,
+          context: {
+            tick_number:
+              tick.tick_number === undefined || tick.tick_number === null
+                ? 'unknown'
+                : String(tick.tick_number),
+            transactions: Array.isArray(tick.transactions)
+              ? tick.transactions.length
+              : 0,
+          },
+        },
+      );
+    });
+
+    activeCall.on('error', (err) => {
+      clearActiveCall();
+      recordRuntimeError('sequencer_tick_stream', err, {
+        addr: HARNESS_SEQUENCER_GRPC_ADDR,
+      });
+      scheduleReconnect('error');
+    });
+
+    activeCall.on('end', () => {
+      clearActiveCall();
+      scheduleReconnect('end');
+    });
+
+    activeCall.on('close', () => {
+      clearActiveCall();
+      scheduleReconnect('close');
+    });
+  };
+
+  connect();
 }
 
 function parseRelayIngestEvent(
@@ -4847,6 +5510,325 @@ function deriveEventContext(event: HarnessEvent): {
   };
 }
 
+function frontendSubscriberMatchesOptions(
+  subscriber: FrontendStreamSubscriber,
+  options: {
+    owner?: string | null;
+    mangoAccount?: string | null;
+    market?: string | null;
+    forceAll?: boolean;
+  },
+): boolean {
+  const shouldConsiderOwner =
+    options.forceAll ||
+    (!!options.owner &&
+      (!subscriber.owner || subscriber.owner === options.owner)) ||
+    (!!options.mangoAccount &&
+      (!subscriber.mangoAccount ||
+        subscriber.mangoAccount === options.mangoAccount));
+  const shouldConsiderMarket =
+    options.forceAll ||
+    (!!options.market &&
+      (!subscriber.market || subscriber.market === options.market));
+  if (!options.forceAll && !shouldConsiderOwner && !shouldConsiderMarket) {
+    return false;
+  }
+  return true;
+}
+
+function sideFromDiscriminant(side: number): 'bid' | 'ask' {
+  return side === 0 ? 'bid' : 'ask';
+}
+
+function buildFrontendPreconfirmIntent(
+  event: RelayIntentAcceptedEvent,
+): FrontendPreconfirmIntent {
+  const payload = Buffer.from(event.payload_b64, 'base64');
+  try {
+    const decoded = decodeQueuePayload(payload);
+    switch (decoded.variant) {
+      case QueuePayloadVariantHarness.PerpPlaceOrderV2: {
+        const side = sideFromDiscriminant(decoded.side);
+        return {
+          action: 'place_order',
+          side,
+          price_lots: decoded.price_lots.toString(),
+          max_base_lots: decoded.max_base_lots.toString(),
+          max_quote_lots: decoded.max_quote_lots.toString(),
+          client_order_id: decoded.client_order_id.toString(),
+          order_type: decoded.order_type,
+          self_trade_behavior: decoded.self_trade_behavior,
+          reduce_only: decoded.reduce_only,
+          expiry_timestamp: decoded.expiry_timestamp.toString(),
+          limit: decoded.limit,
+          reserve_estimate: {
+            base_lots: side === 'ask' ? decoded.max_base_lots.toString() : null,
+            quote_lots: side === 'bid' ? decoded.max_quote_lots.toString() : null,
+          },
+        };
+      }
+      case QueuePayloadVariantHarness.PerpCancelOrder:
+        return {
+          action: 'cancel_order',
+          order_id: decoded.order_id.toString(),
+        };
+      case QueuePayloadVariantHarness.PerpCancelOrderByClientOrderId:
+        return {
+          action: 'cancel_order_by_client_order_id',
+          client_order_id: decoded.client_order_id.toString(),
+        };
+      case QueuePayloadVariantHarness.PerpCancelAllOrders:
+        return {
+          action: 'cancel_all_orders',
+          limit: decoded.limit,
+        };
+      case QueuePayloadVariantHarness.PerpCancelAllOrdersBySide:
+        return {
+          action: 'cancel_all_orders_by_side',
+          side:
+            decoded.side_option === null
+              ? 'all'
+              : sideFromDiscriminant(decoded.side_option),
+          limit: decoded.limit,
+        };
+      case QueuePayloadVariantHarness.LiquidityDeposit:
+        return {
+          action: 'liquidity_deposit',
+          amount: decoded.amount.toString(),
+          reduce_only: decoded.reduce_only,
+        };
+      case QueuePayloadVariantHarness.LiquidityWithdraw:
+        return {
+          action: 'liquidity_withdraw',
+          amount: decoded.amount.toString(),
+          allow_borrow: decoded.allow_borrow,
+        };
+      default:
+        return {
+          action: 'unknown',
+          payload_bytes: payload.length,
+        };
+    }
+  } catch {
+    return {
+      action: 'unknown',
+      payload_bytes: payload.length,
+    };
+  }
+}
+
+function buildFrontendPreconfirmEvent(
+  event: RelayIntentAcceptedEvent,
+): FrontendPreconfirmEvent {
+  return {
+    phase: 'pre_confirmed',
+    source: 'sequencer_ack',
+    ts_ms: event.ts_ms || Date.now(),
+    view: 'optimistic',
+    tracking_key: `${event.group}:${event.sequence}:${event.kind}`,
+    request_id: event.request_id || null,
+    group: event.group,
+    execution_queue: event.execution_queue,
+    market: event.market,
+    sequence: event.sequence,
+    kind: event.kind,
+    owner: event.user_owner,
+    mango_account: event.mango_account,
+    enqueue_tx_signature: event.enqueue_tx_signature,
+    min_execute_slot: event.min_execute_slot,
+    expires_at_slot: event.expires_at_slot,
+    intent: buildFrontendPreconfirmIntent(event),
+  };
+}
+
+function subscriberShouldReceivePreconfirm(
+  subscriber: FrontendStreamSubscriber,
+  event: RelayIntentAcceptedEvent,
+): boolean {
+  if (subscriber.view !== 'optimistic' || !subscriber.include.has('pre_confirm')) {
+    return false;
+  }
+  if (subscriber.owner && subscriber.owner !== event.user_owner) {
+    return false;
+  }
+  if (subscriber.mangoAccount && subscriber.mangoAccount !== event.mango_account) {
+    return false;
+  }
+  if (subscriber.market && subscriber.market !== event.market) {
+    return false;
+  }
+  return true;
+}
+
+function hasLegacyAcceptedSnapshotSubscribers(options: {
+  owner?: string | null;
+  mangoAccount?: string | null;
+  market?: string | null;
+}): boolean {
+  for (const subscriber of frontendStreamSubscribers.values()) {
+    if (
+      subscriber.view === 'optimistic' &&
+      !subscriber.include.has('pre_confirm') &&
+      frontendSubscriberMatchesOptions(subscriber, options)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function notifyFrontendPreconfirmSubscribers(
+  event: RelayIntentAcceptedEvent,
+): void {
+  if (!frontendStreamSubscribers.size) {
+    return;
+  }
+  measureSync(
+    'notify_frontend_preconfirm_subscribers',
+    () => {
+      const payload = buildFrontendPreconfirmEvent(event);
+      for (const subscriber of Array.from(frontendStreamSubscribers.values())) {
+        if (!subscriberShouldReceivePreconfirm(subscriber, event)) {
+          continue;
+        }
+        if (
+          !writeSseEvent(
+            subscriber.res,
+            'pre_confirm',
+            payload,
+            'frontend_stream_pre_confirm',
+          )
+        ) {
+          frontendStreamSubscribers.delete(subscriber.id);
+        }
+      }
+    },
+    {
+      thresholdMs: HARNESS_SLOW_SSE_NOTIFY_MS,
+      context: {
+        subscribers: frontendStreamSubscribers.size,
+        owner: event.user_owner,
+        mango_account: event.mango_account,
+        market: event.market,
+      },
+    },
+  );
+}
+
+function buildFrontendValidatedLocalEvent(
+  event: QueueItemProcessedEvent,
+): FrontendValidatedLocalEvent | null {
+  const payload = engine.getValidatedLocalPayload(
+    event.group,
+    event.sequence,
+    event.kind,
+  );
+  if (!payload) {
+    return null;
+  }
+  return {
+    phase: 'validated_local',
+    source: 'sequencer_tick',
+    ts_ms: event.ts_ms || Date.now(),
+    view: 'confirmed',
+    tracking_key: payload.tracking_key,
+    request_id: payload.request_id || null,
+    group: payload.group,
+    execution_queue: payload.execution_queue,
+    market: payload.market,
+    sequence: payload.sequence,
+    kind: payload.kind,
+    owner: payload.owner,
+    mango_account: payload.mango_account,
+    queue_process_status: event.status,
+    queue_process_status_name: 'executed',
+    validation_status: payload.validation_status,
+    validation_error: payload.validation_error,
+    tx_signature: event.tx_signature,
+    processed_slot: event.slot,
+    owner_state: payload.owner_state,
+    market_state: payload.market_state,
+  };
+}
+
+function subscriberShouldReceiveValidatedLocal(
+  subscriber: FrontendStreamSubscriber,
+  payload: FrontendValidatedLocalEvent,
+): boolean {
+  if (!subscriber.include.has('validated_local')) {
+    return false;
+  }
+  if (subscriber.owner && subscriber.owner !== payload.owner) {
+    return false;
+  }
+  if (
+    subscriber.mangoAccount &&
+    subscriber.mangoAccount !== payload.mango_account
+  ) {
+    return false;
+  }
+  if (subscriber.market && subscriber.market !== payload.market) {
+    return false;
+  }
+  return true;
+}
+
+function hasLegacyValidatedLocalSnapshotSubscribers(options: {
+  owner?: string | null;
+  mangoAccount?: string | null;
+  market?: string | null;
+}): boolean {
+  for (const subscriber of frontendStreamSubscribers.values()) {
+    if (
+      !subscriber.include.has('validated_local') &&
+      frontendSubscriberMatchesOptions(subscriber, options)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function notifyFrontendValidatedLocalSubscribers(
+  event: QueueItemProcessedEvent,
+): void {
+  if (!frontendStreamSubscribers.size) {
+    return;
+  }
+  measureSync(
+    'notify_frontend_validated_local_subscribers',
+    () => {
+      const payload = buildFrontendValidatedLocalEvent(event);
+      if (!payload) {
+        return;
+      }
+      for (const subscriber of Array.from(frontendStreamSubscribers.values())) {
+        if (!subscriberShouldReceiveValidatedLocal(subscriber, payload)) {
+          continue;
+        }
+        if (
+          !writeSseEvent(
+            subscriber.res,
+            'validated_local',
+            payload,
+            'frontend_stream_validated_local',
+          )
+        ) {
+          frontendStreamSubscribers.delete(subscriber.id);
+        }
+      }
+    },
+    {
+      thresholdMs: HARNESS_SLOW_SSE_NOTIFY_MS,
+      context: {
+        subscribers: frontendStreamSubscribers.size,
+        tx_signature: event.tx_signature,
+        sequence: event.sequence,
+      },
+    },
+  );
+}
+
 async function buildFrontendSnapshotPayload(
   subscriber: FrontendStreamSubscriber,
   onchain: OnchainContext | null,
@@ -5073,22 +6055,7 @@ async function notifyFrontendSubscribers(
       };
 
       for (const subscriber of Array.from(frontendStreamSubscribers.values())) {
-        const shouldConsiderOwner =
-          options.forceAll ||
-          (!!options.owner &&
-            (!subscriber.owner || subscriber.owner === options.owner)) ||
-          (!!options.mangoAccount &&
-            (!subscriber.mangoAccount ||
-              subscriber.mangoAccount === options.mangoAccount));
-        const shouldConsiderMarket =
-          options.forceAll ||
-          (!!options.market &&
-            (!subscriber.market || subscriber.market === options.market));
-        if (
-          !options.forceAll &&
-          !shouldConsiderOwner &&
-          !shouldConsiderMarket
-        ) {
+        if (!frontendSubscriberMatchesOptions(subscriber, options)) {
           continue;
         }
 
@@ -5633,10 +6600,23 @@ function buildHttpServer(
             : 'summary';
         const defaultIncludes = [
           ...(owner || mangoAccount
-            ? ['positions', 'open_orders', 'trades', 'account_metrics']
+            ? [
+                'positions',
+                'open_orders',
+                'trades',
+                'account_metrics',
+                'pre_confirm',
+                'validated_local',
+              ]
             : []),
           ...(market
-            ? ['market_metrics', 'trade_summary', 'orderbook_summary']
+            ? [
+                'market_metrics',
+                'trade_summary',
+                'orderbook_summary',
+                'pre_confirm',
+                'validated_local',
+              ]
             : []),
         ];
         if (market && orderbookMode === 'full') {
@@ -5677,6 +6657,16 @@ function buildHttpServer(
           owner,
           mango_account: mangoAccount,
           market,
+          supported_events:
+            [
+              'snapshot',
+              'account_update',
+              'market_update',
+              ...(view === 'optimistic' && include.has('pre_confirm')
+                ? ['pre_confirm']
+                : []),
+              ...(include.has('validated_local') ? ['validated_local'] : []),
+            ],
         });
         writeSseEvent(res, 'snapshot', {
           view,
@@ -6250,6 +7240,16 @@ async function main(): Promise<void> {
 
   engine.subscribe((event) => {
     try {
+      const isLocalValidatedEvent =
+        event.event_type === 'queue_item_processed' &&
+        event.status === LOCAL_QUEUE_PROCESS_EXECUTED &&
+        isSequencerLocalProcessedSignature(event.tx_signature);
+      if (event.event_type === 'relay_intent_accepted') {
+        notifyFrontendPreconfirmSubscribers(event);
+      }
+      if (isLocalValidatedEvent) {
+        notifyFrontendValidatedLocalSubscribers(event);
+      }
       appendEventLog(event);
       appendTxnLog(event);
       broadcastEvent(event);
@@ -6257,18 +7257,38 @@ async function main(): Promise<void> {
       if (context.market) {
         marketRuntimeMetricsCache.delete(context.market);
       }
-      scheduleTradeStreamNotification(event);
-      scheduleFrontendStreamNotification(onchain, onchainSync, {
-        owner: context.owner,
-        mangoAccount: context.mangoAccount,
-        market: context.market,
-      });
+      if (event.event_type !== 'relay_intent_accepted') {
+        scheduleTradeStreamNotification(event);
+      }
+      if (
+        (event.event_type !== 'relay_intent_accepted' ||
+          hasLegacyAcceptedSnapshotSubscribers({
+            owner: context.owner,
+            mangoAccount: context.mangoAccount,
+            market: context.market,
+          })) &&
+        (!isLocalValidatedEvent ||
+          hasLegacyValidatedLocalSnapshotSubscribers({
+            owner: context.owner,
+            mangoAccount: context.mangoAccount,
+            market: context.market,
+          }))
+      ) {
+        scheduleFrontendStreamNotification(onchain, onchainSync, {
+          owner: context.owner,
+          mangoAccount: context.mangoAccount,
+          market: context.market,
+        });
+      }
     } catch (err) {
       recordRuntimeError('engine_subscriber', err, {
         event_type: event.event_type,
       });
     }
   });
+
+  startContinuumSequencerAcceptedIngest();
+  startContinuumSequencerTickIngest();
 
   await connection.onLogs(
     programId,

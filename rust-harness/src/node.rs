@@ -78,6 +78,18 @@ impl NativeContinuumStateEngine {
         })
     }
 
+    #[napi(js_name = "getValidatedLocalPayloadJson")]
+    pub fn get_validated_local_payload_json(
+        &self,
+        group: String,
+        sequence: String,
+        kind: u32,
+    ) -> Result<Option<String>> {
+        self.with_engine("get_validated_local_payload_json", |engine| {
+            engine.get_validated_local_payload_json(&group, &sequence, kind as u8)
+        })
+    }
+
     #[napi(js_name = "getSnapshotJson")]
     pub fn get_snapshot_json(&self, view: String) -> Result<String> {
         let view = parse_view(&view)?;

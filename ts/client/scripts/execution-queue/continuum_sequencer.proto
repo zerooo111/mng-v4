@@ -1,0 +1,73 @@
+syntax = "proto3";
+
+package continuum.sequencer.v1;
+
+service SequencerService {
+  rpc StreamAcceptedTransactions(StreamAcceptedTransactionsRequest)
+      returns (stream AcceptedTransaction);
+  rpc StreamTicks(StreamTicksRequest) returns (stream Tick);
+}
+
+message AccountMeta {
+  string pubkey = 1;
+  bool is_signer = 2;
+  bool is_writable = 3;
+}
+
+message IntentMetadata {
+  string group = 1;
+  string execution_queue = 2;
+  string market = 3;
+  uint32 kind = 4;
+  repeated AccountMeta remaining_accounts = 5;
+  uint64 min_execute_slot = 6;
+  uint64 expires_at_slot = 7;
+  string user_owner = 8;
+  string mango_account = 9;
+}
+
+message Transaction {
+  string tx_id = 1;
+  bytes payload = 2;
+  bytes signature = 3;
+  bytes public_key = 4;
+  uint64 nonce = 5;
+  uint64 timestamp = 6;
+  IntentMetadata intent_metadata = 7;
+}
+
+message StreamAcceptedTransactionsRequest {}
+
+message AcceptedTransaction {
+  Transaction transaction = 1;
+  uint64 sequence_number = 2;
+  string tx_hash = 3;
+  uint64 ingestion_timestamp = 4;
+}
+
+message StreamTicksRequest {
+  uint64 start_tick = 1;
+}
+
+message Tick {
+  uint64 tick_number = 1;
+  VdfProof vdf_proof = 2;
+  repeated OrderedTransaction transactions = 3;
+  string transaction_batch_hash = 4;
+  uint64 timestamp = 5;
+  string previous_output = 6;
+}
+
+message VdfProof {
+  string input = 1;
+  string output = 2;
+  string proof = 3;
+  uint64 iterations = 4;
+}
+
+message OrderedTransaction {
+  Transaction transaction = 1;
+  uint64 sequence_number = 2;
+  string tx_hash = 3;
+  uint64 ingestion_timestamp = 4;
+}
