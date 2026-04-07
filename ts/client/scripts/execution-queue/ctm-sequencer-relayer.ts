@@ -6,6 +6,7 @@ import {
   Keypair,
   PublicKey,
 } from '@solana/web3.js';
+import crypto from 'crypto';
 import * as dotenv from 'dotenv';
 import fs from 'fs';
 import path from 'path';
@@ -460,6 +461,7 @@ function deriveWsEndpoint(httpUrl: string): string | null {
 
 async function maybeEmitRelayIntentAccepted(event: {
   ts_ms: number;
+  request_id: string;
   group: string;
   execution_queue: string;
   market: string;
@@ -473,6 +475,39 @@ async function maybeEmitRelayIntentAccepted(event: {
   mango_account: string;
   enqueue_tx_signature: string;
 }): Promise<void> {
+  await maybeEmitRelayEvent({
+    event_type: 'relay_intent_accepted',
+    ...event,
+  });
+}
+
+async function maybeEmitRelayIntentStatus(event: {
+  ts_ms: number;
+  request_id: string;
+  status_code: number;
+  status_label: string;
+  reason: string | null;
+  group: string | null;
+  execution_queue: string | null;
+  market: string | null;
+  sequence: string | null;
+  kind: number | null;
+  user_owner: string | null;
+  mango_account: string | null;
+  tx_signature: string | null;
+  grpc_code: number | null;
+  queue_process_status: number | null;
+  queue_process_status_name: string | null;
+}): Promise<void> {
+  const payload = {
+    event_type: 'relay_intent_status',
+    ...event,
+  };
+  console.log(JSON.stringify(payload));
+  await maybeEmitRelayEvent(payload);
+}
+
+async function maybeEmitRelayEvent(event: Record<string, unknown>): Promise<void> {
   if (!RELAYER_EVENT_SINK_URL) {
     return;
   }
@@ -484,10 +519,7 @@ async function maybeEmitRelayIntentAccepted(event: {
     headers.Authorization = `Bearer ${RELAYER_EVENT_SINK_AUTH_TOKEN}`;
   }
 
-  const body = JSON.stringify({
-    event_type: 'relay_intent_accepted',
-    ...event,
-  });
+  const body = JSON.stringify(event);
 
   try {
     const response = await fetch(RELAYER_EVENT_SINK_URL, {
@@ -676,13 +708,17 @@ async function main(): Promise<void> {
       let blockhashMs = 0;
       let buildMs = 0;
       let sendMs = 0;
+      const requestId = crypto.randomUUID();
+      const rawReq = call.request;
+      let sequence: bigint | null = null;
+      let builtKind: number | null = null;
       try {
         const gateStartMs = nowMs();
         await inflightGate.acquireWithTimeout(RELAYER_QUEUE_WAIT_TIMEOUT_MS);
         gateMs = nowMs() - gateStartMs;
         gateHeld = true;
 
-        const req = call.request;
+        const req = rawReq;
         const group = cachedPublicKey(req.group);
         const executionQueue = cachedPublicKey(req.execution_queue);
         const userOwner = cachedPublicKey(req.user_owner);
@@ -722,7 +758,8 @@ async function main(): Promise<void> {
           signature: Buffer.from(req.user_signature ?? []),
         };
 
-        const submitWithSequence = async (sequence: bigint) => {
+        const submitWithSequence = async (nextSequence: bigint) => {
+          sequence = nextSequence;
           const buildStartMs = nowMs();
           const built = await buildExecutionQueueEnqueueCtmWithIntentIxs({
             programId,
@@ -732,7 +769,7 @@ async function main(): Promise<void> {
               configuredExecutionQueueBuffer || executionQueue,
             remainingAccounts,
             payload,
-            sequence,
+            sequence: nextSequence,
             minExecuteSlot,
             expiresAtSlot,
             userOwner,
@@ -770,7 +807,29 @@ async function main(): Promise<void> {
             built.ctmEnvelopePreInstruction,
             built.enqueueInstruction,
           ];
+          builtKind = built.envelope.kind;
           buildMs += nowMs() - buildStartMs;
+
+          void maybeEmitRelayIntentStatus({
+            ts_ms: Date.now(),
+            request_id: requestId,
+            status_code: 1,
+            status_label: 'accepted',
+            reason: null,
+            group: group.toBase58(),
+            execution_queue: executionQueue.toBase58(),
+            market: req.market,
+            sequence: nextSequence.toString(),
+            kind: built.envelope.kind,
+            user_owner: userOwner.toBase58(),
+            mango_account: mangoAccount.toBase58(),
+            tx_signature: null,
+            grpc_code: null,
+            queue_process_status: null,
+            queue_process_status_name: null,
+          }).catch((sinkErr) => {
+            console.error('relay status sink async emit failed:', sinkErr);
+          });
 
           const latestBlockhash = latestForSlot;
           const sendStartMs = nowMs();
@@ -789,10 +848,29 @@ async function main(): Promise<void> {
               pollMs: RELAYER_POST_SEND_STATUS_POLL_MS,
             });
           }
+          void maybeEmitRelayIntentStatus({
+            ts_ms: Date.now(),
+            request_id: requestId,
+            status_code: 2,
+            status_label: 'submitted',
+            reason: null,
+            group: group.toBase58(),
+            execution_queue: executionQueue.toBase58(),
+            market: req.market,
+            sequence: nextSequence.toString(),
+            kind: built.envelope.kind,
+            user_owner: userOwner.toBase58(),
+            mango_account: mangoAccount.toBase58(),
+            tx_signature: status.signature,
+            grpc_code: null,
+            queue_process_status: null,
+            queue_process_status_name: null,
+          }).catch((sinkErr) => {
+            console.error('relay status sink async emit failed:', sinkErr);
+          });
           return { built, status };
         };
 
-        let sequence: bigint;
         let value: Awaited<ReturnType<typeof submitWithSequence>>;
         if (RELAYER_SERIALIZE_SUBMITS) {
           const res = await sequenceStore.withNextSequence(
@@ -808,10 +886,11 @@ async function main(): Promise<void> {
 
         void maybeEmitRelayIntentAccepted({
           ts_ms: Date.now(),
+          request_id: requestId,
           group: group.toBase58(),
           execution_queue: executionQueue.toBase58(),
           market: req.market,
-          sequence: sequence.toString(),
+          sequence: sequence!.toString(),
           kind: value.built.envelope.kind,
           payload_b64: payload.toString('base64'),
           remaining_accounts: req.remaining_accounts ?? [],
@@ -838,6 +917,28 @@ async function main(): Promise<void> {
                 err?.message?.includes('DEADLINE_EXCEEDED')
               ? grpc.status.DEADLINE_EXCEEDED
               : grpc.status.INVALID_ARGUMENT;
+        void maybeEmitRelayIntentStatus({
+          ts_ms: Date.now(),
+          request_id: requestId,
+          status_code: 0,
+          status_label: 'rejected',
+          reason: err?.message || `${err}`,
+          group: rawReq.group ? String(rawReq.group) : null,
+          execution_queue: rawReq.execution_queue
+            ? String(rawReq.execution_queue)
+            : null,
+          market: rawReq.market ? String(rawReq.market) : null,
+          sequence: sequence ? sequence.toString() : null,
+          kind: builtKind,
+          user_owner: rawReq.user_owner ? String(rawReq.user_owner) : null,
+          mango_account: rawReq.mango_account ? String(rawReq.mango_account) : null,
+          tx_signature: null,
+          grpc_code: code,
+          queue_process_status: null,
+          queue_process_status_name: null,
+        }).catch((sinkErr) => {
+          console.error('relay status sink async emit failed:', sinkErr);
+        });
         callback(
           {
             code,

@@ -66,6 +66,7 @@ use proto::{
 };
 
 const SPL_MEMO_PROGRAM_ID: Pubkey = pubkey!("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
+static NEXT_RELAY_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 struct Config {
@@ -125,6 +126,7 @@ struct Config {
     executor_admin_tx_timeout_ms: u64,
     executor_expired_head_drop_batch_max: usize,
     executor_expired_head_drop_grace_secs: u64,
+    executor_gap_recovery_drop_batch_max: usize,
     /// Maximum consecutive failures for the same sequence before the executor
     /// proactively fires an admin-drop tx. This handles the case where the
     /// normal auto-drop path (via signature status + log inspection) fails
@@ -268,6 +270,8 @@ impl Config {
             parse_u64_env("EXECUTION_QUEUE_CRANK_EXPIRED_HEAD_DROP_BATCH_MAX", 8)? as usize;
         let executor_expired_head_drop_grace_secs =
             parse_u64_env("EXECUTION_QUEUE_CRANK_EXPIRED_HEAD_DROP_GRACE_SECS", 5)?;
+        let executor_gap_recovery_drop_batch_max =
+            parse_u64_env("EXECUTION_QUEUE_CRANK_GAP_RECOVERY_DROP_BATCH_MAX", 8)? as usize;
         let executor_max_sequence_failures =
             parse_u64_env("EXECUTION_QUEUE_CRANK_MAX_SEQUENCE_FAILURES", 5)? as u32;
         let executor_no_lane_match_drop_slots =
@@ -330,6 +334,7 @@ impl Config {
             executor_admin_tx_timeout_ms,
             executor_expired_head_drop_batch_max,
             executor_expired_head_drop_grace_secs,
+            executor_gap_recovery_drop_batch_max,
             executor_max_sequence_failures,
             executor_no_lane_match_drop_slots,
         })
@@ -794,12 +799,109 @@ struct RelayEventAccountMeta {
 #[derive(Deserialize)]
 struct RelayIntentAcceptedEvent {
     event_type: String,
+    #[serde(default)]
+    request_id: Option<String>,
     group: String,
     execution_queue: String,
     market: String,
     sequence: String,
     user_owner: String,
     remaining_accounts: Vec<RelayEventAccountMeta>,
+}
+
+#[derive(Clone)]
+struct RelayIntentStatusContext {
+    request_id: String,
+    group: Option<String>,
+    execution_queue: Option<String>,
+    market: Option<String>,
+    sequence: Option<String>,
+    kind: Option<u32>,
+    user_owner: Option<String>,
+    mango_account: Option<String>,
+    tx_signature: Option<String>,
+}
+
+#[derive(Serialize)]
+struct RelayIntentStatusEvent {
+    event_type: &'static str,
+    ts_ms: u64,
+    request_id: String,
+    status_code: u8,
+    status_label: String,
+    reason: Option<String>,
+    group: Option<String>,
+    execution_queue: Option<String>,
+    market: Option<String>,
+    sequence: Option<String>,
+    kind: Option<u32>,
+    user_owner: Option<String>,
+    mango_account: Option<String>,
+    tx_signature: Option<String>,
+    grpc_code: Option<i32>,
+    queue_process_status: Option<u32>,
+    queue_process_status_name: Option<String>,
+}
+
+impl RelayIntentStatusContext {
+    fn from_request(request: &SubmitIntentRequest) -> Self {
+        let next_id = NEXT_RELAY_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+        Self {
+            request_id: format!("relay-{}-{next_id}", unix_timestamp_ms()),
+            group: (!request.group.is_empty()).then(|| request.group.clone()),
+            execution_queue: (!request.execution_queue.is_empty())
+                .then(|| request.execution_queue.clone()),
+            market: (!request.market.is_empty()).then(|| request.market.clone()),
+            sequence: None,
+            kind: None,
+            user_owner: (!request.user_owner.is_empty()).then(|| request.user_owner.clone()),
+            mango_account: (!request.mango_account.is_empty())
+                .then(|| request.mango_account.clone()),
+            tx_signature: None,
+        }
+    }
+
+    fn with_sequence(&mut self, sequence: u64) {
+        self.sequence = Some(sequence.to_string());
+    }
+
+    fn with_kind(&mut self, kind: u32) {
+        self.kind = Some(kind);
+    }
+
+    fn with_signature(&mut self, signature: &Signature) {
+        self.tx_signature = Some(signature.to_string());
+    }
+
+    fn event(
+        &self,
+        status_code: u8,
+        status_label: impl Into<String>,
+        reason: Option<String>,
+        grpc_code: Option<i32>,
+        queue_process_status: Option<u32>,
+        queue_process_status_name: Option<String>,
+    ) -> RelayIntentStatusEvent {
+        RelayIntentStatusEvent {
+            event_type: "relay_intent_status",
+            ts_ms: unix_timestamp_ms(),
+            request_id: self.request_id.clone(),
+            status_code,
+            status_label: status_label.into(),
+            reason,
+            group: self.group.clone(),
+            execution_queue: self.execution_queue.clone(),
+            market: self.market.clone(),
+            sequence: self.sequence.clone(),
+            kind: self.kind,
+            user_owner: self.user_owner.clone(),
+            mango_account: self.mango_account.clone(),
+            tx_signature: self.tx_signature.clone(),
+            grpc_code,
+            queue_process_status,
+            queue_process_status_name,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1149,11 +1251,18 @@ struct PendingHeadDispatch {
     sequence: u64,
     accounts_hash: Option<[u8; 32]>,
     lane_hash: [u8; 32],
+    dispatch_kind: PendingDispatchKind,
     sent_at_ms: u64,
     last_status_check_ms: u64,
     no_advance_recorded: bool,
     targeted: bool,
     signature: Signature,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingDispatchKind {
+    Execute,
+    GapSkip,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1655,7 +1764,10 @@ impl Engine {
     ) -> Result<Signature> {
         let queue_account = self.rpc.get_account(&executor.execution_queue).await?;
         let queue_state = inspect_queue_admin_state(&queue_account.data);
-        if queue_state.head.reason != "ctm_pending" || queue_state.head.next_sequence != sequence {
+        let head_matches = queue_state.head.next_sequence == sequence;
+        let head_is_pending = head_matches && queue_state.head.reason == "ctm_pending";
+        let head_is_gap = head_matches && queue_state.head.is_ctm_gap_state();
+        if !head_is_pending && !head_is_gap {
             return Err(anyhow!(
                 "queue head moved before admin drop: expected_sequence={} current_sequence={} reason={}",
                 sequence,
@@ -1663,11 +1775,33 @@ impl Engine {
                 queue_state.head.reason
             ));
         }
-        let expired_batch = self.inspect_expired_head_batch(&queue_account.data, sequence);
-        let sequences_to_drop = if expired_batch.sequences.is_empty() {
-            vec![sequence]
+        let recovery_mode = if head_is_pending {
+            "head_drop"
         } else {
-            expired_batch.sequences
+            "gap_span_drop"
+        };
+        let expired_batch = self.inspect_expired_head_batch(&queue_account.data, sequence);
+        let sequences_to_drop = if head_is_pending {
+            if expired_batch.sequences.is_empty() {
+                vec![sequence]
+            } else {
+                expired_batch.sequences
+            }
+        } else {
+            let gap_batch = inspect_gap_recovery_batch(
+                &queue_account.data,
+                &queue_state.head,
+                self.config.executor_gap_recovery_drop_batch_max,
+            );
+            if gap_batch.is_empty() {
+                return Err(anyhow!(
+                    "queue gap recovery found no pending CTM span: expected_sequence={} current_sequence={} max_seen_sequence={}",
+                    sequence,
+                    queue_state.head.next_sequence,
+                    queue_state.head.max_seen_sequence
+                ));
+            }
+            gap_batch
         };
 
         let mut instructions = vec![build_execution_queue_configure_instruction(
@@ -1727,12 +1861,21 @@ impl Engine {
         self.await_signature_result(signature, self.config.executor_admin_tx_timeout_ms)
             .await?;
         executor.pending_dispatches.lock().await.clear();
+        {
+            let mut sequence_failures = executor.sequence_failure_counts.lock().await;
+            for dropped_sequence in &sequences_to_drop {
+                sequence_failures.remove(dropped_sequence);
+            }
+        }
         executor.last_inspect_ms.store(0, Ordering::Relaxed);
         *executor.cached_head.lock().await = None;
         info!(
-            "executor admin recovery completed start_sequence={} dropped={} reason={} tx={}",
+            "executor admin recovery completed start_sequence={} first_dropped_sequence={} last_dropped_sequence={} dropped={} mode={} reason={} tx={}",
             sequence,
+            sequences_to_drop.first().copied().unwrap_or(sequence),
+            sequences_to_drop.last().copied().unwrap_or(sequence),
             sequences_to_drop.len(),
+            recovery_mode,
             reason,
             signature
         );
@@ -1929,200 +2072,247 @@ impl Engine {
         &self,
         request: SubmitIntentRequest,
     ) -> Result<SubmitIntentResponse, Status> {
-        let parse_started = Instant::now();
-        let group = parse_pubkey(&request.group)?;
-        let execution_queue = parse_pubkey(&request.execution_queue)?;
-        if self.config.queue_soft_limit > 0 {
-            if let Some((queue_count, gap_span, head_available)) =
-                self.current_queue_state_for(group, execution_queue)
-            {
-                if queue_count >= self.config.queue_soft_limit {
-                    return Err(Status::resource_exhausted(format!(
-                        "execution queue backpressure count={} soft_limit={}",
-                        queue_count, self.config.queue_soft_limit
-                    )));
-                }
-                if !head_available && gap_span >= self.config.queue_gap_soft_limit {
-                    return Err(Status::resource_exhausted(format!(
-                        "execution queue gap backpressure count={} gap_span={} gap_soft_limit={}",
-                        queue_count, gap_span, self.config.queue_gap_soft_limit
-                    )));
-                }
-                let degraded_head_limit = self.config.queue_soft_limit / 2;
-                if !head_available && degraded_head_limit > 0 && queue_count >= degraded_head_limit
+        let mut status_ctx = RelayIntentStatusContext::from_request(&request);
+        let result: Result<SubmitIntentResponse, Status> = async {
+            let parse_started = Instant::now();
+            let group = parse_pubkey(&request.group)?;
+            let execution_queue = parse_pubkey(&request.execution_queue)?;
+            if self.config.queue_soft_limit > 0 {
+                if let Some((queue_count, gap_span, head_available)) =
+                    self.current_queue_state_for(group, execution_queue)
                 {
-                    return Err(Status::resource_exhausted(format!(
-                        "execution queue head-gap backpressure count={} degraded_limit={} gap_span={}",
-                        queue_count, degraded_head_limit, gap_span
-                    )));
+                    if queue_count >= self.config.queue_soft_limit {
+                        return Err(Status::resource_exhausted(format!(
+                            "execution queue backpressure count={} soft_limit={}",
+                            queue_count, self.config.queue_soft_limit
+                        )));
+                    }
+                    if !head_available && gap_span >= self.config.queue_gap_soft_limit {
+                        return Err(Status::resource_exhausted(format!(
+                            "execution queue gap backpressure count={} gap_span={} gap_soft_limit={}",
+                            queue_count, gap_span, self.config.queue_gap_soft_limit
+                        )));
+                    }
+                    let degraded_head_limit = self.config.queue_soft_limit / 2;
+                    if !head_available
+                        && degraded_head_limit > 0
+                        && queue_count >= degraded_head_limit
+                    {
+                        return Err(Status::resource_exhausted(format!(
+                            "execution queue head-gap backpressure count={} degraded_limit={} gap_span={}",
+                            queue_count, degraded_head_limit, gap_span
+                        )));
+                    }
                 }
             }
-        }
-        self.ensure_harness_ready(&request.market).await?;
-        let user_owner = parse_pubkey(&request.user_owner)?;
-        let mango_account = parse_pubkey(&request.mango_account)?;
-        let remaining_accounts = parse_remaining_accounts(&request.remaining_accounts)?;
-        let user_signature = parse_signature_bytes(&request.user_signature)?;
-        let chain = self.blockhashes.snapshot().await;
-        let parse_elapsed = parse_started.elapsed();
-        let min_execute_slot = if request.min_execute_slot == 0 {
-            chain.slot + self.config.min_execute_slot_offset
-        } else {
-            request.min_execute_slot
-        };
-        let expires_at_slot = request.expires_at_slot;
+            self.ensure_harness_ready(&request.market).await?;
+            let user_owner = parse_pubkey(&request.user_owner)?;
+            let mango_account = parse_pubkey(&request.mango_account)?;
+            let remaining_accounts = parse_remaining_accounts(&request.remaining_accounts)?;
+            let user_signature = parse_signature_bytes(&request.user_signature)?;
+            let chain = self.blockhashes.snapshot().await;
+            let parse_elapsed = parse_started.elapsed();
+            let min_execute_slot = if request.min_execute_slot == 0 {
+                chain.slot + self.config.min_execute_slot_offset
+            } else {
+                request.min_execute_slot
+            };
+            let expires_at_slot = request.expires_at_slot;
 
-        let sequence_key = format!("{}:{}", group, request.market);
-        if let Some(queue_floor) = self.current_queue_floor_for(group, execution_queue) {
-            self.sequences
-                .observe_queue_floor(&sequence_key, queue_floor)
-                .await;
-            if self.config.sequence_pending_soft_limit > 0 {
-                let submitted_depth = self
-                    .sequences
-                    .submitted_depth_from(&sequence_key, queue_floor)
+            let sequence_key = format!("{}:{}", group, request.market);
+            if let Some(queue_floor) = self.current_queue_floor_for(group, execution_queue) {
+                self.sequences
+                    .observe_queue_floor(&sequence_key, queue_floor)
                     .await;
-                if submitted_depth >= self.config.sequence_pending_soft_limit {
-                    return Err(Status::resource_exhausted(format!(
-                        "execution queue sequence backpressure submitted_depth={} floor={} soft_limit={}",
-                        submitted_depth, queue_floor, self.config.sequence_pending_soft_limit
-                    )));
+                if self.config.sequence_pending_soft_limit > 0 {
+                    let submitted_depth = self
+                        .sequences
+                        .submitted_depth_from(&sequence_key, queue_floor)
+                        .await;
+                    if submitted_depth >= self.config.sequence_pending_soft_limit {
+                        return Err(Status::resource_exhausted(format!(
+                            "execution queue sequence backpressure submitted_depth={} floor={} soft_limit={}",
+                            submitted_depth, queue_floor, self.config.sequence_pending_soft_limit
+                        )));
+                    }
                 }
             }
-        }
-        let sequence = self.sequences.reserve(&sequence_key).await;
+            let sequence = self.sequences.reserve(&sequence_key).await;
+            status_ctx.with_sequence(sequence);
 
-        let payload_hash = hashv(&[&request.payload]).to_bytes();
-        let accounts_hash = hash_execution_queue_accounts_for_ctm_enqueue(
-            group,
-            execution_queue,
-            &remaining_accounts,
-        );
-        let envelope = CtmEnvelope {
-            sequence,
-            min_execute_slot,
-            kind: 0,
-            payload_hash,
-            accounts_hash,
-            expires_at_slot,
-        };
-
-        let user_intent_message =
-            canonical_user_intent_message(group, mango_account, user_owner, &envelope);
-        let ctm_envelope_message = canonical_envelope_message(group, &envelope);
-
-        let user_message_variant = if self.config.verify_user_signature {
-            verify_user_signature(user_owner, &user_signature, &user_intent_message)?
-        } else {
-            UserSignatureMessage::Raw(user_intent_message)
-        };
-
-        let user_preinstruction = build_presigned_ed25519_instruction(
-            user_owner.to_bytes(),
-            user_message_variant.as_bytes(),
-            user_signature,
-        );
-        let ctm_signature = self.config.ctm.sign_message(&ctm_envelope_message);
-        let ctm_preinstruction = build_presigned_ed25519_instruction(
-            self.config.ctm.pubkey().to_bytes(),
-            &ctm_envelope_message,
-            ctm_signature
-                .as_ref()
-                .try_into()
-                .map_err(|_| Status::internal("ctm signature length was not 64 bytes"))?,
-        );
-        let enqueue_instruction = build_enqueue_instruction(
-            self.config.program_id,
-            group,
-            execution_queue,
-            &remaining_accounts,
-            envelope.clone(),
-            request.payload.clone(),
-        );
-        let prepare_elapsed = parse_started.elapsed().saturating_sub(parse_elapsed);
-
-        let mut instructions = vec![
-            ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
-            user_preinstruction,
-            ctm_preinstruction,
-            enqueue_instruction,
-        ];
-        if self.config.prioritization_fee > 0 {
-            instructions.insert(
-                0,
-                ComputeBudgetInstruction::set_compute_unit_price(self.config.prioritization_fee),
+            let payload_hash = hashv(&[&request.payload]).to_bytes();
+            let accounts_hash = hash_execution_queue_accounts_for_ctm_enqueue(
+                group,
+                execution_queue,
+                &remaining_accounts,
             );
-        }
+            let envelope = CtmEnvelope {
+                sequence,
+                min_execute_slot,
+                kind: 0,
+                payload_hash,
+                accounts_hash,
+                expires_at_slot,
+            };
+            status_ctx.with_kind(envelope.kind as u32);
 
-        let message = MessageV0::try_compile(
-            &self.config.payer.pubkey(),
-            &instructions,
-            &[],
-            chain.blockhash,
-        )
-        .map_err(internal_status)?;
-        let mut tx = VersionedTransaction::try_new(
-            solana_sdk::message::VersionedMessage::V0(message),
-            &[self.config.payer.as_ref()],
-        )
-        .map_err(internal_status)?;
-        let send_cfg = RpcSendTransactionConfig {
-            skip_preflight: self.config.skip_preflight,
-            preflight_commitment: Some(CommitmentConfig::processed().commitment),
-            max_retries: self.config.submit_rpc_max_retries,
-            ..RpcSendTransactionConfig::default()
-        };
-        let send_started = Instant::now();
-        let tx_signature = match self.rpc.send_transaction_with_config(&tx, send_cfg).await {
-            Ok(signature) => signature,
-            Err(err) => {
-                self.metrics.observe_submit_stages(
-                    parse_elapsed,
-                    prepare_elapsed,
-                    send_started.elapsed(),
+            let user_intent_message =
+                canonical_user_intent_message(group, mango_account, user_owner, &envelope);
+            let ctm_envelope_message = canonical_envelope_message(group, &envelope);
+
+            let user_message_variant = if self.config.verify_user_signature {
+                verify_user_signature(user_owner, &user_signature, &user_intent_message)?
+            } else {
+                UserSignatureMessage::Raw(user_intent_message)
+            };
+
+            let user_preinstruction = build_presigned_ed25519_instruction(
+                user_owner.to_bytes(),
+                user_message_variant.as_bytes(),
+                user_signature,
+            );
+            let ctm_signature = self.config.ctm.sign_message(&ctm_envelope_message);
+            let ctm_preinstruction = build_presigned_ed25519_instruction(
+                self.config.ctm.pubkey().to_bytes(),
+                &ctm_envelope_message,
+                ctm_signature
+                    .as_ref()
+                    .try_into()
+                    .map_err(|_| Status::internal("ctm signature length was not 64 bytes"))?,
+            );
+            let enqueue_instruction = build_enqueue_instruction(
+                self.config.program_id,
+                group,
+                execution_queue,
+                &remaining_accounts,
+                envelope.clone(),
+                request.payload.clone(),
+            );
+            let prepare_elapsed = parse_started.elapsed().saturating_sub(parse_elapsed);
+
+            let mut instructions = vec![
+                ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+                user_preinstruction,
+                ctm_preinstruction,
+                enqueue_instruction,
+            ];
+            if self.config.prioritization_fee > 0 {
+                instructions.insert(
+                    0,
+                    ComputeBudgetInstruction::set_compute_unit_price(
+                        self.config.prioritization_fee,
+                    ),
                 );
-                self.recover_sequence_after_submit_error(&sequence_key, sequence, execution_queue)
-                    .await;
-                if is_execution_queue_duplicate_sequence_error(&err) {
-                    return Err(Status::aborted(
-                        "execution queue duplicate sequence; relayer cursor reconciled",
-                    ));
-                }
-                return Err(rpc_status(err));
             }
-        };
-        self.metrics
-            .observe_submit_stages(parse_elapsed, prepare_elapsed, send_started.elapsed());
-        tx.signatures[0] = tx_signature;
-        self.sequences.commit_success(&sequence_key, sequence).await;
-        tokio::spawn(self.clone().watch_submitted_sequence(
-            sequence_key.clone(),
-            sequence,
-            execution_queue,
-            tx_signature,
-        ));
 
-        if let Some(executor) = &self.executor {
-            if executor.group == group && executor.execution_queue == execution_queue {
-                executor
-                    .register_dynamic_lane(
-                        format!("dynamic-{}-{}", request.market, sequence),
-                        &remaining_accounts,
-                        self.config.executor_include_legacy_fixed_hash,
+            let message = MessageV0::try_compile(
+                &self.config.payer.pubkey(),
+                &instructions,
+                &[],
+                chain.blockhash,
+            )
+            .map_err(internal_status)?;
+            let mut tx = VersionedTransaction::try_new(
+                solana_sdk::message::VersionedMessage::V0(message),
+                &[self.config.payer.as_ref()],
+            )
+            .map_err(internal_status)?;
+            self.maybe_emit_status_event(status_ctx.event(
+                1,
+                "accepted",
+                None,
+                None,
+                None,
+                None,
+            ))
+            .await;
+            let send_cfg = RpcSendTransactionConfig {
+                skip_preflight: self.config.skip_preflight,
+                preflight_commitment: Some(CommitmentConfig::processed().commitment),
+                max_retries: self.config.submit_rpc_max_retries,
+                ..RpcSendTransactionConfig::default()
+            };
+            let send_started = Instant::now();
+            let tx_signature = match self.rpc.send_transaction_with_config(&tx, send_cfg).await {
+                Ok(signature) => signature,
+                Err(err) => {
+                    self.metrics.observe_submit_stages(
+                        parse_elapsed,
+                        prepare_elapsed,
+                        send_started.elapsed(),
+                    );
+                    self.recover_sequence_after_submit_error(
+                        &sequence_key,
+                        sequence,
+                        execution_queue,
                     )
                     .await;
+                    if is_execution_queue_duplicate_sequence_error(&err) {
+                        return Err(Status::aborted(
+                            "execution queue duplicate sequence; relayer cursor reconciled",
+                        ));
+                    }
+                    return Err(rpc_status(err));
+                }
+            };
+            self.metrics
+                .observe_submit_stages(parse_elapsed, prepare_elapsed, send_started.elapsed());
+            tx.signatures[0] = tx_signature;
+            status_ctx.with_signature(&tx_signature);
+            self.sequences.commit_success(&sequence_key, sequence).await;
+            tokio::spawn(self.clone().watch_submitted_sequence(
+                sequence_key.clone(),
+                sequence,
+                execution_queue,
+                tx_signature,
+            ));
+
+            if let Some(executor) = &self.executor {
+                if executor.group == group && executor.execution_queue == execution_queue {
+                    executor
+                        .register_dynamic_lane(
+                            format!("dynamic-{}-{}", request.market, sequence),
+                            &remaining_accounts,
+                            self.config.executor_include_legacy_fixed_hash,
+                        )
+                        .await;
+                }
             }
+
+            self.maybe_emit_status_event(status_ctx.event(
+                2,
+                "submitted",
+                None,
+                None,
+                None,
+                None,
+            ))
+            .await;
+            self.maybe_emit_event(&request, &envelope, &tx_signature, &status_ctx.request_id)
+                .await;
+
+            Ok(SubmitIntentResponse {
+                sequence,
+                tx_signature: tx_signature.to_string(),
+                user_intent_message: user_intent_message.to_vec(),
+                ctm_envelope_message: ctm_envelope_message.to_vec(),
+            })
+        }
+        .await;
+
+        if let Err(status) = &result {
+            self.maybe_emit_status_event(status_ctx.event(
+                0,
+                "rejected",
+                Some(status.message().to_string()),
+                Some(status.code() as i32),
+                None,
+                None,
+            ))
+            .await;
         }
 
-        self.maybe_emit_event(&request, &envelope, &tx_signature)
-            .await;
-
-        Ok(SubmitIntentResponse {
-            sequence,
-            tx_signature: tx_signature.to_string(),
-            user_intent_message: user_intent_message.to_vec(),
-            ctm_envelope_message: ctm_envelope_message.to_vec(),
-        })
+        result
     }
 
     async fn recover_sequence_after_submit_error(
@@ -2221,6 +2411,7 @@ impl Engine {
         request: &SubmitIntentRequest,
         envelope: &CtmEnvelope,
         tx_signature: &Signature,
+        request_id: &str,
     ) {
         let Some(url) = self.config.event_sink_url.clone() else {
             return;
@@ -2235,6 +2426,7 @@ impl Engine {
         struct EventBody {
             event_type: &'static str,
             ts_ms: u64,
+            request_id: String,
             group: String,
             execution_queue: String,
             market: String,
@@ -2259,10 +2451,8 @@ impl Engine {
             .collect();
         let body = EventBody {
             event_type: "relay_intent_accepted",
-            ts_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
+            ts_ms: unix_timestamp_ms(),
+            request_id: request_id.to_string(),
             group: request.group.clone(),
             execution_queue: request.execution_queue.clone(),
             market: request.market.clone(),
@@ -2279,6 +2469,23 @@ impl Engine {
             mango_account: request.mango_account.clone(),
             enqueue_tx_signature: tx_signature.to_string(),
         };
+        self.emit_sink_json(body, url).await;
+    }
+
+    async fn maybe_emit_status_event(&self, event: RelayIntentStatusEvent) {
+        let Some(url) = self.config.event_sink_url.clone() else {
+            return;
+        };
+        self.emit_sink_json(event, url).await;
+    }
+
+    async fn emit_sink_json<T>(&self, body: T, url: String)
+    where
+        T: Serialize + Send + Sync + 'static,
+    {
+        if let Ok(line) = serde_json::to_string(&body) {
+            info!("{line}");
+        }
         let client = self.http_client.clone();
         tokio::spawn(async move {
             if let Err(err) = client.post(url).json(&body).send().await {
@@ -2415,18 +2622,23 @@ impl Engine {
                                     .execute_confirmed_no_advance
                                     .fetch_add(1, Ordering::Relaxed);
                                 debug!(
-                                    "executor tx confirmed but queue head unchanged sequence={} sig={}",
-                                    retained[index].sequence, signature
-                                );
-                                // Treat confirmed-no-advance as a persistent failure;
-                                // if the head doesn't move after N confirmed txs, the
-                                // lane accounts likely have a runtime flag mismatch.
-                                self.maybe_auto_drop_sequence_after_failure_threshold(
-                                    executor,
+                                    "executor tx confirmed but queue head unchanged sequence={} mode={:?} sig={}",
                                     retained[index].sequence,
-                                    "confirmed_no_advance",
-                                )
-                                .await;
+                                    retained[index].dispatch_kind,
+                                    signature
+                                );
+                                if retained[index].dispatch_kind == PendingDispatchKind::Execute {
+                                    // Treat confirmed-no-advance targeted executes as a
+                                    // persistent failure; if the head doesn't move after N
+                                    // confirmed txs, the lane accounts likely have a
+                                    // runtime flag mismatch.
+                                    self.maybe_auto_drop_sequence_after_failure_threshold(
+                                        executor,
+                                        retained[index].sequence,
+                                        "confirmed_no_advance",
+                                    )
+                                    .await;
+                                }
                             }
                         }
                         Some(status) => {
@@ -2784,14 +2996,29 @@ impl Engine {
             return Ok(ExecuteLoopOutcome::Busy);
         }
 
+        let backoff_snapshot = { executor.backoff_until_ms.lock().await.clone() };
+
         if gap_skip_mode {
+            let Some(gap_skip_lane) = candidate_lanes.iter().find(|lane| {
+                let lane_key = bytes_to_hex(&lane.hash);
+                backoff_snapshot.get(&lane_key).copied().unwrap_or(0) <= now_ms
+            }) else {
+                debug!(
+                    "executor gap-skip suppressed: queue_count={} next_sequence={} reason=no_available_speculative_lane",
+                    head.count, head.next_sequence,
+                );
+                return Ok(ExecuteLoopOutcome::Busy);
+            };
             self.metrics
                 .execute_attempts
                 .fetch_add(1, Ordering::Relaxed);
             self.metrics
                 .execute_targeted
                 .fetch_add(1, Ordering::Relaxed);
-            match self.build_gap_skip_tx(executor, head.next_sequence).await {
+            match self
+                .build_gap_skip_tx(executor, gap_skip_lane, head.next_sequence)
+                .await
+            {
                 Ok((tx, send_cfg)) => match self
                     .rpc
                     .send_transaction_with_config(&tx, send_cfg)
@@ -2805,6 +3032,7 @@ impl Engine {
                             sequence: head.next_sequence,
                             accounts_hash: None,
                             lane_hash: [0u8; 32],
+                            dispatch_kind: PendingDispatchKind::GapSkip,
                             sent_at_ms: now_ms,
                             last_status_check_ms: now_ms,
                             no_advance_recorded: false,
@@ -2812,8 +3040,8 @@ impl Engine {
                             signature: signature.clone(),
                         });
                         info!(
-                            "executor sent gap-skip sequence={} queue_count={} tx={}",
-                            head.next_sequence, head.count, signature,
+                            "executor sent gap-skip sequence={} queue_count={} lane={} tx={}",
+                            head.next_sequence, head.count, gap_skip_lane.name, signature,
                         );
                         return Ok(ExecuteLoopOutcome::Sent);
                     }
@@ -2836,7 +3064,6 @@ impl Engine {
         }
 
         // Collect eligible lanes (de-dup by hash, skip backed-off lanes)
-        let backoff_snapshot = { executor.backoff_until_ms.lock().await.clone() };
         let mut eligible_lanes: Vec<Lane> = Vec::new();
         let mut seen_hashes = std::collections::HashSet::new();
         for lane in candidate_lanes {
@@ -2925,6 +3152,7 @@ impl Engine {
                     sequence: head.next_sequence,
                     accounts_hash: head.head_accounts_hash,
                     lane_hash: eligible_lanes[0].hash,
+                    dispatch_kind: PendingDispatchKind::Execute,
                     sent_at_ms: now_ms,
                     last_status_check_ms: now_ms,
                     no_advance_recorded: false,
@@ -3077,6 +3305,7 @@ impl Engine {
     async fn build_gap_skip_tx(
         &self,
         executor: &Arc<ExecutorState>,
+        lane: &Lane,
         head_sequence: u64,
     ) -> Result<(VersionedTransaction, RpcSendTransactionConfig)> {
         let chain = self.blockhashes.snapshot().await;
@@ -3090,7 +3319,7 @@ impl Engine {
                 self.config.program_id,
                 executor.group,
                 executor.execution_queue,
-                &[],
+                &lane.remaining_accounts,
                 self.config.executor_max_items.max(1),
             ),
         ];
@@ -3735,6 +3964,10 @@ struct QueueHead {
 }
 
 impl QueueHead {
+    fn is_ctm_gap_state(&self) -> bool {
+        matches!(self.reason, "ctm_gap_or_empty_slot" | "ctm_sequence_mismatch")
+    }
+
     fn blocked_reason(&self) -> String {
         format!(
             "reason={} ctm_count={} liquidity_count={} ctm_sequence={} ctm_kind={} ctm_status={}",
@@ -4021,6 +4254,53 @@ fn inspect_next_enqueue_sequence(queue_data: &[u8]) -> u64 {
         }
         head.max_seen_sequence.saturating_add(1)
     }
+}
+
+fn find_next_pending_ctm_sequence(
+    queue_data: &[u8],
+    next_sequence: u64,
+    max_seen_sequence: u64,
+) -> Option<u64> {
+    if max_seen_sequence < next_sequence {
+        return None;
+    }
+    let mut sequence = next_sequence;
+    while sequence <= max_seen_sequence {
+        if inspect_queue_sequence_presence(queue_data, sequence) == QueueSequencePresence::Pending {
+            return Some(sequence);
+        }
+        sequence = sequence.saturating_add(1);
+    }
+    None
+}
+
+fn inspect_gap_recovery_batch(
+    queue_data: &[u8],
+    head: &QueueHead,
+    max_batch: usize,
+) -> Vec<u64> {
+    if max_batch == 0 || !head.is_ctm_gap_state() {
+        return Vec::new();
+    }
+    let Some(first_pending_sequence) =
+        find_next_pending_ctm_sequence(queue_data, head.next_sequence, head.max_seen_sequence)
+    else {
+        return Vec::new();
+    };
+
+    let mut sequences = Vec::new();
+    let end_sequence = first_pending_sequence
+        .saturating_add(max_batch.saturating_sub(1) as u64)
+        .min(head.max_seen_sequence);
+    let mut sequence = first_pending_sequence;
+    while sequence <= end_sequence {
+        if inspect_queue_sequence_presence(queue_data, sequence) != QueueSequencePresence::Pending {
+            break;
+        }
+        sequences.push(sequence);
+        sequence = sequence.saturating_add(1);
+    }
+    sequences
 }
 
 fn inspect_queue_sequence_presence(queue_data: &[u8], sequence: u64) -> QueueSequencePresence {
@@ -4421,6 +4701,56 @@ mod tests {
         assert_eq!(head.ctm_sequence, Some(0));
         assert_eq!(head.ctm_kind, Some(0));
         assert_eq!(head.ctm_status, Some(0));
+    }
+
+    #[test]
+    fn inspect_gap_recovery_batch_returns_first_contiguous_pending_span_after_gap() {
+        let mut data = vec![0u8; EXECUTION_QUEUE_LIQUIDITY_ITEMS_OFFSET];
+        write_u32(&mut data, EXECUTION_QUEUE_COUNT_OFFSET, 3);
+        write_u64(&mut data, EXECUTION_QUEUE_NEXT_SEQUENCE_OFFSET, 12);
+        write_u64(&mut data, EXECUTION_QUEUE_MAX_SEEN_SEQUENCE_OFFSET, 16);
+        write_u32(&mut data, EXECUTION_QUEUE_CTM_COUNT_OFFSET, 3);
+
+        for sequence in 14_u64..=16 {
+            let item_offset = queue_item_offset(sequence);
+            write_u64(
+                &mut data,
+                item_offset + EXECUTION_QUEUE_ITEM_SEQUENCE_OFFSET,
+                sequence,
+            );
+            data[item_offset + EXECUTION_QUEUE_ITEM_KIND_OFFSET] = 0;
+            data[item_offset + EXECUTION_QUEUE_ITEM_STATUS_OFFSET] = 1;
+        }
+
+        let head = inspect_queue_head(&data);
+        assert!(head.is_ctm_gap_state());
+        assert_eq!(
+            inspect_gap_recovery_batch(&data, &head, 8),
+            vec![14, 15, 16]
+        );
+    }
+
+    #[test]
+    fn inspect_gap_recovery_batch_respects_batch_cap() {
+        let mut data = vec![0u8; EXECUTION_QUEUE_LIQUIDITY_ITEMS_OFFSET];
+        write_u32(&mut data, EXECUTION_QUEUE_COUNT_OFFSET, 4);
+        write_u64(&mut data, EXECUTION_QUEUE_NEXT_SEQUENCE_OFFSET, 20);
+        write_u64(&mut data, EXECUTION_QUEUE_MAX_SEEN_SEQUENCE_OFFSET, 25);
+        write_u32(&mut data, EXECUTION_QUEUE_CTM_COUNT_OFFSET, 4);
+
+        for sequence in 22_u64..=25 {
+            let item_offset = queue_item_offset(sequence);
+            write_u64(
+                &mut data,
+                item_offset + EXECUTION_QUEUE_ITEM_SEQUENCE_OFFSET,
+                sequence,
+            );
+            data[item_offset + EXECUTION_QUEUE_ITEM_KIND_OFFSET] = 0;
+            data[item_offset + EXECUTION_QUEUE_ITEM_STATUS_OFFSET] = 1;
+        }
+
+        let head = inspect_queue_head(&data);
+        assert_eq!(inspect_gap_recovery_batch(&data, &head, 2), vec![22, 23]);
     }
 
     #[test]

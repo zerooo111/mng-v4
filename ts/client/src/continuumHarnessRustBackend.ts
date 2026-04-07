@@ -16,6 +16,7 @@ import type {
   QueueState,
   QueueView,
   RelayIntentAcceptedEvent,
+  RelayIntentStatusEvent,
   UserBalances,
   UserState,
 } from './continuumHarness';
@@ -23,6 +24,7 @@ import type {
 type NativeContinuumStateEngine = {
   bootstrapFromOnchainSnapshotJson(snapshotJson: string): void;
   ingestRelayIntentJson(eventJson: string): void;
+  ingestRelayIntentStatusJson?: (eventJson: string) => void;
   ingestQueueEnqueuedJson(eventJson: string): void;
   ingestQueueProcessedJson(eventJson: string): void;
   listDivergencesJson(limit: number): string;
@@ -155,6 +157,11 @@ class RustContinuumStateEngine implements ContinuumHarnessBackend {
 
   ingestRelayIntent(event: RelayIntentAcceptedEvent): void {
     this.native.ingestRelayIntentJson(JSON.stringify(event));
+    this.emit(event);
+  }
+
+  ingestRelayIntentStatus(event: RelayIntentStatusEvent): void {
+    this.native.ingestRelayIntentStatusJson?.(JSON.stringify(event));
     this.emit(event);
   }
 

@@ -3,11 +3,14 @@
  *
  * Usage:
  *   npx ts-node ts/client/scripts/execution-queue/admin-drop-head.ts [count]
+ *   npx ts-node ts/client/scripts/execution-queue/admin-drop-head.ts --sequences 123,124,125
  *
  * Reads config from environment (CLUSTER_URL_OVERRIDE, EXECUTION_QUEUE_ADMIN_KEYPAIR, etc.)
  * or falls back to devnet-stack.env defaults.
  *
  * The optional [count] argument specifies how many sequential head items to drop (default 1).
+ * Use --sequences to drop an explicit set of pending CTM sequences, which is useful
+ * when the queue is stuck behind a front gap and there is no decodable current head item.
  */
 import {
   Connection,
@@ -89,7 +92,22 @@ function buildDropCtmIx(admin: PublicKey, sequence: bigint): TransactionInstruct
 }
 
 async function main() {
-  const dropCount = Math.max(1, Number(process.argv[2] || '1'));
+  const args = process.argv.slice(2);
+  let dropCount = 1;
+  let explicitSequences: bigint[] = [];
+  if (args[0] === '--sequences' || args[0] === '--seq') {
+    const raw = args[1] || '';
+    explicitSequences = raw
+      .split(',')
+      .map((value) => value.trim())
+      .filter((value) => value.length > 0)
+      .map((value) => BigInt(value));
+    if (explicitSequences.length === 0) {
+      throw new Error('expected comma-separated sequences after --sequences');
+    }
+  } else {
+    dropCount = Math.max(1, Number(args[0] || '1'));
+  }
   const adminKey = Keypair.fromSecretKey(
     Uint8Array.from(JSON.parse(fs.readFileSync(ADMIN_KEYPAIR_PATH, 'utf-8'))),
   );
@@ -107,7 +125,7 @@ async function main() {
     `Queue: count=${header.count} next=${header.nextSequence} max=${header.maxSeenSequence} ctm=${header.ctmCount}`,
   );
 
-  if (!headItem) {
+  if (!headItem && explicitSequences.length === 0) {
     console.log('No head item found — nothing to drop.');
     return;
   }
@@ -119,13 +137,15 @@ async function main() {
     decoded = null;
   }
 
-  console.log(
-    `Head: sequence=${headItem.sequence} kind=${headItem.kind} status=${headItem.status} ` +
-      `accountsHash=${headItem.accountsHash.toString('hex')} ` +
-      `payloadHash=${headItem.payloadHash.toString('hex')}`,
-  );
-  if (decoded) {
-    console.log(`Decoded payload: ${JSON.stringify(decoded, (_k, v) => (typeof v === 'bigint' ? v.toString() : v))}`);
+  if (headItem) {
+    console.log(
+      `Head: sequence=${headItem.sequence} kind=${headItem.kind} status=${headItem.status} ` +
+        `accountsHash=${headItem.accountsHash.toString('hex')} ` +
+        `payloadHash=${headItem.payloadHash.toString('hex')}`,
+    );
+    if (decoded) {
+      console.log(`Decoded payload: ${JSON.stringify(decoded, (_k, v) => (typeof v === 'bigint' ? v.toString() : v))}`);
+    }
   }
 
   const gapWaitSlots = data.readBigUInt64LE(184);
@@ -133,11 +153,17 @@ async function main() {
   const pauseIngress = data.readUInt8(145) !== 0;
   const currentPauseExecute = data.readUInt8(146) !== 0;
 
-  const headSequence = BigInt(headItem.sequence.toString());
-  const sequencesToDrop: bigint[] = [];
-  for (let i = 0; i < dropCount; i++) {
-    sequencesToDrop.push(headSequence + BigInt(i));
-  }
+  const sequencesToDrop: bigint[] =
+    explicitSequences.length > 0
+      ? explicitSequences
+      : (() => {
+          const headSequence = BigInt(headItem!.sequence.toString());
+          const sequences: bigint[] = [];
+          for (let i = 0; i < dropCount; i++) {
+            sequences.push(headSequence + BigInt(i));
+          }
+          return sequences;
+        })();
 
   console.log(
     `Dropping ${sequencesToDrop.length} item(s): sequences=[${sequencesToDrop.join(', ')}]`,

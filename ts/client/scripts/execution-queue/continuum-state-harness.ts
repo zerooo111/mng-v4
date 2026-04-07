@@ -32,6 +32,7 @@ import {
   QueueState,
   QueueView,
   RelayIntentAcceptedEvent,
+  RelayIntentStatusEvent,
   UserState,
   decodeQueuePayload,
   decodeQueueAnchorEvent,
@@ -70,6 +71,9 @@ const HARNESS_INSTANCE_ID = `${process.pid}-${HARNESS_PROCESS_STARTED_TS_MS}`;
 const HARNESS_EVENT_LOG_PATH =
   process.env.CONTINUUM_HARNESS_EVENT_LOG_PATH ||
   '/tmp/continuum-harness-events.jsonl';
+const HARNESS_TXN_LOG_PATH =
+  process.env.CONTINUUM_HARNESS_TXN_LOG_PATH ||
+  HARNESS_EVENT_LOG_PATH.replace(/\.jsonl$/i, '.txns.jsonl');
 const HARNESS_RELAY_INGEST_TOKEN =
   process.env.CONTINUUM_HARNESS_RELAY_INGEST_TOKEN || '';
 const HARNESS_REPLAY_LOG =
@@ -1027,6 +1031,17 @@ function summarizeBackendCallArgs(
             market: event.market,
             sequence: event.sequence,
             kind: event.kind,
+          }
+        : undefined;
+    }
+    case 'ingestRelayIntentStatus': {
+      const event = args[0] as RelayIntentStatusEvent | undefined;
+      return event
+        ? {
+            event_type: event.event_type,
+            request_id: event.request_id,
+            status_code: event.status_code,
+            sequence: event.sequence || 'none',
           }
         : undefined;
     }
@@ -2425,6 +2440,40 @@ function appendEventLog(event: HarnessEvent): void {
   );
 }
 
+function appendTxnLog(event: HarnessEvent): void {
+  if (!HARNESS_REPLAY_LOG) {
+    return;
+  }
+  if (
+    event.event_type !== 'relay_intent_accepted' &&
+    event.event_type !== 'relay_intent_status'
+  ) {
+    return;
+  }
+  measureSync(
+    'append_txn_log',
+    () => {
+      try {
+        appendLineWithRotation(
+          HARNESS_TXN_LOG_PATH,
+          `${JSON.stringify(event)}\n`,
+          HARNESS_EVENT_LOG_MAX_BYTES,
+        );
+      } catch (err) {
+        recordRuntimeError('append_txn_log', err, {
+          event_type: event.event_type,
+        });
+      }
+    },
+    {
+      thresholdMs: HARNESS_SLOW_COMPONENT_MS,
+      context: {
+        event_type: event.event_type,
+      },
+    },
+  );
+}
+
 function parseRelayIntentEvent(raw: any): RelayIntentAcceptedEvent {
   if (!raw || raw.event_type !== 'relay_intent_accepted') {
     throw new Error('invalid relay intent event_type');
@@ -2448,6 +2497,9 @@ function parseRelayIntentEvent(raw: any): RelayIntentAcceptedEvent {
   return {
     event_type: 'relay_intent_accepted',
     ts_ms: Number(raw.ts_ms || Date.now()),
+    request_id: String(
+      raw.request_id || `${raw.group}:${raw.sequence}:${Number(raw.kind ?? 0)}`,
+    ),
     group: String(raw.group),
     execution_queue: String(raw.execution_queue),
     market: String(raw.market),
@@ -2467,6 +2519,61 @@ function parseRelayIntentEvent(raw: any): RelayIntentAcceptedEvent {
     mango_account: String(raw.mango_account),
     enqueue_tx_signature: String(raw.enqueue_tx_signature),
   };
+}
+
+function parseRelayIntentStatusEvent(raw: any): RelayIntentStatusEvent {
+  if (!raw || raw.event_type !== 'relay_intent_status') {
+    throw new Error('invalid relay intent status event_type');
+  }
+  if (raw.status_code === undefined || raw.status_code === null) {
+    throw new Error('missing field: status_code');
+  }
+  return {
+    event_type: 'relay_intent_status',
+    ts_ms: Number(raw.ts_ms || Date.now()),
+    request_id: String(raw.request_id || `status:${Date.now()}`),
+    status_code: Number(raw.status_code),
+    status_label: String(raw.status_label || 'unknown'),
+    reason:
+      raw.reason === undefined || raw.reason === null ? null : String(raw.reason),
+    group: raw.group ? String(raw.group) : null,
+    execution_queue: raw.execution_queue ? String(raw.execution_queue) : null,
+    market: raw.market ? String(raw.market) : null,
+    sequence:
+      raw.sequence === undefined || raw.sequence === null
+        ? null
+        : String(raw.sequence),
+    kind:
+      raw.kind === undefined || raw.kind === null ? null : Number(raw.kind),
+    user_owner: raw.user_owner ? String(raw.user_owner) : null,
+    mango_account: raw.mango_account ? String(raw.mango_account) : null,
+    tx_signature:
+      raw.tx_signature === undefined || raw.tx_signature === null
+        ? null
+        : String(raw.tx_signature),
+    grpc_code:
+      raw.grpc_code === undefined || raw.grpc_code === null
+        ? null
+        : Number(raw.grpc_code),
+    queue_process_status:
+      raw.queue_process_status === undefined || raw.queue_process_status === null
+        ? null
+        : Number(raw.queue_process_status),
+    queue_process_status_name:
+      raw.queue_process_status_name === undefined ||
+      raw.queue_process_status_name === null
+        ? null
+        : String(raw.queue_process_status_name),
+  };
+}
+
+function parseRelayIngestEvent(
+  raw: any,
+): RelayIntentAcceptedEvent | RelayIntentStatusEvent {
+  if (raw?.event_type === 'relay_intent_status') {
+    return parseRelayIntentStatusEvent(raw);
+  }
+  return parseRelayIntentEvent(raw);
 }
 
 function checkRelayIngestAuth(req: IncomingMessage): boolean {
@@ -2688,7 +2795,9 @@ function replayEventLogIfPresent(): void {
         try {
           const event = JSON.parse(trimmed) as HarnessEvent;
           if (event.event_type === 'relay_intent_accepted') {
-            engine.ingestRelayIntent(event);
+            engine.ingestRelayIntent(parseRelayIntentEvent(event));
+          } else if (event.event_type === 'relay_intent_status') {
+            engine.ingestRelayIntentStatus(parseRelayIntentStatusEvent(event));
           } else if (event.event_type === 'queue_item_enqueued') {
             engine.ingestQueueEnqueued(event);
           } else if (event.event_type === 'queue_item_processed') {
@@ -4709,6 +4818,17 @@ function deriveEventContext(event: HarnessEvent): {
       mangoAccount: event.mango_account,
     };
   }
+  if (event.event_type === 'relay_intent_status') {
+    const intent =
+      event.group && event.sequence !== null && event.kind !== null
+        ? engine.findIntent(event.group, event.sequence, event.kind)
+        : null;
+    return {
+      market: event.market || intent?.market || null,
+      owner: event.user_owner || intent?.user_owner || null,
+      mangoAccount: event.mango_account || intent?.mango_account || null,
+    };
+  }
   if (
     event.event_type === 'queue_item_enqueued' ||
     event.event_type === 'queue_item_processed'
@@ -5350,11 +5470,18 @@ function buildHttpServer(
           return;
         }
         const body = await readBody(req);
-        const payload = parseRelayIntentEvent(JSON.parse(body));
-        engine.ingestRelayIntent(payload);
+        const payload = parseRelayIngestEvent(JSON.parse(body));
+        if (payload.event_type === 'relay_intent_status') {
+          engine.ingestRelayIntentStatus(payload);
+        } else {
+          engine.ingestRelayIntent(payload);
+        }
         writeJson(res, 202, {
           ok: true,
-          key: `${payload.group}:${payload.sequence}:${payload.kind}`,
+          key:
+            payload.event_type === 'relay_intent_status'
+              ? `${payload.request_id}:${payload.status_code}`
+              : `${payload.group}:${payload.sequence}:${payload.kind}`,
         });
         return;
       }
@@ -6124,6 +6251,7 @@ async function main(): Promise<void> {
   engine.subscribe((event) => {
     try {
       appendEventLog(event);
+      appendTxnLog(event);
       broadcastEvent(event);
       const context = deriveEventContext(event);
       if (context.market) {

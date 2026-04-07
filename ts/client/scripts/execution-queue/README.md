@@ -179,6 +179,70 @@ Additional executor metrics now exposed by the Rust engine:
 The executor now defaults to reason-coded head inspection and only uses speculative execute sends
 for queue-gap recovery (`EXECUTION_QUEUE_CRANK_SAFE_SPECULATIVE=true`).
 
+### Security and Liveness
+
+The executor now handles orphaned CTM front-gaps in two stages instead of wedging the queue behind
+the missing sequence:
+
+1. Speculative gap-skip:
+   - when `next_sequence` points at `ctm_gap_or_empty_slot` or `ctm_sequence_mismatch`, the Rust
+     executor sends `execution_queue_execute` using a real configured lane account set
+   - this is required because on-chain gap handling still validates the remaining account layout
+   - confirmed gap-skip transactions that do not advance the head are treated as a liveness signal,
+     not an immediate lane failure, because `gap_wait_slots` may not have elapsed yet
+2. Admin fallback:
+   - if the gap remains stale, the executor admin-drops the first contiguous pending CTM span behind
+     the gap and resumes forward progress
+   - expired-head auto-drop remains separate and still handles genuinely stale head items
+
+Recommended defaults:
+- keep `EXECUTION_QUEUE_CRANK_SAFE_SPECULATIVE=true`
+- leave `EXECUTION_QUEUE_CRANK_AUTO_DROP_EXPIRED_HEADS=true`
+- use `EXECUTION_QUEUE_CRANK_GAP_RECOVERY_DROP_BATCH_MAX` to cap how many orphaned CTM items are
+  dropped in a single recovery transaction
+- use `EXECUTION_QUEUE_CRANK_MAX_SEQUENCE_FAILURES` and
+  `EXECUTION_QUEUE_CRANK_NO_LANE_MATCH_DROP_SLOTS` as the final safety valves for deterministic
+  head stalls
+
+Operationally, this means a missing head sequence no longer blocks every later pending order behind
+it forever. The executor first tries to let the on-chain queue advance itself, and only falls back
+to lossy admin recovery when the front gap has clearly become orphaned.
+
+### Logging and Audit Trail
+
+The Rust relayer now emits two intent-facing event streams to the harness sink:
+- `relay_intent_accepted`
+- `relay_intent_status`
+
+`relay_intent_status` is the lifecycle record to use for order tracing. It includes:
+- `request_id`
+- `status_code`
+- `status_label`
+- `reason`
+- `grpc_code`
+- `group`, `execution_queue`, `market`, `sequence`, `kind`
+- `user_owner`, `mango_account`
+- `tx_signature`
+- `queue_process_status`, `queue_process_status_name`
+
+Status codes:
+- `0`: rejected
+- `1`: accepted
+- `2`: submitted
+- `3`: executed
+
+This gives a stable per-intent audit chain:
+1. inbound request received by gRPC/HTTP bridge
+2. sequence assigned and accepted
+3. enqueue transaction submitted
+4. queue item observed executed, or rejected earlier with a reason
+
+The relayer text log is still:
+- `.devnet/logs/ctm-relayer.log`
+
+The harness persists the structured records into JSONL so operators can trace any order after the
+fact without scraping console logs.
+
 ### Devnet RPC Provider Selection
 
 The persistent devnet stack can switch write-path RPC providers for the relayer and quoter via:
@@ -248,6 +312,33 @@ Rust backend notes:
 - the loader now expects a real `.node` artifact and will call `scripts/build-rust-harness-native.js` to build/copy it into place if needed
 - set `CONTINUUM_HARNESS_BACKEND=ts-backend` only if you intentionally want the legacy TS replay engine
 - optional overrides: `CONTINUUM_HARNESS_RUST_PROFILE`, `CONTINUUM_HARNESS_RUST_NATIVE_PATH`, `CONTINUUM_HARNESS_RUST_AUTO_BUILD`
+
+### Harness Logging
+
+The harness keeps two JSONL files:
+- `CONTINUUM_HARNESS_EVENT_LOG_PATH`
+  - full relay + queue + replay event stream
+- `CONTINUUM_HARNESS_TXN_LOG_PATH`
+  - focused transaction/status stream for operator debugging
+
+If `CONTINUUM_HARNESS_TXN_LOG_PATH` is not set, it is derived automatically by replacing the
+event-log suffix with `.txns.jsonl`.
+
+In the devnet stack this means:
+- event log: `.devnet/run/continuum-harness-<group>.jsonl`
+- txn log: `.devnet/run/continuum-harness-<group>.txns.jsonl`
+
+The harness accepts relayer lifecycle events at:
+- `POST /ingest/relay-intent`
+
+and persists both:
+- `relay_intent_accepted`
+- `relay_intent_status`
+
+This is the file to consult first when a bot says:
+- an order was accepted but never executed
+- a cancel failed with a relayer-side reason
+- a sequence was assigned but never landed on chain
 
 ### Key Endpoints
 

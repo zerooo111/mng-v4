@@ -15,6 +15,13 @@ export enum QueueItemKindHarness {
   LiquidityWithdraw = 2,
 }
 
+export enum RelayIntentStatusCode {
+  Rejected = 0,
+  Accepted = 1,
+  Submitted = 2,
+  Executed = 3,
+}
+
 export enum QueuePayloadVariantHarness {
   PerpPlaceOrderV2 = 0,
   PerpCancelOrder = 1,
@@ -36,6 +43,7 @@ export type AccountMetaWire = {
 export type RelayIntentAcceptedEvent = {
   event_type: 'relay_intent_accepted';
   ts_ms: number;
+  request_id?: string;
   group: string;
   execution_queue: string;
   market: string;
@@ -48,6 +56,26 @@ export type RelayIntentAcceptedEvent = {
   user_owner: string;
   mango_account: string;
   enqueue_tx_signature: string;
+};
+
+export type RelayIntentStatusEvent = {
+  event_type: 'relay_intent_status';
+  ts_ms: number;
+  request_id: string;
+  status_code: number;
+  status_label: string;
+  reason: string | null;
+  group: string | null;
+  execution_queue: string | null;
+  market: string | null;
+  sequence: string | null;
+  kind: number | null;
+  user_owner: string | null;
+  mango_account: string | null;
+  tx_signature: string | null;
+  grpc_code: number | null;
+  queue_process_status: number | null;
+  queue_process_status_name: string | null;
 };
 
 export type QueueItemEnqueuedEvent = {
@@ -83,6 +111,7 @@ export type DivergenceEvent = {
 
 export type HarnessEvent =
   | RelayIntentAcceptedEvent
+  | RelayIntentStatusEvent
   | QueueItemEnqueuedEvent
   | QueueItemProcessedEvent
   | DivergenceEvent;
@@ -145,6 +174,7 @@ export type DecodedQueuePayload =
 
 export type CanonicalIntent = {
   key: string;
+  request_id: string;
   group: string;
   execution_queue: string;
   market: string;
@@ -491,6 +521,10 @@ export function statusToString(status: number): string {
   }
 }
 
+function processedStatusReason(status: number): string {
+  return `queue_item_processed:${statusToString(status)}`;
+}
+
 export function parseProgramDataLogLine(line: string): Buffer | null {
   const marker = 'Program data: ';
   const idx = line.indexOf(marker);
@@ -832,6 +866,11 @@ export class ContinuumStateEngine {
     return this.intentsByKey.get(queueItemKey(group, sequence, kind)) || null;
   }
 
+  ingestRelayIntentStatus(event: RelayIntentStatusEvent): void {
+    this.revision += 1;
+    this.emitEvent(event);
+  }
+
   ingestRelayIntent(event: RelayIntentAcceptedEvent): void {
     const payload = Buffer.from(event.payload_b64, 'base64');
     let decodedPayload: DecodedQueuePayload | null = null;
@@ -846,6 +885,7 @@ export class ContinuumStateEngine {
 
     const canonical: CanonicalIntent = {
       key,
+      request_id: event.request_id || key,
       group: event.group,
       execution_queue: event.execution_queue,
       market: event.market,
@@ -926,6 +966,7 @@ export class ContinuumStateEngine {
       });
       const placeholder: CanonicalIntent = {
         key,
+        request_id: queueItemKey(event.group, event.sequence, event.kind),
         group: event.group,
         execution_queue: 'unknown',
         market: 'unknown',
@@ -952,6 +993,25 @@ export class ContinuumStateEngine {
       this.intentsByKey.set(key, placeholder);
       this.revision += 1;
       this.emitEvent(event);
+      this.emitEvent({
+        event_type: 'relay_intent_status',
+        ts_ms: event.ts_ms || Date.now(),
+        request_id: placeholder.request_id,
+        status_code: RelayIntentStatusCode.Executed,
+        status_label: 'executed',
+        reason: processedStatusReason(event.status),
+        group: placeholder.group,
+        execution_queue: placeholder.execution_queue,
+        market: placeholder.market,
+        sequence: placeholder.sequence.toString(),
+        kind: placeholder.kind,
+        user_owner: placeholder.user_owner,
+        mango_account: placeholder.mango_account,
+        tx_signature: event.tx_signature,
+        grpc_code: null,
+        queue_process_status: event.status,
+        queue_process_status_name: statusToString(event.status),
+      });
       return;
     }
 
@@ -975,6 +1035,25 @@ export class ContinuumStateEngine {
 
     this.revision += 1;
     this.emitEvent(event);
+    this.emitEvent({
+      event_type: 'relay_intent_status',
+      ts_ms: event.ts_ms || Date.now(),
+      request_id: intent.request_id,
+      status_code: RelayIntentStatusCode.Executed,
+      status_label: 'executed',
+      reason: processedStatusReason(event.status),
+      group: intent.group,
+      execution_queue: intent.execution_queue,
+      market: intent.market,
+      sequence: intent.sequence.toString(),
+      kind: intent.kind,
+      user_owner: intent.user_owner,
+      mango_account: intent.mango_account,
+      tx_signature: event.tx_signature,
+      grpc_code: null,
+      queue_process_status: event.status,
+      queue_process_status_name: statusToString(event.status),
+    });
 
     // Prune processed intents after a short delay to keep memory bounded.
     // The intent is no longer needed for optimistic state once confirmed.

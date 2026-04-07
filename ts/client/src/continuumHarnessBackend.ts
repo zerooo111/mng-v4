@@ -20,6 +20,7 @@ export type ContinuumHarnessBackend = Pick<
   | 'ingestQueueEnqueued'
   | 'ingestQueueProcessed'
   | 'ingestRelayIntent'
+  | 'ingestRelayIntentStatus'
   | 'listDivergences'
   | 'listIntents'
   | 'reportExternalDivergence'
@@ -162,6 +163,7 @@ function assertValidBackend(
     'ingestQueueEnqueued',
     'ingestQueueProcessed',
     'ingestRelayIntent',
+    'ingestRelayIntentStatus',
     'listDivergences',
     'listIntents',
     'reportExternalDivergence',
