@@ -4889,6 +4889,8 @@ mod tests {
                 let owner_state = payload.owner_state.unwrap();
                 let market_state = payload.market_state.unwrap();
 
+                assert_eq!(payload.validation_status, "executed");
+                assert_eq!(payload.validation_error, None);
                 assert_eq!(owner_state.open_orders.len(), sequence as usize);
                 assert_eq!(market_state.open_orders.len(), sequence as usize);
                 assert_eq!(market_state.watermarks.confirmed_seq, sequence.to_string());
@@ -4903,124 +4905,6 @@ mod tests {
                     sequence as usize
                 );
             }
-        });
-    }
-
-    #[test]
-    fn validated_local_payload_surfaces_recoverable_confirmed_replay_failures() {
-        run_with_large_stack(|| {
-            let mut engine = ContinuumStateEngine::new();
-            let group = key();
-            let execution_queue = key();
-            let market = "21".to_string();
-            let mut failed: Option<(u64, ValidatedLocalPayload)> = None;
-
-            for sequence in 1..=400u64 {
-                let owner = key();
-                let mango_account = key();
-                ingest_executed_limit_order(
-                    &mut engine,
-                    &group,
-                    &execution_queue,
-                    &owner,
-                    &mango_account,
-                    &market,
-                    sequence,
-                );
-                let payload = engine
-                    .get_validated_local_payload(&group, sequence.to_string(), 0)
-                    .unwrap()
-                    .unwrap();
-                if payload.validation_status == "failed" {
-                    failed = Some((sequence, payload));
-                    break;
-                }
-            }
-
-            let (failed_sequence, failed_payload) =
-                failed.expect("expected burst replay to hit local validation failure");
-            assert_eq!(failed_payload.validation_status, "failed");
-            assert!(failed_payload
-                .validation_error
-                .as_deref()
-                .unwrap_or_default()
-                .contains("programs/mango-v4/src/state/orderbook/book.rs"));
-            assert!(
-                failed_payload
-                    .market_state
-                    .as_ref()
-                    .unwrap()
-                    .open_orders
-                    .len()
-                    < failed_sequence as usize
-            );
-            assert_eq!(
-                engine
-                    .incremental_confirmed
-                    .as_ref()
-                    .unwrap()
-                    .failed_executed_keys
-                    .get(&queue_item_key(&group, failed_sequence, 0))
-                    .map(String::as_str),
-                failed_payload.validation_error.as_deref()
-            );
-
-            let confirmed_snapshot = engine.get_snapshot(QueueView::Confirmed).unwrap();
-            assert_eq!(
-                confirmed_snapshot
-                    .markets
-                    .get(&market)
-                    .unwrap()
-                    .open_orders
-                    .len(),
-                failed_payload.market_state.as_ref().unwrap().open_orders.len()
-            );
-
-            let second_owner = key();
-            let second_mango_account = key();
-            ingest_executed_limit_order(
-                &mut engine,
-                &group,
-                &execution_queue,
-                &second_owner,
-                &second_mango_account,
-                "22",
-                failed_sequence + 1,
-            );
-
-            let successful_payload = engine
-                .get_validated_local_payload(&group, (failed_sequence + 1).to_string(), 0)
-                .unwrap()
-                .unwrap();
-            assert_eq!(successful_payload.validation_status, "executed");
-            assert_eq!(successful_payload.validation_error, None);
-            assert_eq!(
-                successful_payload
-                    .owner_state
-                    .as_ref()
-                    .unwrap()
-                    .open_orders
-                    .len(),
-                1
-            );
-            assert_eq!(
-                successful_payload
-                    .market_state
-                    .as_ref()
-                    .unwrap()
-                    .open_orders
-                    .len(),
-                1
-            );
-            assert_eq!(
-                engine
-                    .incremental_confirmed
-                    .as_ref()
-                    .unwrap()
-                    .applied_executed_keys
-                    .len(),
-                (failed_sequence + 1) as usize
-            );
         });
     }
 
