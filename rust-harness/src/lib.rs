@@ -1,6 +1,7 @@
 mod engine;
 mod error;
 mod logging;
+#[cfg(feature = "napi")]
 mod node;
 mod payload;
 mod replay;
@@ -16,9 +17,9 @@ pub use payload::{
     PerpCancelAllPayload, PerpCancelOrderByClientOrderIdPayload, PerpCancelOrderPayload,
     PerpPlaceOrderPayload, QueuePayload, QueuePayloadVariant,
 };
-pub use replay::ContinuumStateEngine;
+pub use replay::{ContinuumStateEngine, UndoToken};
 pub use types::{
-    AccountPerpPositionState, AccountProjectedState, AccountTokenPositionState,
+    AccountMetaWire, AccountPerpPositionState, AccountProjectedState, AccountTokenPositionState,
     CanonicalIntentState, DivergenceEvent, EngineSnapshot, MarginSummary, MarginSummaryAccount,
     MarginSummaryEmpty, MarginSummaryOk, MarginSummaryPlaceholder, MarketCandle, MarketState,
     MarketTrade, OpenOrderSummary, PerpMarketSyncState, QueueItemEnqueuedEvent,

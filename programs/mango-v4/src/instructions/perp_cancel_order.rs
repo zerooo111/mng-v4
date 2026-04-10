@@ -45,22 +45,6 @@ fn perp_cancel_order_inner<'info>(
     asks: &AccountLoader<'info, BookSide>,
     order_id: u128,
 ) -> Result<()> {
-    let perp_market_index = perp_market.load()?.perp_market_index;
-    let account_ref = account.load_full()?;
-    require!(
-        account_ref.fixed.is_owner_or_delegate(owner),
-        MangoError::SomeError
-    );
-    let (slot, _) = account_ref
-        .perp_find_order_with_order_id(perp_market_index, order_id)
-        .ok_or_else(|| {
-            error_msg_typed!(
-                MangoError::PerpOrderIdNotFound,
-                "could not find perp order with id {order_id} in user account"
-            )
-        })?;
-    drop(account_ref);
-
     let account_pk = account.key();
     let mut account = account.load_full_mut()?;
     require!(
@@ -68,37 +52,29 @@ fn perp_cancel_order_inner<'info>(
         MangoError::SomeError
     );
 
+    let perp_market = perp_market.load_mut()?;
     let mut book = Orderbook {
         bids: bids.load_mut()?,
         asks: asks.load_mut()?,
     };
 
-    perp_cancel_order_by_slot_with_loaded_context(
+    let (slot, _) = account
+        .perp_find_order_with_order_id(perp_market.perp_market_index, order_id)
+        .ok_or_else(|| {
+            error_msg_typed!(
+                MangoError::PerpOrderIdNotFound,
+                "could not find perp order with id {order_id} in user account"
+            )
+        })?;
+
+    book.cancel_order_by_slot(
         &mut account.borrow_mut(),
         &account_pk,
-        &mut book,
-        perp_market_index,
-        slot as u8,
-        order_id,
-    )
-}
+        slot,
+        perp_market.perp_market_index,
+    )?;
 
-pub(crate) fn perp_cancel_order_by_slot_with_loaded_context<'a>(
-    account: &mut MangoAccountRefMut,
-    account_pk: &Pubkey,
-    book: &mut Orderbook<'a>,
-    perp_market_index: PerpMarketIndex,
-    slot: u8,
-    expected_order_id: u128,
-) -> Result<()> {
-    let slot = usize::from(slot);
-    let oo = account.perp_order_by_raw_index(slot)?;
-    require!(
-        oo.is_active_for_market(perp_market_index) && oo.id == expected_order_id,
-        MangoError::PerpOrderIdNotFound
-    );
-
-    book.cancel_order_by_slot(account, account_pk, slot, perp_market_index)
+    Ok(())
 }
 
 pub(crate) fn perp_cancel_order_from_account_infos<'info>(

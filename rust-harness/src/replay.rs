@@ -365,6 +365,32 @@ pub struct ContinuumStateEngine {
     baseline_perp_markets: BTreeMap<String, PerpMarketSyncState>,
     baseline_token_banks: BTreeMap<String, TokenBankSyncState>,
     baseline_bootstrapped: bool,
+    /// Phase 3: live in-place optimistic projection. Updated incrementally
+    /// by `apply_relay_intent_local` so reads don't need to walk all
+    /// stored intents and replay them through HarnessEngine. Cleared on
+    /// bootstrap, on `rollback_local` (forces a rebuild on next access),
+    /// and on `mark_optimistic_dirty` (e.g. after a queue-processed event
+    /// has been observed and the intent's effect is now confirmed).
+    ///
+    /// The lazy `view_state` rebuild path is preserved as a fallback for
+    /// the confirmed view, for the bootstrap-cold case, and for any code
+    /// path that hasn't been migrated to the incremental API yet.
+    live_optimistic_projection: Option<Projection>,
+    /// Sample timestamp captured the last time the live projection was
+    /// rebuilt or applied — used so reads can pass a fresh `now_ts` to
+    /// `snapshot_from_projection` and `prune_expired_orders`.
+    live_optimistic_built_at_ms: u64,
+}
+
+/// Returned by `apply_relay_intent_local`. Holds enough information for
+/// `rollback_local` to undo the apply on hard ingress failure. Per-intent
+/// granularity, per the design plan in opti_updates.md.
+#[derive(Debug, Clone)]
+pub struct UndoToken {
+    /// Canonical intent key — `{group}:{sequence}:{kind}`. Looking up by
+    /// this key in `intents_by_key` gives us the original CanonicalIntent
+    /// and lets us replay the remaining intents on rebuild.
+    pub intent_key: String,
 }
 
 impl Default for ContinuumStateEngine {
@@ -397,6 +423,8 @@ impl ContinuumStateEngine {
             baseline_perp_markets: BTreeMap::new(),
             baseline_token_banks: BTreeMap::new(),
             baseline_bootstrapped: false,
+            live_optimistic_projection: None,
+            live_optimistic_built_at_ms: 0,
         }
     }
 
@@ -487,6 +515,12 @@ impl ContinuumStateEngine {
         self.prune_rebased_intents();
         self.enforce_retention_limits();
         self.invalidate_incremental_confirmed();
+        // Phase 3: drop the live optimistic projection — it was built on
+        // top of the previous baseline and is no longer valid. The next
+        // call to apply_relay_intent_local or get_*_state will rebuild it
+        // from the new baseline + still-pending intents.
+        self.live_optimistic_projection = None;
+        self.live_optimistic_built_at_ms = 0;
         self.touch();
         Ok(())
     }
@@ -570,6 +604,168 @@ impl ContinuumStateEngine {
     pub fn ingest_relay_intent_json(&mut self, event_json: &str) -> Result<()> {
         let event: RelayIntentAcceptedEvent = serde_json::from_str(event_json)?;
         self.ingest_relay_intent(event)
+    }
+
+    /// Phase 3 hot-path API: apply a relay intent INCREMENTALLY to the live
+    /// optimistic projection so subsequent reads don't have to walk all
+    /// stored intents. Stores the canonical intent and returns the resulting
+    /// `ExecutionResult` (used as the on-the-wire `StateDelta`) plus an
+    /// `UndoToken` that lets a caller roll the apply back on hard ingress
+    /// failure.
+    ///
+    /// Builds the live projection lazily on first call after bootstrap. The
+    /// first apply pays a one-time O(N) build cost (replays any
+    /// already-stored intents on top of the baseline); subsequent applies
+    /// are O(1).
+    ///
+    /// Bumps revision so any code path still using the lazy `view_state`
+    /// cache for the confirmed view also sees the change.
+    pub fn apply_relay_intent_local(
+        &mut self,
+        event: RelayIntentAcceptedEvent,
+    ) -> Result<(ExecutionResult, UndoToken)> {
+        let payload = BASE64_STANDARD
+            .decode(event.payload_b64.as_bytes())
+            .unwrap_or_default();
+        let decoded_payload = QueuePayload::decode(&payload).ok();
+
+        let sequence = parse_u64_field("sequence", &event.sequence)?;
+        let market_index = parse_market_index(&event.market)?;
+        let user_owner_pubkey = parse_pubkey("user_owner", &event.user_owner)?;
+        let mango_account_pubkey = parse_pubkey("mango_account", &event.mango_account)?;
+        let key = queue_item_key(&event.group, sequence, event.kind);
+        let existing = self.intents_by_key.get(&key).cloned();
+
+        let canonical = CanonicalIntent {
+            key: key.clone(),
+            group: event.group.clone(),
+            execution_queue: event.execution_queue,
+            market: event.market.clone(),
+            market_index: Some(market_index),
+            sequence,
+            kind: event.kind,
+            payload_b64: event.payload_b64,
+            decoded_payload,
+            remaining_accounts: event.remaining_accounts,
+            min_execute_slot: parse_u64_field("min_execute_slot", &event.min_execute_slot)?,
+            expires_at_slot: parse_u64_field("expires_at_slot", &event.expires_at_slot)?,
+            user_owner: event.user_owner.clone(),
+            user_owner_pubkey: Some(user_owner_pubkey),
+            mango_account: event.mango_account.clone(),
+            mango_account_pubkey: Some(mango_account_pubkey),
+            enqueue_tx_signature: event.enqueue_tx_signature.clone(),
+            accepted_ts_ms: event.ts_ms,
+            enqueued_slot: existing.as_ref().and_then(|it| it.enqueued_slot),
+            processed_slot: existing.as_ref().and_then(|it| it.processed_slot),
+            processed_ts_ms: existing.as_ref().and_then(|it| it.processed_ts_ms),
+            processed_unix_ts: existing.as_ref().and_then(|it| it.processed_unix_ts),
+            processed_status: existing.as_ref().and_then(|it| it.processed_status),
+            processed_tx_signature: existing
+                .as_ref()
+                .and_then(|it| it.processed_tx_signature.clone()),
+        };
+
+        if let Some(existing_intent) = &existing {
+            if existing_intent.enqueue_tx_signature != canonical.enqueue_tx_signature {
+                self.emit_divergence(
+                    "duplicate_key_different_signature",
+                    &key,
+                    HashMap::from([
+                        (
+                            "existing_signature".to_string(),
+                            existing_intent.enqueue_tx_signature.clone(),
+                        ),
+                        (
+                            "incoming_signature".to_string(),
+                            canonical.enqueue_tx_signature.clone(),
+                        ),
+                    ]),
+                );
+            }
+        }
+
+        // Insert into the canonical intent map. Keeping intents_by_key in
+        // sync is required so the lazy fallback rebuild path still works
+        // and so divergence detection / retention can see the new intent.
+        self.intents_by_key.insert(key.clone(), canonical.clone());
+        self.enforce_retention_limits();
+
+        // Make sure the live projection exists. First-call cost is one
+        // baseline build + replay of stored intents (skipping the one we
+        // just added; it's applied next). Subsequent calls are O(1).
+        self.ensure_live_optimistic_projection()?;
+
+        // Apply the new intent to the live projection in place. The
+        // borrow-checker dance: temporarily take the projection out of the
+        // engine, call apply_intent (which borrows &self immutably), then
+        // put the projection back.
+        let now_ts = now_ts_ms() / 1_000;
+        let mut projection = self
+            .live_optimistic_projection
+            .take()
+            .expect("ensure_live_optimistic_projection guarantees Some");
+        let apply_result = self.apply_intent(&canonical, &mut projection, now_ts);
+        self.live_optimistic_projection = Some(projection);
+        self.live_optimistic_built_at_ms = now_ts_ms();
+        let result = match apply_result {
+            Ok(Some(execution_result)) => execution_result,
+            Ok(None) => ExecutionResult::default(),
+            Err(err) => {
+                // Apply failed mid-flight. Conservative: drop the live
+                // projection so it gets fully rebuilt on next access. The
+                // intent stays in intents_by_key so the rebuild includes
+                // it (and may surface the same error then). The caller's
+                // rollback path can remove it via rollback_local.
+                self.live_optimistic_projection = None;
+                self.touch();
+                return Err(err);
+            }
+        };
+
+        // Bump revision so the confirmed-view cache (which doesn't use the
+        // live projection) is invalidated for any reader who falls back to
+        // the lazy path.
+        self.touch();
+
+        Ok((result, UndoToken { intent_key: key }))
+    }
+
+    /// Phase 3 rollback path: undo a previously-applied relay intent on
+    /// hard ingress failure (e.g. signature verify, account not found,
+    /// program reject). Removes the intent from `intents_by_key` and
+    /// drops the live optimistic projection so the next read rebuilds it
+    /// from baseline + the still-pending intents.
+    ///
+    /// This is the simple-but-correct rollback. A future optimization
+    /// could capture an inverse-op snapshot in the UndoToken and apply it
+    /// in place to avoid the rebuild — but rebuild on rollback is fine
+    /// because hard failures are rare and the rebuild only happens once
+    /// per failure (not per read).
+    pub fn rollback_local(&mut self, undo: UndoToken) -> Result<()> {
+        if self.intents_by_key.remove(&undo.intent_key).is_none() {
+            return Ok(());
+        }
+        self.live_optimistic_projection = None;
+        self.live_optimistic_built_at_ms = 0;
+        self.invalidate_incremental_confirmed();
+        self.touch();
+        Ok(())
+    }
+
+    /// Idempotent: builds `live_optimistic_projection` if it's None.
+    /// Reuses the existing build_baseline_projection + apply_intent
+    /// machinery so the live projection is byte-identical to what
+    /// `build_view_state(QueueView::Optimistic)` would produce.
+    fn ensure_live_optimistic_projection(&mut self) -> Result<()> {
+        if self.live_optimistic_projection.is_some() {
+            return Ok(());
+        }
+        let now_ts_ms_value = now_ts_ms();
+        let now_ts = now_ts_ms_value / 1_000;
+        let projection = self.build_projection(QueueView::Optimistic, now_ts)?;
+        self.live_optimistic_projection = Some(projection);
+        self.live_optimistic_built_at_ms = now_ts_ms_value;
+        Ok(())
     }
 
     pub fn ingest_queue_enqueued(&mut self, event: QueueItemEnqueuedEvent) -> Result<()> {
@@ -1320,14 +1516,42 @@ impl ContinuumStateEngine {
                 Ok(&self.cached_confirmed.as_ref().unwrap().state)
             }
             QueueView::Optimistic => {
-                let rebuild = self
+                // Phase 3 fast path: if the live projection is up to date
+                // we can snapshot from it directly without rebuilding from
+                // baseline. The cache is keyed on the same `revision` we
+                // bump in `apply_relay_intent_local`, so cache hits are
+                // free; cache misses materialize a fresh ViewState from
+                // the live projection (which is itself O(1) per ingest).
+                let cache_hit = self
                     .cached_optimistic
                     .as_ref()
-                    .map(|cache| cache.revision != revision)
-                    .unwrap_or(true);
-                if rebuild {
-                    let state = self.build_view_state(QueueView::Optimistic)?;
-                    self.cached_optimistic = Some(ViewStateCache { revision, state });
+                    .map(|cache| cache.revision == revision)
+                    .unwrap_or(false);
+                if !cache_hit {
+                    if self.live_optimistic_projection.is_some() {
+                        let now_ts_ms_value = now_ts_ms();
+                        let now_ts = now_ts_ms_value / 1_000;
+                        let projection = self
+                            .live_optimistic_projection
+                            .as_ref()
+                            .expect("just checked is_some");
+                        let snapshot = self.snapshot_from_projection(
+                            QueueView::Optimistic,
+                            projection,
+                            now_ts_ms_value,
+                            now_ts,
+                        )?;
+                        let state = ViewState {
+                            snapshot,
+                            trades: projection.trades.clone(),
+                        };
+                        self.cached_optimistic = Some(ViewStateCache { revision, state });
+                    } else {
+                        // Bootstrap-cold or post-rollback: fall back to the
+                        // legacy lazy rebuild from baseline + replay.
+                        let state = self.build_view_state(QueueView::Optimistic)?;
+                        self.cached_optimistic = Some(ViewStateCache { revision, state });
+                    }
                 }
                 Ok(&self.cached_optimistic.as_ref().unwrap().state)
             }
@@ -1613,7 +1837,7 @@ impl ContinuumStateEngine {
         let mut next_projection = state.projection.clone();
         let validation_error =
             match self.apply_intent(intent, &mut next_projection, execution_ts) {
-                Ok(()) => None,
+                Ok(_) => None,
                 Err(err) if is_recoverable_local_validation_error(&err) => {
                     Some(err.to_string())
                 }
@@ -1640,9 +1864,9 @@ impl ContinuumStateEngine {
         intent: &CanonicalIntent,
         projection: &mut Projection,
         simulation_now_ts: u64,
-    ) -> Result<()> {
+    ) -> Result<Option<ExecutionResult>> {
         let Some(payload) = intent.decoded_payload else {
-            return Ok(());
+            return Ok(None);
         };
 
         projection.active_markets.insert(intent.market.clone());
@@ -1663,7 +1887,7 @@ impl ContinuumStateEngine {
 
         match payload {
             QueuePayload::LiquidityDeposit(_) | QueuePayload::LiquidityWithdraw(_) => {
-                return Ok(());
+                return Ok(None);
             }
             _ => {}
         }
@@ -1711,8 +1935,12 @@ impl ContinuumStateEngine {
             payload,
             simulation_now_ts,
         )?;
+        // Phase 3: clone the result so callers (e.g. apply_relay_intent_local)
+        // can return it as a StateDelta. Cheap — ExecutionResult contains
+        // small Vecs of ExecutionFill / ExecutionOut.
+        let returned = result.clone();
         self.record_execution_trades(intent, projection, result);
-        Ok(())
+        Ok(Some(returned))
     }
 
     fn record_execution_trades(

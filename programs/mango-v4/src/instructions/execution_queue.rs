@@ -1,17 +1,17 @@
 use crate::accounts_ix::*;
-use crate::accounts_zerocopy::*;
 use crate::error::*;
-use crate::health::*;
+use crate::health::{new_health_cache, ScanningAccountRetriever};
 use crate::state::*;
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::ed25519_program;
 use anchor_lang::solana_program::entrypoint::MAX_PERMITTED_DATA_INCREASE;
-use anchor_lang::solana_program::hash::{hashv, Hasher};
+use anchor_lang::solana_program::hash::hashv;
 use anchor_lang::solana_program::instruction::{AccountMeta, Instruction};
 use anchor_lang::solana_program::program::{invoke, invoke_signed};
 use anchor_lang::solana_program::system_instruction;
 use anchor_lang::solana_program::sysvar::instructions as tx_instructions;
 use anchor_lang::InstructionData;
+use fixed::types::I80F48;
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
 pub struct ExecutionQueueConfigParams {
@@ -54,7 +54,6 @@ const ED25519_PUBKEY_LEN: usize = 32;
 const ED25519_CURRENT_INSTRUCTION_INDEX: u16 = u16::MAX;
 const QUEUE_PAYLOAD_VERSION_V1: u8 = 1;
 const QUEUE_PAYLOAD_HEADER_LEN: usize = 4;
-const PERP_BATCH_INTENT_MAX_OPS: usize = 8;
 // One retry is sufficient: with the C-1 hash integrity fix, the cranker cannot
 // provide wrong accounts to artificially fail dispatch. Non-transient failures
 // (expired order, frozen account, paused market) won't resolve on retry.
@@ -72,15 +71,6 @@ pub enum QueuePayloadVariant {
     PerpCancelAllOrdersBySide = 4,
     LiquidityDeposit = 5,
     LiquidityWithdraw = 6,
-    PerpCancelOrderBySlot = 7,
-    PerpBatchIntent = 8,
-}
-
-#[repr(u8)]
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PerpBatchSubOpVariant {
-    PerpCancelOrderBySlot = 0,
-    PerpPlaceOrderV2 = 1,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
@@ -100,23 +90,6 @@ pub struct PerpPlaceOrderV2Payload {
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
 pub struct PerpCancelOrderPayload {
     pub order_id: u128,
-}
-
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
-pub struct PerpCancelOrderBySlotPayload {
-    pub slot: u8,
-    pub expected_order_id: u128,
-}
-
-#[derive(Clone, Debug)]
-pub enum PerpBatchSubOp {
-    PerpCancelOrderBySlot(PerpCancelOrderBySlotPayload),
-    PerpPlaceOrderV2(PerpPlaceOrderV2Payload),
-}
-
-#[derive(Clone, Debug)]
-pub struct PerpBatchIntentPayload {
-    pub operations: Vec<PerpBatchSubOp>,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
@@ -151,13 +124,17 @@ pub struct LiquidityWithdrawPayload {
 enum QueuePayloadBody {
     PerpPlaceOrderV2(PerpPlaceOrderV2Payload),
     PerpCancelOrder(PerpCancelOrderPayload),
-    PerpCancelOrderBySlot(PerpCancelOrderBySlotPayload),
-    PerpBatchIntent(PerpBatchIntentPayload),
     PerpCancelOrderByClientOrderId(PerpCancelOrderByClientOrderIdPayload),
     PerpCancelAllOrders(PerpCancelAllOrdersPayload),
     PerpCancelAllOrdersBySide(PerpCancelAllOrdersBySidePayload),
     LiquidityDeposit(LiquidityDepositPayload),
     LiquidityWithdraw(LiquidityWithdrawPayload),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QueueHealthRegionSpec {
+    account_index: usize,
+    health_accounts_start: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -194,12 +171,6 @@ struct Ed25519SignatureOffsets {
     message_instruction_index: u16,
 }
 
-struct Ed25519MatchRequest<'a> {
-    signer: Pubkey,
-    message: &'a [u8],
-    found: bool,
-}
-
 fn split_dispatch_accounts<'a, 'info>(
     remaining_accounts: &'a [AccountInfo<'info>],
     execution_queue_key: Pubkey,
@@ -228,23 +199,45 @@ fn split_dispatch_accounts<'a, 'info>(
     }
 }
 
-#[cfg(test)]
-fn hash_accounts(accounts: &[AccountMeta]) -> [u8; 32] {
-    let mut hasher = Hasher::default();
-    for a in accounts {
-        hasher.hash(a.pubkey.as_ref());
-        hasher.hash(&[u8::from(a.is_signer), u8::from(a.is_writable)]);
+/// Merge runtime flags for hash computation: OR flags for accounts that appear
+/// in both remaining and fixed sets, output in remaining order.
+fn merge_effective_runtime_flags_for_hash(
+    remaining_accounts: &[AccountMeta],
+    fixed_accounts: &[AccountMeta],
+) -> Vec<AccountMeta> {
+    use std::collections::HashMap;
+    let mut merged = HashMap::<Pubkey, (bool, bool)>::new();
+    for account in fixed_accounts.iter().chain(remaining_accounts.iter()) {
+        let entry = merged
+            .entry(account.pubkey)
+            .or_insert((account.is_signer, account.is_writable));
+        entry.0 |= account.is_signer;
+        entry.1 |= account.is_writable;
     }
-    hasher.result().to_bytes()
+    remaining_accounts
+        .iter()
+        .map(|account| {
+            let (is_signer, is_writable) = merged
+                .get(&account.pubkey)
+                .copied()
+                .unwrap_or((account.is_signer, account.is_writable));
+            AccountMeta {
+                pubkey: account.pubkey,
+                is_signer,
+                is_writable,
+            }
+        })
+        .collect()
 }
 
-fn hash_account_infos(accounts: &[AccountInfo]) -> [u8; 32] {
-    let mut hasher = Hasher::default();
-    for ai in accounts {
-        hasher.hash(ai.key.as_ref());
-        hasher.hash(&[u8::from(ai.is_signer), u8::from(ai.is_writable)]);
+fn hash_accounts(accounts: &[AccountMeta]) -> [u8; 32] {
+    let mut bytes = Vec::with_capacity(accounts.len() * 34);
+    for a in accounts {
+        bytes.extend_from_slice(a.pubkey.as_ref());
+        bytes.push(u8::from(a.is_signer));
+        bytes.push(u8::from(a.is_writable));
     }
-    hasher.result().to_bytes()
+    hashv(&[&bytes]).to_bytes()
 }
 
 fn canonical_envelope_message(group: Pubkey, envelope: &CtmEnvelope) -> [u8; 32] {
@@ -301,8 +294,6 @@ fn queue_payload_variant_from_u8(value: u8) -> Result<QueuePayloadVariant> {
         4 => Ok(QueuePayloadVariant::PerpCancelAllOrdersBySide),
         5 => Ok(QueuePayloadVariant::LiquidityDeposit),
         6 => Ok(QueuePayloadVariant::LiquidityWithdraw),
-        7 => Ok(QueuePayloadVariant::PerpCancelOrderBySlot),
-        8 => Ok(QueuePayloadVariant::PerpBatchIntent),
         _ => err!(MangoError::ExecutionQueuePayloadVariantInvalid),
     }
 }
@@ -311,8 +302,6 @@ fn queue_item_kind_for_payload_variant(variant: QueuePayloadVariant) -> u8 {
     match variant {
         QueuePayloadVariant::PerpPlaceOrderV2
         | QueuePayloadVariant::PerpCancelOrder
-        | QueuePayloadVariant::PerpCancelOrderBySlot
-        | QueuePayloadVariant::PerpBatchIntent
         | QueuePayloadVariant::PerpCancelOrderByClientOrderId
         | QueuePayloadVariant::PerpCancelAllOrders
         | QueuePayloadVariant::PerpCancelAllOrdersBySide => QueueItemKind::CtmWrapped as u8,
@@ -321,11 +310,15 @@ fn queue_item_kind_for_payload_variant(variant: QueuePayloadVariant) -> u8 {
     }
 }
 
-fn variant_requires_atomic_failure_rollback(variant: QueuePayloadVariant) -> bool {
-    matches!(
-        variant,
-        QueuePayloadVariant::PerpPlaceOrderV2 | QueuePayloadVariant::PerpBatchIntent
-    )
+fn queue_health_region_spec(variant: QueuePayloadVariant) -> Option<QueueHealthRegionSpec> {
+    match variant {
+        // Only place orders can worsen health; cancels release margin and are always safe.
+        QueuePayloadVariant::PerpPlaceOrderV2 => Some(QueueHealthRegionSpec {
+            account_index: 1,
+            health_accounts_start: 8,
+        }),
+        _ => None,
+    }
 }
 
 fn variant_uses_user_signature(variant: QueuePayloadVariant) -> bool {
@@ -333,8 +326,6 @@ fn variant_uses_user_signature(variant: QueuePayloadVariant) -> bool {
         variant,
         QueuePayloadVariant::PerpPlaceOrderV2
             | QueuePayloadVariant::PerpCancelOrder
-            | QueuePayloadVariant::PerpCancelOrderBySlot
-            | QueuePayloadVariant::PerpBatchIntent
             | QueuePayloadVariant::PerpCancelOrderByClientOrderId
             | QueuePayloadVariant::PerpCancelAllOrders
             | QueuePayloadVariant::PerpCancelAllOrdersBySide
@@ -343,48 +334,6 @@ fn variant_uses_user_signature(variant: QueuePayloadVariant) -> bool {
 
 fn variant_uses_queue_owner_signer(_variant: QueuePayloadVariant) -> bool {
     false
-}
-
-fn decode_perp_batch_intent_payload(body: &[u8]) -> Result<PerpBatchIntentPayload> {
-    require!(
-        !body.is_empty(),
-        MangoError::ExecutionQueuePayloadDecodeFailed
-    );
-
-    let op_count = body[0] as usize;
-    require!(
-        op_count > 0 && op_count <= PERP_BATCH_INTENT_MAX_OPS,
-        MangoError::ExecutionQueuePayloadDecodeFailed
-    );
-
-    let mut remaining = &body[1..];
-    let mut operations = Vec::with_capacity(op_count);
-    for _ in 0..op_count {
-        let op_variant = *remaining
-            .first()
-            .ok_or_else(|| error!(MangoError::ExecutionQueuePayloadDecodeFailed))?;
-        remaining = &remaining[1..];
-        match op_variant {
-            value if value == PerpBatchSubOpVariant::PerpCancelOrderBySlot as u8 => {
-                let op = PerpCancelOrderBySlotPayload::deserialize(&mut remaining)
-                    .map_err(|_| error!(MangoError::ExecutionQueuePayloadDecodeFailed))?;
-                operations.push(PerpBatchSubOp::PerpCancelOrderBySlot(op));
-            }
-            value if value == PerpBatchSubOpVariant::PerpPlaceOrderV2 as u8 => {
-                let op = PerpPlaceOrderV2Payload::deserialize(&mut remaining)
-                    .map_err(|_| error!(MangoError::ExecutionQueuePayloadDecodeFailed))?;
-                operations.push(PerpBatchSubOp::PerpPlaceOrderV2(op));
-            }
-            _ => return err!(MangoError::ExecutionQueuePayloadDecodeFailed),
-        }
-    }
-
-    require!(
-        remaining.is_empty(),
-        MangoError::ExecutionQueuePayloadDecodeFailed
-    );
-
-    Ok(PerpBatchIntentPayload { operations })
 }
 
 fn decode_payload_body(variant: QueuePayloadVariant, body: &[u8]) -> Result<QueuePayloadBody> {
@@ -397,13 +346,6 @@ fn decode_payload_body(variant: QueuePayloadVariant, body: &[u8]) -> Result<Queu
             PerpCancelOrderPayload::try_from_slice(body)
                 .map_err(|_| error!(MangoError::ExecutionQueuePayloadDecodeFailed))?,
         ),
-        QueuePayloadVariant::PerpCancelOrderBySlot => QueuePayloadBody::PerpCancelOrderBySlot(
-            PerpCancelOrderBySlotPayload::try_from_slice(body)
-                .map_err(|_| error!(MangoError::ExecutionQueuePayloadDecodeFailed))?,
-        ),
-        QueuePayloadVariant::PerpBatchIntent => {
-            QueuePayloadBody::PerpBatchIntent(decode_perp_batch_intent_payload(body)?)
-        }
         QueuePayloadVariant::PerpCancelOrderByClientOrderId => {
             QueuePayloadBody::PerpCancelOrderByClientOrderId(
                 PerpCancelOrderByClientOrderIdPayload::try_from_slice(body)
@@ -486,9 +428,6 @@ fn build_dispatch_ix_data(payload: &DecodedQueuePayload) -> Vec<u8> {
             order_id: p.order_id,
         }
         .data(),
-        QueuePayloadBody::PerpCancelOrderBySlot(_) | QueuePayloadBody::PerpBatchIntent(_) => {
-            Vec::new()
-        }
         QueuePayloadBody::PerpCancelOrderByClientOrderId(p) => {
             crate::instruction::PerpCancelOrderByClientOrderId {
                 client_order_id: p.client_order_id,
@@ -577,20 +516,6 @@ fn prevalidate_terminal_ctm_payload(
             }
             None
         }
-        QueuePayloadBody::PerpBatchIntent(batch) => {
-            for operation in &batch.operations {
-                let PerpBatchSubOp::PerpPlaceOrderV2(place) = operation else {
-                    continue;
-                };
-                if place.price_lots < 0 {
-                    return Some(TerminalCtmFailureReason::InvalidNumericInput);
-                }
-                if place.expiry_timestamp != 0 && place.expiry_timestamp <= now_ts {
-                    return Some(TerminalCtmFailureReason::Expired);
-                }
-            }
-            None
-        }
         _ => None,
     }
 }
@@ -638,266 +563,6 @@ fn dispatch_perp_cancel_order<'info>(
     Ok(())
 }
 
-fn dispatch_perp_cancel_order_by_slot<'info>(
-    payload: &PerpCancelOrderBySlotPayload,
-    dispatch_accounts: &[AccountInfo<'info>],
-) -> Result<()> {
-    require!(
-        dispatch_accounts.len() >= 6,
-        MangoError::ExecutionQueueDispatchAccountLayoutInvalid
-    );
-
-    let group = AccountLoader::try_from(&dispatch_accounts[0])
-        .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?;
-    let account = AccountLoader::try_from(&dispatch_accounts[1])
-        .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?;
-    let owner = *dispatch_accounts[2].key;
-    let perp_market = AccountLoader::try_from(&dispatch_accounts[3])
-        .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?;
-    let bids = AccountLoader::try_from(&dispatch_accounts[4])
-        .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?;
-    let asks = AccountLoader::try_from(&dispatch_accounts[5])
-        .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?;
-
-    super::perp_cancel_order::validate_perp_cancel_order_queue_accounts(
-        &group,
-        &account,
-        &perp_market,
-        &bids,
-        &asks,
-        IxGate::PerpCancelOrder,
-        true,
-    )?;
-
-    let account_pk = account.key();
-    let perp_market_index = perp_market.load()?.perp_market_index;
-    let mut account = account.load_full_mut()?;
-    require!(
-        account.fixed.is_owner_or_delegate(owner),
-        MangoError::SomeError
-    );
-    let mut book = Orderbook {
-        bids: bids.load_mut()?,
-        asks: asks.load_mut()?,
-    };
-
-    super::perp_cancel_order::perp_cancel_order_by_slot_with_loaded_context(
-        &mut account.borrow_mut(),
-        &account_pk,
-        &mut book,
-        perp_market_index,
-        payload.slot,
-        payload.expected_order_id,
-    )
-}
-
-fn dispatch_perp_batch_intent<'info>(
-    payload: &PerpBatchIntentPayload,
-    dispatch_accounts: &[AccountInfo<'info>],
-) -> Result<()> {
-    require!(
-        dispatch_accounts.len() >= 8,
-        MangoError::ExecutionQueueDispatchAccountLayoutInvalid
-    );
-    require!(
-        !payload.operations.is_empty(),
-        MangoError::ExecutionQueuePayloadDecodeFailed
-    );
-
-    let group = AccountLoader::try_from(&dispatch_accounts[0])
-        .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?;
-    let account = AccountLoader::try_from(&dispatch_accounts[1])
-        .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?;
-    let owner = *dispatch_accounts[2].key;
-    let perp_market = AccountLoader::try_from(&dispatch_accounts[3])
-        .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?;
-    let bids = AccountLoader::try_from(&dispatch_accounts[4])
-        .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?;
-    let asks = AccountLoader::try_from(&dispatch_accounts[5])
-        .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?;
-    let event_queue = AccountLoader::try_from(&dispatch_accounts[6])
-        .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?;
-    let oracle = &dispatch_accounts[7];
-
-    super::perp_place_order::validate_perp_place_order_queue_accounts(
-        &group,
-        &account,
-        &perp_market,
-        &bids,
-        &asks,
-        &event_queue,
-        oracle,
-    )?;
-
-    let clock = Clock::get()?;
-    let now_ts: u64 = clock.unix_timestamp.try_into().unwrap_or(0);
-    let now_slot = clock.slot;
-    let group_key = group.key();
-    let (sidecar_ai_opt, health_accounts) =
-        split_optional_risk_sidecar_account(group_key, account.key(), &dispatch_accounts[8..]);
-    let has_place = payload
-        .operations
-        .iter()
-        .any(|op| matches!(op, PerpBatchSubOp::PerpPlaceOrderV2(_)));
-
-    let group_data = group.load()?;
-    let buyback_fees_expiry_interval = group_data.buyback_fees_expiry_interval;
-    drop(group_data);
-
-    let oracle_price = {
-        let mut perp_market = perp_market.load_mut()?;
-        let book = Orderbook {
-            bids: bids.load_mut()?,
-            asks: asks.load_mut()?,
-        };
-
-        let oracle_ref = &AccountInfoRef::borrow(oracle)?;
-        let oracle_state = perp_market.oracle_state(
-            &OracleAccountInfos::from_reader(oracle_ref),
-            None,
-        )?;
-        let oracle_price = oracle_state.price;
-        perp_market.update_funding_and_stable_price(&book, &oracle_state, now_ts)?;
-        oracle_price
-    };
-
-    let (perp_market_index, settle_token_index) = {
-        let perp_market = perp_market.load()?;
-        (
-            perp_market.perp_market_index,
-            perp_market.settle_token_index,
-        )
-    };
-
-    let account_pk = account.key();
-    {
-        let mut account = account.load_full_mut()?;
-        require!(
-            account.fixed.is_owner_or_delegate(owner),
-            MangoError::SomeError
-        );
-        account.ensure_perp_position(perp_market_index, settle_token_index)?;
-    }
-
-    let account_for_hash = account.load_full()?;
-    let account_hash_ref = account_for_hash.borrow();
-    let pre_account_state_hash = risk_sidecar_account_state_hash(&account_hash_ref)?;
-    let pre_health_accounts_state_hash =
-        risk_sidecar_health_accounts_state_hash(&account_hash_ref, health_accounts, now_slot, now_ts)?;
-    drop(account_hash_ref);
-    drop(account_for_hash);
-    let mut sidecar_account_opt =
-        load_risk_sidecar_account(group_key, account_pk, sidecar_ai_opt)?;
-    let mut account = account.load_full_mut()?;
-
-    let mut pre_health_opt = None;
-    if has_place && !account.fixed.is_in_health_region() {
-        let mut account_ref = account.borrow_mut();
-        let session = if let Some(snapshot) = sidecar_account_opt
-            .as_ref()
-            .map(|sidecar| {
-                matching_risk_sidecar_snapshot(
-                    sidecar,
-                    group_key,
-                    account_pk,
-                    pre_account_state_hash,
-                    pre_health_accounts_state_hash,
-                )
-            })
-            .transpose()?
-            .flatten()
-        {
-            ExactRiskSidecarSession::prepare_from_snapshot(account_pk, &mut account_ref, &snapshot)
-                .context("pre init health from risk sidecar")?
-        } else {
-            ExactRiskSidecarSession::prepare_from_fixed_accounts(
-                account_pk,
-                &mut account_ref,
-                health_accounts,
-                now_slot,
-                now_ts,
-            )
-            .context("pre init health")?
-        };
-        session.require_token_info(settle_token_index)?;
-        pre_health_opt = Some(session);
-    }
-
-    {
-        let mut perp_market = perp_market.load_mut()?;
-        let mut book = Orderbook {
-            bids: bids.load_mut()?,
-            asks: asks.load_mut()?,
-        };
-        let mut event_queue = event_queue.load_mut()?;
-
-        for operation in &payload.operations {
-            match operation {
-                PerpBatchSubOp::PerpCancelOrderBySlot(cancel) => {
-                    super::perp_cancel_order::perp_cancel_order_by_slot_with_loaded_context(
-                        &mut account.borrow_mut(),
-                        &account_pk,
-                        &mut book,
-                        perp_market_index,
-                        cancel.slot,
-                        cancel.expected_order_id,
-                    )?;
-                }
-                PerpBatchSubOp::PerpPlaceOrderV2(place) => {
-                    let order = build_perp_place_order_from_queue_payload(place)?;
-                    super::perp_place_order::perp_place_order_with_loaded_context(
-                        &mut account.borrow_mut(),
-                        &account_pk,
-                        &mut perp_market,
-                        &mut book,
-                        &mut event_queue,
-                        oracle_price,
-                        order,
-                        now_ts,
-                        buyback_fees_expiry_interval,
-                        place.limit,
-                    )?;
-                }
-            }
-        }
-
-        if let Some(risk_session) = pre_health_opt.as_mut() {
-            let mut account_ref = account.borrow_mut();
-            risk_session.recompute_perp_and_check_post(&mut account_ref, &perp_market)?;
-        }
-    }
-
-    let snapshot_opt = if let Some(risk_session) = pre_health_opt.take() {
-        Some(risk_session.into_snapshot(&account.borrow()))
-    } else {
-        None
-    };
-    drop(account);
-
-    if let (Some(snapshot), Some(sidecar_account)) = (snapshot_opt.as_ref(), sidecar_account_opt.as_mut()) {
-        if sidecar_account.to_account_info().is_writable {
-            let account_loader = AccountLoader::try_from(&dispatch_accounts[1])
-                .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?;
-            let account_for_hash = account_loader.load_full()?;
-            let account_hash_ref = account_for_hash.borrow();
-            let post_account_state_hash = risk_sidecar_account_state_hash(&account_hash_ref)?;
-            let post_health_accounts_state_hash =
-                risk_sidecar_health_accounts_state_hash(&account_hash_ref, health_accounts, now_slot, now_ts)?;
-            refresh_risk_sidecar_account(
-                sidecar_account,
-                snapshot,
-                post_account_state_hash,
-                post_health_accounts_state_hash,
-                now_slot,
-                now_ts,
-                false,
-            )?;
-        }
-    }
-
-    Ok(())
-}
-
 fn dispatch_perp_cancel_order_by_client_order_id<'info>(
     payload: &PerpCancelOrderByClientOrderIdPayload,
     dispatch_accounts: &[AccountInfo<'info>],
@@ -923,12 +588,6 @@ fn dispatch_queue_payload(
         }
         QueuePayloadBody::PerpCancelOrder(cancel) => {
             return dispatch_perp_cancel_order(cancel, dispatch_accounts);
-        }
-        QueuePayloadBody::PerpCancelOrderBySlot(cancel) => {
-            return dispatch_perp_cancel_order_by_slot(cancel, dispatch_accounts);
-        }
-        QueuePayloadBody::PerpBatchIntent(batch) => {
-            return dispatch_perp_batch_intent(batch, dispatch_accounts);
         }
         QueuePayloadBody::PerpCancelOrderByClientOrderId(cancel) => {
             return dispatch_perp_cancel_order_by_client_order_id(cancel, dispatch_accounts);
@@ -1048,27 +707,24 @@ fn extract_bytes<'a>(
     data.get(offset..offset + len)
 }
 
-fn all_ed25519_requests_found(requests: &[Ed25519MatchRequest]) -> bool {
-    requests.iter().all(|request| request.found)
-}
-
-fn record_ed25519_ix_matches(
+fn ed25519_ix_matches(
     ix: &Instruction,
     ix_index: usize,
-    requests: &mut [Ed25519MatchRequest],
-) {
+    ctm_signer: Pubkey,
+    message: &[u8],
+) -> bool {
     if ix.program_id != ed25519_program::id() || ix.data.len() < ED25519_INSTRUCTION_HEADER_LEN {
-        return;
+        return false;
     }
 
     let signature_count = ix.data[0] as usize;
     if signature_count == 0 {
-        return;
+        return false;
     }
 
     let min_len = ED25519_INSTRUCTION_HEADER_LEN + signature_count * ED25519_SIGNATURE_OFFSETS_LEN;
     if ix.data.len() < min_len {
-        return;
+        return false;
     }
 
     for signature_index in 0..signature_count {
@@ -1076,6 +732,7 @@ fn record_ed25519_ix_matches(
             continue;
         };
 
+        // Require the referenced signature blob to exist in this ed25519 instruction.
         if extract_bytes(
             ix,
             ix_index,
@@ -1098,6 +755,14 @@ fn record_ed25519_ix_matches(
             continue;
         };
 
+        if public_key_bytes != ctm_signer.as_ref() {
+            continue;
+        }
+
+        if offsets.message_data_size as usize != message.len() {
+            continue;
+        }
+
         let Some(message_bytes) = extract_bytes(
             ix,
             ix_index,
@@ -1108,47 +773,111 @@ fn record_ed25519_ix_matches(
             continue;
         };
 
-        for request in requests.iter_mut().filter(|request| !request.found) {
-            if public_key_bytes == request.signer.as_ref() && message_bytes == request.message {
-                request.found = true;
-            }
-        }
-
-        if all_ed25519_requests_found(requests) {
-            return;
+        if message_bytes == message {
+            return true;
         }
     }
+
+    false
 }
 
-fn scan_ed25519_preinstructions(
+fn has_ed25519_preinstruction(
     ixs: &AccountInfo,
-    requests: &mut [Ed25519MatchRequest],
-) -> Result<()> {
-    if requests.is_empty() {
-        return Ok(());
-    }
-
+    ctm_signer: Pubkey,
+    message: &[u8],
+) -> Result<bool> {
     let current_index = tx_instructions::load_current_index_checked(ixs)? as usize;
     for index in 0..current_index {
         let ix = tx_instructions::load_instruction_at_checked(index, ixs)?;
-        record_ed25519_ix_matches(&ix, index, requests);
-        if all_ed25519_requests_found(requests) {
-            break;
+        if ed25519_ix_matches(&ix, index, ctm_signer, message) {
+            return Ok(true);
         }
     }
 
+    Ok(false)
+}
+
+fn verify_ed25519_preinstruction(ixs: &AccountInfo, signer: Pubkey, message: &[u8]) -> Result<()> {
+    let found = has_ed25519_preinstruction(ixs, signer, message)?;
+    require!(found, MangoError::CtmSignatureMissing);
     Ok(())
 }
 
-#[cfg(test)]
-fn ed25519_ix_matches(ix: &Instruction, ix_index: usize, signer: Pubkey, message: &[u8]) -> bool {
-    let mut requests = [Ed25519MatchRequest {
-        signer,
-        message,
-        found: false,
-    }];
-    record_ed25519_ix_matches(ix, ix_index, &mut requests);
-    requests[0].found
+fn verify_user_ed25519_preinstruction(
+    ixs: &AccountInfo,
+    signer: Pubkey,
+    msg_hash: [u8; 32],
+) -> Result<()> {
+    if has_ed25519_preinstruction(ixs, signer, msg_hash.as_ref())? {
+        return Ok(());
+    }
+
+    // Frontend compatibility: some wallets sign utf8(hex(intent_hash)).
+    let msg_hex_utf8 = canonical_user_intent_message_hex_utf8(msg_hash);
+    let found_hex = has_ed25519_preinstruction(ixs, signer, msg_hex_utf8.as_ref())?;
+    require!(found_hex, MangoError::ExecutionQueueUserSignatureMissing);
+    Ok(())
+}
+
+fn queue_health_region_begin(
+    dispatch_accounts: &[AccountInfo],
+    spec: QueueHealthRegionSpec,
+) -> Result<()> {
+    require!(
+        dispatch_accounts.len() > spec.account_index,
+        MangoError::ExecutionQueueDispatchAccountLayoutInvalid
+    );
+    let account =
+        AccountLoader::<MangoAccountFixed>::try_from(&dispatch_accounts[spec.account_index])
+            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?;
+    let mut account = account.load_full_mut()?;
+    require!(!account.fixed.is_in_health_region(), MangoError::SomeError);
+
+    let group = account.fixed.group;
+    let health_accounts = if dispatch_accounts.len() > spec.health_accounts_start {
+        &dispatch_accounts[spec.health_accounts_start..]
+    } else {
+        &[]
+    };
+    let account_retriever = ScanningAccountRetriever::new(health_accounts, &group)
+        .context("create account retriever")?;
+    let now_ts: u64 = Clock::get()?.unix_timestamp.try_into().unwrap();
+    let health_cache = new_health_cache(&account.borrow(), &account_retriever, now_ts)?;
+    let pre_init_health = account.check_health_pre(&health_cache)?;
+    account.fixed.set_in_health_region(true);
+    account.fixed.health_region_begin_init_health = pre_init_health.ceil().to_num();
+    Ok(())
+}
+
+fn queue_health_region_end(
+    dispatch_accounts: &[AccountInfo],
+    spec: QueueHealthRegionSpec,
+) -> Result<()> {
+    require!(
+        dispatch_accounts.len() > spec.account_index,
+        MangoError::ExecutionQueueDispatchAccountLayoutInvalid
+    );
+    let account =
+        AccountLoader::<MangoAccountFixed>::try_from(&dispatch_accounts[spec.account_index])
+            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?;
+    let mut account = account.load_full_mut()?;
+    require!(account.fixed.is_in_health_region(), MangoError::SomeError);
+
+    let group = account.fixed.group;
+    let health_accounts = if dispatch_accounts.len() > spec.health_accounts_start {
+        &dispatch_accounts[spec.health_accounts_start..]
+    } else {
+        &[]
+    };
+    let account_retriever = ScanningAccountRetriever::new(health_accounts, &group)
+        .context("create account retriever")?;
+    let now_ts: u64 = Clock::get()?.unix_timestamp.try_into().unwrap();
+    let health_cache = new_health_cache(&account.borrow(), &account_retriever, now_ts)?;
+    let pre_init_health = I80F48::from(account.fixed.health_region_begin_init_health);
+    account.check_health_post(&health_cache, pre_init_health)?;
+    account.fixed.set_in_health_region(false);
+    account.fixed.health_region_begin_init_health = 0;
+    Ok(())
 }
 
 pub fn execution_queue_create(_ctx: Context<ExecutionQueueCreate>) -> Result<()> {
@@ -1311,7 +1040,16 @@ pub fn execution_queue_enqueue_ctm(
         );
     }
 
-    let account_hash = hash_account_infos(dispatch_accounts);
+    let account_hash = hash_accounts(
+        &dispatch_accounts
+            .iter()
+            .map(|ai| AccountMeta {
+                pubkey: *ai.key,
+                is_signer: ai.is_signer,
+                is_writable: ai.is_writable,
+            })
+            .collect::<Vec<_>>(),
+    );
     require!(
         account_hash == envelope.accounts_hash,
         MangoError::ExecutionQueueAccountsHashMismatch
@@ -1326,9 +1064,14 @@ pub fn execution_queue_enqueue_ctm(
         MangoError::InvalidSequenceNumber
     );
 
-    let uses_user_signature = variant_uses_user_signature(decoded_payload.variant);
-    let ctm_message = canonical_envelope_message(ctx.accounts.group.key(), &envelope);
-    let user_intent_messages = if uses_user_signature {
+    let msg_hash = canonical_envelope_message(ctx.accounts.group.key(), &envelope);
+    verify_ed25519_preinstruction(
+        ctx.accounts.instructions.as_ref(),
+        queue.ctm_signer,
+        msg_hash.as_ref(),
+    )?;
+
+    if variant_uses_user_signature(decoded_payload.variant) {
         let (mango_account_key, user_owner) =
             extract_user_owner_for_ctm_payload(ctx.accounts.group.key(), dispatch_accounts)?;
         let user_intent_hash = canonical_user_intent_message(
@@ -1337,38 +1080,11 @@ pub fn execution_queue_enqueue_ctm(
             user_owner,
             &envelope,
         );
-        let user_intent_hex_utf8 = canonical_user_intent_message_hex_utf8(user_intent_hash);
-        Some((user_owner, user_intent_hash, user_intent_hex_utf8))
-    } else {
-        None
-    };
-    let mut signature_requests = Vec::with_capacity(if uses_user_signature { 3 } else { 1 });
-    signature_requests.push(Ed25519MatchRequest {
-        signer: queue.ctm_signer,
-        message: ctm_message.as_ref(),
-        found: false,
-    });
-    if let Some((user_owner, user_intent_hash, user_intent_hex_utf8)) =
-        user_intent_messages.as_ref()
-    {
-        signature_requests.push(Ed25519MatchRequest {
-            signer: *user_owner,
-            message: user_intent_hash.as_ref(),
-            found: false,
-        });
-        signature_requests.push(Ed25519MatchRequest {
-            signer: *user_owner,
-            message: user_intent_hex_utf8.as_ref(),
-            found: false,
-        });
-    }
-    scan_ed25519_preinstructions(ctx.accounts.instructions.as_ref(), &mut signature_requests)?;
-    require!(signature_requests[0].found, MangoError::CtmSignatureMissing);
-    if uses_user_signature {
-        require!(
-            signature_requests[1].found || signature_requests[2].found,
-            MangoError::ExecutionQueueUserSignatureMissing
-        );
+        verify_user_ed25519_preinstruction(
+            ctx.accounts.instructions.as_ref(),
+            user_owner,
+            user_intent_hash,
+        )?;
     }
 
     let mut item = QueueItem::default();
@@ -1450,7 +1166,16 @@ pub fn execution_queue_enqueue_direct(
         MangoError::ExecutionQueuePayloadKindMismatch
     );
 
-    let account_hash = hash_account_infos(dispatch_accounts);
+    let account_hash = hash_accounts(
+        &dispatch_accounts
+            .iter()
+            .map(|ai| AccountMeta {
+                pubkey: *ai.key,
+                is_signer: ai.is_signer,
+                is_writable: ai.is_writable,
+            })
+            .collect::<Vec<_>>(),
+    );
     require!(
         account_hash == envelope.accounts_hash,
         MangoError::ExecutionQueueAccountsHashMismatch
@@ -1472,24 +1197,11 @@ pub fn execution_queue_enqueue_direct(
             user_owner,
             &envelope,
         );
-        let user_intent_hex_utf8 = canonical_user_intent_message_hex_utf8(user_intent_hash);
-        let mut signature_requests = vec![
-            Ed25519MatchRequest {
-                signer: user_owner,
-                message: user_intent_hash.as_ref(),
-                found: false,
-            },
-            Ed25519MatchRequest {
-                signer: user_owner,
-                message: user_intent_hex_utf8.as_ref(),
-                found: false,
-            },
-        ];
-        scan_ed25519_preinstructions(ctx.accounts.instructions.as_ref(), &mut signature_requests)?;
-        require!(
-            signature_requests[0].found || signature_requests[1].found,
-            MangoError::ExecutionQueueUserSignatureMissing
-        );
+        verify_user_ed25519_preinstruction(
+            ctx.accounts.instructions.as_ref(),
+            user_owner,
+            user_intent_hash,
+        )?;
     }
 
     // Assign sequence: use max_seen_sequence + 1 to avoid collisions with relayer sequences
@@ -1568,7 +1280,7 @@ pub fn execution_queue_enqueue_liquidity(
     );
 
     let payload_hash = hashv(&[&payload]).to_bytes();
-    let accounts_hash = hash_account_infos(dispatch_accounts);
+    let accounts_hash = hash_accounts(&account_metas_from_infos(dispatch_accounts));
     let min_execute_slot = clock.slot + queue.header.liquidity_delay_slots;
     let mut item = QueueItem::default();
     item.sequence = 0;
@@ -1615,7 +1327,7 @@ pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u
         );
     }
 
-    let provided_accounts_hash = hash_account_infos(dispatch_accounts);
+    let provided_accounts_hash = hash_accounts(&account_metas_from_infos(dispatch_accounts));
     let now_ts: u64 = clock.unix_timestamp.try_into().unwrap_or(0);
     for _ in 0..max_items {
         let mut candidate: Option<ExecutableCandidate> = None;
@@ -1740,8 +1452,7 @@ pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u
             continue;
         }
 
-        let requires_atomic_failure_rollback =
-            variant_requires_atomic_failure_rollback(decoded_payload.variant);
+        let item_health_region = queue_health_region_spec(decoded_payload.variant);
 
         if candidate.is_ctm {
             if let Some(reason) = prevalidate_terminal_ctm_payload(&decoded_payload, now_ts) {
@@ -1763,6 +1474,49 @@ pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u
             }
         }
 
+        // Pre-dispatch check: if a health-gated item has exhausted retries, clear it
+        // WITHOUT dispatching. This prevents a permanently-failing health-gated item
+        // from blocking the queue (since post-dispatch health failures must roll back
+        // the entire tx and thus cannot increment the retry counter).
+        if item_health_region.is_some()
+            && candidate.is_ctm
+            && candidate.retries >= EXECUTION_QUEUE_MAX_RETRIES
+        {
+            let mut queue = ctx.accounts.execution_queue.load_mut()?;
+            queue.clear_ctm_item_at(candidate.sequence);
+            emit!(QueueItemProcessed {
+                group: ctx.accounts.group.key(),
+                sequence: candidate.sequence,
+                kind: candidate.kind,
+                status: QueueItemStatus::Failed as u8,
+            });
+            continue;
+        }
+
+        if let Some(spec) = item_health_region {
+            if queue_health_region_begin(dispatch_accounts, spec).is_err() {
+                let mut queue = ctx.accounts.execution_queue.load_mut()?;
+                if candidate.is_ctm {
+                    // Health region begin failed (e.g., account already in health region).
+                    // Increment retry so it eventually gets cleared by the pre-dispatch check above.
+                    let retries = queue.increment_ctm_retry(candidate.sequence, clock.slot);
+                    if retries >= EXECUTION_QUEUE_MAX_RETRIES {
+                        queue.clear_ctm_item_at(candidate.sequence);
+                        emit!(QueueItemProcessed {
+                            group: ctx.accounts.group.key(),
+                            sequence: candidate.sequence,
+                            kind: candidate.kind,
+                            status: QueueItemStatus::Failed as u8,
+                        });
+                        continue;
+                    }
+                } else {
+                    let _ = queue.pop_liquidity_head();
+                }
+                break;
+            }
+        }
+
         let dispatch_result = dispatch_queue_payload(
             &decoded_payload,
             dispatch_accounts,
@@ -1771,6 +1525,14 @@ pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u
             execution_queue_key,
             execution_queue_bump,
         );
+        let dispatch_result = if let Some(spec) = item_health_region {
+            match dispatch_result {
+                Ok(()) => queue_health_region_end(dispatch_accounts, spec),
+                Err(err) => Err(err),
+            }
+        } else {
+            dispatch_result
+        };
 
         if dispatch_result.is_ok() {
             let mut queue = ctx.accounts.execution_queue.load_mut()?;
@@ -1790,10 +1552,26 @@ pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u
 
         // Dispatch failed. Handle retries and clearing.
         if candidate.is_ctm {
-            if requires_atomic_failure_rollback {
+            if item_health_region.is_some() {
                 // Health-gated items (PerpPlaceOrderV2) mutate perp book state
-                // directly before the post-check, so a failed dispatch must roll
-                // back the whole tx to preserve orderbook/account atomicity.
+                // directly before the health check, so a failed health check
+                // cannot be swallowed — the tx must roll back to undo book mutations.
+                //
+                // However, we MUST NOT let a permanently-failing item block the
+                // queue forever. If the item has already been retried enough times,
+                // clear it and return Ok. Otherwise, increment the retry counter
+                // (which persists across tx rollback only if we DON'T bubble the error)
+                // and roll back.
+                //
+                // Strategy: use a pre-dispatch retry check. If retries >= max,
+                // skip dispatch entirely and clear the item.
+                // Since we already dispatched and it failed, we must roll back.
+                // The retry counter was NOT incremented (would be rolled back anyway).
+                // The cranker's offchain skip-list handles this:
+                // after seeing repeated simulation failures for a sequence, the cranker
+                // should call execution_queue_drop_ctm or wait for gap_wait_slots to expire.
+                //
+                // For non-health-gated dispatch errors, clear immediately:
                 return dispatch_result;
             }
             // Non-health-gated CTM (cancel orders, etc.): retry up to max, then discard.
@@ -1893,7 +1671,7 @@ pub fn execution_queue_execute_multi(
     // per item, replacing it with O(lane_count) byte comparisons.
     let precomputed_lane_hashes: Vec<[u8; 32]> = lane_slices
         .iter()
-        .map(|lane| hash_account_infos(lane))
+        .map(|lane| hash_accounts(&account_metas_from_infos(lane)))
         .collect();
 
     for _ in 0..max_items {
@@ -2009,8 +1787,7 @@ pub fn execution_queue_execute_multi(
             continue;
         }
 
-        let requires_atomic_failure_rollback =
-            variant_requires_atomic_failure_rollback(decoded_payload.variant);
+        let item_health_region = queue_health_region_spec(decoded_payload.variant);
 
         if candidate.is_ctm {
             if let Some(reason) = prevalidate_terminal_ctm_payload(&decoded_payload, now_ts) {
@@ -2032,6 +1809,43 @@ pub fn execution_queue_execute_multi(
             }
         }
 
+        // Pre-dispatch check: if a health-gated item has exhausted retries, clear it
+        // WITHOUT dispatching (same logic as execute single-lane path).
+        if item_health_region.is_some()
+            && candidate.is_ctm
+            && candidate.retries >= EXECUTION_QUEUE_MAX_RETRIES
+        {
+            let mut queue = ctx.accounts.execution_queue.load_mut()?;
+            queue.clear_ctm_item_at(candidate.sequence);
+            emit!(QueueItemProcessed {
+                group: group_key,
+                sequence: candidate.sequence,
+                kind: candidate.kind,
+                status: QueueItemStatus::Failed as u8,
+            });
+            continue;
+        }
+
+        if let Some(spec) = item_health_region {
+            if queue_health_region_begin(dispatch_accounts, spec).is_err() {
+                let mut queue = ctx.accounts.execution_queue.load_mut()?;
+                if candidate.is_ctm {
+                    let retries = queue.increment_ctm_retry(candidate.sequence, clock.slot);
+                    if retries >= EXECUTION_QUEUE_MAX_RETRIES {
+                        queue.clear_ctm_item_at(candidate.sequence);
+                        emit!(QueueItemProcessed {
+                            group: group_key,
+                            sequence: candidate.sequence,
+                            kind: candidate.kind,
+                            status: QueueItemStatus::Failed as u8,
+                        });
+                        continue;
+                    }
+                }
+                break;
+            }
+        }
+
         // Dispatch
         let dispatch_result = dispatch_queue_payload(
             &decoded_payload,
@@ -2041,6 +1855,14 @@ pub fn execution_queue_execute_multi(
             execution_queue_key,
             execution_queue_bump,
         );
+        let dispatch_result = if let Some(spec) = item_health_region {
+            match dispatch_result {
+                Ok(()) => queue_health_region_end(dispatch_accounts, spec),
+                Err(err) => Err(err),
+            }
+        } else {
+            dispatch_result
+        };
 
         if dispatch_result.is_ok() {
             let mut queue = ctx.accounts.execution_queue.load_mut()?;
@@ -2057,9 +1879,12 @@ pub fn execution_queue_execute_multi(
         }
 
         if candidate.is_ctm {
-            if requires_atomic_failure_rollback {
-                // Atomic CTM failures must roll back the entire tx because the
-                // dispatch path may have already mutated the shared hot context.
+            if item_health_region.is_some() {
+                // Health-gated CTM failures must roll back the entire tx because
+                // the direct dispatch mutates perp book state before the health check.
+                // The retry counter cannot be persisted (tx rolls back), so the
+                // cranker's offchain skip-list and the pre-dispatch retry check
+                // (above) handle repeated failures.
                 return dispatch_result;
             }
             // Non-health-gated CTM: retry up to max, then discard.

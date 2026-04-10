@@ -199,14 +199,6 @@ pub enum MangoError {
     ExecutionQueueAdminActionRequiresPause,
     #[msg("execution queue sequence is not currently pending")]
     ExecutionQueueSequenceNotPending,
-    #[msg("risk sidecar account is invalid")]
-    RiskSidecarInvalidAccount,
-    #[msg("risk sidecar account capacity is too small for the current snapshot")]
-    RiskSidecarCapacityTooSmall,
-    #[msg("risk sidecar snapshot is too large to encode")]
-    RiskSidecarSnapshotTooLarge,
-    #[msg("risk sidecar snapshot failed to decode")]
-    RiskSidecarSnapshotDecodeFailed,
 }
 
 impl MangoError {

@@ -79,10 +79,8 @@ impl<'a> Orderbook<'a> {
         let mut remaining_quote_lots = order.max_quote_lots;
         let mut decremented_base_lots = 0i64;
         let mut decremented_quote_lots = 0i64;
-        let mut orders_to_change: Vec<(BookSideOrderHandle, i64)> =
-            Vec::with_capacity(limit as usize);
-        let mut orders_to_delete: Vec<(BookSideOrderTree, u128)> =
-            Vec::with_capacity(limit as usize + DROP_EXPIRED_ORDER_LIMIT);
+        let mut orders_to_change: Vec<(BookSideOrderHandle, i64)> = vec![];
+        let mut orders_to_delete: Vec<(BookSideOrderTree, u128)> = vec![];
         let mut number_of_dropped_expired_orders = 0;
         let opposing_bookside = self.bookside_mut(other_side);
         for best_opposing in opposing_bookside.iter_all_including_invalid(now_ts, oracle_price_lots)
@@ -113,9 +111,11 @@ impl<'a> Orderbook<'a> {
             if !side.is_price_within_limit(best_opposing_price, price_lots) {
                 break;
             } else if post_only {
+                msg!("Order could not be placed due to PostOnly");
                 post_target = None;
                 break; // return silently to not fail other instructions in tx
             } else if limit == 0 {
+                msg!("Order matching limit reached");
                 post_target = None;
                 break;
             }
@@ -262,6 +262,7 @@ impl<'a> Orderbook<'a> {
             // price limit check computed lazily to save CU on average
             let native_price = market.lot_to_native_price(price_lots);
             if !market.inside_price_limit(side, native_price, oracle_price) {
+                msg!("Posting on book disallowed due to price limits, order price {:?}, oracle price {:?}", native_price, oracle_price);
                 post_target = None;
             }
         }
@@ -297,7 +298,7 @@ impl<'a> Orderbook<'a> {
                 event_queue.push_back(cast(event)).unwrap();
             }
 
-            let owner_slot = mango_account.perp_next_order_slot_fast()?;
+            let owner_slot = mango_account.perp_next_order_slot()?;
             let new_order = LeafNode::new(
                 owner_slot as u8,
                 order_id,
@@ -310,6 +311,18 @@ impl<'a> Orderbook<'a> {
                 order.client_order_id,
             );
             let _result = bookside.insert_leaf(order_tree_target, &new_order)?;
+
+            // TODO OPT remove if PlacePerpOrder needs more compute
+            msg!(
+                "{} on book order_id={} quantity={} price={}",
+                match side {
+                    Side::Bid => "bid",
+                    Side::Ask => "ask",
+                },
+                order_id,
+                book_base_quantity,
+                price_lots
+            );
 
             mango_account.add_perp_order(
                 market.perp_market_index,

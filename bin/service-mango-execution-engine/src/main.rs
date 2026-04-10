@@ -57,13 +57,16 @@ use solana_sdk::{
 };
 use tokio::{
     fs,
-    sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore},
+    sync::{mpsc, Mutex, OwnedSemaphorePermit, RwLock, Semaphore},
     task::JoinHandle,
     time::{sleep, timeout},
 };
 use tonic::{transport::Server, Code, Request, Response, Status};
 use tracing::{debug, info, warn};
 use warp::Filter;
+
+use parking_lot::Mutex as PlMutex;
+use rust_harness::{ContinuumStateEngine, EngineSnapshot, QueueView, UndoToken};
 
 pub mod proto {
     tonic::include_proto!("ctmsequencer");
@@ -187,6 +190,69 @@ struct Config {
     /// Maximum age (ms) of the perp event consumer heartbeat before the event
     /// cranker is reported unhealthy on /metrics.
     event_cranker_stale_threshold_ms: u64,
+    /// URL the "processed" latency prober polls to read the on-chain
+    /// reconciliation watermark. Empty disables that tracker.
+    latency_processed_url: Option<String>,
+    /// JSON path for the processed watermark inside the response (default
+    /// `data.last_processed_sequence` for the queue endpoint).
+    latency_processed_field: String,
+    /// URL the "optimistic" latency prober polls to read the harness
+    /// orderbook optimistic watermark. Empty disables that tracker.
+    latency_optimistic_url: Option<String>,
+    /// JSON path for the optimistic watermark inside the response (default
+    /// `data.watermarks.optimistic_seq` for the markets endpoint).
+    latency_optimistic_field: String,
+    /// How often each latency prober hits the harness, in milliseconds.
+    /// Shared by both processed and optimistic probers.
+    latency_probe_interval_ms: u64,
+    /// HTTP timeout per latency-probe request, in milliseconds.
+    latency_probe_timeout_ms: u64,
+    /// Maximum number of in-flight pending sequences in each latency tracker
+    /// before the oldest are evicted.
+    latency_pending_max_size: usize,
+    /// Maximum age (ms) of a pending entry before it is force-expired and
+    /// dropped from the tracker (a.k.a. the "watermark didn't catch up"
+    /// timeout).
+    latency_pending_max_age_ms: u64,
+    /// Sliding-window capacity for completed latency samples used to compute
+    /// p50/p95. Shared across all three latency series.
+    latency_samples_capacity: usize,
+    /// Bounded mpsc channel capacity for the background submitter pool.
+    /// Controls how many in-flight enqueue txs can be queued waiting for an
+    /// RPC submit slot. When the channel is full, new submit_intent calls
+    /// are rejected with RESOURCE_EXHAUSTED until the queue drains.
+    bg_submit_channel_cap: usize,
+    /// Number of background submitter worker tasks. Each worker serially
+    /// drains one PendingSubmit at a time and calls
+    /// `rpc.send_transaction_with_config`. Total parallelism = workers.
+    bg_submit_workers: usize,
+    /// Maximum retries per PendingSubmit on transient RPC failures.
+    /// Hard failures (signature verify, account not found, program reject,
+    /// etc.) skip retries and immediately roll back the local sequence.
+    bg_submit_max_retries: u32,
+    /// Base backoff in milliseconds for the exponential retry on transient
+    /// RPC failures. Doubled per attempt, capped at 6 doublings.
+    bg_submit_retry_base_ms: u64,
+    /// Phase 3.5: TTL (in milliseconds) for the margin-check account
+    /// cache. Set to 0 to disable caching entirely (every margin check
+    /// hits RPC). 500 ms is the recommended starting point — short
+    /// enough to bound oracle staleness, long enough to give ~100% cache
+    /// hit rate at sustained tps.
+    margin_cache_ttl_ms: u64,
+    /// Maximum number of cached margin-check accounts. Soft cap; the
+    /// oldest entries are evicted when the cache exceeds this size.
+    margin_cache_max_entries: usize,
+    /// Phase 2: enable in-process optimistic state via the embedded
+    /// rust-harness crate. Defaults to false so the legacy HTTP path is
+    /// preserved until soaked.
+    local_state_enabled: bool,
+    /// URL the relayer hits at startup to bootstrap its in-process state
+    /// from the legacy harness. Only consulted when local_state_enabled is
+    /// true. The relayer makes ONE GET request here at startup and never
+    /// again — Phase 5 replaces this with a Rust on-chain reader.
+    local_state_bootstrap_url: String,
+    /// Per-request HTTP timeout for the bootstrap fetch (ms).
+    local_state_bootstrap_timeout_ms: u64,
 }
 
 impl Config {
@@ -360,6 +426,74 @@ impl Config {
             "CTM_RELAYER_EVENT_CRANKER_STALE_MS",
             executor_perp_consume_interval_ms.saturating_mul(5).max(10_000),
         )?;
+        // "Processed" tracker — uses the lightweight queue endpoint, which
+        // doesn't trigger an upstream RPC fetch on the harness side. This
+        // measures `ingress -> harness has reconciled past my sequence on
+        // chain`, which is dominated by Solana slot inclusion + harness
+        // reconciliation lag. Typically ~1 s.
+        let latency_processed_url = std::env::var("CTM_RELAYER_LATENCY_PROCESSED_URL")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .or_else(|| {
+                Some("http://127.0.0.1:9091/state/queue/0?view=optimistic".to_string())
+            });
+        let latency_processed_field = std::env::var("CTM_RELAYER_LATENCY_PROCESSED_FIELD")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "data.last_processed_sequence".to_string());
+        // "Optimistic" tracker — uses the markets endpoint's optimistic_seq
+        // watermark. The harness updates this from the relay-intent event
+        // stream BEFORE on-chain confirmation, so it measures
+        // `ingress -> harness internal optimistic state shows my sequence`.
+        // Should be ~50-250ms.
+        let latency_optimistic_url = std::env::var("CTM_RELAYER_LATENCY_OPTIMISTIC_URL")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .or_else(|| {
+                Some("http://127.0.0.1:9091/state/markets/0?view=optimistic".to_string())
+            });
+        let latency_optimistic_field = std::env::var("CTM_RELAYER_LATENCY_OPTIMISTIC_FIELD")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "data.watermarks.optimistic_seq".to_string());
+        // Phase 1.3: tightened from 250ms to 25ms so latency measurements
+        // have ≤25ms of polling jitter. The harness queue endpoint is ~200
+        // bytes and doesn't trigger an upstream RPC fetch, so 10× the
+        // polling rate adds negligible load.
+        let latency_probe_interval_ms =
+            parse_u64_env("CTM_RELAYER_LATENCY_PROBE_INTERVAL_MS", 25)?;
+        let latency_probe_timeout_ms =
+            parse_u64_env("CTM_RELAYER_LATENCY_PROBE_TIMEOUT_MS", 2_000)?;
+        let latency_pending_max_size =
+            parse_u64_env("CTM_RELAYER_LATENCY_PENDING_MAX_SIZE", 100_000)? as usize;
+        let latency_pending_max_age_ms =
+            parse_u64_env("CTM_RELAYER_LATENCY_PENDING_MAX_AGE_MS", 60_000)?;
+        let latency_samples_capacity =
+            parse_u64_env("CTM_RELAYER_LATENCY_SAMPLES_CAPACITY", 4_096)? as usize;
+        let bg_submit_channel_cap =
+            parse_u64_env("CTM_RELAYER_BG_SUBMIT_CHANNEL_CAP", 1_024)? as usize;
+        let bg_submit_workers =
+            parse_u64_env("CTM_RELAYER_BG_SUBMIT_WORKERS", 16)? as usize;
+        let bg_submit_max_retries =
+            parse_u64_env("CTM_RELAYER_BG_SUBMIT_MAX_RETRIES", 5)? as u32;
+        let bg_submit_retry_base_ms =
+            parse_u64_env("CTM_RELAYER_BG_SUBMIT_RETRY_BASE_MS", 50)?;
+        let margin_cache_ttl_ms =
+            parse_u64_env("CTM_RELAYER_MARGIN_CACHE_TTL_MS", 500)?;
+        let margin_cache_max_entries =
+            parse_u64_env("CTM_RELAYER_MARGIN_CACHE_MAX_ENTRIES", 4096)? as usize;
+        let local_state_enabled = parse_bool_env("CTM_RELAYER_LOCAL_STATE", false);
+        let local_state_bootstrap_url = std::env::var("CTM_RELAYER_LOCAL_STATE_BOOTSTRAP_URL")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "http://127.0.0.1:9091/state/full?view=confirmed".to_string());
+        let local_state_bootstrap_timeout_ms =
+            parse_u64_env("CTM_RELAYER_LOCAL_STATE_BOOTSTRAP_TIMEOUT_MS", 30_000)?;
 
         Ok(Self {
             cluster_url,
@@ -435,6 +569,24 @@ impl Config {
             balance_poll_interval_ms,
             executor_stale_threshold_ms,
             event_cranker_stale_threshold_ms,
+            latency_processed_url,
+            latency_processed_field,
+            latency_optimistic_url,
+            latency_optimistic_field,
+            latency_probe_interval_ms,
+            latency_probe_timeout_ms,
+            latency_pending_max_size,
+            latency_pending_max_age_ms,
+            latency_samples_capacity,
+            bg_submit_channel_cap,
+            bg_submit_workers,
+            bg_submit_max_retries,
+            bg_submit_retry_base_ms,
+            margin_cache_ttl_ms,
+            margin_cache_max_entries,
+            local_state_enabled,
+            local_state_bootstrap_url,
+            local_state_bootstrap_timeout_ms,
         })
     }
 }
@@ -486,6 +638,38 @@ struct Metrics {
     /// on-chain failure (the tx landed but the program errored).
     executed_failed_total: AtomicU64,
 
+    // ---- Background submitter pool counters (Phase 1.1).
+    /// Lifetime count of bg-submitted txs that succeeded on the first try
+    /// or after retries.
+    bg_submit_ok_total: AtomicU64,
+    /// Lifetime count of bg-submitted txs that hit a hard failure and were
+    /// rolled back.
+    bg_submit_failed_total: AtomicU64,
+    /// Lifetime count of transient failures observed by bg workers (each
+    /// retry attempt counts once).
+    bg_submit_transient_total: AtomicU64,
+    /// Lifetime count of submit_intent calls rejected because the bg
+    /// channel was full at try_send time.
+    bg_submit_channel_full_total: AtomicU64,
+    /// Lifetime count of retries dropped because the retry-spawned task
+    /// could not re-enqueue (channel closed).
+    bg_submit_retry_dropped_total: AtomicU64,
+    /// Current count of in-flight PendingSubmits in the bg channel +
+    /// workers. Bumped on enqueue; decremented on terminal outcome
+    /// (success or hard failure). Useful as a real-time pool depth gauge.
+    bg_submit_inflight: AtomicU64,
+
+    // ---- Phase 3.5 margin-check account cache.
+    /// Lifetime count of cache hits in `fetch_margin_check_account_map`.
+    margin_cache_hit_total: AtomicU64,
+    /// Lifetime count of cache misses (resulted in an RPC fetch).
+    margin_cache_miss_total: AtomicU64,
+    /// Lifetime count of evictions (entry exceeded the soft size cap or
+    /// expired during a sweep).
+    margin_cache_evicted_total: AtomicU64,
+    /// Current size of the cache.
+    margin_cache_size: AtomicU64,
+
     // ---- Sampler-published rate / windowed values. Only the sampler task
     // writes these; the /metrics renderer only reads them.
     /// Ingress rate sampled over the last 10s, scaled by 1000 (so a value of
@@ -532,6 +716,86 @@ struct Metrics {
     /// Wall-clock ms when the perp event consumer loop last completed an
     /// iteration.
     event_cranker_last_tick_ms: AtomicU64,
+
+    // ---- Ingress -> "submitted" latency (relayer-only).
+    // Hot path pushes elapsed_ms into submit_latency_samples ring; sampler
+    // computes percentiles 1Hz and publishes here. Captures only successful
+    // submissions, since rejected requests don't represent a meaningful
+    // submit pipeline timing.
+    /// Median latency from order ingress to the moment the relayer's
+    /// submit_intent returned Ok (i.e. the relayer signed and dispatched the
+    /// enqueue tx via RPC).
+    latency_ingress_to_submitted_p50_ms: AtomicU64,
+    latency_ingress_to_submitted_p95_ms: AtomicU64,
+    latency_ingress_to_submitted_max_ms: AtomicU64,
+    latency_ingress_to_submitted_samples: AtomicU64,
+    /// Per-stage published gauges (sampler-written; written from
+    /// stage_*_latency histograms once per second).
+    latency_stage_parse_p50_ms: AtomicU64,
+    latency_stage_parse_p95_ms: AtomicU64,
+    latency_stage_margin_check_p50_ms: AtomicU64,
+    latency_stage_margin_check_p95_ms: AtomicU64,
+    latency_stage_sign_p50_ms: AtomicU64,
+    latency_stage_sign_p95_ms: AtomicU64,
+    latency_stage_event_dispatch_p50_ms: AtomicU64,
+    latency_stage_event_dispatch_p95_ms: AtomicU64,
+    latency_stage_bg_rpc_submit_p50_ms: AtomicU64,
+    latency_stage_bg_rpc_submit_p95_ms: AtomicU64,
+
+    // ---- Ingress -> "optimistic" latency.
+    // Driven by LatencyTracker against the markets endpoint's
+    // data.watermarks.optimistic_seq. Captures the time until the harness
+    // applies the relayer's relay-intent event into its optimistic state.
+    latency_ingress_to_optimistic_p50_ms: AtomicU64,
+    latency_ingress_to_optimistic_p95_ms: AtomicU64,
+    latency_ingress_to_optimistic_max_ms: AtomicU64,
+    latency_ingress_to_optimistic_samples: AtomicU64,
+    latency_optimistic_completed_total: AtomicU64,
+    latency_optimistic_expired_total: AtomicU64,
+    latency_optimistic_pending_inflight: AtomicU64,
+    /// Last optimistic watermark observed by the optimistic prober.
+    harness_optimistic_watermark_seq: AtomicU64,
+    /// Wall-clock ms when the optimistic prober last successfully read the
+    /// optimistic watermark.
+    latency_optimistic_prober_last_ms: AtomicU64,
+
+    // ---- Ingress -> "processed" latency.
+    // Driven by LatencyTracker against the queue endpoint's
+    // data.last_processed_sequence. Captures the time until the harness has
+    // reconciled past the user's sequence from on-chain state.
+    latency_ingress_to_processed_p50_ms: AtomicU64,
+    latency_ingress_to_processed_p95_ms: AtomicU64,
+    latency_ingress_to_processed_max_ms: AtomicU64,
+    latency_ingress_to_processed_samples: AtomicU64,
+    latency_processed_completed_total: AtomicU64,
+    latency_processed_expired_total: AtomicU64,
+    latency_processed_pending_inflight: AtomicU64,
+    /// Last processed watermark observed by the processed prober.
+    harness_processed_watermark_seq: AtomicU64,
+    /// Wall-clock ms when the processed prober last successfully read the
+    /// processed watermark.
+    latency_processed_prober_last_ms: AtomicU64,
+
+    // ---- Hot-path-owned latency histograms.
+    // Each LatencyHistogram is a fixed-size sample ring + a write counter.
+    // The hot path acquires the histogram's std mutex once per recorded
+    // sample (the same pattern as note_user_owner). The metrics sampler
+    // computes percentiles once per second under a brief read lock. No
+    // lock is ever held across an `.await`.
+    /// End-to-end submit_intent latency for accepted intents.
+    submit_latency: LatencyHistogram,
+    /// Per-stage histograms for the submit_intent pipeline. Phase 0
+    /// instrumentation: tells us where the time goes inside the relayer.
+    stage_parse_latency: LatencyHistogram,
+    stage_margin_check_latency: LatencyHistogram,
+    stage_sign_latency: LatencyHistogram,
+    /// Time from `tx` signed to the bg-submitter receiving it from the mpsc
+    /// channel — i.e. the dispatch hand-off cost.
+    stage_event_dispatch_latency: LatencyHistogram,
+    /// Time spent inside `rpc.send_transaction_with_config` from the
+    /// background submitter worker. This is no longer on the user-visible
+    /// critical path after Phase 1.1; we keep it as a gauge for ops.
+    stage_bg_rpc_submit_latency: LatencyHistogram,
 }
 
 impl Metrics {
@@ -594,6 +858,26 @@ impl Metrics {
             .store(now_ms, Ordering::Relaxed);
     }
 
+    /// Hot-path: push a submit latency sample. Delegates to the
+    /// LatencyHistogram on `submit_latency`.
+    #[inline]
+    fn record_submit_latency(&self, ms: u64) {
+        self.submit_latency.record(ms);
+    }
+
+    /// Sampler-only path (1 Hz): snapshot the submit-latency ring and
+    /// compute percentile statistics.
+    #[inline]
+    fn compute_submit_summary(&self) -> LatencySummary {
+        self.submit_latency.compute_summary()
+    }
+
+    /// Legacy stage averages — kept around so the existing render output for
+    /// `submit_*_avg_ms` continues to compile, even though the call from
+    /// submit_intent_inner was removed in Phase 1.1 (we now have per-stage
+    /// LatencyHistograms instead). Marked dead-code-allowed; safe to delete
+    /// once the avg_ms render lines are retired.
+    #[allow(dead_code)]
     fn observe_submit_stages(&self, parse: Duration, prepare: Duration, send: Duration) {
         self.submit_parse_total_ms
             .fetch_add(parse.as_millis() as u64, Ordering::Relaxed);
@@ -798,6 +1082,68 @@ impl Metrics {
                 "execution_engine_executed_failed_total {}",
                 self.executed_failed_total.load(Ordering::Relaxed)
             ),
+
+            // ---------- Background submitter pool (Phase 1.1) ----------
+            "# HELP execution_engine_bg_submit_ok_total Successful background tx submits (after any retries)".to_string(),
+            "# TYPE execution_engine_bg_submit_ok_total counter".to_string(),
+            format!(
+                "execution_engine_bg_submit_ok_total {}",
+                self.bg_submit_ok_total.load(Ordering::Relaxed)
+            ),
+            "# HELP execution_engine_bg_submit_failed_total Hard failures from the bg submitter (rolled back the local sequence)".to_string(),
+            "# TYPE execution_engine_bg_submit_failed_total counter".to_string(),
+            format!(
+                "execution_engine_bg_submit_failed_total {}",
+                self.bg_submit_failed_total.load(Ordering::Relaxed)
+            ),
+            "# HELP execution_engine_bg_submit_transient_total Transient RPC failures observed by the bg submitter (each retry attempt counted)".to_string(),
+            "# TYPE execution_engine_bg_submit_transient_total counter".to_string(),
+            format!(
+                "execution_engine_bg_submit_transient_total {}",
+                self.bg_submit_transient_total.load(Ordering::Relaxed)
+            ),
+            "# HELP execution_engine_bg_submit_channel_full_total submit_intent calls rejected because the bg channel was full".to_string(),
+            "# TYPE execution_engine_bg_submit_channel_full_total counter".to_string(),
+            format!(
+                "execution_engine_bg_submit_channel_full_total {}",
+                self.bg_submit_channel_full_total.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_bg_submit_retry_dropped_total counter".to_string(),
+            format!(
+                "execution_engine_bg_submit_retry_dropped_total {}",
+                self.bg_submit_retry_dropped_total.load(Ordering::Relaxed)
+            ),
+            "# HELP execution_engine_bg_submit_inflight Current count of in-flight bg submits (queue + workers)".to_string(),
+            "# TYPE execution_engine_bg_submit_inflight gauge".to_string(),
+            format!(
+                "execution_engine_bg_submit_inflight {}",
+                self.bg_submit_inflight.load(Ordering::Relaxed)
+            ),
+
+            // ---------- Phase 3.5 margin-check account cache ----------
+            "# HELP execution_engine_margin_cache_hit_total Margin precheck account fetch served from local TTL cache".to_string(),
+            "# TYPE execution_engine_margin_cache_hit_total counter".to_string(),
+            format!(
+                "execution_engine_margin_cache_hit_total {}",
+                self.margin_cache_hit_total.load(Ordering::Relaxed)
+            ),
+            "# HELP execution_engine_margin_cache_miss_total Margin precheck account fetch fell through to RPC".to_string(),
+            "# TYPE execution_engine_margin_cache_miss_total counter".to_string(),
+            format!(
+                "execution_engine_margin_cache_miss_total {}",
+                self.margin_cache_miss_total.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_margin_cache_evicted_total counter".to_string(),
+            format!(
+                "execution_engine_margin_cache_evicted_total {}",
+                self.margin_cache_evicted_total.load(Ordering::Relaxed)
+            ),
+            "# HELP execution_engine_margin_cache_size Current count of entries in the margin precheck account cache".to_string(),
+            "# TYPE execution_engine_margin_cache_size gauge".to_string(),
+            format!(
+                "execution_engine_margin_cache_size {}",
+                self.margin_cache_size.load(Ordering::Relaxed)
+            ),
             "# HELP execution_engine_ingress_tps_10s Ingress txns per second sampled over last 10s".to_string(),
             "# TYPE execution_engine_ingress_tps_10s gauge".to_string(),
             format!(
@@ -847,8 +1193,497 @@ impl Metrics {
                 "execution_engine_sampler_last_tick_ms {}",
                 self.sampler_last_tick_ms.load(Ordering::Relaxed)
             ),
+
+            // ---------- Latency: ingress -> submitted (relayer-only) ----------
+            "# HELP execution_engine_latency_ingress_to_submitted_p50_ms Median latency (ms) from order ingress to relayer submit_intent returning Ok".to_string(),
+            "# TYPE execution_engine_latency_ingress_to_submitted_p50_ms gauge".to_string(),
+            format!(
+                "execution_engine_latency_ingress_to_submitted_p50_ms {}",
+                self.latency_ingress_to_submitted_p50_ms.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_latency_ingress_to_submitted_p95_ms gauge".to_string(),
+            format!(
+                "execution_engine_latency_ingress_to_submitted_p95_ms {}",
+                self.latency_ingress_to_submitted_p95_ms.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_latency_ingress_to_submitted_max_ms gauge".to_string(),
+            format!(
+                "execution_engine_latency_ingress_to_submitted_max_ms {}",
+                self.latency_ingress_to_submitted_max_ms.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_latency_ingress_to_submitted_samples gauge".to_string(),
+            format!(
+                "execution_engine_latency_ingress_to_submitted_samples {}",
+                self.latency_ingress_to_submitted_samples.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_latency_submit_total counter".to_string(),
+            format!(
+                "execution_engine_latency_submit_total {}",
+                self.submit_latency.record_total()
+            ),
+
+            // ---------- Latency: per-stage breakdown of submit_intent (Phase 0) ----------
+            "# HELP execution_engine_latency_stage_parse_p50_ms Median time spent in parse_submit_intent_keys + payload decode".to_string(),
+            "# TYPE execution_engine_latency_stage_parse_p50_ms gauge".to_string(),
+            format!(
+                "execution_engine_latency_stage_parse_p50_ms {}",
+                self.latency_stage_parse_p50_ms.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_latency_stage_parse_p95_ms gauge".to_string(),
+            format!(
+                "execution_engine_latency_stage_parse_p95_ms {}",
+                self.latency_stage_parse_p95_ms.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_latency_stage_parse_total counter".to_string(),
+            format!(
+                "execution_engine_latency_stage_parse_total {}",
+                self.stage_parse_latency.record_total()
+            ),
+            "# HELP execution_engine_latency_stage_margin_check_p50_ms Median time spent in ensure_submit_margin_ready (HTTP to harness today)".to_string(),
+            "# TYPE execution_engine_latency_stage_margin_check_p50_ms gauge".to_string(),
+            format!(
+                "execution_engine_latency_stage_margin_check_p50_ms {}",
+                self.latency_stage_margin_check_p50_ms.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_latency_stage_margin_check_p95_ms gauge".to_string(),
+            format!(
+                "execution_engine_latency_stage_margin_check_p95_ms {}",
+                self.latency_stage_margin_check_p95_ms.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_latency_stage_margin_check_total counter".to_string(),
+            format!(
+                "execution_engine_latency_stage_margin_check_total {}",
+                self.stage_margin_check_latency.record_total()
+            ),
+            "# HELP execution_engine_latency_stage_sign_p50_ms Median time spent building + signing the enqueue tx".to_string(),
+            "# TYPE execution_engine_latency_stage_sign_p50_ms gauge".to_string(),
+            format!(
+                "execution_engine_latency_stage_sign_p50_ms {}",
+                self.latency_stage_sign_p50_ms.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_latency_stage_sign_p95_ms gauge".to_string(),
+            format!(
+                "execution_engine_latency_stage_sign_p95_ms {}",
+                self.latency_stage_sign_p95_ms.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_latency_stage_sign_total counter".to_string(),
+            format!(
+                "execution_engine_latency_stage_sign_total {}",
+                self.stage_sign_latency.record_total()
+            ),
+            "# HELP execution_engine_latency_stage_event_dispatch_p50_ms Median time from signed tx to bg-submit channel hand-off".to_string(),
+            "# TYPE execution_engine_latency_stage_event_dispatch_p50_ms gauge".to_string(),
+            format!(
+                "execution_engine_latency_stage_event_dispatch_p50_ms {}",
+                self.latency_stage_event_dispatch_p50_ms.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_latency_stage_event_dispatch_p95_ms gauge".to_string(),
+            format!(
+                "execution_engine_latency_stage_event_dispatch_p95_ms {}",
+                self.latency_stage_event_dispatch_p95_ms.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_latency_stage_event_dispatch_total counter".to_string(),
+            format!(
+                "execution_engine_latency_stage_event_dispatch_total {}",
+                self.stage_event_dispatch_latency.record_total()
+            ),
+            "# HELP execution_engine_latency_stage_bg_rpc_submit_p50_ms Median time spent in rpc.send_transaction inside the bg submitter pool (off the user-visible critical path)".to_string(),
+            "# TYPE execution_engine_latency_stage_bg_rpc_submit_p50_ms gauge".to_string(),
+            format!(
+                "execution_engine_latency_stage_bg_rpc_submit_p50_ms {}",
+                self.latency_stage_bg_rpc_submit_p50_ms.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_latency_stage_bg_rpc_submit_p95_ms gauge".to_string(),
+            format!(
+                "execution_engine_latency_stage_bg_rpc_submit_p95_ms {}",
+                self.latency_stage_bg_rpc_submit_p95_ms.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_latency_stage_bg_rpc_submit_total counter".to_string(),
+            format!(
+                "execution_engine_latency_stage_bg_rpc_submit_total {}",
+                self.stage_bg_rpc_submit_latency.record_total()
+            ),
+
+            // ---------- Latency: ingress -> optimistic (harness internal state) ----------
+            "# HELP execution_engine_latency_ingress_to_optimistic_p50_ms Median latency (ms) from order ingress to harness optimistic_seq watermark catching up".to_string(),
+            "# TYPE execution_engine_latency_ingress_to_optimistic_p50_ms gauge".to_string(),
+            format!(
+                "execution_engine_latency_ingress_to_optimistic_p50_ms {}",
+                self.latency_ingress_to_optimistic_p50_ms.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_latency_ingress_to_optimistic_p95_ms gauge".to_string(),
+            format!(
+                "execution_engine_latency_ingress_to_optimistic_p95_ms {}",
+                self.latency_ingress_to_optimistic_p95_ms.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_latency_ingress_to_optimistic_max_ms gauge".to_string(),
+            format!(
+                "execution_engine_latency_ingress_to_optimistic_max_ms {}",
+                self.latency_ingress_to_optimistic_max_ms.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_latency_ingress_to_optimistic_samples gauge".to_string(),
+            format!(
+                "execution_engine_latency_ingress_to_optimistic_samples {}",
+                self.latency_ingress_to_optimistic_samples.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_latency_optimistic_completed_total counter".to_string(),
+            format!(
+                "execution_engine_latency_optimistic_completed_total {}",
+                self.latency_optimistic_completed_total.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_latency_optimistic_expired_total counter".to_string(),
+            format!(
+                "execution_engine_latency_optimistic_expired_total {}",
+                self.latency_optimistic_expired_total.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_latency_optimistic_pending_inflight gauge".to_string(),
+            format!(
+                "execution_engine_latency_optimistic_pending_inflight {}",
+                self.latency_optimistic_pending_inflight.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_harness_optimistic_watermark_seq gauge".to_string(),
+            format!(
+                "execution_engine_harness_optimistic_watermark_seq {}",
+                self.harness_optimistic_watermark_seq.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_latency_optimistic_prober_last_ms gauge".to_string(),
+            format!(
+                "execution_engine_latency_optimistic_prober_last_ms {}",
+                self.latency_optimistic_prober_last_ms.load(Ordering::Relaxed)
+            ),
+
+            // ---------- Latency: ingress -> processed (harness on-chain reconciliation) ----------
+            "# HELP execution_engine_latency_ingress_to_processed_p50_ms Median latency (ms) from order ingress to harness last_processed_sequence catching up".to_string(),
+            "# TYPE execution_engine_latency_ingress_to_processed_p50_ms gauge".to_string(),
+            format!(
+                "execution_engine_latency_ingress_to_processed_p50_ms {}",
+                self.latency_ingress_to_processed_p50_ms.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_latency_ingress_to_processed_p95_ms gauge".to_string(),
+            format!(
+                "execution_engine_latency_ingress_to_processed_p95_ms {}",
+                self.latency_ingress_to_processed_p95_ms.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_latency_ingress_to_processed_max_ms gauge".to_string(),
+            format!(
+                "execution_engine_latency_ingress_to_processed_max_ms {}",
+                self.latency_ingress_to_processed_max_ms.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_latency_ingress_to_processed_samples gauge".to_string(),
+            format!(
+                "execution_engine_latency_ingress_to_processed_samples {}",
+                self.latency_ingress_to_processed_samples.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_latency_processed_completed_total counter".to_string(),
+            format!(
+                "execution_engine_latency_processed_completed_total {}",
+                self.latency_processed_completed_total.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_latency_processed_expired_total counter".to_string(),
+            format!(
+                "execution_engine_latency_processed_expired_total {}",
+                self.latency_processed_expired_total.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_latency_processed_pending_inflight gauge".to_string(),
+            format!(
+                "execution_engine_latency_processed_pending_inflight {}",
+                self.latency_processed_pending_inflight.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_harness_processed_watermark_seq gauge".to_string(),
+            format!(
+                "execution_engine_harness_processed_watermark_seq {}",
+                self.harness_processed_watermark_seq.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_latency_processed_prober_last_ms gauge".to_string(),
+            format!(
+                "execution_engine_latency_processed_prober_last_ms {}",
+                self.latency_processed_prober_last_ms.load(Ordering::Relaxed)
+            ),
         ]
         .join("\n")
+    }
+}
+
+/// Snapshot of percentile statistics for the latency-sample window. Returned
+/// by LatencyTracker::compute_summary and consumed once per second by the
+/// metrics sampler — never touched by the hot path.
+#[derive(Default, Clone, Copy)]
+struct LatencySummary {
+    count: u64,
+    p50_ms: u64,
+    p95_ms: u64,
+    max_ms: u64,
+}
+
+/// One unit of work for the background submitter pool. Carries the
+/// already-signed VersionedTransaction plus the metadata the worker needs
+/// to roll back the local sequence on hard failure.
+#[derive(Debug, Clone)]
+struct PendingSubmit {
+    sequence_key: String,
+    sequence: u64,
+    execution_queue: Pubkey,
+    tx: VersionedTransaction,
+    /// Pre-computed locally from `tx.signatures[0]` so the user-visible
+    /// gRPC response doesn't have to wait for `rpc.send_transaction` to
+    /// echo it back.
+    tx_signature: Signature,
+    /// Number of retry attempts so far. 0 = first attempt.
+    attempts: u32,
+    /// Wall-clock ms when this was first enqueued. Useful for diagnostics
+    /// and to compute total time-in-flight including retries.
+    enqueued_at_ms: u64,
+    /// Phase 3: token from `apply_relay_intent_local`. On hard ingress
+    /// failure the bg submitter calls `state.rollback_local(undo)` to
+    /// reverse the in-process optimistic apply. None when local state is
+    /// disabled or when the apply itself failed (in which case there's
+    /// nothing to undo).
+    undo_token: Option<UndoToken>,
+}
+
+/// Conservative classification of solana_client errors into "transient"
+/// (worth retrying — network blip, server too busy, blockhash race) and
+/// "hard" (worth rolling back — signature verify, account not found,
+/// program reject). Anything not explicitly transient is treated as hard
+/// to avoid masking real bugs.
+fn is_transient_rpc_error(err: &solana_client::client_error::ClientError) -> bool {
+    let msg = err.to_string().to_ascii_lowercase();
+    if msg.contains("timeout") || msg.contains("timed out") {
+        return true;
+    }
+    if msg.contains("connection refused")
+        || msg.contains("connection reset")
+        || msg.contains("connection closed")
+        || msg.contains("connection aborted")
+        || msg.contains("broken pipe")
+    {
+        return true;
+    }
+    if msg.contains("blockhashnotfound") || msg.contains("blockhash not found") {
+        return true;
+    }
+    if msg.contains("too many requests") || msg.contains("429") {
+        return true;
+    }
+    if msg.contains("server is busy")
+        || msg.contains("server too busy")
+        || msg.contains("node is unhealthy")
+    {
+        return true;
+    }
+    if msg.contains("502 ") || msg.contains("503 ") || msg.contains("504 ") {
+        return true;
+    }
+    false
+}
+
+/// Reusable lock-and-push latency histogram. Used both for the existing
+/// submit-latency series and for the per-stage timings introduced in
+/// Phase 0. Hot-path producers acquire the std mutex briefly to push one
+/// u64 sample; the metrics sampler computes percentiles from a snapshot
+/// once per second under another brief lock. The mutex is never held
+/// across an `.await`.
+#[derive(Default)]
+struct LatencyHistogram {
+    samples: StdMutex<VecDeque<u64>>,
+    /// Maximum number of samples retained. Initialized once at startup
+    /// from config; never mutated thereafter.
+    capacity: AtomicU64,
+    /// Lifetime count of samples recorded — exposed as a Prometheus counter
+    /// so external monitors can compute deltas independently of the ring.
+    record_total: AtomicU64,
+}
+
+impl LatencyHistogram {
+    fn set_capacity(&self, cap: usize) {
+        self.capacity.store(cap as u64, Ordering::Relaxed);
+    }
+
+    /// Hot-path: push one sample. Single std mutex acquisition + bounded
+    /// VecDeque push. The capacity bound is enforced by popping the oldest
+    /// entry when the ring overflows.
+    #[inline]
+    fn record(&self, ms: u64) {
+        let cap = self.capacity.load(Ordering::Relaxed) as usize;
+        if cap == 0 {
+            return;
+        }
+        if let Ok(mut guard) = self.samples.lock() {
+            guard.push_back(ms);
+            while guard.len() > cap {
+                guard.pop_front();
+            }
+        }
+        self.record_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Sampler-only path (1 Hz): snapshot the ring, sort, compute stats.
+    fn compute_summary(&self) -> LatencySummary {
+        let snapshot: Vec<u64> = match self.samples.lock() {
+            Ok(guard) => guard.iter().copied().collect(),
+            Err(_) => return LatencySummary::default(),
+        };
+        if snapshot.is_empty() {
+            return LatencySummary::default();
+        }
+        let mut sorted = snapshot;
+        sorted.sort_unstable();
+        let n = sorted.len();
+        let p50 = sorted[n / 2];
+        let p95_idx = (((n as f64) * 0.95).floor() as usize).min(n - 1);
+        let p95 = sorted[p95_idx];
+        let max = *sorted.last().unwrap();
+        LatencySummary {
+            count: n as u64,
+            p50_ms: p50,
+            p95_ms: p95,
+            max_ms: max,
+        }
+    }
+
+    fn record_total(&self) -> u64 {
+        self.record_total.load(Ordering::Relaxed)
+    }
+}
+
+/// Tracks "ingress -> orderbook-visible" latency for accepted submit_intent
+/// calls. The hot path only ever does a single bounded BTreeMap insert under
+/// a std::sync::Mutex (the lock is never held across an `.await`). The
+/// background harness prober drains entries whose sequence is now <= the
+/// orderbook watermark, computes per-entry latency, and pushes the values
+/// into a ring of recent samples. The metrics sampler computes percentiles
+/// from that ring once per second and publishes them as gauges.
+struct LatencyTracker {
+    /// sequence -> ingress wall-clock ms. BTreeMap so the prober can drain a
+    /// prefix in O(k) when the watermark advances.
+    pending: StdMutex<BTreeMap<u64, u64>>,
+    /// Ring of completed latency samples (oldest at the front, newest at the
+    /// back). Bounded by samples_capacity.
+    samples: StdMutex<VecDeque<u64>>,
+    /// Ring capacity, ie maximum number of recent latency samples retained.
+    samples_capacity: usize,
+    /// Maximum allowed size of the pending map. When exceeded, the smallest
+    /// (oldest) sequence is force-evicted.
+    pending_max_size: usize,
+    /// Pending entries older than this age (ms) are dropped on the next
+    /// prober pass without contributing a sample, to bound memory in case
+    /// the watermark stalls.
+    pending_max_age_ms: u64,
+    completed_total: AtomicU64,
+    expired_total: AtomicU64,
+}
+
+impl LatencyTracker {
+    fn new(samples_capacity: usize, pending_max_size: usize, pending_max_age_ms: u64) -> Self {
+        Self {
+            pending: StdMutex::new(BTreeMap::new()),
+            samples: StdMutex::new(VecDeque::with_capacity(samples_capacity)),
+            samples_capacity,
+            pending_max_size,
+            pending_max_age_ms,
+            completed_total: AtomicU64::new(0),
+            expired_total: AtomicU64::new(0),
+        }
+    }
+
+    /// Hot-path: insert a pending entry. Single std Mutex acquisition +
+    /// BTreeMap insert. Lock never held across an `.await`. Failures are
+    /// silently ignored — metrics must never affect intent flow.
+    #[inline]
+    fn note_ingress(&self, sequence: u64, ingress_ts_ms: u64) {
+        if let Ok(mut guard) = self.pending.lock() {
+            guard.insert(sequence, ingress_ts_ms);
+            // Bound the map. The smallest sequence is the oldest entry under
+            // the per-market monotonic-sequence assumption, so popping from
+            // the front evicts the oldest in flight.
+            while guard.len() > self.pending_max_size {
+                let first_seq = match guard.iter().next() {
+                    Some((&seq, _)) => seq,
+                    None => break,
+                };
+                guard.remove(&first_seq);
+                self.expired_total.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Background-task path: drain entries whose sequence is <= watermark,
+    /// computing latency for each. Also evicts pending entries older than
+    /// pending_max_age_ms regardless of watermark, to bound the map when
+    /// reconciliation stalls.
+    fn complete_up_to(&self, watermark: u64, now_ms: u64) -> usize {
+        let drained: Vec<u64> = {
+            let Ok(mut guard) = self.pending.lock() else {
+                return 0;
+            };
+            // Drain matched-by-watermark prefix.
+            let to_complete: Vec<u64> = guard
+                .range(..=watermark)
+                .map(|(&seq, _)| seq)
+                .collect();
+            let mut latencies = Vec::with_capacity(to_complete.len());
+            for seq in to_complete {
+                if let Some(ingress_ts) = guard.remove(&seq) {
+                    latencies.push(now_ms.saturating_sub(ingress_ts));
+                }
+            }
+            // Sweep stale entries that the watermark hasn't caught up to.
+            let stale_cutoff = now_ms.saturating_sub(self.pending_max_age_ms);
+            let stale: Vec<u64> = guard
+                .iter()
+                .filter(|(_, &ts)| ts < stale_cutoff)
+                .map(|(&seq, _)| seq)
+                .collect();
+            for seq in stale {
+                guard.remove(&seq);
+                self.expired_total.fetch_add(1, Ordering::Relaxed);
+            }
+            latencies
+        };
+
+        let drained_count = drained.len();
+        if drained_count > 0 {
+            self.completed_total
+                .fetch_add(drained_count as u64, Ordering::Relaxed);
+            if let Ok(mut samples) = self.samples.lock() {
+                for lat in drained {
+                    samples.push_back(lat);
+                    while samples.len() > self.samples_capacity {
+                        samples.pop_front();
+                    }
+                }
+            }
+        }
+        drained_count
+    }
+
+    /// Sampler-only path (1 Hz). Snapshots the samples ring under a brief
+    /// lock, sorts the snapshot, and computes p50/p95/max.
+    fn compute_summary(&self) -> LatencySummary {
+        let snapshot: Vec<u64> = match self.samples.lock() {
+            Ok(guard) => guard.iter().copied().collect(),
+            Err(_) => return LatencySummary::default(),
+        };
+        if snapshot.is_empty() {
+            return LatencySummary::default();
+        }
+        let mut sorted = snapshot;
+        sorted.sort_unstable();
+        let n = sorted.len();
+        let p50 = sorted[n / 2];
+        let p95_idx = (((n as f64) * 0.95).floor() as usize).min(n - 1);
+        let p95 = sorted[p95_idx];
+        let max = *sorted.last().unwrap();
+        LatencySummary {
+            count: n as u64,
+            p50_ms: p50,
+            p95_ms: p95,
+            max_ms: max,
+        }
+    }
+
+    fn pending_len(&self) -> usize {
+        self.pending.lock().map(|g| g.len()).unwrap_or(0)
     }
 }
 
@@ -943,6 +1778,61 @@ struct Lane {
     name: String,
     remaining_accounts: Vec<AccountMeta>,
     hash: [u8; 32],
+}
+
+fn lane_account_width(lane: &Lane) -> usize {
+    lane.remaining_accounts.len()
+}
+
+fn shared_lane_account_width(lanes: &[Lane]) -> Result<usize> {
+    let lane_widths: Vec<usize> = lanes.iter().map(lane_account_width).collect();
+    let Some(accounts_per_lane) = lane_widths.first().copied() else {
+        return Err(anyhow!("cannot build execute_multi with zero lanes"));
+    };
+    if lane_widths.iter().any(|width| *width != accounts_per_lane) {
+        return Err(anyhow!(
+            "incompatible execute_multi lane account widths: {:?}",
+            lane_widths
+        ));
+    }
+    Ok(accounts_per_lane)
+}
+
+fn select_layout_compatible_lanes(
+    candidate_lanes: Vec<Lane>,
+    backoff_snapshot: &HashMap<String, u64>,
+    now_ms: u64,
+    target_lane_fanout: usize,
+) -> (Vec<Lane>, usize, usize) {
+    let mut eligible_lanes: Vec<Lane> = Vec::new();
+    let mut seen_hashes = HashSet::new();
+    let mut required_width: Option<usize> = None;
+    let mut dropped_for_layout = 0usize;
+
+    for lane in candidate_lanes {
+        let lane_key = bytes_to_hex(&lane.hash);
+        let blocked_until = backoff_snapshot.get(&lane_key).copied().unwrap_or(0);
+        if blocked_until > now_ms {
+            continue;
+        }
+        if !seen_hashes.insert(lane.hash) {
+            continue;
+        }
+        if let Some(width) = required_width {
+            if lane_account_width(&lane) != width {
+                dropped_for_layout += 1;
+                continue;
+            }
+        } else {
+            required_width = Some(lane_account_width(&lane));
+        }
+        eligible_lanes.push(lane);
+        if eligible_lanes.len() >= target_lane_fanout {
+            break;
+        }
+    }
+
+    (eligible_lanes, seen_hashes.len(), dropped_for_layout)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1747,6 +2637,57 @@ struct Engine {
     /// the number of distinct senders in the active window, not lifetime
     /// cardinality.
     unique_addresses: Arc<StdMutex<HashMap<[u8; 32], u64>>>,
+    /// Tracks ingress->harness-optimistic-state latency by sequence. Hot path
+    /// only inserts after a successful submit; the optimistic prober drains
+    /// entries as the harness optimistic_seq watermark advances.
+    latency_optimistic_tracker: Arc<LatencyTracker>,
+    /// Tracks ingress->harness-on-chain-processed latency by sequence. Hot
+    /// path only inserts after a successful submit; the processed prober
+    /// drains entries as the harness last_processed_sequence advances.
+    latency_processed_tracker: Arc<LatencyTracker>,
+    /// Sender side of the bounded mpsc channel feeding the background
+    /// submitter pool. The hot path only ever calls `try_send` on this so
+    /// it never awaits backpressure — full channel becomes a clear
+    /// resource_exhausted error to the caller.
+    bg_submit_tx: mpsc::Sender<PendingSubmit>,
+    /// In-process optimistic state (Phase 2). Linked from rust-harness as
+    /// an rlib — no FFI, no JSON, no napi mutex. The hot path acquires the
+    /// parking_lot Mutex for sub-microsecond critical sections.
+    ///
+    /// **Why Mutex (not RwLock):** rust_harness::engine::MarketState holds
+    /// the per-market BookSide via `RefCell<BookSide>` which is `!Sync`.
+    /// Mutex requires only `Send` from its contents (which RefCell
+    /// satisfies); RwLock requires `Sync` (which RefCell does not). Phase
+    /// 3's incremental refactor will replace the inner RefCell with a
+    /// thread-safe wrapper so we can drop back to RwLock for concurrent
+    /// reads.
+    ///
+    /// `None` when `CTM_RELAYER_LOCAL_STATE=false` — in that mode the
+    /// relayer falls back to the legacy harness HTTP path. Default-on once
+    /// soak-tested per the deployment plan.
+    state: Option<Arc<PlMutex<ContinuumStateEngine>>>,
+    /// Per-market metadata cache (Phase 2). Populated lazily on first
+    /// `fetch_harness_market_metadata` miss; subsequent submits hit the
+    /// cache for free. Static data — perp_market and oracle pubkeys don't
+    /// change for the lifetime of a market.
+    market_metadata_cache: Arc<StdMutex<HashMap<u16, HarnessMarketMetadata>>>,
+    /// Phase 3.5: TTL cache for the margin-check account fetch. The hot
+    /// path checks here first; cache hits skip the `get_multiple_accounts`
+    /// RPC entirely. The cache stores the same authoritative on-chain
+    /// bytes we'd fetch today, just for `margin_cache_ttl_ms` ≤ ~500 ms.
+    /// Acceptable staleness because the margin check is a pre-flight
+    /// optimization, not authoritative — false accepts are caught by the
+    /// on-chain program and rolled back via Phase 3's `rollback_local`.
+    margin_account_cache: Arc<StdMutex<HashMap<Pubkey, CachedMarginAccount>>>,
+}
+
+/// One entry in the margin-check account cache. Holds a clone of the
+/// `KeyedAccountSharedData` returned by `get_multiple_accounts`, plus the
+/// wall-clock ms it was cached at so the hot path can check expiry.
+#[derive(Clone)]
+struct CachedMarginAccount {
+    account: KeyedAccountSharedData,
+    cached_at_ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1787,6 +2728,30 @@ enum ExecuteLoopOutcome {
     Idle,
     Busy,
     Sent,
+}
+
+#[derive(Debug)]
+enum ExecuteDispatchError {
+    Build(anyhow::Error),
+    Send(anyhow::Error),
+}
+
+impl ExecuteDispatchError {
+    fn err(&self) -> &anyhow::Error {
+        match self {
+            Self::Build(err) | Self::Send(err) => err,
+        }
+    }
+
+    fn into_err(self) -> anyhow::Error {
+        match self {
+            Self::Build(err) | Self::Send(err) => err,
+        }
+    }
+
+    fn is_build(&self) -> bool {
+        matches!(self, Self::Build(_))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1834,6 +2799,15 @@ fn classify_lane_failure(err: &anyhow::Error) -> LaneFailureClass {
     } else {
         LaneFailureClass::Transient
     }
+}
+
+fn is_transaction_too_large_error(err: &anyhow::Error) -> bool {
+    let msg = format!("{err:#}").to_ascii_lowercase();
+    msg.contains("transaction too large")
+        || msg.contains("versionedtransaction too large")
+        || msg.contains("base64 encoded")
+        || msg.contains("max: encoded/raw")
+        || msg.contains("packet too large")
 }
 
 impl Engine {
@@ -2089,6 +3063,25 @@ impl Engine {
         request: &SubmitIntentRequest,
         keys: ParsedSubmitIntentKeys,
     ) -> Result<Option<HarnessUserState>, Status> {
+        // Phase 2 fast path: in-process state. Single parking_lot Mutex
+        // acquisition; no HTTP, no JSON, no FFI. The lock is held for the
+        // duration of get_user_state which may trigger an internal lazy
+        // rebuild — bounded by the active intent count.
+        if let Some(state) = &self.state {
+            let owner = keys.user_owner.to_string();
+            let user_state = state
+                .lock()
+                .get_user_state(&owner, QueueView::Optimistic)
+                .map_err(|err| {
+                    self.reject_submit_request(
+                        request,
+                        Code::Internal,
+                        format!("local state get_user_state failed owner={owner}: {err}"),
+                    )
+                })?;
+            return Ok(Some(harness_user_state_from_rust_harness(user_state)));
+        }
+
         let Some(harness_base_url) = self.config.harness_base_url.as_deref() else {
             return Ok(None);
         };
@@ -2138,12 +3131,35 @@ impl Engine {
         request: &SubmitIntentRequest,
         margin_snapshot: &HarnessMarginSnapshot,
     ) -> Result<HashMap<PerpMarketIndex, HarnessMarketMetadata>, Status> {
+        // Phase 2 cache: market metadata (perp_market + oracle pubkeys) is
+        // static for the lifetime of a market. Check the in-process cache
+        // first; only fall through to HTTP for misses. After warmup all
+        // submits hit the cache and skip the harness entirely.
+        let mut metadata = HashMap::new();
+        let mut misses: Vec<PerpMarketIndex> = Vec::new();
+        {
+            if let Ok(cache) = self.market_metadata_cache.lock() {
+                for market_index in margin_snapshot.overlays.keys().copied() {
+                    if let Some(entry) = cache.get(&market_index) {
+                        metadata.insert(market_index, entry.clone());
+                    } else {
+                        misses.push(market_index);
+                    }
+                }
+            } else {
+                // Poisoned mutex — fall through to HTTP for everything.
+                misses.extend(margin_snapshot.overlays.keys().copied());
+            }
+        }
+        if misses.is_empty() {
+            return Ok(metadata);
+        }
+
         let Some(harness_base_url) = self.config.harness_base_url.as_deref() else {
-            return Ok(HashMap::new());
+            return Ok(metadata);
         };
         let timeout = Duration::from_millis(self.config.harness_health_timeout_ms);
-        let mut metadata = HashMap::new();
-        for market_index in margin_snapshot.overlays.keys().copied() {
+        for market_index in misses {
             let url = format!(
                 "{}/state/markets/{}?view=optimistic&metadata_only=true",
                 harness_base_url.trim_end_matches('/'),
@@ -2201,6 +3217,10 @@ impl Engine {
                     ),
                 ));
             }
+            // Populate the cache for next time.
+            if let Ok(mut cache) = self.market_metadata_cache.lock() {
+                cache.insert(market_index, market_metadata.clone());
+            }
             metadata.insert(market_index, market_metadata);
         }
         Ok(metadata)
@@ -2213,6 +3233,7 @@ impl Engine {
         remaining_accounts: &[AccountMeta],
         extra_market_metadata: &HashMap<PerpMarketIndex, HarnessMarketMetadata>,
     ) -> Result<HashMap<Pubkey, KeyedAccountSharedData>, Status> {
+        // Build the deduped list of pubkeys we need.
         let mut pubkeys = Vec::with_capacity(
             1 + remaining_accounts.len() + extra_market_metadata.len().saturating_mul(2),
         );
@@ -2243,9 +3264,51 @@ impl Engine {
             })?);
         }
 
+        // Phase 3.5: serve cache hits and collect misses for a single
+        // get_multiple_accounts call. The cache lookup is one std Mutex
+        // acquisition; never crosses an `.await`.
+        let ttl_ms = self.config.margin_cache_ttl_ms;
+        let now_ms = unix_timestamp_ms();
+        let mut accounts: HashMap<Pubkey, KeyedAccountSharedData> =
+            HashMap::with_capacity(pubkeys.len());
+        let mut misses: Vec<Pubkey> = Vec::new();
+        if ttl_ms > 0 {
+            if let Ok(cache) = self.margin_account_cache.lock() {
+                for &pubkey in &pubkeys {
+                    match cache.get(&pubkey) {
+                        Some(entry)
+                            if now_ms.saturating_sub(entry.cached_at_ms) <= ttl_ms =>
+                        {
+                            accounts.insert(pubkey, entry.account.clone());
+                        }
+                        _ => misses.push(pubkey),
+                    }
+                }
+            } else {
+                misses.extend(pubkeys.iter().copied());
+            }
+        } else {
+            // Cache disabled — every pubkey is a miss.
+            misses.extend(pubkeys.iter().copied());
+        }
+
+        let hits = (pubkeys.len() - misses.len()) as u64;
+        if hits > 0 {
+            self.metrics
+                .margin_cache_hit_total
+                .fetch_add(hits, Ordering::Relaxed);
+        }
+        if misses.is_empty() {
+            return Ok(accounts);
+        }
+        self.metrics
+            .margin_cache_miss_total
+            .fetch_add(misses.len() as u64, Ordering::Relaxed);
+
+        // Single batched RPC for the misses.
         let fetched = self
             .rpc
-            .get_multiple_accounts(&pubkeys)
+            .get_multiple_accounts(&misses)
             .await
             .map_err(|err| {
                 self.reject_submit_request(
@@ -2254,8 +3317,16 @@ impl Engine {
                     format!("margin precheck account fetch failed: {err}"),
                 )
             })?;
-        let mut accounts = HashMap::with_capacity(pubkeys.len());
-        for (pubkey, maybe_account) in pubkeys.into_iter().zip(fetched.into_iter()) {
+
+        // Insert into the cache while we have the data; enforce the soft
+        // size cap by evicting the oldest entries when over.
+        let max_entries = self.config.margin_cache_max_entries;
+        let mut cache_guard = if ttl_ms > 0 {
+            self.margin_account_cache.lock().ok()
+        } else {
+            None
+        };
+        for (pubkey, maybe_account) in misses.into_iter().zip(fetched.into_iter()) {
             let Some(account) = maybe_account else {
                 return Err(self.reject_submit_request(
                     request,
@@ -2263,7 +3334,56 @@ impl Engine {
                     format!("margin precheck account not found: {pubkey}"),
                 ));
             };
-            accounts.insert(pubkey, KeyedAccountSharedData::new(pubkey, account.into()));
+            let keyed = KeyedAccountSharedData::new(pubkey, account.into());
+            if let Some(cache) = cache_guard.as_mut() {
+                cache.insert(
+                    pubkey,
+                    CachedMarginAccount {
+                        account: keyed.clone(),
+                        cached_at_ms: now_ms,
+                    },
+                );
+                // Enforce the soft cap. The eviction policy is "drop
+                // expired entries first; if still over, drop the oldest
+                // remaining one." Cheap because we only run it on the
+                // miss path, not on every hit.
+                if cache.len() > max_entries {
+                    let stale_cutoff = now_ms.saturating_sub(ttl_ms);
+                    let stale_keys: Vec<Pubkey> = cache
+                        .iter()
+                        .filter(|(_, entry)| entry.cached_at_ms < stale_cutoff)
+                        .map(|(pk, _)| *pk)
+                        .collect();
+                    let stale_count = stale_keys.len() as u64;
+                    for key in stale_keys {
+                        cache.remove(&key);
+                    }
+                    if stale_count > 0 {
+                        self.metrics
+                            .margin_cache_evicted_total
+                            .fetch_add(stale_count, Ordering::Relaxed);
+                    }
+                    // Still over? Drop the single oldest entry.
+                    while cache.len() > max_entries {
+                        if let Some(oldest) = cache
+                            .iter()
+                            .min_by_key(|(_, entry)| entry.cached_at_ms)
+                            .map(|(pk, _)| *pk)
+                        {
+                            cache.remove(&oldest);
+                            self.metrics
+                                .margin_cache_evicted_total
+                                .fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                self.metrics
+                    .margin_cache_size
+                    .store(cache.len() as u64, Ordering::Relaxed);
+            }
+            accounts.insert(pubkey, keyed);
         }
         Ok(accounts)
     }
@@ -3167,6 +4287,10 @@ impl Engine {
         // queue-timeout / semaphore rejections still show up as ingress.
         // Single relaxed fetch_add — does not block the hot path.
         self.metrics.record_ingress();
+        // Capture wall-clock arrival time for ingress->ob latency tracking.
+        // unix_timestamp_ms is one syscall; not held across an await beyond
+        // what submit_intent already does.
+        let request_arrived_ms = unix_timestamp_ms();
         let started = Instant::now();
         let permit = match self.acquire_permit().await {
             Ok(permit) => permit,
@@ -3183,9 +4307,28 @@ impl Engine {
         self.metrics.inflight.fetch_sub(1, Ordering::Relaxed);
         drop(permit);
 
-        self.metrics
-            .observe_submit(started.elapsed(), result.is_ok());
+        let elapsed = started.elapsed();
+        self.metrics.observe_submit(elapsed, result.is_ok());
         self.metrics.record_ingress_outcome(result.is_ok());
+
+        // Stamp the latency trackers only for accepted intents — only those
+        // ever land on chain or reach the harness state. All three taps are
+        // bounded, lock-and-release operations that never hold a lock across
+        // an `.await`.
+        if let Ok(ref response) = result {
+            // (1) Submit latency: ingress -> relayer's submit_intent Ok.
+            self.metrics
+                .record_submit_latency(elapsed.as_millis() as u64);
+            // (2) Optimistic latency: ingress -> harness applies the
+            // relay-intent event into its optimistic state.
+            self.latency_optimistic_tracker
+                .note_ingress(response.sequence, request_arrived_ms);
+            // (3) Processed latency: ingress -> harness has reconciled past
+            // the sequence from on-chain state.
+            self.latency_processed_tracker
+                .note_ingress(response.sequence, request_arrived_ms);
+        }
+
         result
     }
 
@@ -3228,6 +4371,13 @@ impl Engine {
                 ));
             }
             let keys = self.parse_submit_intent_keys(&request)?;
+            // Phase 0: stamp parse-stage latency. Anything that early-returns
+            // before this point is excluded from the histogram, which is what
+            // we want — we're measuring the happy path.
+            let after_parse_elapsed = parse_started.elapsed();
+            self.metrics
+                .stage_parse_latency
+                .record(after_parse_elapsed.as_millis() as u64);
             let group = keys.group;
             let execution_queue = keys.execution_queue;
             if self.config.queue_soft_limit > 0 {
@@ -3260,6 +4410,15 @@ impl Engine {
             }
             self.ensure_harness_ready(&request.market).await?;
             self.ensure_submit_margin_ready(&request, keys).await?;
+            // Phase 0: stamp margin-check stage latency, computed against the
+            // parse stage end so it's strictly the time spent in
+            // ensure_harness_ready + ensure_submit_margin_ready.
+            let after_margin_elapsed = parse_started.elapsed();
+            self.metrics.stage_margin_check_latency.record(
+                after_margin_elapsed
+                    .saturating_sub(after_parse_elapsed)
+                    .as_millis() as u64,
+            );
             let user_owner = keys.user_owner;
             let mango_account = keys.mango_account;
 
@@ -3386,11 +4545,21 @@ impl Engine {
                 chain.blockhash,
             )
             .map_err(internal_status)?;
-            let mut tx = VersionedTransaction::try_new(
+            let tx = VersionedTransaction::try_new(
                 solana_sdk::message::VersionedMessage::V0(message),
                 &[self.config.payer.as_ref()],
             )
             .map_err(internal_status)?;
+            // Phase 0: stamp sign-stage latency, computed against the margin
+            // stage end so it captures sequence reservation, envelope build,
+            // signature verification, instruction assembly, MessageV0 compile,
+            // and VersionedTransaction signing.
+            let after_sign_elapsed = parse_started.elapsed();
+            self.metrics.stage_sign_latency.record(
+                after_sign_elapsed
+                    .saturating_sub(after_margin_elapsed)
+                    .as_millis() as u64,
+            );
             self.maybe_emit_status_event(status_ctx.event(
                 1,
                 "accepted",
@@ -3400,39 +4569,88 @@ impl Engine {
                 None,
             ))
             .await;
-            let send_cfg = RpcSendTransactionConfig {
-                skip_preflight: self.config.skip_preflight,
-                preflight_commitment: Some(CommitmentConfig::processed().commitment),
-                max_retries: self.config.submit_rpc_max_retries,
-                ..RpcSendTransactionConfig::default()
+            // Phase 1.1: the signature is already locally derivable from the
+            // signed VersionedTransaction; we don't need rpc.send_transaction
+            // to echo it back. Capture it here and hand the tx off to the
+            // background submitter pool. The user-visible gRPC response no
+            // longer waits for Helius — the bg worker drains it
+            // asynchronously.
+            let tx_signature = tx.signatures[0];
+            status_ctx.with_signature(&tx_signature);
+
+            // Suppress unused-warning for prepare_elapsed (kept for now for
+            // diagnostic legibility; the bg submitter records its own
+            // bg_rpc_submit timing).
+            let _ = (parse_elapsed, prepare_elapsed);
+
+            // Phase 3: apply the intent to the in-process optimistic state
+            // BEFORE bg dispatch so subsequent reads (margin checks,
+            // orderbook polls, frontend SSE) reflect it immediately. The
+            // UndoToken travels with the PendingSubmit so the bg worker
+            // can roll it back on hard ingress failure.
+            let undo_token =
+                self.apply_relay_intent_to_local_state(&request, &envelope, &tx_signature);
+
+            let dispatch_started = Instant::now();
+            let pending = PendingSubmit {
+                sequence_key: sequence_key.clone(),
+                sequence,
+                execution_queue,
+                tx,
+                tx_signature,
+                attempts: 0,
+                enqueued_at_ms: unix_timestamp_ms(),
+                undo_token,
             };
-            let send_started = Instant::now();
-            let tx_signature = match self.rpc.send_transaction_with_config(&tx, send_cfg).await {
-                Ok(signature) => signature,
-                Err(err) => {
-                    self.metrics.observe_submit_stages(
-                        parse_elapsed,
-                        prepare_elapsed,
-                        send_started.elapsed(),
-                    );
+            match self.bg_submit_tx.try_send(pending) {
+                Ok(()) => {
+                    self.metrics
+                        .stage_event_dispatch_latency
+                        .record(dispatch_started.elapsed().as_millis() as u64);
+                    self.metrics
+                        .bg_submit_inflight
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Err(mpsc::error::TrySendError::Full(rejected)) => {
+                    self.metrics
+                        .bg_submit_channel_full_total
+                        .fetch_add(1, Ordering::Relaxed);
                     self.recover_sequence_after_submit_error(
                         &sequence_key,
                         sequence,
                         execution_queue,
                     )
                     .await;
-                    if is_execution_queue_duplicate_sequence_error(&err) {
-                        return Err(Status::aborted(
-                            "execution queue duplicate sequence; relayer cursor reconciled",
-                        ));
+                    // Phase 3: roll back the local state apply since the
+                    // tx will never be submitted.
+                    if let (Some(state), Some(undo)) =
+                        (self.state.as_ref(), rejected.undo_token)
+                    {
+                        let _ = state.lock().rollback_local(undo);
                     }
-                    return Err(rpc_status(err));
+                    return Err(Status::resource_exhausted(
+                        "background submit channel full",
+                    ));
                 }
-            };
-            self.metrics
-                .observe_submit_stages(parse_elapsed, prepare_elapsed, send_started.elapsed());
-            tx.signatures[0] = tx_signature;
-            status_ctx.with_signature(&tx_signature);
+                Err(mpsc::error::TrySendError::Closed(rejected)) => {
+                    self.recover_sequence_after_submit_error(
+                        &sequence_key,
+                        sequence,
+                        execution_queue,
+                    )
+                    .await;
+                    if let (Some(state), Some(undo)) =
+                        (self.state.as_ref(), rejected.undo_token)
+                    {
+                        let _ = state.lock().rollback_local(undo);
+                    }
+                    return Err(Status::internal("background submit channel closed"));
+                }
+            }
+
+            // Hand-off to the bg pool succeeded — commit the local sequence
+            // cursor, spawn the chain-confirmation watcher, register the
+            // dynamic executor lane, and emit downstream status events.
             self.sequences.commit_success(&sequence_key, sequence).await;
             tokio::spawn(self.clone().watch_submitted_sequence(
                 sequence_key.clone(),
@@ -3524,6 +4742,115 @@ impl Engine {
         }
     }
 
+    /// Drain one PendingSubmit through `rpc.send_transaction_with_config`.
+    /// Called from background submitter workers; never on the user-visible
+    /// hot path. Outcomes:
+    /// - Success: bump bg_submit_ok_total, decrement bg_submit_inflight.
+    /// - Transient failure (retryable): bump bg_submit_transient_total,
+    ///   spawn a delayed retry that re-enqueues the same PendingSubmit.
+    ///   bg_submit_inflight stays elevated until the retry resolves.
+    /// - Hard failure or retries exhausted: bump bg_submit_failed_total,
+    ///   roll back the local sequence cursor, decrement bg_submit_inflight.
+    async fn handle_bg_submit(&self, mut pending: PendingSubmit) {
+        let send_cfg = RpcSendTransactionConfig {
+            skip_preflight: self.config.skip_preflight,
+            preflight_commitment: Some(CommitmentConfig::processed().commitment),
+            max_retries: self.config.submit_rpc_max_retries,
+            ..RpcSendTransactionConfig::default()
+        };
+        let send_started = Instant::now();
+        match self
+            .rpc
+            .send_transaction_with_config(&pending.tx, send_cfg)
+            .await
+        {
+            Ok(_) => {
+                self.metrics
+                    .stage_bg_rpc_submit_latency
+                    .record(send_started.elapsed().as_millis() as u64);
+                self.metrics
+                    .bg_submit_ok_total
+                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .bg_submit_inflight
+                    .fetch_sub(1, Ordering::Relaxed);
+            }
+            Err(err)
+                if is_transient_rpc_error(&err)
+                    && pending.attempts < self.config.bg_submit_max_retries =>
+            {
+                self.metrics
+                    .bg_submit_transient_total
+                    .fetch_add(1, Ordering::Relaxed);
+                pending.attempts = pending.attempts.saturating_add(1);
+                let shift = pending.attempts.min(6) as u64;
+                let backoff = Duration::from_millis(
+                    self.config.bg_submit_retry_base_ms.saturating_mul(1u64 << shift),
+                );
+                debug!(
+                    "bg submitter transient error sequence={} attempt={} backoff_ms={} err={err:?}",
+                    pending.sequence,
+                    pending.attempts,
+                    backoff.as_millis()
+                );
+                let retry_tx = self.bg_submit_tx.clone();
+                let metrics = self.metrics.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(backoff).await;
+                    if let Err(send_err) = retry_tx.send(pending).await {
+                        warn!("bg submitter retry channel closed: {send_err:?}");
+                        metrics
+                            .bg_submit_retry_dropped_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        metrics
+                            .bg_submit_failed_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        metrics
+                            .bg_submit_inflight
+                            .fetch_sub(1, Ordering::Relaxed);
+                    }
+                });
+            }
+            Err(err) => {
+                self.metrics
+                    .stage_bg_rpc_submit_latency
+                    .record(send_started.elapsed().as_millis() as u64);
+                self.metrics
+                    .bg_submit_failed_total
+                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .bg_submit_inflight
+                    .fetch_sub(1, Ordering::Relaxed);
+                let inflight_ms = unix_timestamp_ms().saturating_sub(pending.enqueued_at_ms);
+                warn!(
+                    "bg submitter hard failure sequence={} sig={} attempts={} inflight_ms={} err={err:?}",
+                    pending.sequence, pending.tx_signature, pending.attempts, inflight_ms
+                );
+                if !is_execution_queue_duplicate_sequence_error(&err) {
+                    self.recover_sequence_after_submit_error(
+                        &pending.sequence_key,
+                        pending.sequence,
+                        pending.execution_queue,
+                    )
+                    .await;
+                }
+                // Phase 3: roll back the in-process optimistic state apply
+                // since the tx never landed on chain. The reconciler is a
+                // second safety net for any state we miss here.
+                if let (Some(state), Some(undo)) =
+                    (self.state.as_ref(), pending.undo_token.take())
+                {
+                    if let Err(rb_err) = state.lock().rollback_local(undo) {
+                        warn!(
+                            "bg submitter rollback_local failed sequence={} err={rb_err:?}",
+                            pending.sequence
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     async fn watch_submitted_sequence(
         self,
         sequence_key: String,
@@ -3580,6 +4907,59 @@ impl Engine {
         }
     }
 
+    /// Phase 3: build a `RelayIntentAcceptedEvent` from the relayer's
+    /// SubmitIntentRequest + envelope, and apply it INCREMENTALLY to the
+    /// in-process optimistic state. Returns the resulting `UndoToken` so
+    /// the caller can plumb it through to the bg submitter for hard-fail
+    /// rollback. Returns `None` when local state is disabled or when the
+    /// apply itself failed (in which case there's nothing to undo).
+    ///
+    /// This is the hot-path entry point for Phase 3. Single parking_lot
+    /// Mutex acquisition; never held across an `.await`.
+    fn apply_relay_intent_to_local_state(
+        &self,
+        request: &SubmitIntentRequest,
+        envelope: &CtmEnvelope,
+        tx_signature: &Signature,
+    ) -> Option<UndoToken> {
+        let state = self.state.as_ref()?;
+        use base64::Engine as _;
+        let local_event = rust_harness::RelayIntentAcceptedEvent {
+            event_type: "relay_intent_accepted".to_string(),
+            ts_ms: unix_timestamp_ms(),
+            group: request.group.clone(),
+            execution_queue: request.execution_queue.clone(),
+            market: request.market.clone(),
+            sequence: envelope.sequence.to_string(),
+            kind: envelope.kind,
+            payload_b64: base64::engine::general_purpose::STANDARD.encode(&request.payload),
+            remaining_accounts: request
+                .remaining_accounts
+                .iter()
+                .map(|account: &AccountMetaProto| rust_harness::AccountMetaWire {
+                    pubkey: account.pubkey.clone(),
+                    is_signer: account.is_signer,
+                    is_writable: account.is_writable,
+                })
+                .collect(),
+            min_execute_slot: envelope.min_execute_slot.to_string(),
+            expires_at_slot: envelope.expires_at_slot.to_string(),
+            user_owner: request.user_owner.clone(),
+            mango_account: request.mango_account.clone(),
+            enqueue_tx_signature: tx_signature.to_string(),
+        };
+        match state.lock().apply_relay_intent_local(local_event) {
+            Ok((_delta, undo)) => Some(undo),
+            Err(err) => {
+                warn!(
+                    "local state apply_relay_intent_local failed: sequence={} err={err:?}",
+                    envelope.sequence
+                );
+                None
+            }
+        }
+    }
+
     async fn maybe_emit_event(
         &self,
         request: &SubmitIntentRequest,
@@ -3587,6 +4967,16 @@ impl Engine {
         tx_signature: &Signature,
         request_id: &str,
     ) {
+        // Phase 2/3: the in-process state apply moved to
+        // `apply_relay_intent_to_local_state`, called earlier in the hot
+        // path so its UndoToken can be plumbed through to the bg
+        // submitter. This function only handles the legacy HTTP sink for
+        // any consumers (e.g. the TS harness shell) that haven't migrated
+        // off it yet.
+        use base64::Engine as _;
+        let payload_b64 = base64::engine::general_purpose::STANDARD.encode(&request.payload);
+        let ts_ms = unix_timestamp_ms();
+
         let Some(url) = self.config.event_sink_url.clone() else {
             return;
         };
@@ -3625,17 +5015,14 @@ impl Engine {
             .collect();
         let body = EventBody {
             event_type: "relay_intent_accepted",
-            ts_ms: unix_timestamp_ms(),
+            ts_ms,
             request_id: request_id.to_string(),
             group: request.group.clone(),
             execution_queue: request.execution_queue.clone(),
             market: request.market.clone(),
             sequence: envelope.sequence.to_string(),
             kind: envelope.kind as u32,
-            payload_b64: {
-                use base64::Engine;
-                base64::engine::general_purpose::STANDARD.encode(&request.payload)
-            },
+            payload_b64,
             remaining_accounts,
             min_execute_slot: envelope.min_execute_slot.to_string(),
             expires_at_slot: envelope.expires_at_slot.to_string(),
@@ -3685,57 +5072,77 @@ impl Engine {
             executor.group, executor.execution_queue, interval_ms, limit
         );
 
-        // Resolve perp_market and event_queue pubkeys from any lane's
-        // canonical remaining_accounts layout. Layout indices:
-        //   [0] group, [1] mango_account, [2] owner,
-        //   [3] perp_market, [4] bids, [5] asks, [6] event_queue, [7] oracle, ...
-        let (perp_market_pk, event_queue_pk) = loop {
-            let lanes = executor.lanes_snapshot().await;
-            if let Some(lane) = lanes.first() {
-                if lane.remaining_accounts.len() >= 7 {
-                    break (
-                        lane.remaining_accounts[3].pubkey,
-                        lane.remaining_accounts[6].pubkey,
-                    );
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(interval_ms)).await;
-        };
-        info!(
-            "perp event consumer resolved perp_market={} event_queue={}",
-            perp_market_pk, event_queue_pk
-        );
+        let mut known_markets: HashSet<Pubkey> = HashSet::new();
 
         loop {
             tokio::time::sleep(Duration::from_millis(interval_ms)).await;
             // Heartbeat the cranker on every tick — even an empty queue is a
-            // sign the cranker is alive and polling. The healthy gauge in the
-            // sampler treats anything within event_cranker_stale_threshold_ms
-            // as healthy.
+            // sign the cranker is alive and polling.
             self.metrics.tick_event_cranker(unix_timestamp_ms());
-            match self
-                .consume_perp_events_once(
-                    executor.group,
-                    perp_market_pk,
-                    event_queue_pk,
-                    limit,
-                )
-                .await
-            {
-                Ok(0) => {
-                    // queue empty — nothing to do
+
+            // Re-scan lanes every tick so newly added markets (dynamic lanes)
+            // get picked up. Canonical layout per lane:
+            //   [0] group, [1] mango_account, [2] owner,
+            //   [3] perp_market, [4] bids, [5] asks, [6] event_queue, [7] oracle, ...
+            // Dedupe by perp_market to avoid consuming the same event queue
+            // multiple times per tick when multiple lanes exist for the same
+            // market (different accounts, same perp market).
+            let lanes = executor.lanes_snapshot().await;
+            let mut markets: Vec<(Pubkey, Pubkey)> = Vec::new();
+            let mut seen: HashSet<Pubkey> = HashSet::new();
+            for lane in lanes.iter() {
+                if lane.remaining_accounts.len() < 7 {
+                    continue;
                 }
-                Ok(consumed) => {
-                    debug!(
-                        "perp event consumer consumed {} events perp_market={}",
-                        consumed, perp_market_pk
-                    );
-                    self.metrics
-                        .perp_events_consumed
-                        .fetch_add(consumed as u64, Ordering::Relaxed);
+                let perp_market = lane.remaining_accounts[3].pubkey;
+                let event_queue = lane.remaining_accounts[6].pubkey;
+                if seen.insert(perp_market) {
+                    markets.push((perp_market, event_queue));
                 }
-                Err(err) => {
-                    warn!("perp event consumer error: {err:#}");
+            }
+
+            // Log newly discovered markets
+            for (pm, _) in &markets {
+                if known_markets.insert(*pm) {
+                    info!("perp event consumer tracking new market perp_market={pm}");
+                }
+            }
+
+            if markets.is_empty() {
+                continue;
+            }
+
+            // Consume events for each unique (perp_market, event_queue) pair.
+            // Serial to avoid blockhash race and RPC rate limits; each call is
+            // only one tx so this stays cheap even with many markets.
+            for (perp_market_pk, event_queue_pk) in markets {
+                match self
+                    .consume_perp_events_once(
+                        executor.group,
+                        perp_market_pk,
+                        event_queue_pk,
+                        limit,
+                    )
+                    .await
+                {
+                    Ok(0) => {
+                        // queue empty — nothing to do
+                    }
+                    Ok(consumed) => {
+                        debug!(
+                            "perp event consumer consumed {} events perp_market={}",
+                            consumed, perp_market_pk
+                        );
+                        self.metrics
+                            .perp_events_consumed
+                            .fetch_add(consumed as u64, Ordering::Relaxed);
+                    }
+                    Err(err) => {
+                        warn!(
+                            "perp event consumer error perp_market={}: {err:#}",
+                            perp_market_pk
+                        );
+                    }
                 }
             }
         }
@@ -4557,34 +5964,54 @@ impl Engine {
             }
         }
 
-        // Collect eligible lanes (de-dup by hash, skip backed-off lanes)
+        // Collect eligible lanes (de-dup by hash, skip backed-off lanes).
+        // execute_multi requires a fixed accounts_per_lane width, so only lanes
+        // compatible with the first selected lane can be batched together.
         let target_lane_fanout = planner_lane_fanout;
-        let mut eligible_lanes: Vec<Lane> = Vec::new();
-        let mut seen_hashes = std::collections::HashSet::new();
-        for lane in candidate_lanes {
-            let lane_key = bytes_to_hex(&lane.hash);
-            let blocked_until = backoff_snapshot.get(&lane_key).copied().unwrap_or(0);
-            if blocked_until > unix_timestamp_ms() {
-                continue;
-            }
-            if !seen_hashes.insert(lane.hash) {
-                continue;
-            }
-            eligible_lanes.push(lane);
-            if eligible_lanes.len() >= target_lane_fanout {
-                break;
-            }
-        }
+        let (eligible_lanes, unique_hashes, dropped_for_layout) = select_layout_compatible_lanes(
+            candidate_lanes,
+            &backoff_snapshot,
+            now_ms,
+            target_lane_fanout,
+        );
 
         if eligible_lanes.is_empty() {
             return Ok(ExecuteLoopOutcome::Busy);
+        }
+
+        if !speculative_mode {
+            if let Some(head_hash) = head.head_accounts_hash {
+                if eligible_lanes.first().map(|lane| lane.hash) != Some(head_hash) {
+                    self.metrics
+                        .execute_lane_suppressed
+                        .fetch_add(1, Ordering::Relaxed);
+                    debug!(
+                        "executor targeted lane suppressed sequence={} reason=head_lane_unavailable_after_filtering head_hash={} queue_count={}",
+                        planned_sequence,
+                        bytes_to_hex(&head_hash),
+                        head.count,
+                    );
+                    return Ok(ExecuteLoopOutcome::Busy);
+                }
+            }
+        }
+
+        if dropped_for_layout > 0 {
+            debug!(
+                "executor multi-lane layout filtered sequence={} retained_lanes={} dropped_lanes={} accounts_per_lane={} speculative={}",
+                planned_sequence,
+                eligible_lanes.len(),
+                dropped_for_layout,
+                lane_account_width(&eligible_lanes[0]),
+                speculative_mode,
+            );
         }
 
         if eligible_lanes.len() > 1 {
             info!(
                 "executor multi-lane eligible_lanes={} unique_hashes={}",
                 eligible_lanes.len(),
-                seen_hashes.len(),
+                unique_hashes,
             );
         }
 
@@ -4742,41 +6169,13 @@ impl Engine {
                 .fetch_add(1, Ordering::Relaxed);
         }
 
-        let (tx, send_cfg) = if eligible_lanes.len() > 1 {
-            match self
-                .build_execute_multi_tx(&eligible_lanes, executor, planned_sequence)
-                .await
-            {
-                Ok(built) => built,
-                Err(err) => {
-                    warn!("executor multi-lane build failed, falling back to single: {err:?}");
-                    self.build_execute_tx(&eligible_lanes[0], executor, planned_sequence)
-                        .await?
-                }
-            }
-        } else {
-            self.build_execute_tx(&eligible_lanes[0], executor, planned_sequence)
-                .await?
-        };
-
-        // Dual-send: fire-and-forget to secondary RPC for higher landing probability
-        if let Some(secondary) = &self.secondary_rpc {
-            let tx_clone = tx.clone();
-            let cfg_clone = send_cfg;
-            let sec = secondary.clone();
-            tokio::spawn(async move {
-                let _ = sec.send_transaction_with_config(&tx_clone, cfg_clone).await;
-            });
-        }
+        let requested_lane_count = eligible_lanes.len();
 
         // Optimistic advance mode: send transaction asynchronously (fire-and-forget)
         // and immediately return Sent so the next loop iteration can build the next
         // tx without waiting for the RPC send round-trip (~200ms).  Confirmation
         // happens via the normal pending_dispatches reconciliation loop.
         if self.config.executor_optimistic_advance {
-            let rpc = self.rpc.clone();
-            let tx_clone = tx.clone();
-            let cfg_clone = send_cfg;
             let metrics = self.metrics.clone();
             let pending = executor.pending_dispatches.clone();
             let executor_clone = executor.clone();
@@ -4796,10 +6195,18 @@ impl Engine {
             };
             let self_ref = self.clone();
             let lane_hash_for_failure = eligible_lanes[0].hash;
+            let lanes_for_send = eligible_lanes.clone();
 
             tokio::spawn(async move {
-                match rpc.send_transaction_with_config(&tx_clone, cfg_clone).await {
-                    Ok(signature) => {
+                match self_ref
+                    .send_execute_with_lane_reduction(
+                        &lanes_for_send,
+                        &executor_clone,
+                        planned_sequence,
+                    )
+                    .await
+                {
+                    Ok((signature, sent_lane_count)) => {
                         metrics.execute_sent.fetch_add(1, Ordering::Relaxed);
                         if is_pipeline {
                             metrics
@@ -4818,9 +6225,19 @@ impl Engine {
                             targeted: !is_speculative,
                             signature: signature.clone(),
                         });
+                        if sent_lane_count < lanes_for_send.len() {
+                            info!(
+                                "executor multi-lane fanout reduced sequence={} requested_lanes={} sent_lanes={} speculative={}",
+                                sequence,
+                                lanes_for_send.len(),
+                                sent_lane_count,
+                                is_speculative,
+                            );
+                        }
                     }
                     Err(err) => {
-                        let failure_class = classify_lane_failure(&anyhow::anyhow!("{err}"));
+                        let err = err.into_err();
+                        let failure_class = classify_lane_failure(&err);
                         if failure_class.is_deterministic() {
                             self_ref
                                 .apply_executor_lane_failure(
@@ -4843,7 +6260,7 @@ impl Engine {
                 .fetch_sub(0, Ordering::Relaxed); // noop to keep counters consistent
             info!(
                 "executor fire-and-forget multi-lane lanes={} sequence={} queue_count={} pending_same_head={} speculative={}",
-                eligible_lanes.len(),
+                requested_lane_count,
                 planned_sequence,
                 head.count,
                 logged_same_head_pending,
@@ -4855,13 +6272,11 @@ impl Engine {
         }
 
         let send_result = self
-            .rpc
-            .send_transaction_with_config(&tx, send_cfg)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"));
+            .send_execute_with_lane_reduction(&eligible_lanes, executor, planned_sequence)
+            .await;
 
         match send_result {
-            Ok(signature) => {
+            Ok((signature, sent_lane_count)) => {
                 self.metrics.execute_sent.fetch_add(1, Ordering::Relaxed);
                 if same_head_pending_count > 0 {
                     self.metrics
@@ -4886,7 +6301,7 @@ impl Engine {
                 });
                 info!(
                     "executor sent multi-lane lanes={} sequence={} queue_count={} pending_total={} pending_same_head={} speculative={} tx={}",
-                    eligible_lanes.len(),
+                    sent_lane_count,
                     planned_sequence,
                     head.count,
                     pending_snapshot.len() + 1,
@@ -4898,10 +6313,20 @@ impl Engine {
                     speculative_mode,
                     signature,
                 );
+                if sent_lane_count < requested_lane_count {
+                    info!(
+                        "executor multi-lane fanout reduced sequence={} requested_lanes={} sent_lanes={} speculative={}",
+                        planned_sequence,
+                        requested_lane_count,
+                        sent_lane_count,
+                        speculative_mode,
+                    );
+                }
 
                 return Ok(ExecuteLoopOutcome::Sent);
             }
             Err(err) => {
+                let err = err.into_err();
                 let failure_class = classify_lane_failure(&err);
                 if failure_class.is_deterministic() {
                     self.apply_executor_lane_failure(
@@ -4930,6 +6355,76 @@ impl Engine {
         let (tx, send_cfg) = self.build_execute_tx(lane, executor, head_sequence).await?;
         let signature = self.rpc.send_transaction_with_config(&tx, send_cfg).await?;
         Ok(signature)
+    }
+
+    async fn send_execute_with_lane_reduction(
+        &self,
+        lanes: &[Lane],
+        executor: &Arc<ExecutorState>,
+        head_sequence: u64,
+    ) -> std::result::Result<(Signature, usize), ExecuteDispatchError> {
+        let mut lane_count = lanes.len().max(1);
+        while lane_count > 0 {
+            let selected_lanes = &lanes[..lane_count];
+            match self
+                .send_execute_attempt(selected_lanes, executor, head_sequence)
+                .await
+            {
+                Ok(signature) => return Ok((signature, lane_count)),
+                Err(err) if lane_count > 1 && is_transaction_too_large_error(err.err()) => {
+                    warn!(
+                        "executor multi-lane tx oversized sequence={} lanes={} stage={} err={:?}; retrying with fewer lanes",
+                        head_sequence,
+                        lane_count,
+                        if err.is_build() { "build" } else { "send" },
+                        err.err(),
+                    );
+                    lane_count -= 1;
+                }
+                Err(err) if lane_count > 1 && err.is_build() => {
+                    warn!(
+                        "executor multi-lane build failed sequence={} lanes={} err={:?}; falling back to single lane",
+                        head_sequence,
+                        lane_count,
+                        err.err(),
+                    );
+                    lane_count = 1;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        unreachable!("lane_count starts at >= 1 and only exits via return");
+    }
+
+    async fn send_execute_attempt(
+        &self,
+        lanes: &[Lane],
+        executor: &Arc<ExecutorState>,
+        head_sequence: u64,
+    ) -> std::result::Result<Signature, ExecuteDispatchError> {
+        let (tx, send_cfg) = if lanes.len() > 1 {
+            self.build_execute_multi_tx(lanes, executor, head_sequence)
+                .await
+                .map_err(ExecuteDispatchError::Build)?
+        } else {
+            self.build_execute_tx(&lanes[0], executor, head_sequence)
+                .await
+                .map_err(ExecuteDispatchError::Build)?
+        };
+
+        if let Some(secondary) = &self.secondary_rpc {
+            let tx_clone = tx.clone();
+            let cfg_clone = send_cfg;
+            let sec = secondary.clone();
+            tokio::spawn(async move {
+                let _ = sec.send_transaction_with_config(&tx_clone, cfg_clone).await;
+            });
+        }
+
+        self.rpc
+            .send_transaction_with_config(&tx, send_cfg)
+            .await
+            .map_err(|err| ExecuteDispatchError::Send(anyhow!("{err}")))
     }
 
     async fn build_execute_tx(
@@ -4986,6 +6481,7 @@ impl Engine {
         executor: &Arc<ExecutorState>,
         head_sequence: u64,
     ) -> Result<(VersionedTransaction, RpcSendTransactionConfig)> {
+        let accounts_per_lane = shared_lane_account_width(lanes)? as u16;
         let chain = self.blockhashes.snapshot().await;
         let lane_accounts: Vec<Vec<AccountMeta>> =
             lanes.iter().map(|l| l.remaining_accounts.clone()).collect();
@@ -5002,6 +6498,7 @@ impl Engine {
                 executor.group,
                 executor.execution_queue,
                 &lane_accounts,
+                accounts_per_lane,
                 lane_hashes,
                 executor.effective_max_items(self.config.executor_max_items),
             ),
@@ -5998,11 +7495,11 @@ fn build_execute_multi_instruction(
     group: Pubkey,
     execution_queue: Pubkey,
     lane_accounts: &[Vec<AccountMeta>],
+    accounts_per_lane: u16,
     lane_hashes: Vec<[u8; 32]>,
     max_items: u16,
 ) -> Instruction {
     let lane_count = lane_accounts.len() as u8;
-    let accounts_per_lane = lane_accounts.first().map(|l| l.len()).unwrap_or(0) as u16;
     let mut accounts = vec![
         AccountMeta::new(group, false),
         AccountMeta::new(execution_queue, false),
@@ -6642,6 +8139,12 @@ fn is_execution_queue_duplicate_sequence_error(
         || rendered.contains("Custom(6083)")
 }
 
+/// Legacy mapper from RPC client error → gRPC Status. The submit_intent
+/// hot path no longer calls rpc.send_transaction directly (Phase 1.1
+/// moved that to the bg submitter pool), so this is currently unused.
+/// Kept around for any future hot-path call site that wants to surface a
+/// classified error.
+#[allow(dead_code)]
 fn rpc_status(err: impl std::fmt::Display) -> Status {
     let message = err.to_string();
     if message.contains("custom program error: 0x17bc")
@@ -6719,6 +8222,8 @@ async fn run_metrics_sampler(
     metrics: Arc<Metrics>,
     executor: Option<Arc<ExecutorState>>,
     unique_addresses: Arc<StdMutex<HashMap<[u8; 32], u64>>>,
+    latency_optimistic: Arc<LatencyTracker>,
+    latency_processed: Arc<LatencyTracker>,
     executor_stale_ms: u64,
     event_cranker_stale_ms: u64,
     event_cranker_enabled: bool,
@@ -6844,6 +8349,115 @@ async fn run_metrics_sampler(
             .event_cranker_healthy
             .store(cranker_healthy, Ordering::Relaxed);
 
+        // Latency: snapshot each tracker, sort, and publish percentile
+        // gauges. Each call holds its own short critical section under that
+        // tracker's std mutex; locks are never held across an `.await`.
+
+        // (1) Submit latency (relayer-only).
+        let submit_summary = metrics.compute_submit_summary();
+        metrics
+            .latency_ingress_to_submitted_p50_ms
+            .store(submit_summary.p50_ms, Ordering::Relaxed);
+        metrics
+            .latency_ingress_to_submitted_p95_ms
+            .store(submit_summary.p95_ms, Ordering::Relaxed);
+        metrics
+            .latency_ingress_to_submitted_max_ms
+            .store(submit_summary.max_ms, Ordering::Relaxed);
+        metrics
+            .latency_ingress_to_submitted_samples
+            .store(submit_summary.count, Ordering::Relaxed);
+
+        // (2) Optimistic latency.
+        let opt_summary = latency_optimistic.compute_summary();
+        metrics
+            .latency_ingress_to_optimistic_p50_ms
+            .store(opt_summary.p50_ms, Ordering::Relaxed);
+        metrics
+            .latency_ingress_to_optimistic_p95_ms
+            .store(opt_summary.p95_ms, Ordering::Relaxed);
+        metrics
+            .latency_ingress_to_optimistic_max_ms
+            .store(opt_summary.max_ms, Ordering::Relaxed);
+        metrics
+            .latency_ingress_to_optimistic_samples
+            .store(opt_summary.count, Ordering::Relaxed);
+        metrics.latency_optimistic_completed_total.store(
+            latency_optimistic.completed_total.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        metrics.latency_optimistic_expired_total.store(
+            latency_optimistic.expired_total.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        metrics
+            .latency_optimistic_pending_inflight
+            .store(latency_optimistic.pending_len() as u64, Ordering::Relaxed);
+
+        // (3) Processed latency.
+        let proc_summary = latency_processed.compute_summary();
+        metrics
+            .latency_ingress_to_processed_p50_ms
+            .store(proc_summary.p50_ms, Ordering::Relaxed);
+        metrics
+            .latency_ingress_to_processed_p95_ms
+            .store(proc_summary.p95_ms, Ordering::Relaxed);
+        metrics
+            .latency_ingress_to_processed_max_ms
+            .store(proc_summary.max_ms, Ordering::Relaxed);
+        metrics
+            .latency_ingress_to_processed_samples
+            .store(proc_summary.count, Ordering::Relaxed);
+        metrics.latency_processed_completed_total.store(
+            latency_processed.completed_total.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        metrics.latency_processed_expired_total.store(
+            latency_processed.expired_total.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        metrics
+            .latency_processed_pending_inflight
+            .store(latency_processed.pending_len() as u64, Ordering::Relaxed);
+
+        // (4) Per-stage histograms (Phase 0). Each compute_summary takes a
+        // brief lock on its own histogram; never crosses an `.await`.
+        let stage_parse = metrics.stage_parse_latency.compute_summary();
+        metrics
+            .latency_stage_parse_p50_ms
+            .store(stage_parse.p50_ms, Ordering::Relaxed);
+        metrics
+            .latency_stage_parse_p95_ms
+            .store(stage_parse.p95_ms, Ordering::Relaxed);
+        let stage_margin = metrics.stage_margin_check_latency.compute_summary();
+        metrics
+            .latency_stage_margin_check_p50_ms
+            .store(stage_margin.p50_ms, Ordering::Relaxed);
+        metrics
+            .latency_stage_margin_check_p95_ms
+            .store(stage_margin.p95_ms, Ordering::Relaxed);
+        let stage_sign = metrics.stage_sign_latency.compute_summary();
+        metrics
+            .latency_stage_sign_p50_ms
+            .store(stage_sign.p50_ms, Ordering::Relaxed);
+        metrics
+            .latency_stage_sign_p95_ms
+            .store(stage_sign.p95_ms, Ordering::Relaxed);
+        let stage_event = metrics.stage_event_dispatch_latency.compute_summary();
+        metrics
+            .latency_stage_event_dispatch_p50_ms
+            .store(stage_event.p50_ms, Ordering::Relaxed);
+        metrics
+            .latency_stage_event_dispatch_p95_ms
+            .store(stage_event.p95_ms, Ordering::Relaxed);
+        let stage_bg = metrics.stage_bg_rpc_submit_latency.compute_summary();
+        metrics
+            .latency_stage_bg_rpc_submit_p50_ms
+            .store(stage_bg.p50_ms, Ordering::Relaxed);
+        metrics
+            .latency_stage_bg_rpc_submit_p95_ms
+            .store(stage_bg.p95_ms, Ordering::Relaxed);
+
         metrics
             .sampler_last_tick_ms
             .store(now_ms, Ordering::Relaxed);
@@ -6892,6 +8506,188 @@ async fn run_bridge_health_prober(
     }
 }
 
+/// Convert a `rust_harness::UserState` (returned by the embedded
+/// ContinuumStateEngine) into the relayer's internal `HarnessUserState`
+/// DTO. The two types share the same field shape — this is a pure
+/// re-pack with no allocation overhead beyond what `into_iter().map(...)`
+/// already costs. Used in the Phase 2 hot-path replacement of
+/// `fetch_harness_user_state`'s HTTP fallback.
+fn harness_user_state_from_rust_harness(user: rust_harness::UserState) -> HarnessUserState {
+    HarnessUserState {
+        mango_accounts: user.mango_accounts,
+        open_orders: user
+            .open_orders
+            .into_iter()
+            .map(|o| HarnessOpenOrder {
+                order_id: o.order_id,
+                mango_account: o.mango_account,
+                market: o.market,
+                side: o.side,
+                base_lots: o.base_lots,
+            })
+            .collect(),
+        per_market: user
+            .per_market
+            .into_iter()
+            .map(|p| HarnessUserPerMarket {
+                market: p.market,
+                open_order_base_lots_bid: p.open_order_base_lots_bid,
+                open_order_base_lots_ask: p.open_order_base_lots_ask,
+                base_position_lots: p.base_position_lots,
+                quote_position_native: p.quote_position_native,
+            })
+            .collect(),
+    }
+}
+
+/// One-time startup fetch of an EngineSnapshot from the legacy harness so
+/// the relayer can populate its in-process ContinuumStateEngine. NOT on the
+/// hot path — this runs once during main(), with a long timeout. Phase 5
+/// will replace this with a Rust on-chain reader.
+async fn bootstrap_local_state(
+    url: &str,
+    timeout_ms: u64,
+) -> anyhow::Result<ContinuumStateEngine> {
+    info!("local-state bootstrap: fetching {url} timeout_ms={timeout_ms}");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(timeout_ms))
+        .build()
+        .context("build bootstrap reqwest client")?;
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("local-state bootstrap GET failed: {url}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(anyhow!(
+            "local-state bootstrap returned non-2xx status {} from {}",
+            status,
+            url
+        ));
+    }
+    let body = response
+        .text()
+        .await
+        .context("read local-state bootstrap body")?;
+    let snapshot: EngineSnapshot = serde_json::from_str(&body)
+        .context("decode local-state bootstrap EngineSnapshot")?;
+    let mut engine = ContinuumStateEngine::new();
+    engine
+        .bootstrap_from_onchain_snapshot(snapshot)
+        .map_err(|err| anyhow!("rust-harness bootstrap_from_onchain_snapshot failed: {err}"))?;
+    info!("local-state bootstrap: ContinuumStateEngine seeded successfully");
+    Ok(engine)
+}
+
+/// Parse a harness watermark sequence number out of a JSON response, walking
+/// a dot-separated JSON path (e.g. `data.last_processed_sequence` for the
+/// queue endpoint or `data.watermarks.optimistic_seq` for the markets
+/// endpoint). Accepts both string-encoded and numeric sequence values
+/// because the harness stringifies large integers to avoid JS precision
+/// loss.
+fn parse_harness_watermark(body: &str, json_path: &str) -> Option<u64> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let mut cursor = &v;
+    for segment in json_path.split('.') {
+        cursor = cursor.get(segment)?;
+    }
+    if let Some(s) = cursor.as_str() {
+        s.parse::<u64>().ok()
+    } else if let Some(n) = cursor.as_u64() {
+        Some(n)
+    } else {
+        None
+    }
+}
+
+/// Background task that polls a harness watermark URL, parses out a
+/// sequence number along the configured JSON path, and advances the
+/// associated LatencyTracker. The `watermark_atomic` and `last_ms_atomic`
+/// arguments let one prober update the optimistic gauges and another the
+/// processed gauges without sharing fields.
+///
+/// Hits the harness on its own dedicated reqwest client with a hard
+/// timeout so a stalled or hung harness can never wedge this loop or
+/// back-pressure the hot path.
+async fn run_latency_prober(
+    label: &'static str,
+    metrics: Arc<Metrics>,
+    tracker: Arc<LatencyTracker>,
+    watermark_atomic: fn(&Metrics) -> &AtomicU64,
+    last_ms_atomic: fn(&Metrics) -> &AtomicU64,
+    harness_url: String,
+    watermark_field: String,
+    interval_ms: u64,
+    timeout_ms: u64,
+) {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_millis(timeout_ms))
+        .build()
+    {
+        Ok(c) => c,
+        Err(err) => {
+            warn!("latency prober [{label}]: failed to build client: {err:?}");
+            return;
+        }
+    };
+    info!(
+        "latency prober [{}] enabled url={} field={} interval_ms={} timeout_ms={}",
+        label, harness_url, watermark_field, interval_ms, timeout_ms
+    );
+    loop {
+        match client.get(&harness_url).send().await {
+            Ok(resp) if resp.status().is_success() => match resp.text().await {
+                Ok(body) => {
+                    if let Some(wm) = parse_harness_watermark(&body, &watermark_field) {
+                        let now_ms = unix_timestamp_ms();
+                        tracker.complete_up_to(wm, now_ms);
+                        watermark_atomic(&metrics).store(wm, Ordering::Relaxed);
+                        last_ms_atomic(&metrics).store(now_ms, Ordering::Relaxed);
+                    } else {
+                        debug!(
+                            "latency prober [{label}]: failed to parse watermark at {}",
+                            watermark_field
+                        );
+                    }
+                }
+                Err(err) => debug!("latency prober [{label}] body read failed: {err:?}"),
+            },
+            Ok(resp) => debug!("latency prober [{label}] non-2xx: {}", resp.status()),
+            Err(err) => debug!("latency prober [{label}] error: {err:?}"),
+        }
+        tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+    }
+}
+
+/// Background submitter worker task. Drains PendingSubmits from the shared
+/// mpsc channel and dispatches each through `Engine::handle_bg_submit`. One
+/// of these is spawned per `bg_submit_workers`. The receiver is shared
+/// across workers via a tokio Mutex (mpsc::Receiver is single-consumer by
+/// default; the Mutex implements work-stealing).
+async fn run_bg_submitter(
+    engine: Arc<Engine>,
+    rx: Arc<Mutex<mpsc::Receiver<PendingSubmit>>>,
+    worker_id: usize,
+) {
+    info!("bg submitter worker {worker_id} started");
+    loop {
+        let pending = {
+            let mut guard = rx.lock().await;
+            guard.recv().await
+        };
+        match pending {
+            Some(pending) => {
+                engine.handle_bg_submit(pending).await;
+            }
+            None => {
+                info!("bg submitter worker {worker_id} shutting down (channel closed)");
+                return;
+            }
+        }
+    }
+}
+
 /// Background task that polls the relayer payer balance via RPC and writes
 /// it into the relayer_balance_lamports gauge. Runs at a low cadence
 /// (default 30s) so it adds negligible RPC pressure even when the hot path
@@ -6928,8 +8724,22 @@ async fn run_balance_poller(
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // Build a custom multi-threaded runtime with a wider worker stack.
+    // The default tokio stack is 2 MB which is too small once we embed
+    // rust-harness — its `MangoAccountValue`, `BookSide`, `EventQueue`,
+    // and friends are large stack-allocated types that overflow the
+    // default. The rust-harness test suite uses a 32 MB stack via
+    // `run_with_large_stack`; 8 MB is comfortable for production.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(8 * 1024 * 1024)
+        .build()
+        .context("build tokio runtime with widened worker stack")?;
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -6969,6 +8779,74 @@ async fn main() -> Result<()> {
         });
 
     let unique_addresses = Arc::new(StdMutex::new(HashMap::new()));
+    let latency_optimistic_tracker = Arc::new(LatencyTracker::new(
+        config.latency_samples_capacity,
+        config.latency_pending_max_size,
+        config.latency_pending_max_age_ms,
+    ));
+    let latency_processed_tracker = Arc::new(LatencyTracker::new(
+        config.latency_samples_capacity,
+        config.latency_pending_max_size,
+        config.latency_pending_max_age_ms,
+    ));
+    // Initialize the per-histogram ring capacities. Each histogram lives on
+    // the Metrics struct so the hot path can push without coordinating
+    // with anything else. We size all of them from the same config knob.
+    metrics
+        .submit_latency
+        .set_capacity(config.latency_samples_capacity);
+    metrics
+        .stage_parse_latency
+        .set_capacity(config.latency_samples_capacity);
+    metrics
+        .stage_margin_check_latency
+        .set_capacity(config.latency_samples_capacity);
+    metrics
+        .stage_sign_latency
+        .set_capacity(config.latency_samples_capacity);
+    metrics
+        .stage_event_dispatch_latency
+        .set_capacity(config.latency_samples_capacity);
+    metrics
+        .stage_bg_rpc_submit_latency
+        .set_capacity(config.latency_samples_capacity);
+
+    // Background submitter pool wiring (Phase 1.1). The mpsc channel feeds
+    // a pool of `bg_submit_workers` worker tasks; submit_intent uses the
+    // sender's try_send so the hot path never blocks on backpressure.
+    let (bg_submit_tx, bg_submit_rx) =
+        mpsc::channel::<PendingSubmit>(config.bg_submit_channel_cap);
+    let bg_submit_rx = Arc::new(Mutex::new(bg_submit_rx));
+
+    // Phase 2: optional in-process optimistic state. If
+    // CTM_RELAYER_LOCAL_STATE=true, fetch a one-time snapshot from the
+    // legacy harness and seed an in-process ContinuumStateEngine. The
+    // relayer then owns its own copy and never hits the harness HTTP
+    // endpoint on the hot path again.
+    let local_state = if config.local_state_enabled {
+        match bootstrap_local_state(
+            &config.local_state_bootstrap_url,
+            config.local_state_bootstrap_timeout_ms,
+        )
+        .await
+        {
+            Ok(engine) => {
+                info!(
+                    "CTM_RELAYER_LOCAL_STATE=true — in-process state initialized from {}",
+                    config.local_state_bootstrap_url
+                );
+                Some(Arc::new(PlMutex::new(engine)))
+            }
+            Err(err) => {
+                warn!(
+                    "local-state bootstrap failed; falling back to legacy HTTP path: {err:#}"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let engine = Arc::new(Engine {
         config: config.clone(),
@@ -6984,7 +8862,31 @@ async fn main() -> Result<()> {
         execute_nonce: Arc::new(AtomicU64::new(1)),
         blocked_mango_accounts: Arc::new(Mutex::new(HashMap::new())),
         unique_addresses: unique_addresses.clone(),
+        latency_optimistic_tracker: latency_optimistic_tracker.clone(),
+        latency_processed_tracker: latency_processed_tracker.clone(),
+        bg_submit_tx: bg_submit_tx.clone(),
+        state: local_state,
+        market_metadata_cache: Arc::new(StdMutex::new(HashMap::new())),
+        margin_account_cache: Arc::new(StdMutex::new(HashMap::new())),
     });
+
+    // Spawn the bg submitter worker pool. Each worker shares the receiver
+    // via a tokio Mutex (work-stealing). Workers exit when the channel
+    // closes (which only happens at shutdown).
+    for worker_id in 0..config.bg_submit_workers {
+        tokio::spawn(run_bg_submitter(
+            engine.clone(),
+            bg_submit_rx.clone(),
+            worker_id,
+        ));
+    }
+    info!(
+        "bg submitter pool spawned: workers={} channel_cap={} max_retries={} retry_base_ms={}",
+        config.bg_submit_workers,
+        config.bg_submit_channel_cap,
+        config.bg_submit_max_retries,
+        config.bg_submit_retry_base_ms
+    );
 
     if let Some(http_addr) = config.http_bind_addr {
         tokio::spawn(run_http_server(http_addr, metrics.clone()));
@@ -7000,6 +8902,8 @@ async fn main() -> Result<()> {
         metrics.clone(),
         executor.clone(),
         unique_addresses.clone(),
+        latency_optimistic_tracker.clone(),
+        latency_processed_tracker.clone(),
         config.executor_stale_threshold_ms,
         config.event_cranker_stale_threshold_ms,
         event_cranker_enabled,
@@ -7012,6 +8916,38 @@ async fn main() -> Result<()> {
             bridge_url,
             config.health_probe_interval_ms,
             config.bridge_health_probe_timeout_ms,
+        ));
+    }
+
+    // Optimistic latency prober — drains the optimistic tracker. Each
+    // prober is the sole writer for its own pair of (watermark_seq,
+    // last_ms) gauges, so they never contend with each other or the hot
+    // path.
+    if let Some(latency_url) = config.latency_optimistic_url.clone() {
+        tokio::spawn(run_latency_prober(
+            "optimistic",
+            metrics.clone(),
+            latency_optimistic_tracker.clone(),
+            |m| &m.harness_optimistic_watermark_seq,
+            |m| &m.latency_optimistic_prober_last_ms,
+            latency_url,
+            config.latency_optimistic_field.clone(),
+            config.latency_probe_interval_ms,
+            config.latency_probe_timeout_ms,
+        ));
+    }
+    // Processed latency prober — drains the processed tracker.
+    if let Some(latency_url) = config.latency_processed_url.clone() {
+        tokio::spawn(run_latency_prober(
+            "processed",
+            metrics.clone(),
+            latency_processed_tracker.clone(),
+            |m| &m.harness_processed_watermark_seq,
+            |m| &m.latency_processed_prober_last_ms,
+            latency_url,
+            config.latency_processed_field.clone(),
+            config.latency_probe_interval_ms,
+            config.latency_probe_timeout_ms,
         ));
     }
 
@@ -7050,6 +8986,21 @@ mod tests {
     use super::*;
     use anchor_lang::AnchorSerialize;
 
+    fn make_test_lane(width: usize, hash_byte: u8) -> Lane {
+        let remaining_accounts = (0..width)
+            .map(|offset| {
+                let mut bytes = [hash_byte; 32];
+                bytes[31] = offset as u8;
+                AccountMeta::new(Pubkey::new_from_array(bytes), false)
+            })
+            .collect();
+        Lane {
+            name: format!("lane-{hash_byte}"),
+            remaining_accounts,
+            hash: [hash_byte; 32],
+        }
+    }
+
     fn write_u32(data: &mut [u8], offset: usize, value: u32) {
         data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
@@ -7086,6 +9037,75 @@ mod tests {
     fn parse_startup_flags_rejects_unknown_flag() {
         let err = parse_startup_flags_from_iter(["--wat"]).unwrap_err();
         assert!(err.to_string().contains("unknown startup flag"));
+    }
+
+    #[test]
+    fn detects_transaction_too_large_rpc_error() {
+        let err = anyhow!(
+            "RpcError(RpcResponseError {{ code: -32602, message: \"base64 encoded solana_transaction::versioned::VersionedTransaction too large: 1676 bytes (max: encoded/raw 1644/1232)\" }})"
+        );
+        assert!(is_transaction_too_large_error(&err));
+    }
+
+    #[test]
+    fn ignores_non_size_rpc_errors() {
+        let err = anyhow!(
+            "RpcError(RpcResponseError {{ code: -32005, message: \"Node is unhealthy\" }})"
+        );
+        assert!(!is_transaction_too_large_error(&err));
+    }
+
+    #[test]
+    fn shared_lane_account_width_accepts_uniform_batches() {
+        let lanes = vec![make_test_lane(3, 1), make_test_lane(3, 2), make_test_lane(3, 3)];
+        assert_eq!(shared_lane_account_width(&lanes).unwrap(), 3);
+    }
+
+    #[test]
+    fn shared_lane_account_width_rejects_mixed_batches() {
+        let lanes = vec![make_test_lane(3, 1), make_test_lane(4, 2)];
+        let err = shared_lane_account_width(&lanes).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("incompatible execute_multi lane account widths")
+        );
+    }
+
+    #[test]
+    fn select_layout_compatible_lanes_skips_incompatible_widths() {
+        let lanes = vec![
+            make_test_lane(3, 1),
+            make_test_lane(3, 2),
+            make_test_lane(4, 3),
+            make_test_lane(3, 4),
+        ];
+        let (eligible, unique_hashes, dropped_for_layout) =
+            select_layout_compatible_lanes(lanes, &HashMap::new(), 100, 4);
+
+        assert_eq!(eligible.len(), 3);
+        assert!(eligible.iter().all(|lane| lane_account_width(lane) == 3));
+        assert_eq!(unique_hashes, 4);
+        assert_eq!(dropped_for_layout, 1);
+    }
+
+    #[test]
+    fn select_layout_compatible_lanes_uses_first_unblocked_width() {
+        let lanes = vec![
+            make_test_lane(5, 1),
+            make_test_lane(2, 2),
+            make_test_lane(2, 3),
+            make_test_lane(4, 4),
+        ];
+        let mut backoff_snapshot = HashMap::new();
+        backoff_snapshot.insert(bytes_to_hex(&[1u8; 32]), 200);
+
+        let (eligible, unique_hashes, dropped_for_layout) =
+            select_layout_compatible_lanes(lanes, &backoff_snapshot, 100, 4);
+
+        assert_eq!(eligible.len(), 2);
+        assert!(eligible.iter().all(|lane| lane_account_width(lane) == 2));
+        assert_eq!(unique_hashes, 3);
+        assert_eq!(dropped_for_layout, 1);
     }
 
     #[test]

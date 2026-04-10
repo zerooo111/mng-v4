@@ -1,5 +1,4 @@
 use anchor_lang::prelude::*;
-use fixed::types::I80F48;
 
 use crate::accounts_ix::*;
 use crate::accounts_zerocopy::*;
@@ -8,52 +7,9 @@ use crate::health::*;
 use crate::state::*;
 use crate::util::clock_now;
 
-pub(crate) fn perp_place_order_with_loaded_context<'a>(
-    account: &mut MangoAccountRefMut,
-    account_pk: &Pubkey,
-    perp_market: &mut PerpMarket,
-    book: &mut Orderbook<'a>,
-    event_queue: &mut EventQueue,
-    oracle_price: I80F48,
-    mut order: Order,
-    now_ts: u64,
-    buyback_fees_expiry_interval: u64,
-    limit: u8,
-) -> Result<Option<u128>> {
-    account
-        .fixed
-        .expire_buyback_fees(now_ts, buyback_fees_expiry_interval);
-
-    let pp = account.perp_position(perp_market.perp_market_index)?;
-    let max_base_lots = if order.reduce_only || perp_market.is_reduce_only() {
-        reduce_only_max_base_lots(pp, &order, perp_market.is_reduce_only())
-    } else {
-        order.max_base_lots
-    };
-    if perp_market.is_reduce_only() {
-        require!(
-            order.reduce_only || max_base_lots == order.max_base_lots,
-            MangoError::MarketInReduceOnlyMode
-        )
-    };
-    order.max_base_lots = max_base_lots;
-
-    book.new_order(
-        order,
-        perp_market,
-        event_queue,
-        oracle_price,
-        account,
-        account_pk,
-        now_ts,
-        limit,
-    )
-}
-
 fn perp_place_order_inner<'info>(
     group: AccountLoader<'info, Group>,
     account: AccountLoader<'info, MangoAccountFixed>,
-    account_ai: &AccountInfo<'info>,
     owner: Pubkey,
     perp_market: AccountLoader<'info, PerpMarket>,
     bids: AccountLoader<'info, BookSide>,
@@ -61,15 +17,12 @@ fn perp_place_order_inner<'info>(
     event_queue: AccountLoader<'info, EventQueue>,
     oracle: AccountInfo<'info>,
     remaining_accounts: &[AccountInfo<'info>],
-    order: Order,
+    mut order: Order,
     limit: u8,
 ) -> Result<Option<u128>> {
     require_gte!(order.max_base_lots, 0);
     require_gte!(order.max_quote_lots, 0);
-    let group_key = group.key();
     let account_pk = account.key();
-    let (sidecar_ai_opt, health_accounts) =
-        split_optional_risk_sidecar_account(group_key, account_pk, remaining_accounts);
 
     let (now_ts, now_slot) = clock_now();
     let oracle_price;
@@ -95,6 +48,12 @@ fn perp_place_order_inner<'info>(
         perp_market.update_funding_and_stable_price(&book, &oracle_state, now_ts)?;
     }
 
+    let mut account = account.load_full_mut()?;
+    require!(
+        account.fixed.is_owner_or_delegate(owner),
+        MangoError::SomeError
+    );
+
     let (perp_market_index, settle_token_index) = {
         let perp_market = perp_market.load()?;
         (
@@ -103,127 +62,78 @@ fn perp_place_order_inner<'info>(
         )
     };
 
-    {
-        let mut account = account.load_full_mut()?;
-        require!(
-            account.fixed.is_owner_or_delegate(owner),
-            MangoError::SomeError
-        );
-        account.ensure_perp_position(perp_market_index, settle_token_index)?;
-    }
+    account.ensure_perp_position(perp_market_index, settle_token_index)?;
 
-    let account_for_hash = account.load_full()?;
-    let account_hash_ref = account_for_hash.borrow();
-    let pre_account_state_hash = risk_sidecar_account_state_hash(&account_hash_ref)?;
-    let pre_health_accounts_state_hash =
-        risk_sidecar_health_accounts_state_hash(&account_hash_ref, health_accounts, now_slot, now_ts)?;
-    drop(account_hash_ref);
-    drop(account_for_hash);
-    let account_loader = AccountLoader::try_from(account_ai)
-        .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?;
-    let mut sidecar_account_opt =
-        load_risk_sidecar_account(group_key, account_pk, sidecar_ai_opt)?;
-    let mut account = account.load_full_mut()?;
-
-    let mut pre_health_opt = if !account.fixed.is_in_health_region() {
-        let mut account_ref = account.borrow_mut();
-        let session = if let Some(snapshot) = sidecar_account_opt
-            .as_ref()
-            .map(|sidecar| {
-                matching_risk_sidecar_snapshot(
-                    sidecar,
-                    group_key,
-                    account_pk,
-                    pre_account_state_hash,
-                    pre_health_accounts_state_hash,
-                )
-            })
-            .transpose()?
-            .flatten()
-        {
-            ExactRiskSidecarSession::prepare_from_snapshot(account_pk, &mut account_ref, &snapshot)
-                .context("pre init health from risk sidecar")?
-        } else {
-            ExactRiskSidecarSession::prepare_from_fixed_accounts(
-                account_pk,
-                &mut account_ref,
-                health_accounts,
-                now_slot,
-                now_ts,
-            )
-            .context("pre init health")?
-        };
-        session.require_token_info(settle_token_index)?;
-        Some(session)
-    } else {
-        None
-    };
-
-    let order_id_opt;
-    {
-        let mut perp_market = perp_market.load_mut()?;
-        let mut book = Orderbook {
-            bids: bids.load_mut()?,
-            asks: asks.load_mut()?,
-        };
-        let mut event_queue = event_queue.load_mut()?;
-        let group = group.load()?;
-        let now_ts: u64 = Clock::get()?.unix_timestamp.try_into().unwrap();
-        order_id_opt = perp_place_order_with_loaded_context(
-            &mut account.borrow_mut(),
-            &account_pk,
-            &mut perp_market,
-            &mut book,
-            &mut event_queue,
-            oracle_price,
-            order,
-            now_ts,
-            group.buyback_fees_expiry_interval,
-            limit,
+    let pre_health_opt = if !account.fixed.is_in_health_region() {
+        let retriever = new_fixed_order_account_retriever_with_optional_banks(
+            remaining_accounts,
+            &account.borrow(),
+            now_slot,
         )?;
+        let health_cache = new_health_cache_skipping_missing_banks_and_bad_oracles(
+            &account.borrow(),
+            &retriever,
+            now_ts,
+        )
+        .context("pre init health")?;
 
-        if let Some(risk_session) = pre_health_opt.as_mut() {
-            let mut account_ref = account.borrow_mut();
-            risk_session.recompute_perp_and_check_post(&mut account_ref, &perp_market)?;
-        }
-    }
+        health_cache.token_info_index(settle_token_index)?;
 
-    let snapshot_opt = if let Some(risk_session) = pre_health_opt.take() {
-        Some(risk_session.into_snapshot(&account.borrow()))
+        let pre_init_health = account.check_health_pre(&health_cache)?;
+        Some((health_cache, pre_init_health))
     } else {
         None
     };
-    drop(account);
 
-    if let (Some(snapshot), Some(sidecar_account)) = (snapshot_opt.as_ref(), sidecar_account_opt.as_mut()) {
-        if sidecar_account.to_account_info().is_writable {
-            let clock = Clock::get()?;
-            let now_ts: u64 = clock.unix_timestamp.try_into().unwrap_or(0);
-            let account_for_hash = account_loader.load_full()?;
-            let account_hash_ref = account_for_hash.borrow();
-            let post_account_state_hash = risk_sidecar_account_state_hash(&account_hash_ref)?;
-            let post_health_accounts_state_hash = risk_sidecar_health_accounts_state_hash(
-                &account_hash_ref,
-                health_accounts,
-                clock.slot,
-                now_ts,
-            )?;
-            refresh_risk_sidecar_account(
-                sidecar_account,
-                snapshot,
-                post_account_state_hash,
-                post_health_accounts_state_hash,
-                clock.slot,
-                now_ts,
-                false,
-            )?;
-        }
+    let mut perp_market = perp_market.load_mut()?;
+    let mut book = Orderbook {
+        bids: bids.load_mut()?,
+        asks: asks.load_mut()?,
+    };
+
+    let mut event_queue = event_queue.load_mut()?;
+    let group = group.load()?;
+
+    let now_ts: u64 = Clock::get()?.unix_timestamp.try_into().unwrap();
+    account
+        .fixed
+        .expire_buyback_fees(now_ts, group.buyback_fees_expiry_interval);
+
+    let pp = account.perp_position(perp_market_index)?;
+    let max_base_lots = if order.reduce_only || perp_market.is_reduce_only() {
+        reduce_only_max_base_lots(pp, &order, perp_market.is_reduce_only())
+    } else {
+        order.max_base_lots
+    };
+    if perp_market.is_reduce_only() {
+        require!(
+            order.reduce_only || max_base_lots == order.max_base_lots,
+            MangoError::MarketInReduceOnlyMode
+        )
+    };
+    order.max_base_lots = max_base_lots;
+
+    let order_id_opt = book.new_order(
+        order,
+        &mut perp_market,
+        &mut event_queue,
+        oracle_price,
+        &mut account.borrow_mut(),
+        &account_pk,
+        now_ts,
+        limit,
+    )?;
+
+    if let Some((mut health_cache, pre_init_health)) = pre_health_opt {
+        let perp_position = account.perp_position(perp_market_index)?;
+        health_cache.recompute_perp_info(perp_position, &perp_market)?;
+        account.check_health_post(&health_cache, pre_init_health)?;
     }
 
     Ok(order_id_opt)
 }
 
-pub(crate) fn validate_perp_place_order_queue_accounts<'info>(
+fn validate_perp_place_order_queue_accounts<'info>(
     group: &AccountLoader<'info, Group>,
     account: &AccountLoader<'info, MangoAccountFixed>,
     perp_market: &AccountLoader<'info, PerpMarket>,
@@ -301,7 +211,6 @@ pub(crate) fn perp_place_order_from_account_infos<'info>(
     perp_place_order_inner(
         group,
         account,
-        &dispatch_accounts[1],
         owner,
         perp_market,
         bids,
@@ -325,10 +234,6 @@ pub fn perp_place_order(
     require_gte!(order.max_quote_lots, 0);
 
     let (now_ts, now_slot) = clock_now();
-    let group_key = ctx.accounts.group.key();
-    let account_pk = ctx.accounts.account.key();
-    let (sidecar_ai_opt, health_accounts) =
-        split_optional_risk_sidecar_account(group_key, account_pk, ctx.remaining_accounts);
     let oracle_price;
 
     {
@@ -346,6 +251,14 @@ pub fn perp_place_order(
         perp_market.update_funding_and_stable_price(&book, &oracle_state, now_ts)?;
     }
 
+    let mut account = ctx.accounts.account.load_full_mut()?;
+    require!(
+        account.fixed.is_owner_or_delegate(ctx.accounts.owner.key()),
+        MangoError::SomeError
+    );
+
+    let account_pk = ctx.accounts.account.key();
+
     let (perp_market_index, settle_token_index) = {
         let perp_market = ctx.accounts.perp_market.load()?;
         (
@@ -354,135 +267,72 @@ pub fn perp_place_order(
         )
     };
 
-    {
-        let mut account = ctx.accounts.account.load_full_mut()?;
-        require!(
-            account.fixed.is_owner_or_delegate(ctx.accounts.owner.key()),
-            MangoError::SomeError
-        );
-        account.ensure_perp_position(perp_market_index, settle_token_index)?;
-    }
+    account.ensure_perp_position(perp_market_index, settle_token_index)?;
 
-    let account_for_hash = ctx.accounts.account.load_full()?;
-    let account_hash_ref = account_for_hash.borrow();
-    let pre_account_state_hash = risk_sidecar_account_state_hash(&account_hash_ref)?;
-    let pre_health_accounts_state_hash =
-        risk_sidecar_health_accounts_state_hash(&account_hash_ref, health_accounts, now_slot, now_ts)?;
-    drop(account_hash_ref);
-    drop(account_for_hash);
-    let mut sidecar_account_opt =
-        load_risk_sidecar_account(group_key, account_pk, sidecar_ai_opt)?;
-    let mut account = ctx.accounts.account.load_full_mut()?;
-
-    let mut pre_health_opt = if !account.fixed.is_in_health_region() {
-        let mut account_ref = account.borrow_mut();
-        let session = if let Some(snapshot) = sidecar_account_opt
-            .as_ref()
-            .map(|sidecar| {
-                matching_risk_sidecar_snapshot(
-                    sidecar,
-                    group_key,
-                    account_pk,
-                    pre_account_state_hash,
-                    pre_health_accounts_state_hash,
-                )
-            })
-            .transpose()?
-            .flatten()
-        {
-            ExactRiskSidecarSession::prepare_from_snapshot(account_pk, &mut account_ref, &snapshot)
-                .context("pre init health from risk sidecar")?
-        } else {
-            ExactRiskSidecarSession::prepare_from_fixed_accounts(
-                account_pk,
-                &mut account_ref,
-                health_accounts,
-                now_slot,
-                now_ts,
-            )
-            .context("pre init health")?
-        };
-        session.require_token_info(settle_token_index)?;
-        Some(session)
-    } else {
-        None
-    };
-
-    let order_id_opt;
-    {
-        let mut perp_market = ctx.accounts.perp_market.load_mut()?;
-        let mut book = Orderbook {
-            bids: ctx.accounts.bids.load_mut()?,
-            asks: ctx.accounts.asks.load_mut()?,
-        };
-        let mut event_queue = ctx.accounts.event_queue.load_mut()?;
-        let group = ctx.accounts.group.load()?;
-
-        let now_ts: u64 = Clock::get()?.unix_timestamp.try_into().unwrap();
-        account
-            .fixed
-            .expire_buyback_fees(now_ts, group.buyback_fees_expiry_interval);
-
-        let pp = account.perp_position(perp_market_index)?;
-        let max_base_lots = if order.reduce_only || perp_market.is_reduce_only() {
-            reduce_only_max_base_lots(pp, &order, perp_market.is_reduce_only())
-        } else {
-            order.max_base_lots
-        };
-        if perp_market.is_reduce_only() {
-            require!(
-                order.reduce_only || max_base_lots == order.max_base_lots,
-                MangoError::MarketInReduceOnlyMode
-            )
-        };
-        order.max_base_lots = max_base_lots;
-
-        order_id_opt = book.new_order(
-            order,
-            &mut perp_market,
-            &mut event_queue,
-            oracle_price,
-            &mut account.borrow_mut(),
-            &account_pk,
-            now_ts,
-            limit,
+    let pre_health_opt = if !account.fixed.is_in_health_region() {
+        let retriever = new_fixed_order_account_retriever_with_optional_banks(
+            ctx.remaining_accounts,
+            &account.borrow(),
+            now_slot,
         )?;
+        let health_cache = new_health_cache_skipping_missing_banks_and_bad_oracles(
+            &account.borrow(),
+            &retriever,
+            now_ts,
+        )
+        .context("pre init health")?;
 
-        if let Some(risk_session) = pre_health_opt.as_mut() {
-            let mut account_ref = account.borrow_mut();
-            risk_session.recompute_perp_and_check_post(&mut account_ref, &perp_market)?;
-        }
-    }
+        health_cache.token_info_index(settle_token_index)?;
 
-    let snapshot_opt = if let Some(risk_session) = pre_health_opt.take() {
-        Some(risk_session.into_snapshot(&account.borrow()))
+        let pre_init_health = account.check_health_pre(&health_cache)?;
+        Some((health_cache, pre_init_health))
     } else {
         None
     };
-    drop(account);
-    if let (Some(snapshot), Some(sidecar_account)) = (snapshot_opt.as_ref(), sidecar_account_opt.as_mut()) {
-        if sidecar_account.to_account_info().is_writable {
-            let clock = Clock::get()?;
-            let now_ts: u64 = clock.unix_timestamp.try_into().unwrap_or(0);
-            let account_for_hash = ctx.accounts.account.load_full()?;
-            let account_hash_ref = account_for_hash.borrow();
-            let post_account_state_hash = risk_sidecar_account_state_hash(&account_hash_ref)?;
-            let post_health_accounts_state_hash = risk_sidecar_health_accounts_state_hash(
-                &account_hash_ref,
-                health_accounts,
-                clock.slot,
-                now_ts,
-            )?;
-            refresh_risk_sidecar_account(
-                sidecar_account,
-                snapshot,
-                post_account_state_hash,
-                post_health_accounts_state_hash,
-                clock.slot,
-                now_ts,
-                false,
-            )?;
-        }
+
+    let mut perp_market = ctx.accounts.perp_market.load_mut()?;
+    let mut book = Orderbook {
+        bids: ctx.accounts.bids.load_mut()?,
+        asks: ctx.accounts.asks.load_mut()?,
+    };
+
+    let mut event_queue = ctx.accounts.event_queue.load_mut()?;
+    let group = ctx.accounts.group.load()?;
+
+    let now_ts: u64 = Clock::get()?.unix_timestamp.try_into().unwrap();
+    account
+        .fixed
+        .expire_buyback_fees(now_ts, group.buyback_fees_expiry_interval);
+
+    let pp = account.perp_position(perp_market_index)?;
+    let max_base_lots = if order.reduce_only || perp_market.is_reduce_only() {
+        reduce_only_max_base_lots(pp, &order, perp_market.is_reduce_only())
+    } else {
+        order.max_base_lots
+    };
+    if perp_market.is_reduce_only() {
+        require!(
+            order.reduce_only || max_base_lots == order.max_base_lots,
+            MangoError::MarketInReduceOnlyMode
+        )
+    };
+    order.max_base_lots = max_base_lots;
+
+    let order_id_opt = book.new_order(
+        order,
+        &mut perp_market,
+        &mut event_queue,
+        oracle_price,
+        &mut account.borrow_mut(),
+        &account_pk,
+        now_ts,
+        limit,
+    )?;
+
+    if let Some((mut health_cache, pre_init_health)) = pre_health_opt {
+        let perp_position = account.perp_position(perp_market_index)?;
+        health_cache.recompute_perp_info(perp_position, &perp_market)?;
+        account.check_health_post(&health_cache, pre_init_health)?;
     }
 
     Ok(order_id_opt)

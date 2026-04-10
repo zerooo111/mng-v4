@@ -74,7 +74,11 @@ function parseArgs(args) {
 }
 
 function runCargoBuild(repoRoot, profile) {
-  const cargoArgs = ['build', '-p', 'rust-harness'];
+  // Phase 2 split: napi bindings are now feature-gated in rust-harness so
+  // the relayer can link the crate as a plain rlib without pulling in the
+  // host-provided napi_* symbols. The cdylib still needs them, so this
+  // builder always passes --features napi.
+  const cargoArgs = ['build', '-p', 'rust-harness', '--features', 'napi'];
   if (profile === 'release') {
     cargoArgs.push('--release');
   } else if (profile !== 'debug') {

@@ -7,55 +7,6 @@ use crate::state::*;
 use crate::accounts_ix::*;
 use crate::logs::{emit_perp_balances, emit_stack, FillLogV3};
 
-fn push_unique_mango_account_key(keys: &mut Vec<Pubkey>, key: Pubkey) {
-    if !keys.iter().any(|existing| *existing == key) {
-        keys.push(key);
-    }
-}
-
-fn collect_needed_mango_account_keys(
-    event_queue: &EventQueue,
-    limit: usize,
-) -> Result<Vec<Pubkey>> {
-    let mut keys = Vec::with_capacity(limit.saturating_mul(2));
-    for event in event_queue.iter().take(limit) {
-        match EventType::try_from(event.event_type).map_err(|_| error!(MangoError::SomeError))? {
-            EventType::Fill => {
-                let fill: &FillEvent = cast_ref(event);
-                push_unique_mango_account_key(&mut keys, fill.maker);
-                push_unique_mango_account_key(&mut keys, fill.taker);
-            }
-            EventType::Out => {
-                let out: &OutEvent = cast_ref(event);
-                push_unique_mango_account_key(&mut keys, out.owner);
-            }
-            EventType::Liquidate => {}
-        }
-    }
-    Ok(keys)
-}
-
-fn resolve_mango_account_indices(
-    mango_account_ais: &[AccountInfo],
-    needed_keys: &[Pubkey],
-) -> Vec<(Pubkey, Option<usize>)> {
-    needed_keys
-        .iter()
-        .map(|key| (*key, mango_account_ais.iter().position(|ai| ai.key == key)))
-        .collect()
-}
-
-fn find_mango_account_ai<'a, 'info>(
-    resolved_account_indices: &[(Pubkey, Option<usize>)],
-    mango_account_ais: &'a [AccountInfo<'info>],
-    key: &Pubkey,
-) -> Option<&'a AccountInfo<'info>> {
-    resolved_account_indices
-        .iter()
-        .find(|(candidate, _)| candidate == key)
-        .and_then(|(_, index_opt)| index_opt.map(|index| &mango_account_ais[index]))
-}
-
 /// Load a mango account by key from the list of account infos.
 ///
 /// Message and return Ok() if it's missing, to lock in successful processing
@@ -64,8 +15,8 @@ fn find_mango_account_ai<'a, 'info>(
 /// Special handling for testing groups, where events for accounts with bad
 /// owners (most likely due to force closure of the account) are being skipped.
 macro_rules! load_mango_account {
-    ($name:ident, $key:expr, $resolved:expr, $ais:expr, $group:expr, $event_queue:expr) => {
-        let loader = match find_mango_account_ai($resolved, $ais, &$key) {
+    ($name:ident, $key:expr, $ais:expr, $group:expr, $event_queue:expr) => {
+        let loader = match $ais.iter().find(|ai| ai.key == &$key) {
             None => {
                 msg!(
                     "Unable to find {} account {}",
@@ -103,10 +54,6 @@ pub fn perp_consume_events(ctx: Context<PerpConsumeEvents>, limit: usize) -> Res
     let perp_market_index = perp_market.perp_market_index;
     let mut event_queue = ctx.accounts.event_queue.load_mut()?;
     let mango_account_ais = &ctx.remaining_accounts;
-    let resolved_account_indices = resolve_mango_account_indices(
-        mango_account_ais,
-        &collect_needed_mango_account_keys(&event_queue, limit)?,
-    );
 
     for _ in 0..limit {
         let event = match event_queue.peek_front() {
@@ -123,7 +70,6 @@ pub fn perp_consume_events(ctx: Context<PerpConsumeEvents>, limit: usize) -> Res
                     load_mango_account!(
                         maker_taker,
                         fill.maker,
-                        &resolved_account_indices,
                         mango_account_ais,
                         group,
                         event_queue
@@ -148,22 +94,8 @@ pub fn perp_consume_events(ctx: Context<PerpConsumeEvents>, limit: usize) -> Res
                     let closed_pnl = maker_realized_pnl + taker_realized_pnl;
                     (closed_pnl, closed_pnl)
                 } else {
-                    load_mango_account!(
-                        maker,
-                        fill.maker,
-                        &resolved_account_indices,
-                        mango_account_ais,
-                        group,
-                        event_queue
-                    );
-                    load_mango_account!(
-                        taker,
-                        fill.taker,
-                        &resolved_account_indices,
-                        mango_account_ais,
-                        group,
-                        event_queue
-                    );
+                    load_mango_account!(maker, fill.maker, mango_account_ais, group, event_queue);
+                    load_mango_account!(taker, fill.taker, mango_account_ais, group, event_queue);
 
                     let maker_realized_pnl = maker.execute_perp_maker(
                         perp_market_index,
@@ -211,14 +143,7 @@ pub fn perp_consume_events(ctx: Context<PerpConsumeEvents>, limit: usize) -> Res
             }
             EventType::Out => {
                 let out: &OutEvent = cast_ref(event);
-                load_mango_account!(
-                    owner,
-                    out.owner,
-                    &resolved_account_indices,
-                    mango_account_ais,
-                    group,
-                    event_queue
-                );
+                load_mango_account!(owner, out.owner, mango_account_ais, group, event_queue);
                 owner.execute_perp_out_event(
                     perp_market_index,
                     out.side(),

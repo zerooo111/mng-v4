@@ -8,14 +8,25 @@ name = "rust_harness"
 path = "src/lib.rs"
 crate-type = ["rlib", "cdylib"]
 
+[features]
+# `napi` enables the Node.js N-API bindings exposed in src/node.rs.
+# Enable this when building the cdylib that the legacy TS harness loads
+# (build-rust-harness-native.js does so via `--features napi`).
+# When linking rust-harness as an rlib into a pure Rust binary (e.g. the
+# relayer's service-mango-execution-engine after Phase 2), leave it
+# disabled so the build doesn't try to link the host-provided napi_*
+# symbols.
+default = []
+napi = ["dep:napi", "dep:napi-derive"]
+
 [dependencies]
 anchor-lang = { workspace = true }
 base64 = "0.21"
 bytemuck = { version = "^1.7.2", features = ["min_const_generics"] }
 fixed = { workspace = true }
 mango-v4 = { path = "../programs/mango-v4", default-features = false, features = ["client", "enable-gpl"] }
-napi = { version = "2.16.17", default-features = false, features = ["napi8"] }
-napi-derive = "2.16.13"
+napi = { version = "2.16.17", default-features = false, features = ["napi8"], optional = true }
+napi-derive = { version = "2.16.13", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "1.0"
