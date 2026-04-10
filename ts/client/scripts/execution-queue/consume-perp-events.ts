@@ -4,6 +4,7 @@ import * as dotenv from 'dotenv';
 import fs from 'fs';
 import path from 'path';
 import { MangoClient } from '../../src/client';
+import { PerpMarketIndex } from '../../src/accounts/perp';
 import { runtimeConfigPath } from './scriptEnv';
 
 dotenv.config();
@@ -52,7 +53,7 @@ async function main(): Promise<void> {
 
   const programId = new PublicKey(config.programId);
   const groupPk = new PublicKey(config.group);
-  const marketIndex = MARKET_INDEX_OVERRIDE ?? config.perpMarketIndex;
+  const marketIndex = (MARKET_INDEX_OVERRIDE ?? config.perpMarketIndex) as PerpMarketIndex;
 
   const client = await MangoClient.connect(provider, config.cluster, programId, {
     idsSource: 'get-program-accounts',

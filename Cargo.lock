@@ -6103,6 +6103,7 @@ dependencies = [
  "anchor-lang 0.28.0",
  "anyhow",
  "base64 0.22.1",
+ "fixed",
  "mango-v4",
  "prost 0.12.6",
  "reqwest",

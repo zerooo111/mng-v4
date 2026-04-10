@@ -35,6 +35,9 @@ type NativeContinuumStateEngine = {
     group: string,
     sequence: string,
     kind: number,
+    includeOwnerState: boolean,
+    includeMarketState: boolean,
+    includeMarketOpenOrders: boolean,
   ): string | null;
   getSnapshotJson(view: QueueView): string;
   getMarketStateJson(market: string, view: QueueView): string;
@@ -92,11 +95,22 @@ class RustContinuumStateEngine implements ContinuumHarnessBackend {
     group: string,
     sequence: string | bigint,
     kind: string | number,
+    opts?: {
+      includeOwnerState?: boolean;
+      includeMarketState?: boolean;
+      includeMarketOpenOrders?: boolean;
+    },
   ): ValidatedLocalPayload | null {
+    const includeOwnerState = opts?.includeOwnerState !== false;
+    const includeMarketState = opts?.includeMarketState !== false;
+    const includeMarketOpenOrders = opts?.includeMarketOpenOrders !== false;
     const raw = this.native.getValidatedLocalPayloadJson(
       group,
       String(sequence),
       Number(kind),
+      includeOwnerState,
+      includeMarketState,
+      includeMarketOpenOrders,
     );
     return raw ? (JSON.parse(raw) as ValidatedLocalPayload) : null;
   }

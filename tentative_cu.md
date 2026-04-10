@@ -16,6 +16,39 @@ The remaining dominant costs are:
 
 Queue-level polish still matters, but it is no longer the main lever.
 
+## Current Implementation Status
+
+The following work is now implemented in `mng-v4` as the bridge into the larger architecture:
+
+- queued perp place has already been moved onto the direct fixed-order health path
+- cancel-by-slot, free-slot bitmap lookup, single-pass Ed25519 parsing, and consume-event account preindexing are already in place
+- native single-account `PerpBatchIntent` queue execution is implemented with one loaded hot context and one exact pre/post risk session
+
+The persistent sidecar project is now in stage 1:
+
+- a persistent `RiskSidecar` PDA exists per `group + mango_account`
+- `risk_sidecar_create` and `risk_sidecar_refresh` instructions exist on-chain
+- exact `HealthCache` snapshots are serialized into the sidecar and can be reloaded on hot place paths
+- direct perp place, queue-dispatched perp place, and batch-intent execution can all optionally consume and refresh the sidecar
+- the TS client can now derive the sidecar PDA, build create/refresh instructions, and automatically prepend an existing sidecar to direct perp place and queue perp remaining accounts
+- sidecar invalidation now uses structured health-state digests instead of hashing whole raw account buffers
+- the structured digest covers active Mango-account health slices plus the fixed-order bank, oracle, perp-market, and open-orders inputs that actually drive `HealthCache`
+
+Current invalidation is exact and semantics-preserving, but still conservative:
+
+- the sidecar stores a structured digest of the active Mango-account health state
+- it also stores a structured digest of the fixed-order health-account state actually consumed by hot perp paths
+- those digests cover token balances, perp positions, open-order state, derived oracle prices, bank weights, stable prices, funding inputs, and the fixed-order market/open-orders slice passed to the hot path
+- optional banks and bad-oracle asset positions follow the same skip semantics as the current fixed-order health path
+
+This means any relevant bank, market, oracle, funding, or account-state change invalidates the cached sidecar snapshot automatically, with no change to solvency semantics.
+
+What is not done yet:
+
+- cheap invalidation via explicit bank / perp / oracle version counters instead of recomputing structured digests
+- true incremental maintenance of per-asset and per-perp contributions inside the sidecar without rebuilding exact health first
+- broader reuse on consume/match and non-perp hot paths
+
 ## Exact-Semantics Track
 
 These keep the current trust model and execution semantics intact as much as possible:
@@ -38,6 +71,12 @@ Add a canonical per-account `RiskCache` or `HealthAccount` PDA that stores runni
 Every instruction that mutates balances or perp state updates only the touched contributions. Hot place paths then perform an incremental delta check for the touched perp and settle token instead of rebuilding fresh health from the full account basket. On version mismatch or structural change, fall back to a slow full rebuild.
 
 This is the main architecture project. It is the most credible exact-semantics path to attacking the dominant health cost directly.
+
+Current state:
+
+- stage 1 persistence is implemented with exact snapshot reload and structured health-state invalidation
+- the next milestone is to replace structured digest recomputation with cheaper explicit bank / market / oracle freshness/version tracking
+- the milestone after that is true delta maintenance instead of snapshot rebuild-and-refresh
 
 Expected gain:
 

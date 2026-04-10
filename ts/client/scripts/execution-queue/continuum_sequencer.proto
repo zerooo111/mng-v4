@@ -47,6 +47,7 @@ message AcceptedTransaction {
 
 message StreamTicksRequest {
   uint64 start_tick = 1;
+  bool transactions_only = 2;
 }
 
 message Tick {

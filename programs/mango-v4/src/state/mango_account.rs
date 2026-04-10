@@ -35,6 +35,9 @@ const BORSH_VEC_PADDING_BYTES: usize = 4;
 const BORSH_VEC_SIZE_BYTES: usize = 4;
 const DEFAULT_MANGO_ACCOUNT_VERSION: u8 = 1;
 const DYNAMIC_RESERVED_BYTES: usize = 56;
+const PERP_ORDER_SLOT_BITMAP_VERSION: u8 = 1;
+const PERP_ORDER_SLOT_BITMAP_VERSION_OFFSET: usize = 0;
+const PERP_ORDER_SLOT_BITMAP_OFFSET: usize = 8;
 
 // Return variants for check_liquidatable method, should be wrapped in a Result
 // for a future possiblity of returning any error
@@ -810,6 +813,17 @@ impl<
         &self.dynamic()[reserved_offset..reserved_offset + DYNAMIC_RESERVED_BYTES]
     }
 
+    fn perp_order_slot_bitmap(&self) -> Option<u64> {
+        let reserved = self.dynamic_reserved_bytes();
+        if reserved[PERP_ORDER_SLOT_BITMAP_VERSION_OFFSET] != PERP_ORDER_SLOT_BITMAP_VERSION {
+            return None;
+        }
+
+        let bytes = &reserved
+            [PERP_ORDER_SLOT_BITMAP_OFFSET..PERP_ORDER_SLOT_BITMAP_OFFSET + size_of::<u64>()];
+        Some(u64::from_le_bytes(bytes.try_into().unwrap()))
+    }
+
     /// Returns
     /// - the position
     /// - the raw index into the token positions list (for use with get_raw/deactivate)
@@ -1038,6 +1052,43 @@ impl<
     }
     fn dynamic_mut(&mut self) -> &mut [u8] {
         self.dynamic.deref_or_borrow_mut()
+    }
+
+    fn dynamic_reserved_bytes_mut(&mut self) -> &mut [u8] {
+        let reserved_offset = self.header().reserved_bytes_offset();
+        &mut self.dynamic_mut()[reserved_offset..reserved_offset + DYNAMIC_RESERVED_BYTES]
+    }
+
+    fn set_perp_order_slot_bitmap(&mut self, occupied_slots: u64) {
+        let reserved = self.dynamic_reserved_bytes_mut();
+        reserved[PERP_ORDER_SLOT_BITMAP_VERSION_OFFSET] = PERP_ORDER_SLOT_BITMAP_VERSION;
+        reserved[PERP_ORDER_SLOT_BITMAP_OFFSET..PERP_ORDER_SLOT_BITMAP_OFFSET + size_of::<u64>()]
+            .copy_from_slice(&occupied_slots.to_le_bytes());
+    }
+
+    fn occupied_perp_order_slot_bitmap(&mut self) -> u64 {
+        if let Some(bitmap) = self.perp_order_slot_bitmap() {
+            return bitmap;
+        }
+
+        let mut occupied_slots = 0u64;
+        for raw_index in 0..self.header().perp_oo_count() {
+            if self.perp_order_by_raw_index_unchecked(raw_index).is_active() {
+                occupied_slots |= 1u64 << raw_index;
+            }
+        }
+        self.set_perp_order_slot_bitmap(occupied_slots);
+        occupied_slots
+    }
+
+    fn mark_perp_order_slot_occupied(&mut self, slot: usize) {
+        let occupied_slots = self.occupied_perp_order_slot_bitmap() | (1u64 << slot);
+        self.set_perp_order_slot_bitmap(occupied_slots);
+    }
+
+    fn mark_perp_order_slot_free(&mut self, slot: usize) {
+        let occupied_slots = self.occupied_perp_order_slot_bitmap() & !(1u64 << slot);
+        self.set_perp_order_slot_bitmap(occupied_slots);
     }
 
     pub fn borrow_mut(&mut self) -> MangoAccountRefMut {
@@ -1287,6 +1338,20 @@ impl<
         get_helper_mut(self.dynamic_mut(), offset)
     }
 
+    pub fn perp_next_order_slot_fast(&mut self) -> Result<usize> {
+        let slot_count = self.header().perp_oo_count();
+        let available_mask = if slot_count == 64 {
+            u64::MAX
+        } else {
+            (1u64 << slot_count) - 1
+        };
+        let free_slots = !self.occupied_perp_order_slot_bitmap() & available_mask;
+        if free_slots == 0 {
+            return Err(error_msg!("no free perp order index"));
+        }
+        Ok(free_slots.trailing_zeros() as usize)
+    }
+
     pub fn perp_position_mut(
         &mut self,
         market_index: PerpMarketIndex,
@@ -1397,6 +1462,7 @@ impl<
         oo.id = order.key;
         oo.client_id = order.client_order_id;
         oo.quantity = order.quantity;
+        self.mark_perp_order_slot_occupied(slot);
         Ok(())
     }
 
@@ -1417,6 +1483,7 @@ impl<
 
         let oo = self.perp_order_mut_by_raw_index(slot);
         oo.clear();
+        self.mark_perp_order_slot_free(slot);
 
         Ok(())
     }

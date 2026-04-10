@@ -84,9 +84,19 @@ impl NativeContinuumStateEngine {
         group: String,
         sequence: String,
         kind: u32,
+        include_owner_state: bool,
+        include_market_state: bool,
+        include_market_open_orders: bool,
     ) -> Result<Option<String>> {
         self.with_engine("get_validated_local_payload_json", |engine| {
-            engine.get_validated_local_payload_json(&group, &sequence, kind as u8)
+            engine.get_validated_local_payload_json(
+                &group,
+                &sequence,
+                kind as u8,
+                include_owner_state,
+                include_market_state,
+                include_market_open_orders,
+            )
         })
     }
 

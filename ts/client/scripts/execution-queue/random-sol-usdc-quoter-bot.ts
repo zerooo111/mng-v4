@@ -181,6 +181,7 @@ const FIXED_REFERENCE_PRICE = process.env.QUOTER_FIXED_REFERENCE_PRICE
   ? Number(process.env.QUOTER_FIXED_REFERENCE_PRICE)
   : 0;
 const USE_LIMIT_ORDER = (process.env.QUOTER_USE_LIMIT_ORDER || 'false') === 'true';
+const USE_IOC_ORDER = (process.env.QUOTER_USE_IOC_ORDER || 'false') === 'true';
 const BOTS_JSON_PATH = process.env.QUOTER_BOTS_JSON_PATH || '';
 const BOTS_JSON = process.env.QUOTER_BOTS_JSON || '';
 const PARALLEL_BOT_EXECUTION =
@@ -1598,9 +1599,11 @@ async function main(): Promise<void> {
           clientOrderId,
           orderType: closePlan
             ? PerpOrderType.immediateOrCancel
-            : USE_LIMIT_ORDER
-              ? PerpOrderType.limit
-              : PerpOrderType.postOnlySlide,
+            : USE_IOC_ORDER
+              ? PerpOrderType.immediateOrCancel
+              : USE_LIMIT_ORDER
+                ? PerpOrderType.limit
+                : PerpOrderType.postOnlySlide,
           selfTradeBehavior: PerpSelfTradeBehavior.decrementTake,
           reduceOnly: !!closePlan,
           expiryTimestamp: orderExpiryTimestampSec(nowMs),

@@ -672,6 +672,21 @@ pub mod mango_v4 {
         Ok(())
     }
 
+    pub fn risk_sidecar_create(
+        ctx: Context<RiskSidecarCreate>,
+        snapshot_capacity: u32,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::risk_sidecar_create(ctx, snapshot_capacity)?;
+        Ok(())
+    }
+
+    pub fn risk_sidecar_refresh(ctx: Context<RiskSidecarRefresh>) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::risk_sidecar_refresh(ctx)?;
+        Ok(())
+    }
+
     // todo:
     // ckamm: generally, using an I80F48 arg will make it harder to call
     // because generic anchor clients won't know how to deal with it

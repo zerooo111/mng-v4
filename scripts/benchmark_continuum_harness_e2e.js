@@ -27,6 +27,7 @@ const STREAM_FILTER = (
 ).toLowerCase();
 const SERIAL_WAIT =
   (process.env.BENCH_SERIAL_WAIT || 'false').toLowerCase() === 'true';
+const SUBMIT_INTERVAL_MS = Number(process.env.BENCH_SUBMIT_INTERVAL_MS || '0');
 
 function toMillis(start, end) {
   return Number(end - start) / 1e6;
@@ -65,6 +66,10 @@ function formatSummary(label, summary) {
   )}ms p99=${summary.p99_ms.toFixed(3)}ms max=${summary.max_ms.toFixed(
     3,
   )}ms mean=${summary.mean_ms.toFixed(3)}ms`;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function encodePlaceOrderPayload({
@@ -364,14 +369,99 @@ async function main() {
         return;
       }
       const arrivedMs = toMillis(record.originNs, arrivedNs);
+      const arrivedWallMs = Date.now();
       if (eventType === 'pre_confirm' && record.preConfirmMs === null) {
         record.preConfirmMs = arrivedMs;
+        record.preConfirmPayload = payload;
+        record.preConfirmFromSequencerIngestWallMs =
+          payload &&
+          payload.sequencer_ingest_ts_ms !== undefined &&
+          payload.sequencer_ingest_ts_ms !== null
+            ? Math.max(0, arrivedWallMs - Number(payload.sequencer_ingest_ts_ms))
+            : null;
+        record.preConfirmFromHarnessReceiveWallMs =
+          payload &&
+          payload.harness_accept_received_ts_ms !== undefined &&
+          payload.harness_accept_received_ts_ms !== null
+            ? Math.max(
+                0,
+                arrivedWallMs - Number(payload.harness_accept_received_ts_ms),
+              )
+            : null;
+        record.preConfirmFromHarnessEmitWallMs =
+          payload &&
+          payload.harness_preconfirm_emit_ts_ms !== undefined &&
+          payload.harness_preconfirm_emit_ts_ms !== null
+            ? Math.max(
+                0,
+                arrivedWallMs - Number(payload.harness_preconfirm_emit_ts_ms),
+              )
+            : null;
         eventCounts.pre_confirm += 1;
       } else if (
         eventType === 'validated_local' &&
         record.validatedLocalMs === null
       ) {
         record.validatedLocalMs = arrivedMs;
+        record.validatedLocalFromSequencerIngestWallMs =
+          payload &&
+          payload.ts_ms !== undefined &&
+          payload.ts_ms !== null &&
+          record.preConfirmPayload &&
+          record.preConfirmPayload.sequencer_ingest_ts_ms !== undefined &&
+          record.preConfirmPayload.sequencer_ingest_ts_ms !== null
+            ? Math.max(
+                0,
+                Number(payload.ts_ms) -
+                  Number(record.preConfirmPayload.sequencer_ingest_ts_ms),
+              )
+            : null;
+        record.validatedLocalFromSequencerTickWallMs =
+          payload && payload.ts_ms !== undefined && payload.ts_ms !== null
+            ? Math.max(0, arrivedWallMs - Number(payload.ts_ms))
+            : null;
+        record.validatedLocalFromHarnessTickReceiveWallMs =
+          payload &&
+          payload.harness_tick_received_ts_ms !== undefined &&
+          payload.harness_tick_received_ts_ms !== null
+            ? Math.max(
+                0,
+                arrivedWallMs - Number(payload.harness_tick_received_ts_ms),
+              )
+            : null;
+        record.validatedLocalFromHarnessEmitWallMs =
+          payload &&
+          payload.harness_validated_local_emit_ts_ms !== undefined &&
+          payload.harness_validated_local_emit_ts_ms !== null
+            ? Math.max(
+                0,
+                arrivedWallMs -
+                  Number(payload.harness_validated_local_emit_ts_ms),
+              )
+            : null;
+        record.validatedLocalTickToHarnessReceiveWallMs =
+          payload &&
+          payload.ts_ms !== undefined &&
+          payload.ts_ms !== null &&
+          payload.harness_tick_received_ts_ms !== undefined &&
+          payload.harness_tick_received_ts_ms !== null
+            ? Math.max(
+                0,
+                Number(payload.harness_tick_received_ts_ms) - Number(payload.ts_ms),
+              )
+            : null;
+        record.validatedLocalHarnessReceiveToEmitWallMs =
+          payload &&
+          payload.harness_tick_received_ts_ms !== undefined &&
+          payload.harness_tick_received_ts_ms !== null &&
+          payload.harness_validated_local_emit_ts_ms !== undefined &&
+          payload.harness_validated_local_emit_ts_ms !== null
+            ? Math.max(
+                0,
+                Number(payload.harness_validated_local_emit_ts_ms) -
+                  Number(payload.harness_tick_received_ts_ms),
+              )
+            : null;
         eventCounts.validated_local += 1;
       }
     }
@@ -391,7 +481,17 @@ async function main() {
       submitStartMs: 0,
       ackMs: null,
       preConfirmMs: null,
+      preConfirmPayload: null,
+      preConfirmFromSequencerIngestWallMs: null,
+      preConfirmFromHarnessReceiveWallMs: null,
+      preConfirmFromHarnessEmitWallMs: null,
       validatedLocalMs: null,
+      validatedLocalFromSequencerIngestWallMs: null,
+      validatedLocalFromSequencerTickWallMs: null,
+      validatedLocalFromHarnessTickReceiveWallMs: null,
+      validatedLocalFromHarnessEmitWallMs: null,
+      validatedLocalTickToHarnessReceiveWallMs: null,
+      validatedLocalHarnessReceiveToEmitWallMs: null,
       txId,
       owner: owner.publicKey.toBase58(),
       mangoAccount: mangoAccount.publicKey.toBase58(),
@@ -446,6 +546,9 @@ async function main() {
         'serial events',
       );
     }
+    if (SUBMIT_INTERVAL_MS > 0 && i + 1 < TX_COUNT) {
+      await sleep(SUBMIT_INTERVAL_MS);
+    }
   }
 
   const deadline = Date.now() + TIMEOUT_MS;
@@ -469,8 +572,17 @@ async function main() {
   const ackLatencies = [];
   const preConfirmFromSubmit = [];
   const preConfirmFromAck = [];
+  const preConfirmFromSequencerIngest = [];
+  const preConfirmFromHarnessReceive = [];
+  const preConfirmFromHarnessEmit = [];
   const validatedFromSubmit = [];
   const validatedFromAck = [];
+  const validatedFromSequencerIngest = [];
+  const validatedFromSequencerTick = [];
+  const validatedFromHarnessTickReceive = [];
+  const validatedFromHarnessEmit = [];
+  const validatedTickToHarnessReceive = [];
+  const validatedHarnessReceiveToEmit = [];
   let ackedCount = 0;
   let preConfirmBeforeAck = 0;
   let validatedBeforeAck = 0;
@@ -489,6 +601,17 @@ async function main() {
         }
         preConfirmFromAck.push(Math.max(0, record.preConfirmMs - record.ackMs));
       }
+      if (record.preConfirmFromSequencerIngestWallMs !== null) {
+        preConfirmFromSequencerIngest.push(
+          record.preConfirmFromSequencerIngestWallMs,
+        );
+      }
+      if (record.preConfirmFromHarnessReceiveWallMs !== null) {
+        preConfirmFromHarnessReceive.push(record.preConfirmFromHarnessReceiveWallMs);
+      }
+      if (record.preConfirmFromHarnessEmitWallMs !== null) {
+        preConfirmFromHarnessEmit.push(record.preConfirmFromHarnessEmitWallMs);
+      }
     }
     if (record.validatedLocalMs !== null) {
       validatedFromSubmit.push(record.validatedLocalMs);
@@ -498,6 +621,34 @@ async function main() {
         }
         validatedFromAck.push(
           Math.max(0, record.validatedLocalMs - record.ackMs),
+        );
+      }
+      if (record.validatedLocalFromSequencerTickWallMs !== null) {
+        validatedFromSequencerTick.push(
+          record.validatedLocalFromSequencerTickWallMs,
+        );
+      }
+      if (record.validatedLocalFromSequencerIngestWallMs !== null) {
+        validatedFromSequencerIngest.push(
+          record.validatedLocalFromSequencerIngestWallMs,
+        );
+      }
+      if (record.validatedLocalFromHarnessTickReceiveWallMs !== null) {
+        validatedFromHarnessTickReceive.push(
+          record.validatedLocalFromHarnessTickReceiveWallMs,
+        );
+      }
+      if (record.validatedLocalFromHarnessEmitWallMs !== null) {
+        validatedFromHarnessEmit.push(record.validatedLocalFromHarnessEmitWallMs);
+      }
+      if (record.validatedLocalTickToHarnessReceiveWallMs !== null) {
+        validatedTickToHarnessReceive.push(
+          record.validatedLocalTickToHarnessReceiveWallMs,
+        );
+      }
+      if (record.validatedLocalHarnessReceiveToEmitWallMs !== null) {
+        validatedHarnessReceiveToEmit.push(
+          record.validatedLocalHarnessReceiveToEmitWallMs,
         );
       }
     }
@@ -521,6 +672,7 @@ async function main() {
       owner_mode: OWNER_MODE,
       stream_filter: STREAM_FILTER,
       serial_wait: SERIAL_WAIT,
+      submit_interval_ms: SUBMIT_INTERVAL_MS,
       owner: sharedOwner ? sharedOwner.publicKey.toBase58() : null,
       mango_account: sharedMangoAccount
         ? sharedMangoAccount.publicKey.toBase58()
@@ -540,8 +692,33 @@ async function main() {
       submit_to_ack_ms: summarize(ackLatencies),
       submit_to_pre_confirm_ms: summarize(preConfirmFromSubmit),
       ack_to_pre_confirm_ms_clamped: summarize(preConfirmFromAck),
+      pre_confirm_from_sequencer_ingest_wall_ms: summarize(
+        preConfirmFromSequencerIngest,
+      ),
+      pre_confirm_from_harness_receive_wall_ms: summarize(
+        preConfirmFromHarnessReceive,
+      ),
+      pre_confirm_from_harness_emit_wall_ms: summarize(preConfirmFromHarnessEmit),
       submit_to_validated_local_ms: summarize(validatedFromSubmit),
       ack_to_validated_local_ms_clamped: summarize(validatedFromAck),
+      validated_local_from_sequencer_ingest_ms: summarize(
+        validatedFromSequencerIngest,
+      ),
+      validated_local_from_sequencer_tick_wall_ms: summarize(
+        validatedFromSequencerTick,
+      ),
+      validated_local_from_harness_tick_receive_wall_ms: summarize(
+        validatedFromHarnessTickReceive,
+      ),
+      validated_local_from_harness_emit_wall_ms: summarize(
+        validatedFromHarnessEmit,
+      ),
+      validated_local_tick_to_harness_receive_wall_ms: summarize(
+        validatedTickToHarnessReceive,
+      ),
+      validated_local_harness_receive_to_emit_wall_ms: summarize(
+        validatedHarnessReceiveToEmit,
+      ),
     },
   };
 
@@ -569,6 +746,42 @@ async function main() {
     formatSummary(
       'ack->validated_local(clamped)',
       output.summaries.ack_to_validated_local_ms_clamped,
+    ),
+  );
+  console.log(
+    formatSummary(
+      'validated_local<-sequencer_ingest',
+      output.summaries.validated_local_from_sequencer_ingest_ms,
+    ),
+  );
+  console.log(
+    formatSummary(
+      'validated_local<-sequencer_tick(wall)',
+      output.summaries.validated_local_from_sequencer_tick_wall_ms,
+    ),
+  );
+  console.log(
+    formatSummary(
+      'validated_local<-harness_tick_receive(wall)',
+      output.summaries.validated_local_from_harness_tick_receive_wall_ms,
+    ),
+  );
+  console.log(
+    formatSummary(
+      'validated_local<-harness_emit(wall)',
+      output.summaries.validated_local_from_harness_emit_wall_ms,
+    ),
+  );
+  console.log(
+    formatSummary(
+      'validated_local tick->harness_receive(wall)',
+      output.summaries.validated_local_tick_to_harness_receive_wall_ms,
+    ),
+  );
+  console.log(
+    formatSummary(
+      'validated_local harness_receive->emit(wall)',
+      output.summaries.validated_local_harness_receive_to_emit_wall_ms,
     ),
   );
 

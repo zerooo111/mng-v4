@@ -13,6 +13,7 @@ export const EXECUTION_QUEUE_DOMAIN = 'mango-v4-ctm-envelope-v1';
 export const USER_INTENT_DOMAIN = 'mango-v4-user-intent-v1';
 const EXECUTION_QUEUE_DOMAIN_BYTES = Buffer.from(EXECUTION_QUEUE_DOMAIN, 'utf-8');
 const USER_INTENT_DOMAIN_BYTES = Buffer.from(USER_INTENT_DOMAIN, 'utf-8');
+const EXECUTION_QUEUE_PAYLOAD_MAX = 256;
 const instructionDiscriminatorCache = new Map<string, Buffer>();
 
 export enum QueuePayloadVariant {
@@ -23,6 +24,13 @@ export enum QueuePayloadVariant {
   PerpCancelAllOrdersBySide = 4,
   LiquidityDeposit = 5,
   LiquidityWithdraw = 6,
+  PerpCancelOrderBySlot = 7,
+  PerpBatchIntent = 8,
+}
+
+export enum PerpBatchSubOpVariant {
+  PerpCancelOrderBySlot = 0,
+  PerpPlaceOrderV2 = 1,
 }
 
 export enum QueueItemKind {
@@ -99,6 +107,25 @@ export type PerpPlaceOrderV2QueuePayloadFields = {
 
 export type PerpCancelOrderQueuePayloadFields = {
   orderId: BigNumberish;
+};
+
+export type PerpCancelOrderBySlotQueuePayloadFields = {
+  slot: number;
+  expectedOrderId: BigNumberish;
+};
+
+export type PerpBatchIntentSubOp =
+  | {
+      kind: 'cancelBySlot';
+      slot: number;
+      expectedOrderId: BigNumberish;
+    }
+  | ({
+      kind: 'place';
+    } & PerpPlaceOrderV2QueuePayloadFields);
+
+export type PerpBatchIntentQueuePayloadFields = {
+  operations: PerpBatchIntentSubOp[];
 };
 
 export type PerpCancelOrderByClientOrderIdQueuePayloadFields = {
@@ -347,20 +374,24 @@ export function encodeQueuePayloadV1(
   body: Uint8Array,
   flags = 0,
 ): Buffer {
-  if (variant < 0 || variant > 6) {
+  if (variant < 0 || variant > 8) {
     throw new Error(`invalid queue payload variant: ${variant}`);
   }
-  return Buffer.concat([
+  const payload = Buffer.concat([
     Buffer.from([1, variant]),
     u16ToLe(flags),
     Buffer.from(body),
   ]);
+  if (payload.length > EXECUTION_QUEUE_PAYLOAD_MAX) {
+    throw new Error(`queue payload exceeds ${EXECUTION_QUEUE_PAYLOAD_MAX} bytes`);
+  }
+  return payload;
 }
 
-export function encodePerpPlaceOrderV2QueuePayload(
+function encodePerpPlaceOrderV2QueueBody(
   fields: PerpPlaceOrderV2QueuePayloadFields,
 ): Buffer {
-  const body = Buffer.concat([
+  return Buffer.concat([
     u8(sideToU8(fields.side)),
     i64ToLe(fields.priceLots),
     i64ToLe(fields.maxBaseLots),
@@ -372,6 +403,12 @@ export function encodePerpPlaceOrderV2QueuePayload(
     u64ToLe(fields.expiryTimestamp),
     u8(fields.limit),
   ]);
+}
+
+export function encodePerpPlaceOrderV2QueuePayload(
+  fields: PerpPlaceOrderV2QueuePayloadFields,
+): Buffer {
+  const body = encodePerpPlaceOrderV2QueueBody(fields);
   return encodeQueuePayloadV1(QueuePayloadVariant.PerpPlaceOrderV2, body);
 }
 
@@ -382,6 +419,43 @@ export function encodePerpCancelOrderQueuePayload(
     QueuePayloadVariant.PerpCancelOrder,
     u128ToLe(fields.orderId),
   );
+}
+
+export function encodePerpCancelOrderBySlotQueuePayload(
+  fields: PerpCancelOrderBySlotQueuePayloadFields,
+): Buffer {
+  return encodeQueuePayloadV1(
+    QueuePayloadVariant.PerpCancelOrderBySlot,
+    Buffer.concat([u8(fields.slot), u128ToLe(fields.expectedOrderId)]),
+  );
+}
+
+export function encodePerpBatchIntentQueuePayload(
+  fields: PerpBatchIntentQueuePayloadFields,
+): Buffer {
+  if (fields.operations.length === 0 || fields.operations.length > 8) {
+    throw new Error('batch intent must include 1-8 operations');
+  }
+
+  const body = Buffer.concat([
+    u8(fields.operations.length),
+    ...fields.operations.map((operation) => {
+      if (operation.kind === 'cancelBySlot') {
+        return Buffer.concat([
+          u8(PerpBatchSubOpVariant.PerpCancelOrderBySlot),
+          u8(operation.slot),
+          u128ToLe(operation.expectedOrderId),
+        ]);
+      }
+
+      return Buffer.concat([
+        u8(PerpBatchSubOpVariant.PerpPlaceOrderV2),
+        encodePerpPlaceOrderV2QueueBody(operation),
+      ]);
+    }),
+  ]);
+
+  return encodeQueuePayloadV1(QueuePayloadVariant.PerpBatchIntent, body);
 }
 
 export function encodePerpCancelOrderByClientOrderIdQueuePayload(

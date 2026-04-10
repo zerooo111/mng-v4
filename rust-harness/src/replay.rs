@@ -853,6 +853,9 @@ impl ContinuumStateEngine {
         group: &str,
         sequence: impl ToString,
         kind: u8,
+        include_owner_state: bool,
+        include_market_state: bool,
+        include_market_open_orders: bool,
     ) -> Result<Option<ValidatedLocalPayload>> {
         let sequence = parse_u64_field("sequence", &sequence.to_string())?;
         let key = queue_item_key(group, sequence, kind);
@@ -869,7 +872,12 @@ impl ContinuumStateEngine {
         }
 
         Ok(Some(
-            self.build_validated_local_payload_incremental(&intent)?,
+            self.build_validated_local_payload_incremental(
+                &intent,
+                include_owner_state,
+                include_market_state,
+                include_market_open_orders,
+            )?,
         ))
     }
 
@@ -878,8 +886,18 @@ impl ContinuumStateEngine {
         group: &str,
         sequence: impl ToString,
         kind: u8,
+        include_owner_state: bool,
+        include_market_state: bool,
+        include_market_open_orders: bool,
     ) -> Result<Option<String>> {
-        self.get_validated_local_payload(group, sequence, kind)?
+        self.get_validated_local_payload(
+            group,
+            sequence,
+            kind,
+            include_owner_state,
+            include_market_state,
+            include_market_open_orders,
+        )?
             .map(|payload| serde_json::to_string(&payload))
             .transpose()
             .map_err(Into::into)
@@ -888,6 +906,9 @@ impl ContinuumStateEngine {
     fn build_validated_local_payload_incremental(
         &mut self,
         intent: &CanonicalIntent,
+        include_owner_state: bool,
+        include_market_state: bool,
+        include_market_open_orders: bool,
     ) -> Result<ValidatedLocalPayload> {
         self.sync_incremental_confirmed_state()?;
         let now_ts = now_ts_ms() / 1_000;
@@ -910,16 +931,25 @@ impl ContinuumStateEngine {
                 "executed".to_string()
             },
             validation_error,
-            owner_state: Some(self.build_user_state_from_projection(
-                projection,
-                &intent.user_owner,
-                now_ts,
-            )?),
-            market_state: Some(self.build_market_state_from_projection(
-                projection,
-                &intent.market,
-                now_ts,
-            )?),
+            owner_state: if include_owner_state {
+                Some(self.build_user_state_from_projection(
+                    projection,
+                    &intent.user_owner,
+                    now_ts,
+                )?)
+            } else {
+                None
+            },
+            market_state: if include_market_state {
+                Some(self.build_market_state_from_projection(
+                    projection,
+                    &intent.market,
+                    now_ts,
+                    include_market_open_orders,
+                )?)
+            } else {
+                None
+            },
         })
     }
 
@@ -2125,13 +2155,11 @@ impl ContinuumStateEngine {
         projection: &Projection,
         market: &str,
         now_ts: u64,
+        include_open_orders: bool,
     ) -> Result<MarketState> {
         let (bids, asks, open_orders) = if let Ok(market_index) = parse_market_index(market) {
             if projection.engine.has_market(market_index) {
                 let book = projection.engine.orderbook_snapshot(market_index, now_ts)?;
-                let orders = projection
-                    .engine
-                    .open_orders_snapshot_for_market(market_index, now_ts)?;
                 (
                     book.bids
                         .into_iter()
@@ -2147,10 +2175,16 @@ impl ContinuumStateEngine {
                             base_lots: level.base_lots.to_string(),
                         })
                         .collect(),
-                    orders
-                        .into_iter()
-                        .map(open_order_snapshot_to_summary)
-                        .collect(),
+                    if include_open_orders {
+                        projection
+                            .engine
+                            .open_orders_snapshot_for_market(market_index, now_ts)?
+                            .into_iter()
+                            .map(open_order_snapshot_to_summary)
+                            .collect()
+                    } else {
+                        Vec::new()
+                    },
                 )
             } else {
                 (Vec::new(), Vec::new(), Vec::new())
@@ -4883,7 +4917,14 @@ mod tests {
                     .unwrap();
 
                 let payload = engine
-                    .get_validated_local_payload(&group, sequence.to_string(), 0)
+                    .get_validated_local_payload(
+                        &group,
+                        sequence.to_string(),
+                        0,
+                        true,
+                        true,
+                        true,
+                    )
                     .unwrap()
                     .unwrap();
                 let owner_state = payload.owner_state.unwrap();
@@ -4966,7 +5007,14 @@ mod tests {
                         market,
                     );
                     let incremental_payload = incremental_typed
-                        .get_validated_local_payload(&group, sequence.to_string(), 0)
+                        .get_validated_local_payload(
+                            &group,
+                            sequence.to_string(),
+                            0,
+                            true,
+                            true,
+                            true,
+                        )
                         .unwrap()
                         .unwrap();
                     assert_eq!(
@@ -4982,7 +5030,14 @@ mod tests {
                     );
                     black_box(
                         incremental_json
-                            .get_validated_local_payload_json(&group, sequence.to_string(), 0)
+                            .get_validated_local_payload_json(
+                                &group,
+                                sequence.to_string(),
+                                0,
+                                true,
+                                true,
+                                true,
+                            )
                             .unwrap()
                             .unwrap(),
                     );
@@ -5001,7 +5056,14 @@ mod tests {
 
                 let incremental_typed_started = Instant::now();
                 let incremental_payload = incremental_typed
-                    .get_validated_local_payload(&group, sequence.to_string(), 0)
+                    .get_validated_local_payload(
+                        &group,
+                        sequence.to_string(),
+                        0,
+                        true,
+                        true,
+                        true,
+                    )
                     .unwrap()
                     .unwrap();
                 incremental_typed_samples.push(incremental_typed_started.elapsed().as_nanos());
@@ -5024,7 +5086,14 @@ mod tests {
                 let incremental_json_started = Instant::now();
                 black_box(
                     incremental_json
-                        .get_validated_local_payload_json(&group, sequence.to_string(), 0)
+                        .get_validated_local_payload_json(
+                            &group,
+                            sequence.to_string(),
+                            0,
+                            true,
+                            true,
+                            true,
+                        )
                         .unwrap()
                         .unwrap(),
                 );

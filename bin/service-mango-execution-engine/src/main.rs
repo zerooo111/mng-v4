@@ -1,21 +1,29 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     net::SocketAddr,
     path::{Path, PathBuf},
     str::FromStr,
     sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
+        atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering},
+        Arc, Mutex as StdMutex,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anchor_lang::{AnchorDeserialize, InstructionData};
 use anyhow::{anyhow, Context, Result};
+use fixed::types::I80F48;
 use mango_v4::{
+    accounts_zerocopy::{KeyedAccountSharedData, LoadZeroCopy},
     error::MangoError,
-    instructions::{CtmEnvelope, ExecutionQueueConfigParams, PerpPlaceOrderV2Payload},
+    health::{new_health_cache, FixedOrderAccountRetriever},
+    instructions::{
+        CtmEnvelope, ExecutionQueueConfigParams, PerpCancelOrderBySlotPayload,
+        PerpPlaceOrderV2Payload, QueuePayloadVariant,
+    },
     state::{
+        pyth_mainnet_sol_oracle, pyth_mainnet_usdc_oracle, Bank, EventQueue, EventType,
+        FillEvent, MangoAccountValue, OutEvent, PerpMarket, PerpMarketIndex, Side,
         EXECUTION_QUEUE_COUNT_OFFSET, EXECUTION_QUEUE_CTM_CAPACITY,
         EXECUTION_QUEUE_CTM_ITEMS_OFFSET, EXECUTION_QUEUE_HEAD_OFFSET,
         EXECUTION_QUEUE_ITEM_ACCOUNTS_HASH_OFFSET, EXECUTION_QUEUE_ITEM_KIND_OFFSET,
@@ -35,6 +43,7 @@ use solana_client::{
 };
 use solana_program::{hash::hashv, pubkey};
 use solana_sdk::{
+    account::ReadableAccount,
     commitment_config::CommitmentConfig,
     compute_budget::ComputeBudgetInstruction,
     ed25519_program,
@@ -52,7 +61,7 @@ use tokio::{
     task::JoinHandle,
     time::{sleep, timeout},
 };
-use tonic::{transport::Server, Request, Response, Status};
+use tonic::{transport::Server, Code, Request, Response, Status};
 use tracing::{debug, info, warn};
 use warp::Filter;
 
@@ -66,6 +75,11 @@ use proto::{
 };
 
 const SPL_MEMO_PROGRAM_ID: Pubkey = pubkey!("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
+const QUEUE_PAYLOAD_VERSION_V1: u8 = 1;
+const QUEUE_PAYLOAD_HEADER_LEN: usize = 4;
+const PERP_PLACE_ORDER_V2_PAYLOAD_LEN: usize = 45;
+const PERP_CANCEL_ORDER_BY_SLOT_PAYLOAD_LEN: usize = 17;
+const PERP_BATCH_INTENT_MAX_OPS: usize = 8;
 static NEXT_RELAY_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
@@ -73,6 +87,7 @@ struct Config {
     cluster_url: String,
     bind_addr: SocketAddr,
     http_bind_addr: Option<SocketAddr>,
+    enable_health_check: bool,
     payer: Arc<Keypair>,
     executor_admin: Arc<Keypair>,
     ctm: Arc<Keypair>,
@@ -106,8 +121,11 @@ struct Config {
     executor_interval_ms: u64,
     executor_busy_interval_ms: u64,
     executor_head_lock_ms: u64,
+    executor_head_refresh_ms: u64,
     executor_pending_timeout_ms: u64,
     executor_status_poll_ms: u64,
+    executor_target_lane_fanout: usize,
+    executor_head_scan_items: usize,
     executor_max_pending_txs: usize,
     executor_pipeline_max_per_head: usize,
     executor_same_head_send_interval_ms: u64,
@@ -136,10 +154,43 @@ struct Config {
     /// Solana slots (~400ms each), the executor admin-drops it as a health
     /// failure rather than spinning forever.  Set 0 to disable.
     executor_no_lane_match_drop_slots: u64,
+    /// Maximum number of consecutive pending CTM items with the same head hash
+    /// to drop in one no-lane-match recovery transaction.
+    executor_no_lane_match_drop_batch_max: usize,
+    /// When true, the executor optimistically advances the cached queue head
+    /// after each successful send_transaction, without waiting for on-chain
+    /// confirmation.  This allows back-to-back tx sends at RPC send latency
+    /// (~50ms) rather than send+confirm latency (~400ms+).  If the optimistic
+    /// assumption is wrong (tx dropped), the next periodic inspect corrects it.
+    executor_optimistic_advance: bool,
+    /// Interval at which the engine consumes perp event queue events. When 0,
+    /// the periodic consumer is disabled. Default 2000ms (2s). Each pass
+    /// consumes up to executor_perp_consume_limit events (capped at 8 by the
+    /// on-chain program). Required to free OO slots after fills.
+    executor_perp_consume_interval_ms: u64,
+    /// Max events to consume per perp_consume_events instruction. Capped at 8
+    /// by the on-chain program. Default 8.
+    executor_perp_consume_limit: usize,
+    /// URL to probe for bridge liveness on the /metrics health gauge. Set to
+    /// empty to disable bridge probing entirely.
+    bridge_health_url: Option<String>,
+    /// Per-request HTTP timeout for the bridge health probe, in milliseconds.
+    bridge_health_probe_timeout_ms: u64,
+    /// How often the background health prober runs, in milliseconds.
+    health_probe_interval_ms: u64,
+    /// How often the background relayer-balance poller runs, in milliseconds.
+    /// Set to 0 to disable.
+    balance_poll_interval_ms: u64,
+    /// Maximum age (ms) of the executor heartbeat before the executor is
+    /// reported unhealthy on /metrics.
+    executor_stale_threshold_ms: u64,
+    /// Maximum age (ms) of the perp event consumer heartbeat before the event
+    /// cranker is reported unhealthy on /metrics.
+    event_cranker_stale_threshold_ms: u64,
 }
 
 impl Config {
-    fn from_env() -> Result<Self> {
+    fn from_env(enable_health_check_flag: bool) -> Result<Self> {
         let cluster_url = std::env::var("CLUSTER_URL_OVERRIDE")
             .or_else(|_| std::env::var("MB_CLUSTER_URL"))
             .context("CLUSTER_URL_OVERRIDE or MB_CLUSTER_URL is required")?;
@@ -150,6 +201,8 @@ impl Config {
             Ok(value) if !value.trim().is_empty() => Some(parse_socket_addr(value)?),
             _ => None,
         };
+        let enable_health_check =
+            enable_health_check_flag || parse_bool_env("CTM_RELAYER_ENABLE_HEALTH_CHECK", false);
         let payer = Arc::new(read_keypair_env(
             "CTM_RELAYER_PAYER_KEYPAIR",
             "MB_PAYER_KEYPAIR",
@@ -233,9 +286,14 @@ impl Config {
         let executor_interval_ms = parse_u64_env("EXECUTION_QUEUE_CRANK_INTERVAL_MS", 25)?;
         let executor_busy_interval_ms = parse_u64_env("EXECUTION_QUEUE_CRANK_BUSY_INTERVAL_MS", 1)?;
         let executor_head_lock_ms = parse_u64_env("EXECUTION_QUEUE_CRANK_HEAD_LOCK_MS", 30)?;
+        let executor_head_refresh_ms = parse_u64_env("EXECUTION_QUEUE_CRANK_HEAD_REFRESH_MS", 25)?;
         let executor_pending_timeout_ms =
             parse_u64_env("EXECUTION_QUEUE_CRANK_PENDING_TIMEOUT_MS", 500)?;
         let executor_status_poll_ms = parse_u64_env("EXECUTION_QUEUE_CRANK_STATUS_POLL_MS", 10)?;
+        let executor_target_lane_fanout =
+            parse_u64_env("EXECUTION_QUEUE_CRANK_TARGET_LANE_FANOUT", 1)? as usize;
+        let executor_head_scan_items =
+            parse_u64_env("EXECUTION_QUEUE_CRANK_HEAD_SCAN_ITEMS", 32)? as usize;
         let executor_max_pending_txs =
             parse_u64_env("EXECUTION_QUEUE_CRANK_MAX_PENDING_TXS", 4)? as usize;
         let executor_pipeline_max_per_head =
@@ -276,11 +334,38 @@ impl Config {
             parse_u64_env("EXECUTION_QUEUE_CRANK_MAX_SEQUENCE_FAILURES", 5)? as u32;
         let executor_no_lane_match_drop_slots =
             parse_u64_env("EXECUTION_QUEUE_CRANK_NO_LANE_MATCH_DROP_SLOTS", 2)?;
+        let executor_no_lane_match_drop_batch_max =
+            parse_u64_env("EXECUTION_QUEUE_CRANK_NO_LANE_MATCH_DROP_BATCH_MAX", 16)? as usize;
+        let executor_optimistic_advance = std::env::var("EXECUTION_QUEUE_CRANK_OPTIMISTIC_ADVANCE")
+            .unwrap_or_else(|_| "false".to_string())
+            .eq_ignore_ascii_case("true");
+        let executor_perp_consume_interval_ms =
+            parse_u64_env("EXECUTION_QUEUE_PERP_CONSUME_INTERVAL_MS", 2_000)?;
+        let executor_perp_consume_limit =
+            parse_u64_env("EXECUTION_QUEUE_PERP_CONSUME_LIMIT", 8)?.min(8) as usize;
+        let bridge_health_url = std::env::var("CTM_RELAYER_BRIDGE_HEALTH_URL")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .or_else(|| Some("http://127.0.0.1:9092/healthz".to_string()));
+        let bridge_health_probe_timeout_ms =
+            parse_u64_env("CTM_RELAYER_BRIDGE_HEALTH_PROBE_TIMEOUT_MS", 1_000)?;
+        let health_probe_interval_ms =
+            parse_u64_env("CTM_RELAYER_HEALTH_PROBE_INTERVAL_MS", 5_000)?;
+        let balance_poll_interval_ms =
+            parse_u64_env("CTM_RELAYER_BALANCE_POLL_INTERVAL_MS", 30_000)?;
+        let executor_stale_threshold_ms =
+            parse_u64_env("CTM_RELAYER_EXECUTOR_STALE_MS", 5_000)?;
+        let event_cranker_stale_threshold_ms = parse_u64_env(
+            "CTM_RELAYER_EVENT_CRANKER_STALE_MS",
+            executor_perp_consume_interval_ms.saturating_mul(5).max(10_000),
+        )?;
 
         Ok(Self {
             cluster_url,
             bind_addr,
             http_bind_addr,
+            enable_health_check,
             payer,
             executor_admin,
             ctm,
@@ -314,8 +399,11 @@ impl Config {
             executor_interval_ms,
             executor_busy_interval_ms,
             executor_head_lock_ms,
+            executor_head_refresh_ms,
             executor_pending_timeout_ms,
             executor_status_poll_ms,
+            executor_target_lane_fanout,
+            executor_head_scan_items,
             executor_max_pending_txs,
             executor_pipeline_max_per_head,
             executor_same_head_send_interval_ms,
@@ -337,6 +425,16 @@ impl Config {
             executor_gap_recovery_drop_batch_max,
             executor_max_sequence_failures,
             executor_no_lane_match_drop_slots,
+            executor_no_lane_match_drop_batch_max,
+            executor_optimistic_advance,
+            executor_perp_consume_interval_ms,
+            executor_perp_consume_limit,
+            bridge_health_url,
+            bridge_health_probe_timeout_ms,
+            health_probe_interval_ms,
+            balance_poll_interval_ms,
+            executor_stale_threshold_ms,
+            event_cranker_stale_threshold_ms,
         })
     }
 }
@@ -368,6 +466,72 @@ struct Metrics {
     execute_send_suppressed_pending: AtomicU64,
     execute_head_advanced: AtomicU64,
     execute_head_advance_items: AtomicU64,
+    perp_events_consumed: AtomicU64,
+
+    // ---- New: lifetime totals incremented by hot path / executor.
+    // Producers only ever do `fetch_add(_, Relaxed)`. The sampler task derives
+    // tps and 60s windows from these without ever blocking the hot path.
+    /// Every gRPC submit_intent invocation increments this exactly once at the
+    /// boundary, before any work (queue admit, parse, submit). Captures real
+    /// arrival rate including queue-timeout rejects.
+    ingress_total: AtomicU64,
+    /// submit_intent invocations whose end-to-end result was Ok(_).
+    ingress_accepted_total: AtomicU64,
+    /// submit_intent invocations whose end-to-end result was Err(_).
+    ingress_rejected_total: AtomicU64,
+    /// Number of execution-queue items that successfully landed on chain.
+    /// Bumped at the executor head-advance site by the advance delta.
+    executed_total: AtomicU64,
+    /// Number of executor-dispatched txs whose signature status reported an
+    /// on-chain failure (the tx landed but the program errored).
+    executed_failed_total: AtomicU64,
+
+    // ---- Sampler-published rate / windowed values. Only the sampler task
+    // writes these; the /metrics renderer only reads them.
+    /// Ingress rate sampled over the last 10s, scaled by 1000 (so a value of
+    /// 12_345 means 12.345 tps). Avoids needing floats in atomics.
+    ingress_tps_10s_milli: AtomicU64,
+    ingress_accepted_60s: AtomicU64,
+    ingress_rejected_60s: AtomicU64,
+    /// Executed (head-advance items) rate sampled over the last 10s, scaled
+    /// by 1000.
+    executed_tps_10s_milli: AtomicU64,
+    executed_60s: AtomicU64,
+    executed_failed_60s: AtomicU64,
+    /// Snapshot of the executor's current on-chain queue depth (queue_count).
+    /// Mirrors ExecutorState::current_queue_count for /metrics consumers.
+    execution_queue_depth: AtomicU64,
+    /// Approximate count of distinct user_owner pubkeys observed on the
+    /// ingress path in the last 60 seconds, computed by the sampler task from
+    /// Engine::unique_addresses.
+    unique_addresses_60s: AtomicU64,
+    /// Wall-clock ms when the metrics sampler last ran. Used by external
+    /// monitors to detect a stalled sampler.
+    sampler_last_tick_ms: AtomicU64,
+
+    // ---- Health gauges. Background prober writes; /metrics reader reads.
+    /// 1 if the metrics endpoint can answer, ie this process is running. The
+    /// sampler simply pins this to 1 each tick. External monitors that scrape
+    /// /metrics get an implicit liveness signal regardless.
+    relayer_healthy: AtomicU64,
+    /// 1 when the bridge /healthz probe last succeeded; 0 otherwise.
+    bridge_healthy: AtomicU64,
+    /// 1 when the executor heartbeat is fresher than the configured stale
+    /// threshold; 0 otherwise.
+    executor_healthy: AtomicU64,
+    /// 1 when the perp event cranker heartbeat is fresher than the configured
+    /// stale threshold (or when the cranker is disabled by config).
+    event_cranker_healthy: AtomicU64,
+    /// Last reported relayer payer balance, in lamports. 0 until the first
+    /// poll succeeds.
+    relayer_balance_lamports: AtomicU64,
+    /// Wall-clock ms when the balance was last refreshed.
+    relayer_balance_last_ms: AtomicU64,
+    /// Wall-clock ms when the executor loop last completed an iteration.
+    executor_last_tick_ms: AtomicU64,
+    /// Wall-clock ms when the perp event consumer loop last completed an
+    /// iteration.
+    event_cranker_last_tick_ms: AtomicU64,
 }
 
 impl Metrics {
@@ -381,6 +545,53 @@ impl Metrics {
         } else {
             self.requests_error.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Hot-path: bumped at the very top of submit_intent before any other
+    /// work. Single relaxed fetch_add per request.
+    #[inline(always)]
+    fn record_ingress(&self) {
+        self.ingress_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Hot-path: bumped exactly once per submit_intent return. Single
+    /// branch + fetch_add.
+    #[inline(always)]
+    fn record_ingress_outcome(&self, ok: bool) {
+        if ok {
+            self.ingress_accepted_total.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.ingress_rejected_total.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Bumped from the executor when the on-chain queue head advances by
+    /// `delta` items.
+    #[inline(always)]
+    fn record_executed(&self, delta: u64) {
+        if delta > 0 {
+            self.executed_total.fetch_add(delta, Ordering::Relaxed);
+        }
+    }
+
+    /// Bumped once per executor-dispatched tx whose signature status reports
+    /// an on-chain failure.
+    #[inline(always)]
+    fn record_executed_failed(&self) {
+        self.executed_failed_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Heartbeat for the executor loop. Single relaxed store, no I/O.
+    #[inline(always)]
+    fn tick_executor(&self, now_ms: u64) {
+        self.executor_last_tick_ms.store(now_ms, Ordering::Relaxed);
+    }
+
+    /// Heartbeat for the perp event consumer loop.
+    #[inline(always)]
+    fn tick_event_cranker(&self, now_ms: u64) {
+        self.event_cranker_last_tick_ms
+            .store(now_ms, Ordering::Relaxed);
     }
 
     fn observe_submit_stages(&self, parse: Duration, prepare: Duration, send: Duration) {
@@ -511,6 +722,130 @@ impl Metrics {
             format!(
                 "execution_engine_execute_head_advance_items_total {}",
                 self.execute_head_advance_items.load(Ordering::Relaxed)
+            ),
+
+            // ---------- General health gauges ----------
+            "# HELP execution_engine_relayer_healthy 1 if this relayer process is serving /metrics".to_string(),
+            "# TYPE execution_engine_relayer_healthy gauge".to_string(),
+            format!(
+                "execution_engine_relayer_healthy {}",
+                self.relayer_healthy.load(Ordering::Relaxed)
+            ),
+            "# HELP execution_engine_bridge_healthy 1 if the last HTTP-to-gRPC bridge healthz probe succeeded".to_string(),
+            "# TYPE execution_engine_bridge_healthy gauge".to_string(),
+            format!(
+                "execution_engine_bridge_healthy {}",
+                self.bridge_healthy.load(Ordering::Relaxed)
+            ),
+            "# HELP execution_engine_executor_healthy 1 if executor heartbeat is fresh".to_string(),
+            "# TYPE execution_engine_executor_healthy gauge".to_string(),
+            format!(
+                "execution_engine_executor_healthy {}",
+                self.executor_healthy.load(Ordering::Relaxed)
+            ),
+            "# HELP execution_engine_event_cranker_healthy 1 if perp event consumer heartbeat is fresh".to_string(),
+            "# TYPE execution_engine_event_cranker_healthy gauge".to_string(),
+            format!(
+                "execution_engine_event_cranker_healthy {}",
+                self.event_cranker_healthy.load(Ordering::Relaxed)
+            ),
+            "# HELP execution_engine_relayer_balance_lamports Last polled relayer payer balance in lamports".to_string(),
+            "# TYPE execution_engine_relayer_balance_lamports gauge".to_string(),
+            format!(
+                "execution_engine_relayer_balance_lamports {}",
+                self.relayer_balance_lamports.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_relayer_balance_last_ms gauge".to_string(),
+            format!(
+                "execution_engine_relayer_balance_last_ms {}",
+                self.relayer_balance_last_ms.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_executor_last_tick_ms gauge".to_string(),
+            format!(
+                "execution_engine_executor_last_tick_ms {}",
+                self.executor_last_tick_ms.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_event_cranker_last_tick_ms gauge".to_string(),
+            format!(
+                "execution_engine_event_cranker_last_tick_ms {}",
+                self.event_cranker_last_tick_ms.load(Ordering::Relaxed)
+            ),
+
+            // ---------- Performance / load ----------
+            "# HELP execution_engine_ingress_total Total submit_intent invocations (incl. rejects)".to_string(),
+            "# TYPE execution_engine_ingress_total counter".to_string(),
+            format!(
+                "execution_engine_ingress_total {}",
+                self.ingress_total.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_ingress_accepted_total counter".to_string(),
+            format!(
+                "execution_engine_ingress_accepted_total {}",
+                self.ingress_accepted_total.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_ingress_rejected_total counter".to_string(),
+            format!(
+                "execution_engine_ingress_rejected_total {}",
+                self.ingress_rejected_total.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_executed_total counter".to_string(),
+            format!(
+                "execution_engine_executed_total {}",
+                self.executed_total.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_executed_failed_total counter".to_string(),
+            format!(
+                "execution_engine_executed_failed_total {}",
+                self.executed_failed_total.load(Ordering::Relaxed)
+            ),
+            "# HELP execution_engine_ingress_tps_10s Ingress txns per second sampled over last 10s".to_string(),
+            "# TYPE execution_engine_ingress_tps_10s gauge".to_string(),
+            format!(
+                "execution_engine_ingress_tps_10s {:.3}",
+                self.ingress_tps_10s_milli.load(Ordering::Relaxed) as f64 / 1000.0
+            ),
+            "# TYPE execution_engine_ingress_accepted_60s gauge".to_string(),
+            format!(
+                "execution_engine_ingress_accepted_60s {}",
+                self.ingress_accepted_60s.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_ingress_rejected_60s gauge".to_string(),
+            format!(
+                "execution_engine_ingress_rejected_60s {}",
+                self.ingress_rejected_60s.load(Ordering::Relaxed)
+            ),
+            "# HELP execution_engine_executed_tps_10s Executed (head-advance items) per second over last 10s".to_string(),
+            "# TYPE execution_engine_executed_tps_10s gauge".to_string(),
+            format!(
+                "execution_engine_executed_tps_10s {:.3}",
+                self.executed_tps_10s_milli.load(Ordering::Relaxed) as f64 / 1000.0
+            ),
+            "# TYPE execution_engine_executed_60s gauge".to_string(),
+            format!(
+                "execution_engine_executed_60s {}",
+                self.executed_60s.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_executed_failed_60s gauge".to_string(),
+            format!(
+                "execution_engine_executed_failed_60s {}",
+                self.executed_failed_60s.load(Ordering::Relaxed)
+            ),
+            "# HELP execution_engine_execution_queue_depth Current on-chain execution queue depth".to_string(),
+            "# TYPE execution_engine_execution_queue_depth gauge".to_string(),
+            format!(
+                "execution_engine_execution_queue_depth {}",
+                self.execution_queue_depth.load(Ordering::Relaxed)
+            ),
+            "# HELP execution_engine_unique_addresses_60s Approx distinct user_owner pubkeys observed in the last 60s".to_string(),
+            "# TYPE execution_engine_unique_addresses_60s gauge".to_string(),
+            format!(
+                "execution_engine_unique_addresses_60s {}",
+                self.unique_addresses_60s.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_sampler_last_tick_ms gauge".to_string(),
+            format!(
+                "execution_engine_sampler_last_tick_ms {}",
+                self.sampler_last_tick_ms.load(Ordering::Relaxed)
             ),
         ]
         .join("\n")
@@ -681,6 +1016,14 @@ struct ExecutorState {
     /// Tracks the first slot at which the current head had no lane match.
     /// Tuple of (sequence, first_seen_slot). Reset when the head changes.
     no_lane_match_since: Arc<Mutex<Option<(u64, u64)>>>,
+    /// Adaptive max_items: starts at config.executor_max_items, reduced to 1
+    /// when ProgramFailedToComplete (heap overflow) is detected, then ramped
+    /// back up after consecutive successful head advancements.
+    adaptive_max_items: AtomicU16,
+    /// Counts consecutive successful head advancements while adaptive_max_items
+    /// is below config.executor_max_items. After enough successes, max_items
+    /// is restored to its configured value.
+    adaptive_success_streak: AtomicU32,
 }
 
 impl ExecutorState {
@@ -702,6 +1045,58 @@ impl ExecutorState {
             last_progress_log_sequence: AtomicU64::new(0),
             sequence_failure_counts: Arc::new(Mutex::new(HashMap::new())),
             no_lane_match_since: Arc::new(Mutex::new(None)),
+            adaptive_max_items: AtomicU16::new(0), // 0 = use config default
+            adaptive_success_streak: AtomicU32::new(0),
+        }
+    }
+
+    /// Returns the effective max_items for execute instructions. When the
+    /// adaptive value is non-zero and lower than the config default, it takes
+    /// precedence. This allows the executor to temporarily reduce batch size
+    /// after heap overflow failures, then ramp back up.
+    fn effective_max_items(&self, config_max: u16) -> u16 {
+        let adaptive = self.adaptive_max_items.load(Ordering::Relaxed);
+        if adaptive > 0 && adaptive < config_max {
+            adaptive
+        } else {
+            config_max
+        }
+    }
+
+    /// Called when ProgramFailedToComplete is detected. Immediately reduces
+    /// max_items to 1 to avoid heap overflow on next attempt.
+    fn on_heap_overflow(&self, config_max: u16) {
+        let prev = self.adaptive_max_items.load(Ordering::Relaxed);
+        self.adaptive_max_items.store(1, Ordering::Relaxed);
+        self.adaptive_success_streak.store(0, Ordering::Relaxed);
+        if prev != 1 {
+            warn!(
+                "adaptive max_items reduced {} -> 1 due to ProgramFailedToComplete (heap overflow)",
+                if prev == 0 { config_max } else { prev }
+            );
+        }
+    }
+
+    /// Called after each successful head advancement. If adaptive_max_items is
+    /// reduced, counts successes and ramps back up after 20 consecutive
+    /// successful advancements.
+    fn on_successful_advance(&self, config_max: u16) {
+        let adaptive = self.adaptive_max_items.load(Ordering::Relaxed);
+        if adaptive == 0 || adaptive >= config_max {
+            return; // not in degraded mode
+        }
+        let streak = self.adaptive_success_streak.fetch_add(1, Ordering::Relaxed) + 1;
+        // Ramp up schedule: after 20 successes at current level, double max_items
+        // (capped at config max). This lets us recover TPS gradually.
+        const RAMP_UP_THRESHOLD: u32 = 20;
+        if streak >= RAMP_UP_THRESHOLD {
+            let new_max = (adaptive * 2).min(config_max);
+            self.adaptive_max_items.store(new_max, Ordering::Relaxed);
+            self.adaptive_success_streak.store(0, Ordering::Relaxed);
+            info!(
+                "adaptive max_items ramped up {} -> {} (config_max={}, after {} successes)",
+                adaptive, new_max, config_max, streak
+            );
         }
     }
 
@@ -908,6 +1303,98 @@ impl RelayIntentStatusContext {
 struct CachedChainState {
     blockhash: solana_sdk::hash::Hash,
     slot: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct StartupFlags {
+    enable_health_check: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ParsedSubmitIntentKeys {
+    group: Pubkey,
+    execution_queue: Pubkey,
+    user_owner: Pubkey,
+    mango_account: Pubkey,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct HarnessUserStateResponse {
+    #[serde(default)]
+    data: HarnessUserState,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct HarnessUserState {
+    #[serde(default)]
+    mango_accounts: Vec<String>,
+    #[serde(default)]
+    open_orders: Vec<HarnessOpenOrder>,
+    #[serde(default)]
+    per_market: Vec<HarnessUserPerMarket>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct HarnessOpenOrder {
+    order_id: String,
+    mango_account: String,
+    market: String,
+    side: String,
+    base_lots: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct HarnessUserPerMarket {
+    market: String,
+    open_order_base_lots_bid: String,
+    open_order_base_lots_ask: String,
+    base_position_lots: String,
+    quote_position_native: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct HarnessMarketStateResponse {
+    metadata: Option<HarnessMarketMetadata>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct HarnessMarketMetadata {
+    market_index: u16,
+    perp_market: String,
+    oracle: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MarginCheckOp {
+    Place {
+        side: Side,
+        max_base_lots: i64,
+        reduce_only: bool,
+    },
+    CancelByOrderId {
+        expected_order_id: u128,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HarnessOrderExposure {
+    market_index: PerpMarketIndex,
+    side: Side,
+    base_lots: i64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct UserPerpMarginOverlay {
+    base_position_lots: i64,
+    quote_position_native: I80F48,
+    bids_base_lots: i64,
+    asks_base_lots: i64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct HarnessMarginSnapshot {
+    overlays: HashMap<PerpMarketIndex, UserPerpMarginOverlay>,
+    orders_by_id: HashMap<u128, HarnessOrderExposure>,
 }
 
 struct BlockhashManager {
@@ -1244,6 +1731,22 @@ struct Engine {
     harness_readiness: Arc<Mutex<Option<CachedHarnessReadiness>>>,
     executor: Option<Arc<ExecutorState>>,
     execute_nonce: Arc<AtomicU64>,
+    /// Mango accounts whose perp order slots are full. Keyed by account
+    /// pubkey, value is the wall-clock ms when the block expires.  New
+    /// intents targeting a blocked account are rejected immediately with
+    /// RESOURCE_EXHAUSTED instead of being enqueued.
+    blocked_mango_accounts: Arc<Mutex<HashMap<Pubkey, u64>>>,
+    /// user_owner pubkey -> last-seen wall-clock ms. Used by the metrics
+    /// sampler to compute unique_addresses_60s.
+    ///
+    /// Uses std::sync::Mutex (NOT tokio::sync::Mutex) because the only
+    /// operation on the hot path is a single bounded HashMap insert that is
+    /// dominated by hashing — holding the lock across an `.await` is never
+    /// done. The bounded size keeps it cheap: the metrics sampler sweeps
+    /// stale entries at a fixed cadence, so the map size is proportional to
+    /// the number of distinct senders in the active window, not lifetime
+    /// cardinality.
+    unique_addresses: Arc<StdMutex<HashMap<[u8; 32], u64>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1297,6 +1800,8 @@ enum LaneFailureClass {
 enum TerminalHeadFailureReason {
     ExpiredOrder,
     WrongProgramOwner,
+    PerpOrderSlotsFull,
+    HealthCheckFailed,
 }
 
 impl LaneFailureClass {
@@ -1332,6 +1837,50 @@ fn classify_lane_failure(err: &anyhow::Error) -> LaneFailureClass {
 }
 
 impl Engine {
+    /// Hot-path: stamps `user_owner.to_bytes()` with the current wall-clock
+    /// time in the unique-address tracker. Single std Mutex acquisition +
+    /// HashMap entry update; never held across an await. Failures (poisoned
+    /// lock) are silently ignored — metrics must never affect intent flow.
+    #[inline]
+    fn note_user_owner(&self, user_owner: &Pubkey, now_ms: u64) {
+        if let Ok(mut guard) = self.unique_addresses.lock() {
+            guard.insert(user_owner.to_bytes(), now_ms);
+        }
+    }
+
+    fn reject_submit_request(
+        &self,
+        request: &SubmitIntentRequest,
+        code: Code,
+        message: impl Into<String>,
+    ) -> Status {
+        let message = message.into();
+        warn!(
+            reason = %message,
+            group = %request.group,
+            execution_queue = %request.execution_queue,
+            market = %request.market,
+            user_owner = %request.user_owner,
+            mango_account = %request.mango_account,
+            remaining_accounts_count = request.remaining_accounts.len(),
+            payload_len = request.payload.len(),
+            "direct submit rejected"
+        );
+        Status::new(code, message)
+    }
+
+    fn parse_submit_intent_keys(
+        &self,
+        request: &SubmitIntentRequest,
+    ) -> Result<ParsedSubmitIntentKeys, Status> {
+        Ok(ParsedSubmitIntentKeys {
+            group: parse_pubkey(&request.group)?,
+            execution_queue: parse_pubkey(&request.execution_queue)?,
+            user_owner: parse_pubkey(&request.user_owner)?,
+            mango_account: parse_pubkey(&request.mango_account)?,
+        })
+    }
+
     fn harness_reject_status(&self, message: impl Into<String>, drift_related: bool) -> Status {
         self.metrics
             .harness_submit_rejects
@@ -1476,6 +2025,510 @@ impl Engine {
         Ok(HarnessReadiness { drifted_markets })
     }
 
+    async fn ensure_submit_margin_ready(
+        &self,
+        request: &SubmitIntentRequest,
+        keys: ParsedSubmitIntentKeys,
+    ) -> Result<(), Status> {
+        if !self.config.enable_health_check {
+            return Ok(());
+        }
+        let Some(margin_ops) = decode_margin_check_ops(&request.payload).map_err(|err| {
+            self.reject_submit_request(
+                request,
+                Code::InvalidArgument,
+                format!("failed to decode queue payload for margin precheck: {err}"),
+            )
+        })?
+        else {
+            return Ok(());
+        };
+        let remaining_accounts = parse_remaining_accounts(&request.remaining_accounts)?;
+        if remaining_accounts.len() < 4 {
+            return Err(self.reject_submit_request(
+                request,
+                Code::InvalidArgument,
+                "remaining_accounts missing canonical perp market account",
+            ));
+        }
+
+        let harness_state = self.fetch_harness_user_state(request, keys).await?;
+        let margin_snapshot =
+            build_harness_margin_snapshot(harness_state.as_ref(), &request.mango_account).map_err(
+                |err| {
+                    self.reject_submit_request(
+                        request,
+                        Code::Unavailable,
+                        format!("invalid harness user state for margin precheck: {err}"),
+                    )
+                },
+            )?;
+        let extra_market_metadata = self
+            .fetch_harness_market_metadata(request, &margin_snapshot)
+            .await?;
+        let account_map = self
+            .fetch_margin_check_account_map(
+                request,
+                keys.mango_account,
+                &remaining_accounts,
+                &extra_market_metadata,
+            )
+            .await?;
+        self.evaluate_submit_margin_precheck(
+            request,
+            &remaining_accounts,
+            &margin_ops,
+            margin_snapshot,
+            &extra_market_metadata,
+            account_map,
+        )
+    }
+
+    async fn fetch_harness_user_state(
+        &self,
+        request: &SubmitIntentRequest,
+        keys: ParsedSubmitIntentKeys,
+    ) -> Result<Option<HarnessUserState>, Status> {
+        let Some(harness_base_url) = self.config.harness_base_url.as_deref() else {
+            return Ok(None);
+        };
+        let timeout = Duration::from_millis(self.config.harness_health_timeout_ms);
+        let owner = keys.user_owner.to_string();
+        let url = format!(
+            "{}/state/users/{}?view=optimistic&onchain=false",
+            harness_base_url.trim_end_matches('/'),
+            owner
+        );
+        let response = self
+            .http_client
+            .get(&url)
+            .timeout(timeout)
+            .send()
+            .await
+            .map_err(|err| {
+                self.reject_submit_request(
+                    request,
+                    Code::Unavailable,
+                    format!("harness user-state request failed owner={owner}: {err}"),
+                )
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(self.reject_submit_request(
+                request,
+                Code::Unavailable,
+                format!(
+                    "harness user-state request returned status {} owner={} url={}",
+                    status, owner, url
+                ),
+            ));
+        }
+        let payload: HarnessUserStateResponse = response.json().await.map_err(|err| {
+            self.reject_submit_request(
+                request,
+                Code::Unavailable,
+                format!("failed to decode harness user-state payload owner={owner}: {err}"),
+            )
+        })?;
+        Ok(Some(payload.data))
+    }
+
+    async fn fetch_harness_market_metadata(
+        &self,
+        request: &SubmitIntentRequest,
+        margin_snapshot: &HarnessMarginSnapshot,
+    ) -> Result<HashMap<PerpMarketIndex, HarnessMarketMetadata>, Status> {
+        let Some(harness_base_url) = self.config.harness_base_url.as_deref() else {
+            return Ok(HashMap::new());
+        };
+        let timeout = Duration::from_millis(self.config.harness_health_timeout_ms);
+        let mut metadata = HashMap::new();
+        for market_index in margin_snapshot.overlays.keys().copied() {
+            let url = format!(
+                "{}/state/markets/{}?view=optimistic&metadata_only=true",
+                harness_base_url.trim_end_matches('/'),
+                market_index
+            );
+            let response = self
+                .http_client
+                .get(&url)
+                .timeout(timeout)
+                .send()
+                .await
+                .map_err(|err| {
+                    self.reject_submit_request(
+                        request,
+                        Code::Unavailable,
+                        format!(
+                            "harness market-state request failed market_index={market_index}: {err}"
+                        ),
+                    )
+                })?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(self.reject_submit_request(
+                    request,
+                    Code::Unavailable,
+                    format!(
+                        "harness market-state request returned status {} market_index={} url={}",
+                        status, market_index, url
+                    ),
+                ));
+            }
+            let payload: HarnessMarketStateResponse = response.json().await.map_err(|err| {
+                self.reject_submit_request(
+                    request,
+                    Code::Unavailable,
+                    format!(
+                        "failed to decode harness market-state payload market_index={market_index}: {err}"
+                    ),
+                )
+            })?;
+            let Some(market_metadata) = payload.metadata else {
+                return Err(self.reject_submit_request(
+                    request,
+                    Code::Unavailable,
+                    format!("harness missing market metadata for market_index={market_index}"),
+                ));
+            };
+            if market_metadata.market_index != market_index {
+                return Err(self.reject_submit_request(
+                    request,
+                    Code::Unavailable,
+                    format!(
+                        "harness market metadata mismatch requested_market_index={} returned_market_index={}",
+                        market_index, market_metadata.market_index
+                    ),
+                ));
+            }
+            metadata.insert(market_index, market_metadata);
+        }
+        Ok(metadata)
+    }
+
+    async fn fetch_margin_check_account_map(
+        &self,
+        request: &SubmitIntentRequest,
+        mango_account: Pubkey,
+        remaining_accounts: &[AccountMeta],
+        extra_market_metadata: &HashMap<PerpMarketIndex, HarnessMarketMetadata>,
+    ) -> Result<HashMap<Pubkey, KeyedAccountSharedData>, Status> {
+        let mut pubkeys = Vec::with_capacity(
+            1 + remaining_accounts.len() + extra_market_metadata.len().saturating_mul(2),
+        );
+        let mut seen = HashSet::new();
+        let mut push_pubkey = |pubkey: Pubkey| {
+            if seen.insert(pubkey) {
+                pubkeys.push(pubkey);
+            }
+        };
+        push_pubkey(mango_account);
+        for account in remaining_accounts {
+            push_pubkey(account.pubkey);
+        }
+        for metadata in extra_market_metadata.values() {
+            push_pubkey(parse_pubkey(&metadata.perp_market).map_err(|err| {
+                self.reject_submit_request(
+                    request,
+                    Code::Unavailable,
+                    format!("invalid harness perp market pubkey for margin precheck: {err}"),
+                )
+            })?);
+            push_pubkey(parse_pubkey(&metadata.oracle).map_err(|err| {
+                self.reject_submit_request(
+                    request,
+                    Code::Unavailable,
+                    format!("invalid harness oracle pubkey for margin precheck: {err}"),
+                )
+            })?);
+        }
+
+        let fetched = self
+            .rpc
+            .get_multiple_accounts(&pubkeys)
+            .await
+            .map_err(|err| {
+                self.reject_submit_request(
+                    request,
+                    Code::Unavailable,
+                    format!("margin precheck account fetch failed: {err}"),
+                )
+            })?;
+        let mut accounts = HashMap::with_capacity(pubkeys.len());
+        for (pubkey, maybe_account) in pubkeys.into_iter().zip(fetched.into_iter()) {
+            let Some(account) = maybe_account else {
+                return Err(self.reject_submit_request(
+                    request,
+                    Code::FailedPrecondition,
+                    format!("margin precheck account not found: {pubkey}"),
+                ));
+            };
+            accounts.insert(pubkey, KeyedAccountSharedData::new(pubkey, account.into()));
+        }
+        Ok(accounts)
+    }
+
+    fn evaluate_submit_margin_precheck(
+        &self,
+        request: &SubmitIntentRequest,
+        remaining_accounts: &[AccountMeta],
+        margin_ops: &[MarginCheckOp],
+        margin_snapshot: HarnessMarginSnapshot,
+        extra_market_metadata: &HashMap<PerpMarketIndex, HarnessMarketMetadata>,
+        account_map: HashMap<Pubkey, KeyedAccountSharedData>,
+    ) -> Result<(), Status> {
+        let Some(target_market_meta) = remaining_accounts.get(3) else {
+            return Err(self.reject_submit_request(
+                request,
+                Code::InvalidArgument,
+                "remaining_accounts missing canonical perp market account",
+            ));
+        };
+        let target_market_account =
+            account_map.get(&target_market_meta.pubkey).ok_or_else(|| {
+                self.reject_submit_request(
+                    request,
+                    Code::FailedPrecondition,
+                    format!(
+                        "target perp market account missing for margin precheck: {}",
+                        target_market_meta.pubkey
+                    ),
+                )
+            })?;
+        let target_market = target_market_account.load::<PerpMarket>().map_err(|err| {
+            self.reject_submit_request(
+                request,
+                Code::FailedPrecondition,
+                format!(
+                    "failed to load target perp market {} for margin precheck: {err}",
+                    target_market_meta.pubkey
+                ),
+            )
+        })?;
+        let target_market_index = target_market.perp_market_index;
+        let target_settle_token_index = target_market.settle_token_index;
+
+        let mango_account_key = parse_pubkey(&request.mango_account)?;
+        let mango_account = account_map.get(&mango_account_key).ok_or_else(|| {
+            self.reject_submit_request(
+                request,
+                Code::FailedPrecondition,
+                format!(
+                    "mango account missing for margin precheck: {}",
+                    mango_account_key
+                ),
+            )
+        })?;
+        if mango_account.data.data().len() < 8 {
+            return Err(self.reject_submit_request(
+                request,
+                Code::FailedPrecondition,
+                format!(
+                    "mango account data too short for margin precheck mango_account={} data_len={}",
+                    mango_account_key,
+                    mango_account.data.data().len()
+                ),
+            ));
+        }
+        let mut optimistic_account = MangoAccountValue::from_bytes(&mango_account.data.data()[8..])
+            .map_err(|err| {
+                self.reject_submit_request(
+                    request,
+                    Code::FailedPrecondition,
+                    format!(
+                        "failed to deserialize mango account for margin precheck {}: {err}",
+                        mango_account_key
+                    ),
+                )
+            })?;
+
+        for (market_index, overlay) in &margin_snapshot.overlays {
+            let (market_pubkey, market_account) = if *market_index == target_market_index {
+                (target_market_meta.pubkey, target_market_account)
+            } else {
+                let Some(metadata) = extra_market_metadata.get(market_index) else {
+                    return Err(self.reject_submit_request(
+                        request,
+                        Code::Unavailable,
+                        format!(
+                            "missing harness metadata for optimistic market {} during margin precheck",
+                            market_index
+                        ),
+                    ));
+                };
+                let market_pubkey = parse_pubkey(&metadata.perp_market).map_err(|err| {
+                    self.reject_submit_request(
+                        request,
+                        Code::Unavailable,
+                        format!(
+                            "invalid harness perp market pubkey for market {} during margin precheck: {err}",
+                            market_index
+                        ),
+                    )
+                })?;
+                let market_account = account_map.get(&market_pubkey).ok_or_else(|| {
+                    self.reject_submit_request(
+                        request,
+                        Code::FailedPrecondition,
+                        format!(
+                            "optimistic perp market account missing for margin precheck market={} pubkey={}",
+                            market_index, market_pubkey
+                        ),
+                    )
+                })?;
+                (market_pubkey, market_account)
+            };
+            let market = market_account.load::<PerpMarket>().map_err(|err| {
+                self.reject_submit_request(
+                    request,
+                    Code::FailedPrecondition,
+                    format!(
+                        "failed to load optimistic perp market {} for margin precheck market={}: {err}",
+                        market_pubkey, market_index
+                    ),
+                )
+            })?;
+            let (position, _) = optimistic_account
+                .ensure_perp_position(*market_index, market.settle_token_index)
+                .map_err(|err| {
+                    self.reject_submit_request(
+                        request,
+                        Code::FailedPrecondition,
+                        format!(
+                            "failed to ensure optimistic perp position market={} during margin precheck: {err}",
+                            market_index
+                        ),
+                    )
+                })?;
+            position.base_position_lots = overlay.base_position_lots;
+            position.quote_position_native = overlay.quote_position_native;
+            position.bids_base_lots = overlay.bids_base_lots;
+            position.asks_base_lots = overlay.asks_base_lots;
+        }
+
+        optimistic_account
+            .ensure_perp_position(target_market_index, target_settle_token_index)
+            .map_err(|err| {
+                self.reject_submit_request(
+                    request,
+                    Code::FailedPrecondition,
+                    format!(
+                        "failed to ensure target perp position for margin precheck market={}: {err}",
+                        target_market_index
+                    ),
+                )
+            })?;
+
+        let health_accounts = build_margin_health_accounts(&optimistic_account, &account_map)
+            .map_err(|err| {
+                self.reject_submit_request(
+                    request,
+                    Code::FailedPrecondition,
+                    format!("failed to assemble health accounts for margin precheck: {err}"),
+                )
+            })?;
+        let active_token_len = optimistic_account.active_token_positions().count();
+        let active_perp_len = optimistic_account.active_perp_positions().count();
+        let active_serum3_len = optimistic_account.active_serum3_orders().count();
+        let begin_fallback_oracles = active_token_len * 2
+            + active_perp_len * 2
+            + active_serum3_len
+            + optimistic_account.active_openbook_v2_orders().count();
+        let retriever = FixedOrderAccountRetriever {
+            ais: health_accounts,
+            n_banks: active_token_len,
+            n_perps: active_perp_len,
+            begin_perp: active_token_len * 2,
+            begin_serum3: active_token_len * 2 + active_perp_len * 2,
+            begin_openbook_v2: active_token_len * 2 + active_perp_len * 2 + active_serum3_len,
+            staleness_slot: None,
+            begin_fallback_oracles,
+            usdc_oracle_index: None,
+            sol_oracle_index: None,
+        };
+        let usdc_oracle_index = retriever
+            .ais
+            .iter()
+            .position(|account| account.key == pyth_mainnet_usdc_oracle::ID);
+        let sol_oracle_index = retriever
+            .ais
+            .iter()
+            .position(|account| account.key == pyth_mainnet_sol_oracle::ID);
+        let retriever = FixedOrderAccountRetriever {
+            usdc_oracle_index,
+            sol_oracle_index,
+            ..retriever
+        };
+        let now_ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(internal_status)?
+            .as_secs();
+        let mut health_cache = new_health_cache(&optimistic_account.borrow(), &retriever, now_ts)
+            .map_err(|err| {
+            self.reject_submit_request(
+                request,
+                Code::FailedPrecondition,
+                format!("failed to build health cache for margin precheck: {err}"),
+            )
+        })?;
+        let pre_init_health =
+            optimistic_account
+                .check_health_pre(&health_cache)
+                .map_err(|err| {
+                    self.reject_submit_request(
+                        request,
+                        Code::FailedPrecondition,
+                        format!("account is not eligible for new intents: {err}"),
+                    )
+                })?;
+
+        let mut orders_by_id = margin_snapshot.orders_by_id;
+        apply_margin_check_ops(
+            &mut optimistic_account,
+            target_market,
+            margin_ops,
+            &mut orders_by_id,
+        )
+        .map_err(|err| {
+            self.reject_submit_request(
+                request,
+                Code::FailedPrecondition,
+                format!("failed to apply request delta for margin precheck: {err}"),
+            )
+        })?;
+        let target_position = optimistic_account
+            .perp_position(target_market_index)
+            .map_err(|err| {
+                self.reject_submit_request(
+                    request,
+                    Code::FailedPrecondition,
+                    format!(
+                        "target perp position missing after request delta market={}: {err}",
+                        target_market_index
+                    ),
+                )
+            })?;
+        health_cache
+            .recompute_perp_info(target_position, target_market)
+            .map_err(|err| {
+                self.reject_submit_request(
+                    request,
+                    Code::FailedPrecondition,
+                    format!("failed to recompute perp health info for margin precheck: {err}"),
+                )
+            })?;
+        optimistic_account
+            .check_health_post(&health_cache, pre_init_health)
+            .map_err(|err| {
+                self.reject_submit_request(
+                    request,
+                    Code::FailedPrecondition,
+                    format!("insufficient margin for requested order size: {err}"),
+                )
+            })?;
+        Ok(())
+    }
+
     fn terminal_head_failure_reason(
         &self,
         err: &TransactionError,
@@ -1499,6 +2552,31 @@ impl Engine {
             return Some(TerminalHeadFailureReason::WrongProgramOwner);
         }
 
+        // "no free perp order index" — the mango account's order slots are
+        // full.  This item cannot be executed until slots are freed (which
+        // requires event queue consumption that may never happen for this
+        // account).  Drop the head to unblock the queue.
+        if matches!(
+            err,
+            TransactionError::InstructionError(_, InstructionError::Custom(6000))
+        ) && logs
+            .iter()
+            .any(|line| line.contains("no free perp order index"))
+        {
+            return Some(TerminalHeadFailureReason::PerpOrderSlotsFull);
+        }
+
+        // "health must be positive" / "health must be positive or not decrease"
+        // The account lacks sufficient margin for this order.  The order will
+        // never succeed unless the user deposits more — drop it.
+        if matches!(
+            err,
+            TransactionError::InstructionError(_, InstructionError::Custom(6006))
+                | TransactionError::InstructionError(_, InstructionError::Custom(6007))
+        ) {
+            return Some(TerminalHeadFailureReason::HealthCheckFailed);
+        }
+
         None
     }
 
@@ -1506,6 +2584,8 @@ impl Engine {
         match reason {
             TerminalHeadFailureReason::ExpiredOrder => "expired_order",
             TerminalHeadFailureReason::WrongProgramOwner => "account_owned_by_wrong_program",
+            TerminalHeadFailureReason::PerpOrderSlotsFull => "perp_order_slots_full",
+            TerminalHeadFailureReason::HealthCheckFailed => "health_check_failed",
         }
     }
 
@@ -1531,6 +2611,28 @@ impl Engine {
         let Some(reason) = self.terminal_head_failure_reason(err, &logs) else {
             return false;
         };
+
+        // When perp order slots are full, block the mango account from future
+        // enqueues for 60 seconds.  The account pubkey is the second remaining
+        // account in the lane (index 1: group, mango_account, owner, ...).
+        if matches!(reason, TerminalHeadFailureReason::PerpOrderSlotsFull) {
+            let lanes = executor.lanes_snapshot().await;
+            if let Some(lane) = lanes.iter().find(|l| l.hash == pending.lane_hash) {
+                if lane.remaining_accounts.len() > 1 {
+                    let mango_acct_pk = lane.remaining_accounts[1].pubkey;
+                    let block_until = unix_timestamp_ms() + 60_000;
+                    self.blocked_mango_accounts
+                        .lock()
+                        .await
+                        .insert(mango_acct_pk, block_until);
+                    warn!(
+                        "blocked mango account {} for 60s due to perp_order_slots_full",
+                        mango_acct_pk
+                    );
+                }
+            }
+        }
+
         match self
             .drop_ctm_head_with_admin_tx(
                 executor,
@@ -1782,7 +2884,18 @@ impl Engine {
         };
         let expired_batch = self.inspect_expired_head_batch(&queue_account.data, sequence);
         let sequences_to_drop = if head_is_pending {
-            if expired_batch.sequences.is_empty() {
+            if matches!(reason, "no_lane_match_stale" | "sequence_failure_threshold") {
+                let batch = inspect_no_lane_match_batch(
+                    &queue_account.data,
+                    &queue_state.head,
+                    self.config.executor_no_lane_match_drop_batch_max,
+                );
+                if batch.is_empty() {
+                    vec![sequence]
+                } else {
+                    batch
+                }
+            } else if expired_batch.sequences.is_empty() {
                 vec![sequence]
             } else {
                 expired_batch.sequences
@@ -1804,14 +2917,20 @@ impl Engine {
             gap_batch
         };
 
-        let mut instructions = vec![build_execution_queue_configure_instruction(
+        let mut instructions = vec![ComputeBudgetInstruction::set_compute_unit_limit(1_400_000)];
+        if self.config.executor_prioritization_fee > 0 {
+            instructions.push(ComputeBudgetInstruction::set_compute_unit_price(
+                self.config.executor_prioritization_fee,
+            ));
+        }
+        instructions.push(build_execution_queue_configure_instruction(
             self.config.program_id,
             executor.group,
             executor.execution_queue,
             self.config.executor_admin.pubkey(),
             &queue_state,
             true,
-        )];
+        ));
         for sequence in &sequences_to_drop {
             instructions.push(build_execution_queue_drop_ctm_instruction(
                 self.config.program_id,
@@ -1852,7 +2971,7 @@ impl Engine {
             )?
         };
         let send_cfg = RpcSendTransactionConfig {
-            skip_preflight: false,
+            skip_preflight: self.config.executor_skip_preflight,
             preflight_commitment: Some(CommitmentConfig::processed().commitment),
             max_retries: Some(0),
             ..RpcSendTransactionConfig::default()
@@ -2044,8 +3163,19 @@ impl Engine {
         &self,
         request: SubmitIntentRequest,
     ) -> Result<SubmitIntentResponse, Status> {
+        // Bump ingress at the boundary BEFORE acquire_permit so that
+        // queue-timeout / semaphore rejections still show up as ingress.
+        // Single relaxed fetch_add — does not block the hot path.
+        self.metrics.record_ingress();
         let started = Instant::now();
-        let permit = self.acquire_permit().await?;
+        let permit = match self.acquire_permit().await {
+            Ok(permit) => permit,
+            Err(status) => {
+                // Permit-acquire rejection still counts toward ingress outcome.
+                self.metrics.record_ingress_outcome(false);
+                return Err(status);
+            }
+        };
         self.metrics.inflight.fetch_add(1, Ordering::Relaxed);
 
         let result = self.submit_intent_inner(request).await;
@@ -2055,6 +3185,7 @@ impl Engine {
 
         self.metrics
             .observe_submit(started.elapsed(), result.is_ok());
+        self.metrics.record_ingress_outcome(result.is_ok());
         result
     }
 
@@ -2075,8 +3206,30 @@ impl Engine {
         let mut status_ctx = RelayIntentStatusContext::from_request(&request);
         let result: Result<SubmitIntentResponse, Status> = async {
             let parse_started = Instant::now();
-            let group = parse_pubkey(&request.group)?;
-            let execution_queue = parse_pubkey(&request.execution_queue)?;
+            // Validate market_index is present and parseable as u16 BEFORE
+            // any other work. Reject empty/undefined/non-numeric market values
+            // with a clear error so callers don't waste compute on the rest of
+            // the pipeline.
+            if request.market.trim().is_empty() {
+                return Err(self.reject_submit_request(
+                    &request,
+                    Code::InvalidArgument,
+                    "market index missing: request.market is empty or undefined",
+                ));
+            }
+            if request.market.trim().parse::<u16>().is_err() {
+                return Err(self.reject_submit_request(
+                    &request,
+                    Code::InvalidArgument,
+                    format!(
+                        "market index invalid: '{}' is not a valid u16 perp market index",
+                        request.market
+                    ),
+                ));
+            }
+            let keys = self.parse_submit_intent_keys(&request)?;
+            let group = keys.group;
+            let execution_queue = keys.execution_queue;
             if self.config.queue_soft_limit > 0 {
                 if let Some((queue_count, gap_span, head_available)) =
                     self.current_queue_state_for(group, execution_queue)
@@ -2106,8 +3259,29 @@ impl Engine {
                 }
             }
             self.ensure_harness_ready(&request.market).await?;
-            let user_owner = parse_pubkey(&request.user_owner)?;
-            let mango_account = parse_pubkey(&request.mango_account)?;
+            self.ensure_submit_margin_ready(&request, keys).await?;
+            let user_owner = keys.user_owner;
+            let mango_account = keys.mango_account;
+
+            // Hot-path: stamp the sender's pubkey into the unique-address
+            // tracker. Bounded HashMap insert; never holds the lock across an
+            // await; failures are silently ignored.
+            self.note_user_owner(&user_owner, unix_timestamp_ms());
+
+            // Pre-enqueue gate: reject intents for mango accounts whose perp
+            // order slots are known to be full.
+            {
+                let mut blocked = self.blocked_mango_accounts.lock().await;
+                let now_ms = unix_timestamp_ms();
+                // Evict expired blocks
+                blocked.retain(|_, expires_ms| *expires_ms > now_ms);
+                if let Some(expires_ms) = blocked.get(&mango_account) {
+                    return Err(Status::resource_exhausted(format!(
+                        "mango account {} perp order slots full, blocked until {}ms",
+                        mango_account, expires_ms
+                    )));
+                }
+            }
             let remaining_accounts = parse_remaining_accounts(&request.remaining_accounts)?;
             let user_signature = parse_signature_bytes(&request.user_signature)?;
             let chain = self.blockhashes.snapshot().await;
@@ -2494,22 +3668,216 @@ impl Engine {
         });
     }
 
+    /// Periodic loop that consumes events from the perp event queue. Without
+    /// this, fill events accumulate and maker OO slots are never freed,
+    /// eventually triggering "no free perp order index" errors that block the
+    /// execution queue. The on-chain `perp_consume_events` instruction caps
+    /// limit at 8 per call, so we run on a tight interval (default 2s).
+    async fn run_perp_event_consumer(self: Arc<Self>, executor: Arc<ExecutorState>) {
+        let interval_ms = self.config.executor_perp_consume_interval_ms;
+        if interval_ms == 0 {
+            info!("perp event consumer disabled (interval_ms=0)");
+            return;
+        }
+        let limit = self.config.executor_perp_consume_limit;
+        info!(
+            "perp event consumer enabled group={} queue={} interval_ms={} limit={}",
+            executor.group, executor.execution_queue, interval_ms, limit
+        );
+
+        // Resolve perp_market and event_queue pubkeys from any lane's
+        // canonical remaining_accounts layout. Layout indices:
+        //   [0] group, [1] mango_account, [2] owner,
+        //   [3] perp_market, [4] bids, [5] asks, [6] event_queue, [7] oracle, ...
+        let (perp_market_pk, event_queue_pk) = loop {
+            let lanes = executor.lanes_snapshot().await;
+            if let Some(lane) = lanes.first() {
+                if lane.remaining_accounts.len() >= 7 {
+                    break (
+                        lane.remaining_accounts[3].pubkey,
+                        lane.remaining_accounts[6].pubkey,
+                    );
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+        };
+        info!(
+            "perp event consumer resolved perp_market={} event_queue={}",
+            perp_market_pk, event_queue_pk
+        );
+
+        loop {
+            tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+            // Heartbeat the cranker on every tick — even an empty queue is a
+            // sign the cranker is alive and polling. The healthy gauge in the
+            // sampler treats anything within event_cranker_stale_threshold_ms
+            // as healthy.
+            self.metrics.tick_event_cranker(unix_timestamp_ms());
+            match self
+                .consume_perp_events_once(
+                    executor.group,
+                    perp_market_pk,
+                    event_queue_pk,
+                    limit,
+                )
+                .await
+            {
+                Ok(0) => {
+                    // queue empty — nothing to do
+                }
+                Ok(consumed) => {
+                    debug!(
+                        "perp event consumer consumed {} events perp_market={}",
+                        consumed, perp_market_pk
+                    );
+                    self.metrics
+                        .perp_events_consumed
+                        .fetch_add(consumed as u64, Ordering::Relaxed);
+                }
+                Err(err) => {
+                    warn!("perp event consumer error: {err:#}");
+                }
+            }
+        }
+    }
+
+    /// Reads the perp event queue, collects unique mango account keys
+    /// referenced by the next `limit` events, and sends a single
+    /// perp_consume_events instruction with those accounts as
+    /// remaining_accounts. Returns the number of events consumed.
+    async fn consume_perp_events_once(
+        &self,
+        group: Pubkey,
+        perp_market: Pubkey,
+        event_queue: Pubkey,
+        limit: usize,
+    ) -> Result<usize> {
+        // Fetch event queue account
+        let eq_account = self
+            .rpc
+            .get_account(&event_queue)
+            .await
+            .with_context(|| format!("fetch perp event queue {event_queue}"))?;
+        let keyed = KeyedAccountSharedData::new(event_queue, eq_account.into());
+        let eq = keyed
+            .load::<EventQueue>()
+            .with_context(|| format!("load EventQueue {event_queue}"))?;
+        if eq.is_empty() {
+            return Ok(0);
+        }
+
+        // Walk the next `limit` events to collect unique mango account keys.
+        let mut needed_keys: Vec<Pubkey> = Vec::with_capacity(limit * 2);
+        let mut events_to_consume = 0usize;
+        for ev in eq.iter().take(limit) {
+            let ev_type = match EventType::try_from(ev.event_type) {
+                Ok(t) => t,
+                Err(_) => break,
+            };
+            match ev_type {
+                EventType::Fill => {
+                    let fill: &FillEvent = anchor_lang::__private::bytemuck::cast_ref(ev);
+                    if !needed_keys.contains(&fill.maker) {
+                        needed_keys.push(fill.maker);
+                    }
+                    if !needed_keys.contains(&fill.taker) {
+                        needed_keys.push(fill.taker);
+                    }
+                }
+                EventType::Out => {
+                    let out: &OutEvent = anchor_lang::__private::bytemuck::cast_ref(ev);
+                    if !needed_keys.contains(&out.owner) {
+                        needed_keys.push(out.owner);
+                    }
+                }
+                EventType::Liquidate => {}
+            }
+            events_to_consume += 1;
+        }
+
+        if events_to_consume == 0 {
+            return Ok(0);
+        }
+
+        // Build the perp_consume_events instruction. Account order:
+        //   group, perp_market, event_queue, ..mango_accounts (remaining_accounts)
+        let mut accounts = vec![
+            AccountMeta::new_readonly(group, false),
+            AccountMeta::new(perp_market, false),
+            AccountMeta::new(event_queue, false),
+        ];
+        for key in &needed_keys {
+            accounts.push(AccountMeta::new(*key, false));
+        }
+        let ix = Instruction {
+            program_id: self.config.program_id,
+            accounts,
+            data: mango_v4::instruction::PerpConsumeEvents { limit }.data(),
+        };
+
+        // Build and send tx (payer-signed)
+        let chain = self.blockhashes.snapshot().await;
+        let mut instructions = vec![
+            ComputeBudgetInstruction::set_compute_unit_limit(400_000),
+            ix,
+        ];
+        if self.config.executor_prioritization_fee > 0 {
+            instructions.insert(
+                0,
+                ComputeBudgetInstruction::set_compute_unit_price(
+                    self.config.executor_prioritization_fee,
+                ),
+            );
+        }
+        let message = MessageV0::try_compile(
+            &self.config.payer.pubkey(),
+            &instructions,
+            &[],
+            chain.blockhash,
+        )?;
+        let tx = VersionedTransaction::try_new(
+            solana_sdk::message::VersionedMessage::V0(message),
+            &[self.config.payer.as_ref()],
+        )?;
+        let send_cfg = RpcSendTransactionConfig {
+            skip_preflight: true,
+            preflight_commitment: Some(CommitmentConfig::processed().commitment),
+            max_retries: Some(0),
+            ..RpcSendTransactionConfig::default()
+        };
+        let sig = self
+            .rpc
+            .send_transaction_with_config(&tx, send_cfg)
+            .await
+            .with_context(|| "send perp_consume_events tx")?;
+        debug!(
+            "perp_consume_events sent sig={} attempted_events={}",
+            sig, events_to_consume
+        );
+        Ok(events_to_consume)
+    }
+
     async fn run_executor(self: Arc<Self>, executor: Arc<ExecutorState>) {
         info!(
-            "execution engine executor enabled for group={}, queue={}, max_items={}, interval_ms={}, busy_interval_ms={}, head_lock_ms={}, pending_timeout_ms={}, status_poll_ms={}, max_pending_txs={}, pipeline_max_per_head={}, same_head_send_interval_ms={}, match_head_only={}, safe_speculative={}",
+            "execution engine executor enabled for group={}, queue={}, max_items={}, interval_ms={}, busy_interval_ms={}, head_lock_ms={}, head_refresh_ms={}, pending_timeout_ms={}, status_poll_ms={}, target_lane_fanout={}, head_scan_items={}, max_pending_txs={}, pipeline_max_per_head={}, same_head_send_interval_ms={}, no_lane_match_drop_batch_max={}, match_head_only={}, safe_speculative={}, optimistic_advance={}",
             executor.group,
             executor.execution_queue,
             self.config.executor_max_items,
             self.config.executor_interval_ms,
             self.config.executor_busy_interval_ms,
             self.config.executor_head_lock_ms,
+            self.config.executor_head_refresh_ms,
             self.config.executor_pending_timeout_ms,
             self.config.executor_status_poll_ms,
+            self.config.executor_target_lane_fanout,
+            self.config.executor_head_scan_items,
             self.config.executor_max_pending_txs,
             self.config.executor_pipeline_max_per_head,
             self.config.executor_same_head_send_interval_ms,
+            self.config.executor_no_lane_match_drop_batch_max,
             self.config.executor_match_head_only,
             self.config.executor_safe_speculative,
+            self.config.executor_optimistic_advance,
         );
 
         loop {
@@ -2524,6 +3892,10 @@ impl Engine {
                     self.config.executor_busy_interval_ms
                 }
             };
+            // Heartbeat after every iteration (success or err) so the
+            // sampler-published executor_healthy gauge tracks loop liveness
+            // rather than head movement.
+            self.metrics.tick_executor(unix_timestamp_ms());
             tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
         }
     }
@@ -2627,7 +3999,9 @@ impl Engine {
                                     retained[index].dispatch_kind,
                                     signature
                                 );
-                                if retained[index].dispatch_kind == PendingDispatchKind::Execute {
+                                if retained[index].dispatch_kind == PendingDispatchKind::Execute
+                                    && retained[index].targeted
+                                {
                                     // Treat confirmed-no-advance targeted executes as a
                                     // persistent failure; if the head doesn't move after N
                                     // confirmed txs, the lane accounts likely have a
@@ -2642,6 +4016,18 @@ impl Engine {
                             }
                         }
                         Some(status) => {
+                            // Detect ProgramFailedToComplete (heap overflow)
+                            // and adaptively reduce max_items to prevent
+                            // repeated failures that stall the queue.
+                            if matches!(
+                                status.err.as_ref(),
+                                Some(TransactionError::InstructionError(
+                                    _,
+                                    InstructionError::ProgramFailedToComplete
+                                ))
+                            ) {
+                                executor.on_heap_overflow(self.config.executor_max_items);
+                            }
                             let auto_recovered = match status.err.as_ref() {
                                 Some(err) => {
                                     self.maybe_auto_drop_terminal_head(
@@ -2657,6 +4043,9 @@ impl Engine {
                                 "executor tx failed sequence={} sig={} err={:?}",
                                 retained[index].sequence, signature, status.err
                             );
+                            // The tx landed but the program reported an error.
+                            // Count it as an executed-but-failed sample.
+                            self.metrics.record_executed_failed();
                             if !auto_recovered {
                                 self.apply_executor_lane_failure(
                                     executor,
@@ -2717,11 +4106,32 @@ impl Engine {
     async fn execute_once(&self, executor: &Arc<ExecutorState>) -> Result<ExecuteLoopOutcome> {
         let now_ms = unix_timestamp_ms();
         let last_inspect = executor.last_inspect_ms.load(Ordering::Relaxed);
-        let inspect_interval_ms = 500u64; // Only fetch queue account every 500ms
+        let inspect_interval_ms = self
+            .config
+            .executor_head_refresh_ms
+            .max(self.config.executor_head_lock_ms.max(2));
 
-        let head = if now_ms.saturating_sub(last_inspect) >= inspect_interval_ms {
+        let effective_inspect_ms = if self.config.executor_optimistic_advance {
+            self.config.executor_head_lock_ms.max(2)
+        } else {
+            inspect_interval_ms
+        };
+        let planner_lane_fanout = self.config.executor_target_lane_fanout.max(1).min(20);
+        let mut near_head_lane_entries = Vec::new();
+        let mut near_head_exact_hashes = Vec::new();
+        let head = if now_ms.saturating_sub(last_inspect) >= effective_inspect_ms {
             let accounts = self.rpc.get_account(&executor.execution_queue).await?;
             let head = inspect_queue_head(&accounts.data);
+            near_head_lane_entries = inspect_near_head_lane_entries(
+                &accounts.data,
+                &head,
+                self.config.executor_head_scan_items,
+                planner_lane_fanout,
+            );
+            near_head_exact_hashes = near_head_lane_entries
+                .iter()
+                .map(|(_, hash)| *hash)
+                .collect();
             let previous_head = *executor.cached_head.lock().await;
             executor.update_queue_count(head.count);
             executor.update_queue_next_sequence(head.next_sequence);
@@ -2741,6 +4151,11 @@ impl Engine {
                     self.metrics
                         .execute_head_advance_items
                         .fetch_add(advanced, Ordering::Relaxed);
+                    // Each on-chain head advance corresponds to that many
+                    // execution-queue items that successfully landed.
+                    self.metrics.record_executed(advanced);
+                    // Track successful advancement for adaptive max_items ramp-up
+                    executor.on_successful_advance(self.config.executor_max_items);
                     let last_logged = executor.last_progress_log_sequence.load(Ordering::Relaxed);
                     if head.next_sequence > last_logged {
                         executor
@@ -2797,31 +4212,38 @@ impl Engine {
             .map(|pending| pending.sent_at_ms)
             .max()
             .unwrap_or(0);
-        let can_pipeline_same_head = same_head_pending_count
-            < self.config.executor_pipeline_max_per_head
-            && pending_snapshot.len() < self.config.executor_max_pending_txs
-            && now_ms.saturating_sub(latest_same_head_send_ms)
-                >= self.config.executor_same_head_send_interval_ms;
-        // Only suppress if we've hit the per-head pipeline cap AND the total
-        // pending count is high.  Previously this blocked ALL sends when the
-        // current head had pending txs, idling the cranker even when it could
-        // be targeting a new head.  Now we allow sending as long as the global
-        // pending budget has room — enabling back-to-back txs for consecutive
-        // heads without waiting for confirmations.
-        if same_head_pending_count >= self.config.executor_pipeline_max_per_head
-            && pending_snapshot.len() >= self.config.executor_max_pending_txs
-        {
-            self.metrics
-                .execute_send_suppressed_pending
-                .fetch_add(1, Ordering::Relaxed);
-            return Ok(ExecuteLoopOutcome::Busy);
-        }
-        if same_head_pending_count >= self.config.executor_pipeline_max_per_head {
-            // Hit per-head cap but global budget has room — the head may have
-            // already advanced by the time the next inspect fires.  Re-inspect
-            // immediately instead of sleeping.
-            executor.last_inspect_ms.store(0, Ordering::Relaxed);
-            return Ok(ExecuteLoopOutcome::Busy);
+        // In optimistic mode we still only allow one in-flight execute per
+        // observed head. The execute instruction always starts from the
+        // current on-chain head, so broadcasting multiple txs before the head
+        // changes just creates same-head duplicates and confirmed-no-advance
+        // waste. The "pipeline" behavior we want is to re-inspect
+        // immediately and fire on the next observed head, not to flood the
+        // current one.
+        if self.config.executor_optimistic_advance {
+            if pending_snapshot.len() >= self.config.executor_max_pending_txs {
+                self.metrics
+                    .execute_send_suppressed_pending
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(ExecuteLoopOutcome::Busy);
+            }
+        } else {
+            let _can_pipeline_same_head = same_head_pending_count
+                < self.config.executor_pipeline_max_per_head
+                && pending_snapshot.len() < self.config.executor_max_pending_txs
+                && now_ms.saturating_sub(latest_same_head_send_ms)
+                    >= self.config.executor_same_head_send_interval_ms;
+            if same_head_pending_count >= self.config.executor_pipeline_max_per_head
+                && pending_snapshot.len() >= self.config.executor_max_pending_txs
+            {
+                self.metrics
+                    .execute_send_suppressed_pending
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(ExecuteLoopOutcome::Busy);
+            }
+            if same_head_pending_count >= self.config.executor_pipeline_max_per_head {
+                executor.last_inspect_ms.store(0, Ordering::Relaxed);
+                return Ok(ExecuteLoopOutcome::Busy);
+            }
         }
 
         let mut lanes = executor.lanes_snapshot().await;
@@ -2844,24 +4266,49 @@ impl Engine {
                 "ctm_gap_or_empty_slot" | "ctm_sequence_mismatch"
             );
 
-        let (candidate_lanes, speculative_mode) = if self.config.executor_match_head_only {
+        let (mut candidate_lanes, mut speculative_mode, mut planned_sequence) = if self
+            .config
+            .executor_match_head_only
+        {
             match head.head_accounts_hash {
                 Some(hash) => {
-                    let mut matched: Vec<Lane> = lanes
+                    let mut ordered_hashes = if near_head_exact_hashes.is_empty() {
+                        vec![hash]
+                    } else {
+                        near_head_exact_hashes.clone()
+                    };
+                    if ordered_hashes.first().copied() != Some(hash) {
+                        ordered_hashes.retain(|lane_hash| *lane_hash != hash);
+                        ordered_hashes.insert(0, hash);
+                    }
+                    ordered_hashes.truncate(planner_lane_fanout);
+
+                    let mut lanes_by_hash: HashMap<[u8; 32], Lane> = lanes
                         .iter()
                         .cloned()
-                        .filter(|lane| lane.hash == hash)
+                        .map(|lane| (lane.hash, lane))
                         .collect();
-                    if matched.is_empty() {
+                    let mut matched: Vec<Lane> = ordered_hashes
+                        .iter()
+                        .filter_map(|lane_hash| lanes_by_hash.remove(lane_hash))
+                        .collect();
+                    let mut matched_hashes: HashSet<[u8; 32]> =
+                        matched.iter().map(|lane| lane.hash).collect();
+                    if !matched_hashes.contains(&hash) || matched.len() < ordered_hashes.len() {
                         let _ = self.refresh_dynamic_lanes_from_event_log(executor).await;
-                        matched = executor
-                            .lanes_snapshot()
-                            .await
-                            .into_iter()
-                            .filter(|lane| lane.hash == hash)
+                        lanes = executor.lanes_snapshot().await;
+                        lanes_by_hash = lanes
+                            .iter()
+                            .cloned()
+                            .map(|lane| (lane.hash, lane))
                             .collect();
+                        matched = ordered_hashes
+                            .iter()
+                            .filter_map(|lane_hash| lanes_by_hash.remove(lane_hash))
+                            .collect();
+                        matched_hashes = matched.iter().map(|lane| lane.hash).collect();
                     }
-                    if matched.is_empty() {
+                    if !matched_hashes.contains(&hash) {
                         self.metrics
                             .execute_no_lane_match
                             .fetch_add(1, Ordering::Relaxed);
@@ -2928,38 +4375,24 @@ impl Engine {
                         );
                         return Ok(ExecuteLoopOutcome::Busy);
                     }
-                    // Include additional lanes so execute_multi can batch
-                    // consecutive items with different hashes in one tx.
-                    // With HLT (precomputed lane hashes), per-item hash matching
-                    // is O(L) byte comparisons, so more lanes are affordable.
-                    // Cap at 5 to stay within tx size limit (1232 bytes).
-                    let head_account_count = matched
-                        .first()
-                        .map(|l| l.remaining_accounts.len())
-                        .unwrap_or(0);
-                    let mut seen: std::collections::HashSet<[u8; 32]> =
-                        matched.iter().map(|l| l.hash).collect();
-                    for lane in &lanes {
-                        if seen.len() >= 5 {
-                            break;
-                        }
-                        if seen.contains(&lane.hash) {
-                            continue;
-                        }
-                        if lane.remaining_accounts.len() != head_account_count {
-                            continue;
-                        }
-                        seen.insert(lane.hash);
-                        matched.push(lane.clone());
+
+                    if matched.len() > 1 {
+                        debug!(
+                            "executor near-head lane plan sequence={} scan_items={} candidate_hashes={} matched_lanes={}",
+                            head.next_sequence,
+                            self.config.executor_head_scan_items,
+                            ordered_hashes.len(),
+                            matched.len(),
+                        );
                     }
-                    (matched, false)
+                    (matched, false, head.next_sequence)
                 }
                 None => {
                     self.metrics
                         .execute_head_missing
                         .fetch_add(1, Ordering::Relaxed);
                     let speculative_lanes = if gap_skip_mode {
-                        select_gap_speculative_lanes(lanes)
+                        select_gap_speculative_lanes(lanes.clone())
                     } else {
                         Vec::new()
                     };
@@ -2972,7 +4405,7 @@ impl Engine {
                             head.blocked_reason(),
                             speculative_lanes.len(),
                         );
-                        (speculative_lanes, true)
+                        (speculative_lanes, true, head.next_sequence)
                     } else {
                         self.metrics
                             .execute_head_blocked
@@ -2989,8 +4422,69 @@ impl Engine {
                 }
             }
         } else {
-            (lanes, true)
+            (lanes.clone(), true, head.next_sequence)
         };
+
+        if self.config.executor_optimistic_advance
+            && same_head_pending_count > 0
+            && !speculative_mode
+            && head.reason == "ctm_pending"
+        {
+            if let Some(current_hash) = head.head_accounts_hash {
+                if let Some((successor_sequence, _)) =
+                    near_head_lane_entries
+                        .iter()
+                        .copied()
+                        .find(|(sequence, hash)| {
+                            *sequence > head.next_sequence && *hash != current_hash
+                        })
+                {
+                    let speculative_already_pending = pending_snapshot
+                        .iter()
+                        .any(|pending| !pending.targeted && pending.sequence == successor_sequence);
+                    if !speculative_already_pending {
+                        let successor_hashes: Vec<[u8; 32]> = near_head_lane_entries
+                            .iter()
+                            .copied()
+                            .filter(|(sequence, _)| *sequence >= successor_sequence)
+                            .map(|(_, hash)| hash)
+                            .take(planner_lane_fanout)
+                            .collect();
+                        if !successor_hashes.is_empty() {
+                            let mut lanes_by_hash: HashMap<[u8; 32], Lane> = lanes
+                                .iter()
+                                .cloned()
+                                .map(|lane| (lane.hash, lane))
+                                .collect();
+                            let successor_lanes: Vec<Lane> = successor_hashes
+                                .iter()
+                                .filter_map(|lane_hash| lanes_by_hash.remove(lane_hash))
+                                .collect();
+                            if !successor_lanes.is_empty() {
+                                debug!(
+                                    "executor speculative successor plan base_sequence={} successor_sequence={} hashes={} lanes={}",
+                                    head.next_sequence,
+                                    successor_sequence,
+                                    successor_hashes.len(),
+                                    successor_lanes.len(),
+                                );
+                                candidate_lanes = successor_lanes;
+                                speculative_mode = true;
+                                planned_sequence = successor_sequence;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if self.config.executor_optimistic_advance
+            && same_head_pending_count > 0
+            && !speculative_mode
+        {
+            executor.last_inspect_ms.store(0, Ordering::Relaxed);
+            return Ok(ExecuteLoopOutcome::Busy);
+        }
 
         if pending_snapshot.len() >= self.config.executor_max_pending_txs {
             return Ok(ExecuteLoopOutcome::Busy);
@@ -3064,6 +4558,7 @@ impl Engine {
         }
 
         // Collect eligible lanes (de-dup by hash, skip backed-off lanes)
+        let target_lane_fanout = planner_lane_fanout;
         let mut eligible_lanes: Vec<Lane> = Vec::new();
         let mut seen_hashes = std::collections::HashSet::new();
         for lane in candidate_lanes {
@@ -3076,8 +4571,8 @@ impl Engine {
                 continue;
             }
             eligible_lanes.push(lane);
-            if eligible_lanes.len() >= 5 {
-                break; // Cap at 5 lanes to fit within tx size limit (1232 bytes)
+            if eligible_lanes.len() >= target_lane_fanout {
+                break;
             }
         }
 
@@ -3098,28 +4593,169 @@ impl Engine {
             return Ok(ExecuteLoopOutcome::Busy);
         }
 
+        // Fast-path: if the head's mango account is blocked (perp order slots
+        // full), skip the execute tx entirely and batch-drop items directly.
+        // The mango account is remaining_accounts[1] in the matched lane.
+        // The on-chain drop_ctm instruction doesn't check expiry — it drops
+        // whatever the admin tells it to.  We batch up to 8 consecutive
+        // pending items per tx for high-throughput draining.
+        {
+            let blocked = self.blocked_mango_accounts.lock().await;
+            if !blocked.is_empty() {
+                if let Some(lane) = eligible_lanes.first() {
+                    if lane.remaining_accounts.len() > 1 {
+                        let mango_acct = lane.remaining_accounts[1].pubkey;
+                        if blocked.contains_key(&mango_acct) {
+                            drop(blocked);
+                            // Read queue state and build batch of consecutive pending items
+                            let batch_max = self.config.executor_expired_head_drop_batch_max.max(8);
+                            match self.rpc.get_account(&executor.execution_queue).await {
+                                Ok(queue_account) => {
+                                    let qs = inspect_queue_admin_state(&queue_account.data);
+                                    if qs.head.reason == "ctm_pending"
+                                        && qs.head.next_sequence == head.next_sequence
+                                    {
+                                        // Collect consecutive pending sequences
+                                        let mut seqs = Vec::new();
+                                        let start = qs.head.next_sequence;
+                                        let end = qs
+                                            .head
+                                            .max_seen_sequence
+                                            .saturating_add(1)
+                                            .min(start + batch_max as u64);
+                                        for seq in start..end {
+                                            let off = EXECUTION_QUEUE_CTM_ITEMS_OFFSET
+                                                + (seq as usize % EXECUTION_QUEUE_CTM_CAPACITY)
+                                                    * EXECUTION_QUEUE_ITEM_SIZE;
+                                            if off + EXECUTION_QUEUE_ITEM_SIZE
+                                                > queue_account.data.len()
+                                            {
+                                                break;
+                                            }
+                                            let slot_seq = u64::from_le_bytes(
+                                                queue_account.data[off
+                                                    + EXECUTION_QUEUE_ITEM_SEQUENCE_OFFSET
+                                                    ..off
+                                                        + EXECUTION_QUEUE_ITEM_SEQUENCE_OFFSET
+                                                        + 8]
+                                                    .try_into()
+                                                    .unwrap_or([0; 8]),
+                                            );
+                                            let slot_status = queue_account.data
+                                                [off + EXECUTION_QUEUE_ITEM_STATUS_OFFSET];
+                                            if slot_status != 1 || slot_seq != seq {
+                                                break;
+                                            }
+                                            seqs.push(seq);
+                                        }
+                                        if !seqs.is_empty() {
+                                            let count = seqs.len();
+                                            let mut ixs =
+                                                vec![build_execution_queue_configure_instruction(
+                                                    self.config.program_id,
+                                                    executor.group,
+                                                    executor.execution_queue,
+                                                    self.config.executor_admin.pubkey(),
+                                                    &qs,
+                                                    true,
+                                                )];
+                                            for seq in &seqs {
+                                                ixs.push(
+                                                    build_execution_queue_drop_ctm_instruction(
+                                                        self.config.program_id,
+                                                        executor.group,
+                                                        executor.execution_queue,
+                                                        self.config.executor_admin.pubkey(),
+                                                        *seq,
+                                                    ),
+                                                );
+                                            }
+                                            ixs.push(build_execution_queue_configure_instruction(
+                                                self.config.program_id,
+                                                executor.group,
+                                                executor.execution_queue,
+                                                self.config.executor_admin.pubkey(),
+                                                &qs,
+                                                false,
+                                            ));
+                                            let chain = self.blockhashes.snapshot().await;
+                                            if let Ok(msg) = MessageV0::try_compile(
+                                                &self.config.executor_admin.pubkey(),
+                                                &ixs,
+                                                &[],
+                                                chain.blockhash,
+                                            ) {
+                                                if let Ok(tx) = VersionedTransaction::try_new(
+                                                    solana_sdk::message::VersionedMessage::V0(msg),
+                                                    &[self.config.executor_admin.as_ref()],
+                                                ) {
+                                                    match self
+                                                        .rpc
+                                                        .send_transaction_with_config(
+                                                            &tx,
+                                                            RpcSendTransactionConfig {
+                                                                skip_preflight: true,
+                                                                ..Default::default()
+                                                            },
+                                                        )
+                                                        .await
+                                                    {
+                                                        Ok(sig) => {
+                                                            info!(
+                                                                "executor fast-drop batch={} blocked_account={} seq={}..{} tx={}",
+                                                                count, mango_acct, seqs[0],
+                                                                seqs[seqs.len()-1], sig,
+                                                            );
+                                                        }
+                                                        Err(err) => {
+                                                            debug!("executor fast-drop send failed: {err:?}");
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    debug!("executor fast-drop queue read failed: {err:?}");
+                                }
+                            }
+                            executor.last_inspect_ms.store(0, Ordering::Relaxed);
+                            return Ok(ExecuteLoopOutcome::Sent);
+                        }
+                    }
+                }
+            }
+        }
+
         // Build and send ONE multi-lane execute tx
         self.metrics
             .execute_attempts
             .fetch_add(1, Ordering::Relaxed);
-        self.metrics
-            .execute_targeted
-            .fetch_add(1, Ordering::Relaxed);
+        if speculative_mode {
+            self.metrics
+                .execute_speculative
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.metrics
+                .execute_targeted
+                .fetch_add(1, Ordering::Relaxed);
+        }
 
         let (tx, send_cfg) = if eligible_lanes.len() > 1 {
             match self
-                .build_execute_multi_tx(&eligible_lanes, executor, head.next_sequence)
+                .build_execute_multi_tx(&eligible_lanes, executor, planned_sequence)
                 .await
             {
                 Ok(built) => built,
                 Err(err) => {
                     warn!("executor multi-lane build failed, falling back to single: {err:?}");
-                    self.build_execute_tx(&eligible_lanes[0], executor, head.next_sequence)
+                    self.build_execute_tx(&eligible_lanes[0], executor, planned_sequence)
                         .await?
                 }
             }
         } else {
-            self.build_execute_tx(&eligible_lanes[0], executor, head.next_sequence)
+            self.build_execute_tx(&eligible_lanes[0], executor, planned_sequence)
                 .await?
         };
 
@@ -3131,6 +4767,91 @@ impl Engine {
             tokio::spawn(async move {
                 let _ = sec.send_transaction_with_config(&tx_clone, cfg_clone).await;
             });
+        }
+
+        // Optimistic advance mode: send transaction asynchronously (fire-and-forget)
+        // and immediately return Sent so the next loop iteration can build the next
+        // tx without waiting for the RPC send round-trip (~200ms).  Confirmation
+        // happens via the normal pending_dispatches reconciliation loop.
+        if self.config.executor_optimistic_advance {
+            let rpc = self.rpc.clone();
+            let tx_clone = tx.clone();
+            let cfg_clone = send_cfg;
+            let metrics = self.metrics.clone();
+            let pending = executor.pending_dispatches.clone();
+            let executor_clone = executor.clone();
+            let sequence = planned_sequence;
+            let accounts_hash = if speculative_mode {
+                eligible_lanes.first().map(|lane| lane.hash)
+            } else {
+                head.head_accounts_hash
+            };
+            let lane_hash = eligible_lanes[0].hash;
+            let is_speculative = speculative_mode;
+            let is_pipeline = same_head_pending_count > 0;
+            let logged_same_head_pending = if speculative_mode {
+                same_head_pending_count
+            } else {
+                same_head_pending_count + 1
+            };
+            let self_ref = self.clone();
+            let lane_hash_for_failure = eligible_lanes[0].hash;
+
+            tokio::spawn(async move {
+                match rpc.send_transaction_with_config(&tx_clone, cfg_clone).await {
+                    Ok(signature) => {
+                        metrics.execute_sent.fetch_add(1, Ordering::Relaxed);
+                        if is_pipeline {
+                            metrics
+                                .execute_pipeline_sent
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        let mut dispatches = pending.lock().await;
+                        dispatches.push(PendingHeadDispatch {
+                            sequence,
+                            accounts_hash,
+                            lane_hash,
+                            dispatch_kind: PendingDispatchKind::Execute,
+                            sent_at_ms: unix_timestamp_ms(),
+                            last_status_check_ms: unix_timestamp_ms(),
+                            no_advance_recorded: false,
+                            targeted: !is_speculative,
+                            signature: signature.clone(),
+                        });
+                    }
+                    Err(err) => {
+                        let failure_class = classify_lane_failure(&anyhow::anyhow!("{err}"));
+                        if failure_class.is_deterministic() {
+                            self_ref
+                                .apply_executor_lane_failure(
+                                    &executor_clone,
+                                    lane_hash_for_failure,
+                                    failure_class.as_str(),
+                                )
+                                .await;
+                        }
+                        warn!(
+                            "executor async send failed class={} err={err:?}",
+                            failure_class.as_str(),
+                        );
+                    }
+                }
+            });
+
+            self.metrics
+                .execute_attempts
+                .fetch_sub(0, Ordering::Relaxed); // noop to keep counters consistent
+            info!(
+                "executor fire-and-forget multi-lane lanes={} sequence={} queue_count={} pending_same_head={} speculative={}",
+                eligible_lanes.len(),
+                planned_sequence,
+                head.count,
+                logged_same_head_pending,
+                speculative_mode,
+            );
+            // Force immediate re-inspect to pick up next head
+            executor.last_inspect_ms.store(0, Ordering::Relaxed);
+            return Ok(ExecuteLoopOutcome::Sent);
         }
 
         let send_result = self
@@ -3149,8 +4870,12 @@ impl Engine {
                 }
                 let mut dispatches = executor.pending_dispatches.lock().await;
                 dispatches.push(PendingHeadDispatch {
-                    sequence: head.next_sequence,
-                    accounts_hash: head.head_accounts_hash,
+                    sequence: planned_sequence,
+                    accounts_hash: if speculative_mode {
+                        eligible_lanes.first().map(|lane| lane.hash)
+                    } else {
+                        head.head_accounts_hash
+                    },
                     lane_hash: eligible_lanes[0].hash,
                     dispatch_kind: PendingDispatchKind::Execute,
                     sent_at_ms: now_ms,
@@ -3160,14 +4885,20 @@ impl Engine {
                     signature: signature.clone(),
                 });
                 info!(
-                    "executor sent multi-lane lanes={} sequence={} queue_count={} pending_total={} pending_same_head={} tx={}",
+                    "executor sent multi-lane lanes={} sequence={} queue_count={} pending_total={} pending_same_head={} speculative={} tx={}",
                     eligible_lanes.len(),
-                    head.next_sequence,
+                    planned_sequence,
                     head.count,
                     pending_snapshot.len() + 1,
-                    same_head_pending_count + 1,
+                    if speculative_mode {
+                        same_head_pending_count
+                    } else {
+                        same_head_pending_count + 1
+                    },
+                    speculative_mode,
                     signature,
                 );
+
                 return Ok(ExecuteLoopOutcome::Sent);
             }
             Err(err) => {
@@ -3219,7 +4950,7 @@ impl Engine {
                 executor.group,
                 executor.execution_queue,
                 &lane.remaining_accounts,
-                self.config.executor_max_items,
+                executor.effective_max_items(self.config.executor_max_items),
             ),
         ];
         if self.config.executor_prioritization_fee > 0 {
@@ -3272,7 +5003,7 @@ impl Engine {
                 executor.execution_queue,
                 &lane_accounts,
                 lane_hashes,
-                self.config.executor_max_items,
+                executor.effective_max_items(self.config.executor_max_items),
             ),
         ];
         if self.config.executor_prioritization_fee > 0 {
@@ -3320,7 +5051,9 @@ impl Engine {
                 executor.group,
                 executor.execution_queue,
                 &lane.remaining_accounts,
-                self.config.executor_max_items.max(1),
+                executor
+                    .effective_max_items(self.config.executor_max_items)
+                    .max(1),
             ),
         ];
         if self.config.executor_prioritization_fee > 0 {
@@ -3454,6 +5187,421 @@ fn parse_signature_bytes(bytes: &[u8]) -> Result<[u8; 64], Status> {
     bytes.try_into().map_err(|_| {
         Status::invalid_argument("user_signature must be exactly 64 bytes".to_string())
     })
+}
+
+fn decode_margin_check_ops(payload: &[u8]) -> Result<Option<Vec<MarginCheckOp>>> {
+    if payload.is_empty() {
+        return Ok(None);
+    }
+    if payload.len() < QUEUE_PAYLOAD_HEADER_LEN {
+        return Err(anyhow!(
+            "queue payload too short: expected at least {} bytes, got {}",
+            QUEUE_PAYLOAD_HEADER_LEN,
+            payload.len()
+        ));
+    }
+    let version = payload[0];
+    if version != QUEUE_PAYLOAD_VERSION_V1 {
+        return Err(anyhow!("unsupported queue payload version: {version}"));
+    }
+    let variant = queue_payload_variant_from_byte(payload[1])?;
+    let flags = u16::from_le_bytes([payload[2], payload[3]]);
+    if flags != 0 {
+        return Err(anyhow!("queue payload flags must be zero, got {flags}"));
+    }
+    let body = &payload[QUEUE_PAYLOAD_HEADER_LEN..];
+    match variant {
+        QueuePayloadVariant::PerpPlaceOrderV2 => {
+            let place = decode_perp_place_order_margin_op(body)?;
+            Ok(Some(vec![place]).filter(|ops| !ops.is_empty()))
+        }
+        QueuePayloadVariant::PerpBatchIntent => {
+            let ops = decode_perp_batch_margin_ops(body)?;
+            if ops
+                .iter()
+                .any(|op| matches!(op, MarginCheckOp::Place { .. }))
+            {
+                Ok(Some(ops))
+            } else {
+                Ok(None)
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+fn queue_payload_variant_from_byte(value: u8) -> Result<QueuePayloadVariant> {
+    match value {
+        0 => Ok(QueuePayloadVariant::PerpPlaceOrderV2),
+        1 => Ok(QueuePayloadVariant::PerpCancelOrder),
+        2 => Ok(QueuePayloadVariant::PerpCancelOrderByClientOrderId),
+        3 => Ok(QueuePayloadVariant::PerpCancelAllOrders),
+        4 => Ok(QueuePayloadVariant::PerpCancelAllOrdersBySide),
+        5 => Ok(QueuePayloadVariant::LiquidityDeposit),
+        6 => Ok(QueuePayloadVariant::LiquidityWithdraw),
+        7 => Ok(QueuePayloadVariant::PerpCancelOrderBySlot),
+        8 => Ok(QueuePayloadVariant::PerpBatchIntent),
+        _ => Err(anyhow!("unknown queue payload variant: {value}")),
+    }
+}
+
+fn decode_perp_place_order_margin_op(body: &[u8]) -> Result<MarginCheckOp> {
+    if body.len() != PERP_PLACE_ORDER_V2_PAYLOAD_LEN {
+        return Err(anyhow!(
+            "unexpected perp place payload length: expected {}, got {}",
+            PERP_PLACE_ORDER_V2_PAYLOAD_LEN,
+            body.len()
+        ));
+    }
+    let order = PerpPlaceOrderV2Payload::try_from_slice(body)
+        .map_err(|err| anyhow!("failed to deserialize perp place payload: {err}"))?;
+    Ok(MarginCheckOp::Place {
+        side: order.side,
+        max_base_lots: order.max_base_lots,
+        reduce_only: order.reduce_only,
+    })
+}
+
+fn decode_perp_batch_margin_ops(body: &[u8]) -> Result<Vec<MarginCheckOp>> {
+    if body.is_empty() {
+        return Err(anyhow!("empty perp batch payload"));
+    }
+    let op_count = body[0] as usize;
+    if op_count == 0 || op_count > PERP_BATCH_INTENT_MAX_OPS {
+        return Err(anyhow!("invalid perp batch op count: {op_count}"));
+    }
+
+    let mut offset = 1usize;
+    let mut ops = Vec::with_capacity(op_count);
+    for _ in 0..op_count {
+        if offset >= body.len() {
+            return Err(anyhow!("perp batch payload ended before op header"));
+        }
+        let variant = body[offset];
+        offset += 1;
+        match variant {
+            0 => {
+                if offset + PERP_CANCEL_ORDER_BY_SLOT_PAYLOAD_LEN > body.len() {
+                    return Err(anyhow!("perp batch cancel-by-slot payload truncated"));
+                }
+                let cancel = PerpCancelOrderBySlotPayload::try_from_slice(
+                    &body[offset..offset + PERP_CANCEL_ORDER_BY_SLOT_PAYLOAD_LEN],
+                )
+                .map_err(|err| {
+                    anyhow!("failed to deserialize batch cancel-by-slot payload: {err}")
+                })?;
+                ops.push(MarginCheckOp::CancelByOrderId {
+                    expected_order_id: cancel.expected_order_id,
+                });
+                offset += PERP_CANCEL_ORDER_BY_SLOT_PAYLOAD_LEN;
+            }
+            1 => {
+                if offset + PERP_PLACE_ORDER_V2_PAYLOAD_LEN > body.len() {
+                    return Err(anyhow!("perp batch place payload truncated"));
+                }
+                let place = decode_perp_place_order_margin_op(
+                    &body[offset..offset + PERP_PLACE_ORDER_V2_PAYLOAD_LEN],
+                )?;
+                ops.push(place);
+                offset += PERP_PLACE_ORDER_V2_PAYLOAD_LEN;
+            }
+            _ => return Err(anyhow!("unknown perp batch op variant: {variant}")),
+        }
+    }
+    if offset != body.len() {
+        return Err(anyhow!(
+            "perp batch payload had {} trailing bytes",
+            body.len().saturating_sub(offset)
+        ));
+    }
+    Ok(ops)
+}
+
+fn build_harness_margin_snapshot(
+    user_state: Option<&HarnessUserState>,
+    requested_mango_account: &str,
+) -> Result<HarnessMarginSnapshot> {
+    let Some(user_state) = user_state else {
+        return Ok(HarnessMarginSnapshot::default());
+    };
+
+    let mut snapshot = HarnessMarginSnapshot::default();
+    for order in user_state
+        .open_orders
+        .iter()
+        .filter(|order| order.mango_account == requested_mango_account)
+    {
+        let order_id = parse_wire_u128("harness order_id", &order.order_id)?;
+        let market_index =
+            parse_wire_perp_market_index("harness open order market", &order.market)?;
+        let base_lots = parse_wire_i64("harness open order base_lots", &order.base_lots)?;
+        let side = parse_harness_order_side(&order.side)?;
+        snapshot.orders_by_id.insert(
+            order_id,
+            HarnessOrderExposure {
+                market_index,
+                side,
+                base_lots,
+            },
+        );
+        let overlay = snapshot.overlays.entry(market_index).or_default();
+        match side {
+            Side::Bid => overlay.bids_base_lots = overlay.bids_base_lots.saturating_add(base_lots),
+            Side::Ask => overlay.asks_base_lots = overlay.asks_base_lots.saturating_add(base_lots),
+        }
+    }
+
+    let is_single_account = user_state.mango_accounts.len() == 1
+        && user_state
+            .mango_accounts
+            .iter()
+            .any(|account| account == requested_mango_account);
+    if is_single_account {
+        for entry in &user_state.per_market {
+            let market_index =
+                parse_wire_perp_market_index("harness per_market market", &entry.market)?;
+            let overlay = snapshot.overlays.entry(market_index).or_default();
+            overlay.base_position_lots = parse_wire_i64(
+                "harness per_market base_position_lots",
+                &entry.base_position_lots,
+            )?;
+            overlay.quote_position_native = parse_wire_i80f48(
+                "harness per_market quote_position_native",
+                &entry.quote_position_native,
+            )?;
+            overlay.bids_base_lots = parse_wire_i64(
+                "harness per_market open_order_base_lots_bid",
+                &entry.open_order_base_lots_bid,
+            )?;
+            overlay.asks_base_lots = parse_wire_i64(
+                "harness per_market open_order_base_lots_ask",
+                &entry.open_order_base_lots_ask,
+            )?;
+        }
+    }
+
+    Ok(snapshot)
+}
+
+fn parse_harness_order_side(raw: &str) -> Result<Side> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "bid" => Ok(Side::Bid),
+        "ask" => Ok(Side::Ask),
+        other => Err(anyhow!("invalid harness order side: {other}")),
+    }
+}
+
+fn parse_wire_i64(label: &str, raw: &str) -> Result<i64> {
+    raw.trim()
+        .parse::<i64>()
+        .with_context(|| format!("failed to parse {label} as i64"))
+}
+
+fn parse_wire_u128(label: &str, raw: &str) -> Result<u128> {
+    raw.trim()
+        .parse::<u128>()
+        .with_context(|| format!("failed to parse {label} as u128"))
+}
+
+fn parse_wire_perp_market_index(label: &str, raw: &str) -> Result<PerpMarketIndex> {
+    raw.trim()
+        .parse::<PerpMarketIndex>()
+        .with_context(|| format!("failed to parse {label} as perp market index"))
+}
+
+fn parse_wire_i80f48(label: &str, raw: &str) -> Result<I80F48> {
+    I80F48::from_str(raw.trim()).map_err(|err| anyhow!("failed to parse {label} as I80F48: {err}"))
+}
+
+fn effective_requested_base_lots(
+    side: Side,
+    reduce_only: bool,
+    max_base_lots: i64,
+    current_base_lots: i64,
+) -> i64 {
+    if max_base_lots <= 0 {
+        return 0;
+    }
+    if !reduce_only {
+        return max_base_lots;
+    }
+    match side {
+        Side::Bid => max_base_lots.min((-current_base_lots).max(0)),
+        Side::Ask => max_base_lots.min(current_base_lots.max(0)),
+    }
+}
+
+fn apply_margin_check_ops(
+    account: &mut MangoAccountValue,
+    target_market: &PerpMarket,
+    margin_ops: &[MarginCheckOp],
+    orders_by_id: &mut HashMap<u128, HarnessOrderExposure>,
+) -> Result<()> {
+    let position = account.perp_position_mut(target_market.perp_market_index)?;
+    for op in margin_ops {
+        match *op {
+            MarginCheckOp::CancelByOrderId { expected_order_id } => {
+                let Some(order) = orders_by_id.remove(&expected_order_id) else {
+                    continue;
+                };
+                if order.market_index != target_market.perp_market_index || order.base_lots <= 0 {
+                    continue;
+                }
+                match order.side {
+                    Side::Bid => {
+                        position.bids_base_lots =
+                            position.bids_base_lots.saturating_sub(order.base_lots);
+                    }
+                    Side::Ask => {
+                        position.asks_base_lots =
+                            position.asks_base_lots.saturating_sub(order.base_lots);
+                    }
+                }
+            }
+            MarginCheckOp::Place {
+                side,
+                max_base_lots,
+                reduce_only,
+            } => {
+                let effective_lots = effective_requested_base_lots(
+                    side,
+                    reduce_only,
+                    max_base_lots,
+                    position.effective_base_position_lots(),
+                );
+                if effective_lots <= 0 {
+                    continue;
+                }
+                match side {
+                    Side::Bid => {
+                        position.bids_base_lots =
+                            position.bids_base_lots.saturating_add(effective_lots);
+                    }
+                    Side::Ask => {
+                        position.asks_base_lots =
+                            position.asks_base_lots.saturating_add(effective_lots);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn build_margin_health_accounts(
+    account: &MangoAccountValue,
+    account_map: &HashMap<Pubkey, KeyedAccountSharedData>,
+) -> Result<Vec<KeyedAccountSharedData>> {
+    let mut bank_by_token_index = HashMap::new();
+    let mut perp_by_market_index = HashMap::new();
+    for (pubkey, account_data) in account_map {
+        if let Ok(bank) = account_data.load::<Bank>() {
+            bank_by_token_index
+                .entry(bank.token_index)
+                .or_insert(*pubkey);
+        }
+        if let Ok(perp_market) = account_data.load::<PerpMarket>() {
+            perp_by_market_index
+                .entry(perp_market.perp_market_index)
+                .or_insert(*pubkey);
+        }
+    }
+
+    let mut ordered_accounts = Vec::new();
+    let mut required_pubkeys = HashSet::new();
+    for token_position in account.active_token_positions() {
+        let token_index = token_position.token_index;
+        let bank_pubkey = bank_by_token_index
+            .get(&token_index)
+            .copied()
+            .with_context(|| {
+                format!(
+                    "missing bank account for token index {} during margin precheck",
+                    token_index
+                )
+            })?;
+        append_margin_health_account(account_map, &mut ordered_accounts, bank_pubkey)?;
+        required_pubkeys.insert(bank_pubkey);
+    }
+    for token_position in account.active_token_positions() {
+        let token_index = token_position.token_index;
+        let bank_pubkey = bank_by_token_index
+            .get(&token_index)
+            .copied()
+            .with_context(|| {
+                format!(
+                    "missing bank account for token index {} during margin precheck",
+                    token_index
+                )
+            })?;
+        let bank = account_map
+            .get(&bank_pubkey)
+            .context("bank account disappeared during margin precheck")?
+            .load::<Bank>()?;
+        append_margin_health_account(account_map, &mut ordered_accounts, bank.oracle)?;
+        required_pubkeys.insert(bank.oracle);
+    }
+    for perp_position in account.active_perp_positions() {
+        let market_index = perp_position.market_index;
+        let market_pubkey = perp_by_market_index
+            .get(&market_index)
+            .copied()
+            .with_context(|| {
+                format!(
+                    "missing perp market account for market index {} during margin precheck",
+                    market_index
+                )
+            })?;
+        append_margin_health_account(account_map, &mut ordered_accounts, market_pubkey)?;
+        required_pubkeys.insert(market_pubkey);
+    }
+    for perp_position in account.active_perp_positions() {
+        let market_index = perp_position.market_index;
+        let market_pubkey = perp_by_market_index
+            .get(&market_index)
+            .copied()
+            .with_context(|| {
+                format!(
+                    "missing perp market account for market index {} during margin precheck",
+                    market_index
+                )
+            })?;
+        let market = account_map
+            .get(&market_pubkey)
+            .context("perp market account disappeared during margin precheck")?
+            .load::<PerpMarket>()?;
+        append_margin_health_account(account_map, &mut ordered_accounts, market.oracle)?;
+        required_pubkeys.insert(market.oracle);
+    }
+    for serum_orders in account.active_serum3_orders() {
+        let open_orders = serum_orders.open_orders;
+        append_margin_health_account(account_map, &mut ordered_accounts, open_orders)?;
+        required_pubkeys.insert(open_orders);
+    }
+    for openbook_orders in account.active_openbook_v2_orders() {
+        let open_orders = openbook_orders.open_orders;
+        append_margin_health_account(account_map, &mut ordered_accounts, open_orders)?;
+        required_pubkeys.insert(open_orders);
+    }
+    for (pubkey, account_data) in account_map {
+        if required_pubkeys.contains(pubkey) {
+            continue;
+        }
+        ordered_accounts.push(account_data.clone());
+    }
+    Ok(ordered_accounts)
+}
+
+fn append_margin_health_account(
+    account_map: &HashMap<Pubkey, KeyedAccountSharedData>,
+    ordered_accounts: &mut Vec<KeyedAccountSharedData>,
+    pubkey: Pubkey,
+) -> Result<()> {
+    let account = account_map
+        .get(&pubkey)
+        .with_context(|| format!("required health account missing: {pubkey}"))?;
+    ordered_accounts.push(account.clone());
+    Ok(())
 }
 
 fn merge_effective_runtime_flags(
@@ -3965,7 +6113,10 @@ struct QueueHead {
 
 impl QueueHead {
     fn is_ctm_gap_state(&self) -> bool {
-        matches!(self.reason, "ctm_gap_or_empty_slot" | "ctm_sequence_mismatch")
+        matches!(
+            self.reason,
+            "ctm_gap_or_empty_slot" | "ctm_sequence_mismatch"
+        )
     }
 
     fn blocked_reason(&self) -> String {
@@ -4274,11 +6425,7 @@ fn find_next_pending_ctm_sequence(
     None
 }
 
-fn inspect_gap_recovery_batch(
-    queue_data: &[u8],
-    head: &QueueHead,
-    max_batch: usize,
-) -> Vec<u64> {
+fn inspect_gap_recovery_batch(queue_data: &[u8], head: &QueueHead, max_batch: usize) -> Vec<u64> {
     if max_batch == 0 || !head.is_ctm_gap_state() {
         return Vec::new();
     }
@@ -4295,6 +6442,118 @@ fn inspect_gap_recovery_batch(
     let mut sequence = first_pending_sequence;
     while sequence <= end_sequence {
         if inspect_queue_sequence_presence(queue_data, sequence) != QueueSequencePresence::Pending {
+            break;
+        }
+        sequences.push(sequence);
+        sequence = sequence.saturating_add(1);
+    }
+    sequences
+}
+
+fn inspect_near_head_lane_entries(
+    queue_data: &[u8],
+    head: &QueueHead,
+    max_scan_items: usize,
+    max_unique_hashes: usize,
+) -> Vec<(u64, [u8; 32])> {
+    if max_scan_items == 0 || max_unique_hashes == 0 || head.reason != "ctm_pending" {
+        return Vec::new();
+    }
+
+    let max_scan_items = max_scan_items.min(64);
+    let max_unique_hashes = max_unique_hashes.min(20);
+    let end_sequence = head
+        .next_sequence
+        .saturating_add(max_scan_items.saturating_sub(1) as u64)
+        .min(head.max_seen_sequence);
+
+    let mut entries = Vec::new();
+    let mut seen = HashSet::new();
+    let mut sequence = head.next_sequence;
+    while sequence <= end_sequence {
+        let ctm_offset = EXECUTION_QUEUE_CTM_ITEMS_OFFSET
+            + (sequence as usize % EXECUTION_QUEUE_CTM_CAPACITY) * EXECUTION_QUEUE_ITEM_SIZE;
+        if ctm_offset + EXECUTION_QUEUE_ITEM_SIZE > queue_data.len() {
+            break;
+        }
+        let slot_sequence = u64::from_le_bytes(
+            queue_data[ctm_offset + EXECUTION_QUEUE_ITEM_SEQUENCE_OFFSET
+                ..ctm_offset + EXECUTION_QUEUE_ITEM_SEQUENCE_OFFSET + 8]
+                .try_into()
+                .unwrap_or([0; 8]),
+        );
+        let slot_kind = queue_data[ctm_offset + EXECUTION_QUEUE_ITEM_KIND_OFFSET];
+        let slot_status = queue_data[ctm_offset + EXECUTION_QUEUE_ITEM_STATUS_OFFSET];
+        if slot_status != 1 || slot_kind != 0 || slot_sequence != sequence {
+            break;
+        }
+
+        let mut slot_hash = [0u8; 32];
+        slot_hash.copy_from_slice(
+            &queue_data[ctm_offset + EXECUTION_QUEUE_ITEM_ACCOUNTS_HASH_OFFSET
+                ..ctm_offset + EXECUTION_QUEUE_ITEM_ACCOUNTS_HASH_OFFSET + 32],
+        );
+        if seen.insert(slot_hash) {
+            entries.push((sequence, slot_hash));
+            if entries.len() >= max_unique_hashes {
+                break;
+            }
+        }
+        sequence = sequence.saturating_add(1);
+    }
+
+    entries
+}
+
+fn inspect_near_head_lane_hashes(
+    queue_data: &[u8],
+    head: &QueueHead,
+    max_scan_items: usize,
+    max_unique_hashes: usize,
+) -> Vec<[u8; 32]> {
+    inspect_near_head_lane_entries(queue_data, head, max_scan_items, max_unique_hashes)
+        .into_iter()
+        .map(|(_, hash)| hash)
+        .collect()
+}
+
+fn inspect_no_lane_match_batch(queue_data: &[u8], head: &QueueHead, max_batch: usize) -> Vec<u64> {
+    if max_batch == 0 || head.reason != "ctm_pending" {
+        return Vec::new();
+    }
+    let Some(target_hash) = head.head_accounts_hash else {
+        return Vec::new();
+    };
+
+    let mut sequences = Vec::new();
+    let end_sequence = head
+        .next_sequence
+        .saturating_add(max_batch.saturating_sub(1) as u64)
+        .min(head.max_seen_sequence);
+    let mut sequence = head.next_sequence;
+    while sequence <= end_sequence {
+        let ctm_offset = EXECUTION_QUEUE_CTM_ITEMS_OFFSET
+            + (sequence as usize % EXECUTION_QUEUE_CTM_CAPACITY) * EXECUTION_QUEUE_ITEM_SIZE;
+        if ctm_offset + EXECUTION_QUEUE_ITEM_SIZE > queue_data.len() {
+            break;
+        }
+        let slot_sequence = u64::from_le_bytes(
+            queue_data[ctm_offset + EXECUTION_QUEUE_ITEM_SEQUENCE_OFFSET
+                ..ctm_offset + EXECUTION_QUEUE_ITEM_SEQUENCE_OFFSET + 8]
+                .try_into()
+                .unwrap_or([0; 8]),
+        );
+        let slot_kind = queue_data[ctm_offset + EXECUTION_QUEUE_ITEM_KIND_OFFSET];
+        let slot_status = queue_data[ctm_offset + EXECUTION_QUEUE_ITEM_STATUS_OFFSET];
+        if slot_status != 1 || slot_kind != 0 || slot_sequence != sequence {
+            break;
+        }
+        let mut slot_hash = [0u8; 32];
+        slot_hash.copy_from_slice(
+            &queue_data[ctm_offset + EXECUTION_QUEUE_ITEM_ACCOUNTS_HASH_OFFSET
+                ..ctm_offset + EXECUTION_QUEUE_ITEM_ACCOUNTS_HASH_OFFSET + 32],
+        );
+        if slot_hash != target_hash {
             break;
         }
         sequences.push(sequence);
@@ -4394,6 +6653,32 @@ fn rpc_status(err: impl std::fmt::Display) -> Status {
     Status::deadline_exceeded(message)
 }
 
+fn parse_startup_flags() -> Result<StartupFlags> {
+    parse_startup_flags_from_iter(std::env::args().skip(1))
+}
+
+fn parse_startup_flags_from_iter<I, S>(args: I) -> Result<StartupFlags>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut flags = StartupFlags::default();
+    for arg in args {
+        match arg.as_ref() {
+            "--enable-health-check" => {
+                flags.enable_health_check = true;
+            }
+            "--help" | "-h" => {
+                return Err(anyhow!(
+                    "usage: service-mango-execution-engine [--enable-health-check]"
+                ));
+            }
+            other => return Err(anyhow!("unknown startup flag: {other}")),
+        }
+    }
+    Ok(flags)
+}
+
 async fn run_http_server(bind_addr: SocketAddr, metrics: Arc<Metrics>) {
     let metrics_filter = warp::any().map(move || metrics.clone());
     let healthz =
@@ -4410,6 +6695,239 @@ async fn run_http_server(bind_addr: SocketAddr, metrics: Arc<Metrics>) {
     warp::serve(healthz.or(metrics_route)).run(bind_addr).await;
 }
 
+/// Snapshot of (timestamp_ms, counter_value) used by the sampler to compute
+/// rates and windowed deltas without ever touching the hot path's atomics
+/// more than once per tick.
+#[derive(Clone, Copy)]
+struct CounterTick {
+    ts_ms: u64,
+    ingress_total: u64,
+    ingress_accepted_total: u64,
+    ingress_rejected_total: u64,
+    executed_total: u64,
+    executed_failed_total: u64,
+}
+
+/// Background task that owns the historical snapshots needed to derive rates
+/// and 60s window counts. Hot-path producers only fetch_add lifetime totals;
+/// the sampler reads them once per tick, computes deltas against the ring,
+/// and publishes the results into Metrics' sampler-published gauges.
+///
+/// Critically, this task is the *only* writer for those gauges, so the hot
+/// path never observes contention from the sampler.
+async fn run_metrics_sampler(
+    metrics: Arc<Metrics>,
+    executor: Option<Arc<ExecutorState>>,
+    unique_addresses: Arc<StdMutex<HashMap<[u8; 32], u64>>>,
+    executor_stale_ms: u64,
+    event_cranker_stale_ms: u64,
+    event_cranker_enabled: bool,
+) {
+    // Tick once per second; ring of 70 ticks gives us a 70s window which
+    // comfortably covers the 60s rolling counts.
+    const TICK_MS: u64 = 1_000;
+    const RING_SECONDS: usize = 70;
+    let mut ring: VecDeque<CounterTick> = VecDeque::with_capacity(RING_SECONDS + 1);
+
+    loop {
+        let now_ms = unix_timestamp_ms();
+        let snapshot = CounterTick {
+            ts_ms: now_ms,
+            ingress_total: metrics.ingress_total.load(Ordering::Relaxed),
+            ingress_accepted_total: metrics.ingress_accepted_total.load(Ordering::Relaxed),
+            ingress_rejected_total: metrics.ingress_rejected_total.load(Ordering::Relaxed),
+            executed_total: metrics.executed_total.load(Ordering::Relaxed),
+            executed_failed_total: metrics.executed_failed_total.load(Ordering::Relaxed),
+        };
+        ring.push_back(snapshot);
+        while ring.len() > RING_SECONDS {
+            ring.pop_front();
+        }
+
+        // Helper: find the oldest snapshot whose ts_ms is <= now_ms - window.
+        // Falls back to the oldest snapshot in the ring if the window isn't
+        // yet fully populated, which means the rate is computed against the
+        // shorter actual window.
+        let pick = |window_ms: u64| -> &CounterTick {
+            let cutoff = now_ms.saturating_sub(window_ms);
+            ring.iter()
+                .find(|s| s.ts_ms >= cutoff)
+                .unwrap_or(ring.front().expect("ring populated above"))
+        };
+
+        let s10 = *pick(10_000);
+        let s60 = *pick(60_000);
+
+        // tps = (now_total - then_total) / window_seconds, scaled *1000.
+        let span_10s_ms = now_ms.saturating_sub(s10.ts_ms).max(1);
+        let span_10s_secs_milli = span_10s_ms; // ms per "1 second" yardstick
+        let ingress_delta_10s = snapshot.ingress_total.saturating_sub(s10.ingress_total);
+        let executed_delta_10s = snapshot.executed_total.saturating_sub(s10.executed_total);
+        let ingress_tps_milli = ingress_delta_10s.saturating_mul(1_000_000) / span_10s_secs_milli;
+        let executed_tps_milli =
+            executed_delta_10s.saturating_mul(1_000_000) / span_10s_secs_milli;
+
+        let accepted_60s = snapshot
+            .ingress_accepted_total
+            .saturating_sub(s60.ingress_accepted_total);
+        let rejected_60s = snapshot
+            .ingress_rejected_total
+            .saturating_sub(s60.ingress_rejected_total);
+        let executed_60s = snapshot.executed_total.saturating_sub(s60.executed_total);
+        let executed_failed_60s = snapshot
+            .executed_failed_total
+            .saturating_sub(s60.executed_failed_total);
+
+        metrics
+            .ingress_tps_10s_milli
+            .store(ingress_tps_milli, Ordering::Relaxed);
+        metrics
+            .executed_tps_10s_milli
+            .store(executed_tps_milli, Ordering::Relaxed);
+        metrics
+            .ingress_accepted_60s
+            .store(accepted_60s, Ordering::Relaxed);
+        metrics
+            .ingress_rejected_60s
+            .store(rejected_60s, Ordering::Relaxed);
+        metrics.executed_60s.store(executed_60s, Ordering::Relaxed);
+        metrics
+            .executed_failed_60s
+            .store(executed_failed_60s, Ordering::Relaxed);
+
+        // Mirror executor queue depth into a published gauge so /metrics
+        // readers don't need to peek into ExecutorState.
+        if let Some(exec) = executor.as_ref() {
+            metrics
+                .execution_queue_depth
+                .store(exec.queue_count() as u64, Ordering::Relaxed);
+        }
+
+        // Unique addresses: sweep stale entries (>60s old), publish the
+        // remaining count. Single bounded HashMap pass per second; not on
+        // the hot path.
+        {
+            if let Ok(mut guard) = unique_addresses.lock() {
+                let cutoff = now_ms.saturating_sub(60_000);
+                guard.retain(|_, last_seen_ms| *last_seen_ms >= cutoff);
+                metrics
+                    .unique_addresses_60s
+                    .store(guard.len() as u64, Ordering::Relaxed);
+            }
+        }
+
+        // Heartbeat-derived health gauges. The sampler is the single writer
+        // for these so /metrics renderer just reads.
+        metrics.relayer_healthy.store(1, Ordering::Relaxed);
+        let executor_last = metrics.executor_last_tick_ms.load(Ordering::Relaxed);
+        let executor_healthy = if executor.is_none() {
+            // Executor disabled — report 1 so the gauge isn't a false alarm.
+            1
+        } else if executor_last == 0 {
+            0
+        } else {
+            (now_ms.saturating_sub(executor_last) <= executor_stale_ms) as u64
+        };
+        metrics
+            .executor_healthy
+            .store(executor_healthy, Ordering::Relaxed);
+
+        let cranker_last = metrics.event_cranker_last_tick_ms.load(Ordering::Relaxed);
+        let cranker_healthy = if !event_cranker_enabled {
+            1
+        } else if cranker_last == 0 {
+            0
+        } else {
+            (now_ms.saturating_sub(cranker_last) <= event_cranker_stale_ms) as u64
+        };
+        metrics
+            .event_cranker_healthy
+            .store(cranker_healthy, Ordering::Relaxed);
+
+        metrics
+            .sampler_last_tick_ms
+            .store(now_ms, Ordering::Relaxed);
+
+        tokio::time::sleep(Duration::from_millis(TICK_MS)).await;
+    }
+}
+
+/// Background task that probes the bridge `/healthz` endpoint and writes the
+/// result into the bridge_healthy gauge. Uses its own short-lived reqwest
+/// client with a hard timeout so a hung bridge can never wedge this loop.
+async fn run_bridge_health_prober(
+    metrics: Arc<Metrics>,
+    bridge_url: String,
+    interval_ms: u64,
+    timeout_ms: u64,
+) {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_millis(timeout_ms))
+        .build()
+    {
+        Ok(c) => c,
+        Err(err) => {
+            warn!("bridge health prober: failed to build client: {err:?}");
+            return;
+        }
+    };
+    info!(
+        "bridge health prober enabled url={} interval_ms={} timeout_ms={}",
+        bridge_url, interval_ms, timeout_ms
+    );
+    loop {
+        let healthy = match client.get(&bridge_url).send().await {
+            Ok(resp) if resp.status().is_success() => 1u64,
+            Ok(resp) => {
+                debug!("bridge health probe non-2xx: {}", resp.status());
+                0
+            }
+            Err(err) => {
+                debug!("bridge health probe error: {err:?}");
+                0
+            }
+        };
+        metrics.bridge_healthy.store(healthy, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+    }
+}
+
+/// Background task that polls the relayer payer balance via RPC and writes
+/// it into the relayer_balance_lamports gauge. Runs at a low cadence
+/// (default 30s) so it adds negligible RPC pressure even when the hot path
+/// is saturated.
+async fn run_balance_poller(
+    metrics: Arc<Metrics>,
+    rpc: Arc<RpcClient>,
+    payer: Pubkey,
+    interval_ms: u64,
+) {
+    if interval_ms == 0 {
+        info!("balance poller disabled (interval_ms=0)");
+        return;
+    }
+    info!(
+        "balance poller enabled payer={} interval_ms={}",
+        payer, interval_ms
+    );
+    loop {
+        match rpc.get_balance(&payer).await {
+            Ok(lamports) => {
+                metrics
+                    .relayer_balance_lamports
+                    .store(lamports, Ordering::Relaxed);
+                metrics
+                    .relayer_balance_last_ms
+                    .store(unix_timestamp_ms(), Ordering::Relaxed);
+            }
+            Err(err) => {
+                debug!("balance poll failed: {err:?}");
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -4419,7 +6937,8 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let config = Arc::new(Config::from_env()?);
+    let startup_flags = parse_startup_flags()?;
+    let config = Arc::new(Config::from_env(startup_flags.enable_health_check)?);
     let rpc = Arc::new(RpcClient::new_with_commitment(
         config.cluster_url.clone(),
         CommitmentConfig::processed(),
@@ -4443,12 +6962,17 @@ async fn main() -> Result<()> {
         .filter(|v| !v.trim().is_empty())
         .map(|url| {
             info!("secondary RPC enabled: {}", &url[..url.len().min(60)]);
-            Arc::new(RpcClient::new_with_commitment(url, CommitmentConfig::confirmed()))
+            Arc::new(RpcClient::new_with_commitment(
+                url,
+                CommitmentConfig::confirmed(),
+            ))
         });
+
+    let unique_addresses = Arc::new(StdMutex::new(HashMap::new()));
 
     let engine = Arc::new(Engine {
         config: config.clone(),
-        rpc,
+        rpc: rpc.clone(),
         secondary_rpc,
         blockhashes,
         sequences,
@@ -4458,6 +6982,8 @@ async fn main() -> Result<()> {
         harness_readiness: Arc::new(Mutex::new(None)),
         executor: executor.clone(),
         execute_nonce: Arc::new(AtomicU64::new(1)),
+        blocked_mango_accounts: Arc::new(Mutex::new(HashMap::new())),
+        unique_addresses: unique_addresses.clone(),
     });
 
     if let Some(http_addr) = config.http_bind_addr {
@@ -4465,16 +6991,50 @@ async fn main() -> Result<()> {
         info!("execution engine HTTP listening on {http_addr}");
     }
 
+    // Background metrics sampler — derives all rate / 60s window / queue
+    // depth / unique address / heartbeat-derived health gauges. Single
+    // owner of historical state; never contends with the hot path.
+    let event_cranker_enabled =
+        executor.is_some() && config.executor_perp_consume_interval_ms > 0;
+    tokio::spawn(run_metrics_sampler(
+        metrics.clone(),
+        executor.clone(),
+        unique_addresses.clone(),
+        config.executor_stale_threshold_ms,
+        config.event_cranker_stale_threshold_ms,
+        event_cranker_enabled,
+    ));
+
+    // Optional bridge health prober — only runs if a URL is configured.
+    if let Some(bridge_url) = config.bridge_health_url.clone() {
+        tokio::spawn(run_bridge_health_prober(
+            metrics.clone(),
+            bridge_url,
+            config.health_probe_interval_ms,
+            config.bridge_health_probe_timeout_ms,
+        ));
+    }
+
+    // Background balance poller — non-blocking, low cadence.
+    tokio::spawn(run_balance_poller(
+        metrics.clone(),
+        rpc.clone(),
+        config.payer.pubkey(),
+        config.balance_poll_interval_ms,
+    ));
+
     if let Some(executor) = executor {
-        tokio::spawn(engine.clone().run_executor(executor));
+        tokio::spawn(engine.clone().run_executor(executor.clone()));
+        tokio::spawn(engine.clone().run_perp_event_consumer(executor));
     }
 
     info!(
-        "execution engine gRPC listening on {}, program_id={}, ctm={}, payer={}",
+        "execution engine gRPC listening on {}, program_id={}, ctm={}, payer={}, enable_health_check={}",
         config.bind_addr,
         config.program_id,
         config.ctm.pubkey(),
         config.payer.pubkey(),
+        config.enable_health_check,
     );
 
     Server::builder()
@@ -4488,6 +7048,7 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anchor_lang::AnchorSerialize;
 
     fn write_u32(data: &mut [u8], offset: usize, value: u32) {
         data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
@@ -4495,6 +7056,12 @@ mod tests {
 
     fn write_u64(data: &mut [u8], offset: usize, value: u64) {
         data[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn encode_queue_payload(variant: QueuePayloadVariant, body: &[u8]) -> Vec<u8> {
+        let mut payload = vec![QUEUE_PAYLOAD_VERSION_V1, variant as u8, 0, 0];
+        payload.extend_from_slice(body);
+        payload
     }
 
     #[test]
@@ -4507,6 +7074,137 @@ mod tests {
             derive_harness_base_url(Some("http://127.0.0.1:9091/other")),
             None
         );
+    }
+
+    #[test]
+    fn parse_startup_flags_enables_health_check() {
+        let flags = parse_startup_flags_from_iter(["--enable-health-check"]).unwrap();
+        assert!(flags.enable_health_check);
+    }
+
+    #[test]
+    fn parse_startup_flags_rejects_unknown_flag() {
+        let err = parse_startup_flags_from_iter(["--wat"]).unwrap_err();
+        assert!(err.to_string().contains("unknown startup flag"));
+    }
+
+    #[test]
+    fn decode_margin_check_ops_decodes_perp_place_order_payload() {
+        let body = PerpPlaceOrderV2Payload {
+            side: Side::Bid,
+            price_lots: 100,
+            max_base_lots: 7,
+            max_quote_lots: 700,
+            client_order_id: 1,
+            order_type: mango_v4::state::PlaceOrderType::Limit,
+            self_trade_behavior: mango_v4::state::SelfTradeBehavior::DecrementTake,
+            reduce_only: false,
+            expiry_timestamp: 0,
+            limit: 10,
+        }
+        .try_to_vec()
+        .unwrap();
+        let payload = encode_queue_payload(QueuePayloadVariant::PerpPlaceOrderV2, &body);
+
+        let ops = decode_margin_check_ops(&payload).unwrap().unwrap();
+        assert_eq!(
+            ops,
+            vec![MarginCheckOp::Place {
+                side: Side::Bid,
+                max_base_lots: 7,
+                reduce_only: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn decode_margin_check_ops_decodes_batch_cancel_then_place() {
+        let cancel = PerpCancelOrderBySlotPayload {
+            slot: 3,
+            expected_order_id: 55,
+        }
+        .try_to_vec()
+        .unwrap();
+        let place = PerpPlaceOrderV2Payload {
+            side: Side::Ask,
+            price_lots: 101,
+            max_base_lots: 9,
+            max_quote_lots: 909,
+            client_order_id: 9,
+            order_type: mango_v4::state::PlaceOrderType::Limit,
+            self_trade_behavior: mango_v4::state::SelfTradeBehavior::AbortTransaction,
+            reduce_only: true,
+            expiry_timestamp: 11,
+            limit: 12,
+        }
+        .try_to_vec()
+        .unwrap();
+        let mut body = vec![2, 0];
+        body.extend_from_slice(&cancel);
+        body.push(1);
+        body.extend_from_slice(&place);
+        let payload = encode_queue_payload(QueuePayloadVariant::PerpBatchIntent, &body);
+
+        let ops = decode_margin_check_ops(&payload).unwrap().unwrap();
+        assert_eq!(
+            ops,
+            vec![
+                MarginCheckOp::CancelByOrderId {
+                    expected_order_id: 55,
+                },
+                MarginCheckOp::Place {
+                    side: Side::Ask,
+                    max_base_lots: 9,
+                    reduce_only: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn effective_requested_base_lots_clamps_reduce_only_orders() {
+        assert_eq!(effective_requested_base_lots(Side::Bid, true, 7, -5), 5);
+        assert_eq!(effective_requested_base_lots(Side::Ask, true, 7, 3), 3);
+        assert_eq!(effective_requested_base_lots(Side::Bid, true, 7, 2), 0);
+        assert_eq!(effective_requested_base_lots(Side::Ask, false, 7, 2), 7);
+    }
+
+    #[test]
+    fn build_harness_margin_snapshot_filters_orders_per_mango_account() {
+        let user_state = HarnessUserState {
+            mango_accounts: vec!["acct-a".to_string(), "acct-b".to_string()],
+            open_orders: vec![
+                HarnessOpenOrder {
+                    order_id: "11".to_string(),
+                    mango_account: "acct-a".to_string(),
+                    market: "7".to_string(),
+                    side: "bid".to_string(),
+                    base_lots: "4".to_string(),
+                },
+                HarnessOpenOrder {
+                    order_id: "12".to_string(),
+                    mango_account: "acct-b".to_string(),
+                    market: "7".to_string(),
+                    side: "ask".to_string(),
+                    base_lots: "6".to_string(),
+                },
+            ],
+            per_market: vec![HarnessUserPerMarket {
+                market: "7".to_string(),
+                open_order_base_lots_bid: "10".to_string(),
+                open_order_base_lots_ask: "10".to_string(),
+                base_position_lots: "8".to_string(),
+                quote_position_native: "12".to_string(),
+            }],
+        };
+
+        let snapshot = build_harness_margin_snapshot(Some(&user_state), "acct-a").unwrap();
+        let overlay = snapshot.overlays.get(&7).unwrap();
+        assert_eq!(snapshot.orders_by_id.len(), 1);
+        assert_eq!(overlay.bids_base_lots, 4);
+        assert_eq!(overlay.asks_base_lots, 0);
+        assert_eq!(overlay.base_position_lots, 0);
+        assert_eq!(overlay.quote_position_native, I80F48::ZERO);
     }
 
     #[test]
@@ -4751,6 +7449,77 @@ mod tests {
 
         let head = inspect_queue_head(&data);
         assert_eq!(inspect_gap_recovery_batch(&data, &head, 2), vec![22, 23]);
+    }
+
+    #[test]
+    fn inspect_near_head_lane_hashes_collects_unique_hashes_in_head_order() {
+        let mut data = vec![0u8; EXECUTION_QUEUE_LIQUIDITY_ITEMS_OFFSET];
+        write_u32(&mut data, EXECUTION_QUEUE_COUNT_OFFSET, 6);
+        write_u64(&mut data, EXECUTION_QUEUE_NEXT_SEQUENCE_OFFSET, 10);
+        write_u64(&mut data, EXECUTION_QUEUE_MAX_SEEN_SEQUENCE_OFFSET, 15);
+        write_u32(&mut data, EXECUTION_QUEUE_CTM_COUNT_OFFSET, 6);
+        write_u32(&mut data, EXECUTION_QUEUE_LIQUIDITY_COUNT_OFFSET, 0);
+
+        let hashes = [
+            [0xAA; 32], [0xBB; 32], [0xAA; 32], [0xCC; 32], [0xBB; 32], [0xDD; 32],
+        ];
+        for (index, sequence) in (10_u64..=15).enumerate() {
+            let item_offset = queue_item_offset(sequence);
+            write_u64(
+                &mut data,
+                item_offset + EXECUTION_QUEUE_ITEM_SEQUENCE_OFFSET,
+                sequence,
+            );
+            data[item_offset + EXECUTION_QUEUE_ITEM_KIND_OFFSET] = 0;
+            data[item_offset + EXECUTION_QUEUE_ITEM_STATUS_OFFSET] = 1;
+            data[item_offset + EXECUTION_QUEUE_ITEM_ACCOUNTS_HASH_OFFSET
+                ..item_offset + EXECUTION_QUEUE_ITEM_ACCOUNTS_HASH_OFFSET + 32]
+                .copy_from_slice(&hashes[index]);
+        }
+
+        let head = inspect_queue_head(&data);
+        assert_eq!(
+            inspect_near_head_lane_hashes(&data, &head, 16, 4),
+            vec![[0xAA; 32], [0xBB; 32], [0xCC; 32], [0xDD; 32]]
+        );
+        assert_eq!(
+            inspect_near_head_lane_hashes(&data, &head, 16, 3),
+            vec![[0xAA; 32], [0xBB; 32], [0xCC; 32]]
+        );
+    }
+
+    #[test]
+    fn inspect_near_head_lane_hashes_stops_at_first_non_contiguous_ctm_slot() {
+        let mut data = vec![0u8; EXECUTION_QUEUE_LIQUIDITY_ITEMS_OFFSET];
+        write_u32(&mut data, EXECUTION_QUEUE_COUNT_OFFSET, 3);
+        write_u64(&mut data, EXECUTION_QUEUE_NEXT_SEQUENCE_OFFSET, 20);
+        write_u64(&mut data, EXECUTION_QUEUE_MAX_SEEN_SEQUENCE_OFFSET, 23);
+        write_u32(&mut data, EXECUTION_QUEUE_CTM_COUNT_OFFSET, 3);
+        write_u32(&mut data, EXECUTION_QUEUE_LIQUIDITY_COUNT_OFFSET, 0);
+
+        for (sequence, hash) in [
+            (20_u64, [0x11; 32]),
+            (21_u64, [0x22; 32]),
+            (23_u64, [0x33; 32]),
+        ] {
+            let item_offset = queue_item_offset(sequence);
+            write_u64(
+                &mut data,
+                item_offset + EXECUTION_QUEUE_ITEM_SEQUENCE_OFFSET,
+                sequence,
+            );
+            data[item_offset + EXECUTION_QUEUE_ITEM_KIND_OFFSET] = 0;
+            data[item_offset + EXECUTION_QUEUE_ITEM_STATUS_OFFSET] = 1;
+            data[item_offset + EXECUTION_QUEUE_ITEM_ACCOUNTS_HASH_OFFSET
+                ..item_offset + EXECUTION_QUEUE_ITEM_ACCOUNTS_HASH_OFFSET + 32]
+                .copy_from_slice(&hash);
+        }
+
+        let head = inspect_queue_head(&data);
+        assert_eq!(
+            inspect_near_head_lane_hashes(&data, &head, 16, 4),
+            vec![[0x11; 32], [0x22; 32]]
+        );
     }
 
     #[test]
@@ -5150,5 +7919,42 @@ mod tests {
             inspect_queue_sequence_presence(&data, far_sequence),
             QueueSequencePresence::Absent
         );
+    }
+
+    #[test]
+    fn inspect_no_lane_match_batch_collects_consecutive_matching_hashes() {
+        let mut data = vec![0u8; EXECUTION_QUEUE_LIQUIDITY_ITEMS_OFFSET];
+        write_u32(&mut data, EXECUTION_QUEUE_COUNT_OFFSET, 4);
+        write_u64(&mut data, EXECUTION_QUEUE_NEXT_SEQUENCE_OFFSET, 10);
+        write_u64(&mut data, EXECUTION_QUEUE_MAX_SEEN_SEQUENCE_OFFSET, 13);
+        write_u32(&mut data, EXECUTION_QUEUE_CTM_COUNT_OFFSET, 4);
+        write_u32(&mut data, EXECUTION_QUEUE_LIQUIDITY_COUNT_OFFSET, 0);
+
+        for sequence in 10_u64..=13 {
+            let item_offset = queue_item_offset(sequence);
+            write_u64(
+                &mut data,
+                item_offset + EXECUTION_QUEUE_ITEM_SEQUENCE_OFFSET,
+                sequence,
+            );
+            data[item_offset + EXECUTION_QUEUE_ITEM_KIND_OFFSET] = 0;
+            data[item_offset + EXECUTION_QUEUE_ITEM_STATUS_OFFSET] = 1;
+            let hash = if sequence <= 12 {
+                [0xAA; 32]
+            } else {
+                [0xBB; 32]
+            };
+            data[item_offset + EXECUTION_QUEUE_ITEM_ACCOUNTS_HASH_OFFSET
+                ..item_offset + EXECUTION_QUEUE_ITEM_ACCOUNTS_HASH_OFFSET + 32]
+                .copy_from_slice(&hash);
+        }
+
+        let head = inspect_queue_head(&data);
+        assert_eq!(head.reason, "ctm_pending");
+        assert_eq!(
+            inspect_no_lane_match_batch(&data, &head, 8),
+            vec![10, 11, 12]
+        );
+        assert_eq!(inspect_no_lane_match_batch(&data, &head, 2), vec![10, 11]);
     }
 }

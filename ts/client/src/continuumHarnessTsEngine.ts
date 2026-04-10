@@ -46,6 +46,10 @@ export type RelayIntentAcceptedEvent = {
   event_type: 'relay_intent_accepted';
   ts_ms: number;
   request_id?: string;
+  accepted_source?: string;
+  harness_accept_received_ts_ms?: number;
+  harness_preconfirm_emit_ts_ms?: number;
+  fast_lane_preconfirm_emitted?: boolean;
   group: string;
   execution_queue: string;
   market: string;
@@ -100,7 +104,12 @@ export type QueueItemProcessedEvent = {
   status: number;
   slot: string;
   tx_signature: string;
+  market?: string | null;
+  user_owner?: string | null;
+  mango_account?: string | null;
   processed_unix_ts?: number | null;
+  harness_tick_received_ts_ms?: number | null;
+  harness_validated_local_emit_ts_ms?: number | null;
 };
 
 export type DivergenceEvent = {
@@ -911,12 +920,23 @@ export class ContinuumStateEngine {
     group: string,
     sequence: string | bigint,
     kind: string | number,
+    opts?: {
+      includeOwnerState?: boolean;
+      includeMarketState?: boolean;
+      includeMarketOpenOrders?: boolean;
+    },
   ): ValidatedLocalPayload | null {
     const intent = this.findIntent(group, sequence, kind);
     if (!intent || !intent.payload_b64 || intent.market === 'unknown') {
       return null;
     }
+    const includeOwnerState = opts?.includeOwnerState !== false;
+    const includeMarketState = opts?.includeMarketState !== false;
+    const includeMarketOpenOrders = opts?.includeMarketOpenOrders !== false;
     const snapshot = this.getSnapshot('confirmed');
+    const marketState = includeMarketState
+      ? snapshot.markets[intent.market] || null
+      : null;
     return {
       tracking_key: intent.key,
       request_id: intent.request_id,
@@ -929,8 +949,16 @@ export class ContinuumStateEngine {
       mango_account: intent.mango_account,
       validation_status: 'executed',
       validation_error: null,
-      owner_state: snapshot.users[intent.user_owner] || null,
-      market_state: snapshot.markets[intent.market] || null,
+      owner_state: includeOwnerState
+        ? snapshot.users[intent.user_owner] || null
+        : null,
+      market_state:
+        marketState && !includeMarketOpenOrders
+          ? {
+              ...marketState,
+              open_orders: [],
+            }
+          : marketState,
     };
   }
 

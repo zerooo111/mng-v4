@@ -312,6 +312,10 @@ Rust backend notes:
 - the loader now expects a real `.node` artifact and will call `scripts/build-rust-harness-native.js` to build/copy it into place if needed
 - set `CONTINUUM_HARNESS_BACKEND=ts-backend` only if you intentionally want the legacy TS replay engine
 - optional overrides: `CONTINUUM_HARNESS_RUST_PROFILE`, `CONTINUUM_HARNESS_RUST_NATIVE_PATH`, `CONTINUUM_HARNESS_RUST_AUTO_BUILD`
+- when `CONTINUUM_HARNESS_SEQUENCER_TICK_STREAM_URL` is not set, colocated harnesses now prefer the sequencer internal HTTP `/tick-stream` fast path by default using `CONTINUUM_HARNESS_SEQUENCER_RUNTIME_INFO_PATH` (default `/tmp/continuum-sequencer-runtime.json`)
+- the accepted stream remains on gRPC by default; set `CONTINUUM_HARNESS_SEQUENCER_ACCEPTED_STREAM_URL` only if you explicitly want the HTTP accepted stream
+- set `CONTINUUM_HARNESS_SEQUENCER_PREFER_INTERNAL_HTTP=false` to force the older gRPC tick stream path instead
+- explicit `CONTINUUM_HARNESS_SEQUENCER_ACCEPTED_STREAM_URL` and `CONTINUUM_HARNESS_SEQUENCER_TICK_STREAM_URL` still override the default selection
 
 ### Harness Logging
 

@@ -52,6 +52,12 @@ import { MangoClient } from '../../src/client';
 import { HealthType } from '../../src/accounts/mangoAccount';
 import { HealthCache } from '../../src/accounts/healthCache';
 import {
+  ContinuumHarnessLaneGuard,
+  LaneGuardDecision,
+  LaneGuardMarketSuppression,
+  relayIntentTrackingKey as buildRelayIntentTrackingKey,
+} from '../../src/continuumHarnessLaneGuard';
+import {
   decodeExecutionQueueHeader,
   decodeExecutionQueuePendingItems,
 } from '../../src/executionQueueLayout';
@@ -137,6 +143,9 @@ const HARNESS_SANITY_INTERVAL_MS = Number(
 const HARNESS_ONCHAIN_CACHE_TTL_MS = Number(
   process.env.CONTINUUM_HARNESS_ONCHAIN_CACHE_TTL_MS || '5000',
 );
+const HARNESS_MARKET_METADATA_CACHE_TTL_MS = Number(
+  process.env.CONTINUUM_HARNESS_MARKET_METADATA_CACHE_TTL_MS || '60000',
+);
 const HARNESS_RECONCILE_INTERVAL_MS = Number(
   process.env.CONTINUUM_HARNESS_RECONCILE_INTERVAL_MS || '10000',
 );
@@ -212,13 +221,57 @@ const HARNESS_EVENT_LOOP_LAG_WARN_MS = Number(
 );
 const HARNESS_SEQUENCER_GRPC_ADDR =
   process.env.CONTINUUM_HARNESS_SEQUENCER_GRPC_ADDR || '';
+const HARNESS_SEQUENCER_ACCEPTED_STREAM_URL =
+  process.env.CONTINUUM_HARNESS_SEQUENCER_ACCEPTED_STREAM_URL || '';
+const HARNESS_SEQUENCER_TICK_STREAM_URL =
+  process.env.CONTINUUM_HARNESS_SEQUENCER_TICK_STREAM_URL || '';
+const HARNESS_SEQUENCER_RUNTIME_INFO_PATH =
+  process.env.CONTINUUM_HARNESS_SEQUENCER_RUNTIME_INFO_PATH ||
+  '/tmp/continuum-sequencer-runtime.json';
+const HARNESS_SEQUENCER_PREFER_INTERNAL_HTTP =
+  (process.env.CONTINUUM_HARNESS_SEQUENCER_PREFER_INTERNAL_HTTP || 'true') ===
+  'true';
 const HARNESS_SEQUENCER_GRPC_RECONNECT_MS = Number(
   process.env.CONTINUUM_HARNESS_SEQUENCER_GRPC_RECONNECT_MS || '1000',
+);
+const HARNESS_SEQUENCER_TICK_BATCH_LIMIT = Math.max(
+  1,
+  Number(process.env.CONTINUUM_HARNESS_SEQUENCER_TICK_BATCH_LIMIT || '8'),
+);
+const HARNESS_SEQUENCER_TICK_BATCH_BUDGET_MS = Math.max(
+  1,
+  Number(
+    process.env.CONTINUUM_HARNESS_SEQUENCER_TICK_BATCH_BUDGET_MS || '2',
+  ),
+);
+const HARNESS_LANE_MAX_OPTIMISTIC_PENDING = Math.max(
+  0,
+  Number(process.env.CONTINUUM_HARNESS_LANE_MAX_OPTIMISTIC_PENDING || '1'),
+);
+const HARNESS_LANE_PENDING_SOFT_LIMIT = Math.max(
+  1,
+  Number(process.env.CONTINUUM_HARNESS_LANE_PENDING_SOFT_LIMIT || '2'),
+);
+const HARNESS_LANE_FAILURE_THRESHOLD = Math.max(
+  1,
+  Number(process.env.CONTINUUM_HARNESS_LANE_FAILURE_THRESHOLD || '2'),
+);
+const HARNESS_LANE_SUPPRESSION_MS = Math.max(
+  250,
+  Number(process.env.CONTINUUM_HARNESS_LANE_SUPPRESSION_MS || '5000'),
+);
+const HARNESS_LANE_PENDING_STALE_MS = Math.max(
+  1000,
+  Number(process.env.CONTINUUM_HARNESS_LANE_PENDING_STALE_MS || '15000'),
 );
 const SEQUENCER_TICK_PROCESSED_SIGNATURE_PREFIX = 'sequencer-tick:';
 const LOCAL_QUEUE_PROCESS_EXECUTED = 2;
 
 let engine!: ContinuumHarnessBackend;
+let activeSequencerAcceptedTransport: 'none' | 'grpc' | 'http' = 'none';
+let activeSequencerAcceptedStreamUrl: string | null = null;
+let activeSequencerTickTransport: 'none' | 'grpc' | 'http' = 'none';
+let activeSequencerTickStreamUrl: string | null = null;
 const sseClients = new Set<ServerResponse>();
 const sanityStateByOwner = new Map<string, string>();
 let lastReconciliationSig = '';
@@ -295,6 +348,11 @@ type ReconciliationMarketDrift = {
   onchain_best_ask: string | null;
   bid_base_lots_abs_diff: string;
   ask_base_lots_abs_diff: string;
+  synthetic_reason?: string | null;
+  suppressed_lane_count?: number;
+  suppressed_pending_count?: number;
+  suppressed_pending_sequences?: string[];
+  suppressed_until_ts_ms?: number | null;
 };
 
 type ReconciliationSnapshot = {
@@ -385,12 +443,21 @@ type ContinuumSequencerTickWire = {
   timestamp?: string | number;
 };
 
+type ContinuumSequencerRuntimeInfo = {
+  endpoints?: {
+    internal_grpc?: string;
+    external_grpc?: string;
+    internal_api?: string;
+    external_api?: string;
+  } | null;
+} | null;
+
 type ContinuumSequencerClient = grpc.Client & {
   streamAcceptedTransactions(
     request: Record<string, never>,
   ): grpc.ClientReadableStream<ContinuumSequencerAcceptedTransactionWire>;
   streamTicks(
-    request: { start_tick: number },
+    request: { start_tick: number; transactions_only?: boolean },
   ): grpc.ClientReadableStream<ContinuumSequencerTickWire>;
 };
 
@@ -652,6 +719,11 @@ type FrontendPreconfirmEvent = {
   source: 'sequencer_ack';
   ts_ms: number;
   view: 'optimistic';
+  accepted_source: string | null;
+  fast_lane: boolean;
+  sequencer_ingest_ts_ms: number | null;
+  harness_accept_received_ts_ms: number | null;
+  harness_preconfirm_emit_ts_ms: number | null;
   tracking_key: string;
   request_id: string | null;
   group: string;
@@ -671,6 +743,8 @@ type FrontendValidatedLocalEvent = {
   phase: 'validated_local';
   source: 'sequencer_tick';
   ts_ms: number;
+  harness_tick_received_ts_ms: number | null;
+  harness_validated_local_emit_ts_ms: number | null;
   view: 'confirmed';
   tracking_key: string;
   request_id: string | null;
@@ -703,9 +777,14 @@ const TRADE_SUMMARY_WINDOW_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_STREAM_BACKFILL = 50;
 const DEFAULT_FRONTEND_TRADES_LIMIT = 50;
 const DEFAULT_ORDERBOOK_DEPTH = 10;
+const FAST_PRECONFIRM_KEY_LIMIT = 16_384;
 const tradeStreamSubscribers = new Map<string, TradeStreamSubscriber>();
 const frontendStreamSubscribers = new Map<string, FrontendStreamSubscriber>();
 const tradeStreamCursors = new Map<string, string | null>();
+const fastPreconfirmKeys = new Set<string>();
+const fastPreconfirmKeyOrder: string[] = [];
+const deferredAcceptedIntentIngestQueue: RelayIntentAcceptedEvent[] = [];
+let deferredAcceptedIntentIngestScheduled = false;
 const marketRuntimeMetricsCache = new Map<
   string,
   { fetchedAtMs: number; data: MarketRuntimeMetrics | null }
@@ -725,6 +804,13 @@ let directOnchainRebasePending = false;
 let queueSyncTimer: NodeJS.Timeout | null = null;
 let queueSyncInFlight: Promise<void> | null = null;
 let queueSyncPending = false;
+const laneGuard = new ContinuumHarnessLaneGuard({
+  maxOptimisticPendingPerLane: HARNESS_LANE_MAX_OPTIMISTIC_PENDING,
+  marketPendingSoftLimit: HARNESS_LANE_PENDING_SOFT_LIMIT,
+  failureThreshold: HARNESS_LANE_FAILURE_THRESHOLD,
+  suppressionMs: HARNESS_LANE_SUPPRESSION_MS,
+  pendingStaleMs: HARNESS_LANE_PENDING_STALE_MS,
+});
 
 function ensureDirForFile(filePath: string): void {
   fs.mkdirSync(path.dirname(path.resolve(filePath)), { recursive: true });
@@ -1598,7 +1684,7 @@ async function getMarketMetadataMap(
   if (
     onchain.cachedMarketMetadata &&
     Date.now() - onchain.cachedMarketMetadataFetchedAtMs <
-      HARNESS_ONCHAIN_CACHE_TTL_MS
+      HARNESS_MARKET_METADATA_CACHE_TTL_MS
   ) {
     return onchain.cachedMarketMetadata;
   }
@@ -2654,6 +2740,116 @@ function buildReconciliationSnapshot(
   };
 }
 
+function reconciliationMarketHasDrift(
+  market: ReconciliationMarketDrift | undefined,
+): boolean {
+  if (!market) {
+    return false;
+  }
+  return (
+    market.replay_open_orders !== market.onchain_open_orders ||
+    market.replay_best_bid !== market.onchain_best_bid ||
+    market.replay_best_ask !== market.onchain_best_ask ||
+    market.bid_base_lots_abs_diff !== '0' ||
+    market.ask_base_lots_abs_diff !== '0'
+  );
+}
+
+function suppressedMarketToDrift(
+  market: LaneGuardMarketSuppression,
+  current?: ReconciliationMarketDrift,
+): ReconciliationMarketDrift {
+  const onchainOpenOrders = current?.onchain_open_orders || 0;
+  const replayOpenOrders = Math.max(
+    current?.replay_open_orders || 0,
+    onchainOpenOrders + Math.max(1, market.pendingCount),
+  );
+  return {
+    replay_open_orders: replayOpenOrders,
+    onchain_open_orders: onchainOpenOrders,
+    replay_best_bid: current?.replay_best_bid || null,
+    onchain_best_bid: current?.onchain_best_bid || null,
+    replay_best_ask: current?.replay_best_ask || null,
+    onchain_best_ask: current?.onchain_best_ask || null,
+    bid_base_lots_abs_diff: current?.bid_base_lots_abs_diff || '0',
+    ask_base_lots_abs_diff: current?.ask_base_lots_abs_diff || '0',
+    synthetic_reason: market.reasons.join(',') || 'lane_guard',
+    suppressed_lane_count: market.laneCount,
+    suppressed_pending_count: market.pendingCount,
+    suppressed_pending_sequences: market.pendingSequences,
+    suppressed_until_ts_ms: market.suppressUntilTsMs,
+  };
+}
+
+function buildEffectiveReconciliationSnapshot(
+  base: ReconciliationSnapshot | null,
+  nowMs = Date.now(),
+): ReconciliationSnapshot | null {
+  const suppressedMarkets = laneGuard.getSuppressedMarkets(nowMs);
+  if (!base && suppressedMarkets.size === 0) {
+    return null;
+  }
+
+  const snapshot: ReconciliationSnapshot = base
+    ? {
+        ts_ms: base.ts_ms,
+        replay_generated_ts_ms: base.replay_generated_ts_ms,
+        onchain_generated_ts_ms: base.onchain_generated_ts_ms,
+        totals: { ...base.totals },
+        markets: Object.fromEntries(
+          Object.entries(base.markets).map(([market, drift]) => [
+            market,
+            { ...drift },
+          ]),
+        ),
+      }
+    : {
+        ts_ms: nowMs,
+        replay_generated_ts_ms: nowMs,
+        onchain_generated_ts_ms: nowMs,
+        totals: {
+          replay_open_orders: 0,
+          onchain_open_orders: 0,
+          bid_base_lots_abs_diff: '0',
+          ask_base_lots_abs_diff: '0',
+          markets_with_drift: 0,
+        },
+        markets: {},
+      };
+
+  for (const [market, suppression] of suppressedMarkets.entries()) {
+    snapshot.markets[market] = suppressedMarketToDrift(
+      suppression,
+      snapshot.markets[market],
+    );
+  }
+
+  let replayOpenOrders = 0;
+  let onchainOpenOrders = 0;
+  let bidAbsDiff = 0n;
+  let askAbsDiff = 0n;
+  let marketsWithDrift = 0;
+  for (const drift of Object.values(snapshot.markets)) {
+    replayOpenOrders += drift.replay_open_orders;
+    onchainOpenOrders += drift.onchain_open_orders;
+    bidAbsDiff += decimalStringToBigintTrunc(drift.bid_base_lots_abs_diff);
+    askAbsDiff += decimalStringToBigintTrunc(drift.ask_base_lots_abs_diff);
+    if (reconciliationMarketHasDrift(drift)) {
+      marketsWithDrift += 1;
+    }
+  }
+
+  snapshot.totals = {
+    replay_open_orders: replayOpenOrders,
+    onchain_open_orders: onchainOpenOrders,
+    bid_base_lots_abs_diff: bidAbsDiff.toString(),
+    ask_base_lots_abs_diff: askAbsDiff.toString(),
+    markets_with_drift: marketsWithDrift,
+  };
+  snapshot.ts_ms = nowMs;
+  return snapshot;
+}
+
 function writeSseEvent(
   res: ServerResponse,
   eventName: string,
@@ -2781,6 +2977,25 @@ function parseRelayIntentEvent(raw: any): RelayIntentAcceptedEvent {
     request_id: String(
       raw.request_id || `${raw.group}:${raw.sequence}:${Number(raw.kind ?? 0)}`,
     ),
+    accepted_source:
+      raw.accepted_source === undefined || raw.accepted_source === null
+        ? undefined
+        : String(raw.accepted_source),
+    harness_accept_received_ts_ms:
+      raw.harness_accept_received_ts_ms === undefined ||
+      raw.harness_accept_received_ts_ms === null
+        ? undefined
+        : Number(raw.harness_accept_received_ts_ms),
+    harness_preconfirm_emit_ts_ms:
+      raw.harness_preconfirm_emit_ts_ms === undefined ||
+      raw.harness_preconfirm_emit_ts_ms === null
+        ? undefined
+        : Number(raw.harness_preconfirm_emit_ts_ms),
+    fast_lane_preconfirm_emitted:
+      raw.fast_lane_preconfirm_emitted === undefined ||
+      raw.fast_lane_preconfirm_emitted === null
+        ? undefined
+        : !!raw.fast_lane_preconfirm_emitted,
     group: String(raw.group),
     execution_queue: String(raw.execution_queue),
     market: String(raw.market),
@@ -2883,6 +3098,160 @@ function hasCanonicalIntentData(intent: any): boolean {
   );
 }
 
+function resolveDefaultSequencerAcceptedStreamUrl(): string {
+  return HARNESS_SEQUENCER_ACCEPTED_STREAM_URL;
+}
+
+function resolveDefaultSequencerTickStreamUrl(): string {
+  if (HARNESS_SEQUENCER_TICK_STREAM_URL) {
+    return HARNESS_SEQUENCER_TICK_STREAM_URL;
+  }
+  return resolveDefaultSequencerInternalStreamUrl('/tick-stream');
+}
+
+function resolveDefaultSequencerInternalStreamUrl(streamPath: string): string {
+  if (!HARNESS_SEQUENCER_GRPC_ADDR) {
+    return '';
+  }
+  if (!HARNESS_SEQUENCER_PREFER_INTERNAL_HTTP) {
+    return '';
+  }
+  const runtimeInfo = loadContinuumSequencerRuntimeInfo(
+    HARNESS_SEQUENCER_RUNTIME_INFO_PATH,
+  );
+  if (!runtimeInfo?.endpoints) {
+    return '';
+  }
+  if (
+    HARNESS_SEQUENCER_GRPC_ADDR &&
+    !sequencerRuntimeInfoMatchesGrpcAddr(
+      runtimeInfo,
+      HARNESS_SEQUENCER_GRPC_ADDR,
+    )
+  ) {
+    return '';
+  }
+  return buildSequencerInternalStreamUrl(
+    runtimeInfo.endpoints.internal_api,
+    streamPath,
+  );
+}
+
+function loadContinuumSequencerRuntimeInfo(
+  runtimeInfoPath: string,
+): ContinuumSequencerRuntimeInfo {
+  if (!runtimeInfoPath) {
+    return null;
+  }
+  try {
+    if (!fs.existsSync(runtimeInfoPath)) {
+      return null;
+    }
+    return JSON.parse(
+      fs.readFileSync(runtimeInfoPath, 'utf-8'),
+    ) as ContinuumSequencerRuntimeInfo;
+  } catch {
+    return null;
+  }
+}
+
+function sequencerRuntimeInfoMatchesGrpcAddr(
+  runtimeInfo: ContinuumSequencerRuntimeInfo,
+  grpcAddr: string,
+): boolean {
+  const normalizedGrpcAddr = normalizeSocketAddr(grpcAddr);
+  if (!normalizedGrpcAddr) {
+    return false;
+  }
+  const internalGrpc = normalizeSocketAddr(
+    runtimeInfo?.endpoints?.internal_grpc || '',
+  );
+  const externalGrpc = normalizeSocketAddr(
+    runtimeInfo?.endpoints?.external_grpc || '',
+  );
+  return (
+    normalizedGrpcAddr === internalGrpc || normalizedGrpcAddr === externalGrpc
+  );
+}
+
+function buildSequencerInternalStreamUrl(
+  bindAddr: string | undefined,
+  streamPath: string,
+): string {
+  const parsed = parseSocketAddr(bindAddr || '');
+  if (!parsed || !isLocalSocketHost(parsed.host)) {
+    return '';
+  }
+  const host = normalizeSocketHostForUrl(parsed.host);
+  if (!host) {
+    return '';
+  }
+  return `http://${host}:${parsed.port}${streamPath}`;
+}
+
+function parseSocketAddr(
+  value: string,
+): { host: string; port: string } | null {
+  const trimmed = value.trim();
+  if (!trimmed.length) {
+    return null;
+  }
+  if (trimmed.startsWith('[')) {
+    const bracketIndex = trimmed.indexOf(']');
+    if (bracketIndex < 0 || trimmed.charAt(bracketIndex + 1) !== ':') {
+      return null;
+    }
+    return {
+      host: trimmed.slice(1, bracketIndex),
+      port: trimmed.slice(bracketIndex + 2),
+    };
+  }
+  const separatorIndex = trimmed.lastIndexOf(':');
+  if (separatorIndex <= 0 || separatorIndex === trimmed.length - 1) {
+    return null;
+  }
+  return {
+    host: trimmed.slice(0, separatorIndex),
+    port: trimmed.slice(separatorIndex + 1),
+  };
+}
+
+function normalizeSocketAddr(value: string): string {
+  const parsed = parseSocketAddr(value);
+  if (!parsed) {
+    return '';
+  }
+  return `${parsed.host}:${parsed.port}`;
+}
+
+function isLocalSocketHost(host: string): boolean {
+  const normalized = host.trim().toLowerCase();
+  return (
+    normalized === '127.0.0.1' ||
+    normalized === 'localhost' ||
+    normalized === '::1' ||
+    normalized === '0.0.0.0' ||
+    normalized === '::'
+  );
+}
+
+function normalizeSocketHostForUrl(host: string): string {
+  const normalized = host.trim().toLowerCase();
+  if (!normalized.length) {
+    return '';
+  }
+  if (normalized === '0.0.0.0') {
+    return '127.0.0.1';
+  }
+  if (normalized === '::') {
+    return '[::1]';
+  }
+  if (normalized.includes(':')) {
+    return `[${normalized}]`;
+  }
+  return normalized;
+}
+
 function loadContinuumSequencerProto(): any {
   const protoPath = path.resolve(__dirname, 'continuum_sequencer.proto');
   const pkgDef = protoLoader.loadSync(protoPath, {
@@ -2916,6 +3285,7 @@ function sequencerWireToRelayIntentEvent(params: {
   txHash: string | null | undefined;
   ingestionTimestamp: string | number | null | undefined;
   requestIdPrefix: string;
+  acceptedSource: string;
 }): RelayIntentAcceptedEvent | null {
   const tx = params.transaction;
   const meta = tx?.intent_metadata;
@@ -2937,6 +3307,7 @@ function sequencerWireToRelayIntentEvent(params: {
   return parseRelayIntentEvent({
     event_type: 'relay_intent_accepted',
     ts_ms: microsToMs(params.ingestionTimestamp),
+    accepted_source: params.acceptedSource,
     request_id: `${params.requestIdPrefix}:${String(params.sequenceNumber)}:${String(
       params.txHash || tx.tx_id || 'unknown',
     )}`,
@@ -2972,6 +3343,7 @@ function acceptedTransactionToRelayIntentEvent(
     txHash: raw.tx_hash,
     ingestionTimestamp: raw.ingestion_timestamp,
     requestIdPrefix: 'sequencer',
+    acceptedSource: 'sequencer_accept_stream',
   });
 }
 
@@ -2985,6 +3357,7 @@ function orderedTransactionToRelayIntentEvent(
     txHash: ordered.tx_hash,
     ingestionTimestamp: ordered.ingestion_timestamp,
     requestIdPrefix: `sequencer-tick-${String(tickNumber ?? 'unknown')}`,
+    acceptedSource: 'sequencer_tick_stream',
   });
 }
 
@@ -3000,6 +3373,7 @@ function isSequencerLocalProcessedSignature(
 function orderedTransactionToQueueProcessedEvent(
   tick: ContinuumSequencerTickWire,
   ordered: ContinuumSequencerOrderedTransactionWire,
+  tickReceivedTsMs: number | null = null,
 ): QueueItemProcessedEvent | null {
   const meta = ordered.transaction?.intent_metadata;
   if (
@@ -3026,14 +3400,261 @@ function orderedTransactionToQueueProcessedEvent(
     status: LOCAL_QUEUE_PROCESS_EXECUTED,
     slot: String(meta.min_execute_slot ?? '0'),
     tx_signature: `${SEQUENCER_TICK_PROCESSED_SIGNATURE_PREFIX}${tickNumber}:${txHash}`,
+    market: String(meta.market || ''),
+    user_owner: String(meta.user_owner || ''),
+    mango_account: String(meta.mango_account || ''),
     processed_unix_ts: Math.floor(tsMs / 1_000),
+    harness_tick_received_ts_ms: tickReceivedTsMs,
   };
 }
 
-function startContinuumSequencerAcceptedIngest(): void {
-  if (!HARNESS_SEQUENCER_GRPC_ADDR) {
+function relayIntentTrackingKey(event: Pick<
+  RelayIntentAcceptedEvent,
+  'group' | 'sequence' | 'kind'
+>): string {
+  return buildRelayIntentTrackingKey(event);
+}
+
+function rememberFastPreconfirm(event: Pick<
+  RelayIntentAcceptedEvent,
+  'group' | 'sequence' | 'kind'
+>): void {
+  const key = relayIntentTrackingKey(event);
+  if (fastPreconfirmKeys.has(key)) {
     return;
   }
+  fastPreconfirmKeys.add(key);
+  fastPreconfirmKeyOrder.push(key);
+  while (fastPreconfirmKeyOrder.length > FAST_PRECONFIRM_KEY_LIMIT) {
+    const evicted = fastPreconfirmKeyOrder.shift();
+    if (evicted) {
+      fastPreconfirmKeys.delete(evicted);
+    }
+  }
+}
+
+function hasFastPreconfirm(event: Pick<
+  RelayIntentAcceptedEvent,
+  'group' | 'sequence' | 'kind'
+>): boolean {
+  return fastPreconfirmKeys.has(relayIntentTrackingKey(event));
+}
+
+function logLaneGuardDecision(
+  decision: LaneGuardDecision,
+  source: string,
+): void {
+  console.warn(
+    JSON.stringify({
+      ts: new Date().toISOString(),
+      msg: 'continuum-lane-guard',
+      source,
+      market: decision.market,
+      lane_hash: decision.laneHash,
+      tracking_key: decision.trackingKey,
+      payload_hash: decision.payloadHash,
+      pending_count: decision.pendingCount,
+      suppression_reason: decision.suppressionReason,
+      market_suppressed: decision.marketSuppressed,
+    }),
+  );
+}
+
+function applyLaneGuardAccepted(
+  event: RelayIntentAcceptedEvent,
+  opts: {
+    source: string;
+    persistSuppressedEvent?: boolean;
+    allowFastPreconfirm?: boolean;
+    deferEngineIngest?: boolean;
+    onchain?: OnchainContext | null;
+    onchainSync?: OnchainSyncState;
+  },
+): void {
+  const decision = laneGuard.observeAccepted(
+    event,
+    event.harness_accept_received_ts_ms || event.ts_ms || Date.now(),
+  );
+  // FIFO fix: do NOT drop suppressed intents from replay — that breaks
+  // strict sequence ordering (later intents would replay while earlier
+  // suppressed ones are skipped). We still log the decision and persist
+  // the event for divergence observability, but always continue to ingest.
+  if (decision.shouldSuppressOptimisticReplay) {
+    logLaneGuardDecision(decision, opts.source);
+    if (opts.persistSuppressedEvent) {
+      appendEventLog(event);
+      appendTxnLog(event);
+    }
+    if (
+      decision.marketSuppressionActivated &&
+      opts.onchain &&
+      opts.onchainSync
+    ) {
+      scheduleDirectOnchainRebase(opts.onchain, opts.onchainSync, {
+        reason: 'lane_guard_suppressed_intent',
+        market: event.market,
+        lane_hash: decision.laneHash,
+      });
+    }
+    // fall through to ingest — do not return
+  }
+
+  if (opts.allowFastPreconfirm) {
+    event.fast_lane_preconfirm_emitted = true;
+    event.harness_preconfirm_emit_ts_ms = Date.now();
+    rememberFastPreconfirm(event);
+    notifyFrontendPreconfirmSubscribers(event);
+  }
+
+  if (opts.deferEngineIngest) {
+    scheduleDeferredAcceptedIntentIngest(event);
+    return;
+  }
+
+  engine.ingestRelayIntent(event);
+}
+
+function applyLaneGuardStatus(
+  event: RelayIntentStatusEvent,
+  opts: {
+    source: string;
+    onchain?: OnchainContext | null;
+    onchainSync?: OnchainSyncState;
+  } = { source: 'status' },
+): void {
+  const decision = laneGuard.observeRelayIntentStatus(event, event.ts_ms || Date.now());
+  if (!decision) {
+    return;
+  }
+  if (decision.marketSuppressionActivated) {
+    logLaneGuardDecision(decision, opts.source);
+  }
+  if (
+    decision.marketSuppressionActivated &&
+    opts.onchain &&
+    opts.onchainSync
+  ) {
+    scheduleDirectOnchainRebase(opts.onchain, opts.onchainSync, {
+      reason: 'lane_guard_status_failure',
+      market: decision.market,
+      lane_hash: decision.laneHash,
+    });
+  }
+}
+
+function applyLaneGuardProcessed(
+  event: QueueItemProcessedEvent,
+  opts: {
+    source: string;
+    onchain?: OnchainContext | null;
+    onchainSync?: OnchainSyncState;
+  } = { source: 'processed' },
+): void {
+  const decision = laneGuard.observeQueueItemProcessed(
+    event,
+    event.ts_ms || Date.now(),
+  );
+  if (!decision) {
+    return;
+  }
+  if (decision.marketSuppressionActivated) {
+    logLaneGuardDecision(decision, opts.source);
+  }
+  if (
+    decision.marketSuppressionActivated &&
+    opts.onchain &&
+    opts.onchainSync
+  ) {
+    scheduleDirectOnchainRebase(opts.onchain, opts.onchainSync, {
+      reason: 'lane_guard_processed_failure',
+      market: decision.market,
+      lane_hash: decision.laneHash,
+    });
+  }
+}
+
+function scheduleDeferredAcceptedIntentIngest(event: RelayIntentAcceptedEvent): void {
+  deferredAcceptedIntentIngestQueue.push(event);
+  if (deferredAcceptedIntentIngestScheduled) {
+    return;
+  }
+  deferredAcceptedIntentIngestScheduled = true;
+  setImmediate(() => {
+    deferredAcceptedIntentIngestScheduled = false;
+    while (deferredAcceptedIntentIngestQueue.length > 0) {
+      const next = deferredAcceptedIntentIngestQueue.shift();
+      if (!next) {
+        break;
+      }
+      measureSync(
+        'sequencer_accept_deferred_ingest',
+        () => {
+          engine.ingestRelayIntent(next);
+        },
+        {
+          thresholdMs: HARNESS_SLOW_COMPONENT_MS,
+          context: {
+            sequence: next.sequence,
+            market: next.market,
+          },
+        },
+      );
+    }
+  });
+}
+
+function handleSequencerAcceptedTransactionWire(
+  raw: ContinuumSequencerAcceptedTransactionWire,
+): void {
+  measureSync(
+    'sequencer_accept_stream_message',
+    () => {
+      const event = acceptedTransactionToRelayIntentEvent(raw);
+      if (!event) {
+        return;
+      }
+      const existing = engine.findIntent(event.group, event.sequence, event.kind);
+      if (
+        hasCanonicalIntentData(existing) ||
+        laneGuard.findTrackedIntent(event.group, event.sequence, event.kind)
+      ) {
+        return;
+      }
+      event.harness_accept_received_ts_ms = Date.now();
+      applyLaneGuardAccepted(event, {
+        source: 'sequencer_accept_stream',
+        allowFastPreconfirm: true,
+        deferEngineIngest: true,
+      });
+    },
+    {
+      thresholdMs: HARNESS_SLOW_COMPONENT_MS,
+      context: {
+        sequence:
+          raw.sequence_number === undefined || raw.sequence_number === null
+            ? 'unknown'
+            : String(raw.sequence_number),
+        tx_hash: raw.tx_hash || 'unknown',
+      },
+    },
+  );
+}
+
+function startContinuumSequencerAcceptedIngest(): void {
+  const acceptedStreamUrl = resolveDefaultSequencerAcceptedStreamUrl();
+  if (acceptedStreamUrl) {
+    activeSequencerAcceptedTransport = 'http';
+    activeSequencerAcceptedStreamUrl = acceptedStreamUrl;
+    startContinuumSequencerAcceptedHttpIngest();
+    return;
+  }
+  if (!HARNESS_SEQUENCER_GRPC_ADDR) {
+    activeSequencerAcceptedTransport = 'none';
+    activeSequencerAcceptedStreamUrl = null;
+    return;
+  }
+  activeSequencerAcceptedTransport = 'grpc';
+  activeSequencerAcceptedStreamUrl = null;
 
   const client = createContinuumSequencerClient(HARNESS_SEQUENCER_GRPC_ADDR);
   let reconnectTimer: NodeJS.Timeout | null = null;
@@ -3073,30 +3694,7 @@ function startContinuumSequencerAcceptedIngest(): void {
     }
 
     activeCall.on('data', (raw) => {
-      measureSync(
-        'sequencer_accept_stream_message',
-        () => {
-          const event = acceptedTransactionToRelayIntentEvent(raw);
-          if (!event) {
-            return;
-          }
-          const existing = engine.findIntent(event.group, event.sequence, event.kind);
-          if (hasCanonicalIntentData(existing)) {
-            return;
-          }
-          engine.ingestRelayIntent(event);
-        },
-        {
-          thresholdMs: HARNESS_SLOW_COMPONENT_MS,
-          context: {
-            sequence:
-              raw.sequence_number === undefined || raw.sequence_number === null
-                ? 'unknown'
-                : String(raw.sequence_number),
-            tx_hash: raw.tx_hash || 'unknown',
-          },
-        },
-      );
+      handleSequencerAcceptedTransactionWire(raw);
     });
 
     activeCall.on('error', (err) => {
@@ -3121,10 +3719,216 @@ function startContinuumSequencerAcceptedIngest(): void {
   connect();
 }
 
-function startContinuumSequencerTickIngest(): void {
-  if (!HARNESS_SEQUENCER_GRPC_ADDR) {
+function startContinuumSequencerAcceptedHttpIngest(): void {
+  const acceptedStreamUrl = activeSequencerAcceptedStreamUrl;
+  if (!acceptedStreamUrl) {
     return;
   }
+
+  let reconnectTimer: NodeJS.Timeout | null = null;
+  let activeRequest: http.ClientRequest | null = null;
+  let activeResponse: IncomingMessage | null = null;
+  let pendingBuffer = '';
+
+  const scheduleReconnect = (reason: string) => {
+    if (reconnectTimer) {
+      return;
+    }
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      connect();
+    }, Math.max(100, HARNESS_SEQUENCER_GRPC_RECONNECT_MS));
+    recordRuntimeError('sequencer_accept_http_stream_reconnect', reason, {
+      url: acceptedStreamUrl,
+    });
+  };
+
+  const clearActiveHandles = () => {
+    activeRequest = null;
+    activeResponse = null;
+    pendingBuffer = '';
+  };
+
+  const connect = () => {
+    if (activeRequest || activeResponse) {
+      return;
+    }
+
+    let url: URL;
+    try {
+      url = new URL(acceptedStreamUrl);
+    } catch (err) {
+      recordRuntimeError('sequencer_accept_http_stream_url', err, {
+        url: acceptedStreamUrl,
+      });
+      return;
+    }
+
+    const request = http.request({
+      protocol: url.protocol,
+      hostname: url.hostname,
+      port: url.port,
+      path: `${url.pathname}${url.search}`,
+      method: 'GET',
+      headers: {
+        Accept: 'application/x-ndjson',
+      },
+    });
+
+    activeRequest = request;
+
+    request.on('response', (response) => {
+      activeRequest = null;
+      if (response.statusCode !== 200) {
+        response.resume();
+        clearActiveHandles();
+        recordRuntimeError(
+          'sequencer_accept_http_stream_status',
+          `unexpected_status_${response.statusCode || 0}`,
+          {
+            url: acceptedStreamUrl,
+            status_code: response.statusCode || 0,
+          },
+        );
+        scheduleReconnect(`status_${response.statusCode || 0}`);
+        return;
+      }
+
+      activeResponse = response;
+      response.setEncoding('utf8');
+
+      response.on('data', (chunk: string) => {
+        pendingBuffer += chunk;
+        while (true) {
+          const newlineIndex = pendingBuffer.indexOf('\n');
+          if (newlineIndex < 0) {
+            break;
+          }
+          const line = pendingBuffer.slice(0, newlineIndex).trim();
+          pendingBuffer = pendingBuffer.slice(newlineIndex + 1);
+          if (!line) {
+            continue;
+          }
+          try {
+            const parsed = JSON.parse(
+              line,
+            ) as ContinuumSequencerAcceptedTransactionWire;
+            handleSequencerAcceptedTransactionWire(parsed);
+          } catch (err) {
+            recordRuntimeError('sequencer_accept_http_stream_parse', err, {
+              url: acceptedStreamUrl,
+            });
+          }
+        }
+      });
+
+      response.on('error', (err) => {
+        clearActiveHandles();
+        recordRuntimeError('sequencer_accept_http_stream', err, {
+          url: acceptedStreamUrl,
+        });
+        scheduleReconnect('error');
+      });
+
+      response.on('end', () => {
+        clearActiveHandles();
+        scheduleReconnect('end');
+      });
+
+      response.on('close', () => {
+        clearActiveHandles();
+        scheduleReconnect('close');
+      });
+    });
+
+    request.on('error', (err) => {
+      clearActiveHandles();
+      recordRuntimeError('sequencer_accept_http_stream_connect', err, {
+        url: acceptedStreamUrl,
+      });
+      scheduleReconnect('error');
+    });
+
+    request.end();
+  };
+
+  connect();
+}
+
+function processSequencerTickWire(tick: ContinuumSequencerTickWire): void {
+  measureSync(
+    'sequencer_tick_stream_message',
+    () => {
+      const tickReceivedTsMs = Date.now();
+      for (const ordered of tick.transactions || []) {
+        const acceptedEvent = orderedTransactionToRelayIntentEvent(
+          tick.tick_number,
+          ordered,
+        );
+        if (acceptedEvent) {
+          const existing = engine.findIntent(
+            acceptedEvent.group,
+            acceptedEvent.sequence,
+            acceptedEvent.kind,
+          );
+          if (
+            !hasCanonicalIntentData(existing) &&
+            !laneGuard.findTrackedIntent(
+              acceptedEvent.group,
+              acceptedEvent.sequence,
+              acceptedEvent.kind,
+            )
+          ) {
+            applyLaneGuardAccepted(acceptedEvent, {
+              source: 'sequencer_tick',
+            });
+          }
+        }
+
+        const processedEvent = orderedTransactionToQueueProcessedEvent(
+          tick,
+          ordered,
+          tickReceivedTsMs,
+        );
+        if (!processedEvent) {
+          continue;
+        }
+        applyLaneGuardProcessed(processedEvent, {
+          source: 'sequencer_tick',
+        });
+        engine.ingestQueueProcessed(processedEvent);
+      }
+    },
+    {
+      thresholdMs: HARNESS_SLOW_COMPONENT_MS,
+      context: {
+        tick_number:
+          tick.tick_number === undefined || tick.tick_number === null
+            ? 'unknown'
+            : String(tick.tick_number),
+        transactions: Array.isArray(tick.transactions)
+          ? tick.transactions.length
+          : 0,
+      },
+    },
+  );
+}
+
+function startContinuumSequencerTickIngest(): void {
+  const tickStreamUrl = resolveDefaultSequencerTickStreamUrl();
+  if (tickStreamUrl) {
+    activeSequencerTickTransport = 'http';
+    activeSequencerTickStreamUrl = tickStreamUrl;
+    startContinuumSequencerTickHttpIngest();
+    return;
+  }
+  if (!HARNESS_SEQUENCER_GRPC_ADDR) {
+    activeSequencerTickTransport = 'none';
+    activeSequencerTickStreamUrl = null;
+    return;
+  }
+  activeSequencerTickTransport = 'grpc';
+  activeSequencerTickStreamUrl = null;
 
   const client = createContinuumSequencerClient(HARNESS_SEQUENCER_GRPC_ADDR);
   let reconnectTimer: NodeJS.Timeout | null = null;
@@ -3154,7 +3958,10 @@ function startContinuumSequencerTickIngest(): void {
     }
 
     try {
-      activeCall = client.streamTicks({ start_tick: 0 });
+      activeCall = client.streamTicks({
+        start_tick: 0,
+        transactions_only: true,
+      });
     } catch (err) {
       recordRuntimeError('sequencer_tick_stream_connect', err, {
         addr: HARNESS_SEQUENCER_GRPC_ADDR,
@@ -3164,48 +3971,7 @@ function startContinuumSequencerTickIngest(): void {
     }
 
     activeCall.on('data', (tick) => {
-      measureSync(
-        'sequencer_tick_stream_message',
-        () => {
-          for (const ordered of tick.transactions || []) {
-            const acceptedEvent = orderedTransactionToRelayIntentEvent(
-              tick.tick_number,
-              ordered,
-            );
-            if (acceptedEvent) {
-              const existing = engine.findIntent(
-                acceptedEvent.group,
-                acceptedEvent.sequence,
-                acceptedEvent.kind,
-              );
-              if (!hasCanonicalIntentData(existing)) {
-                engine.ingestRelayIntent(acceptedEvent);
-              }
-            }
-
-            const processedEvent = orderedTransactionToQueueProcessedEvent(
-              tick,
-              ordered,
-            );
-            if (!processedEvent) {
-              continue;
-            }
-            engine.ingestQueueProcessed(processedEvent);
-          }
-        },
-        {
-          thresholdMs: HARNESS_SLOW_COMPONENT_MS,
-          context: {
-            tick_number:
-              tick.tick_number === undefined || tick.tick_number === null
-                ? 'unknown'
-                : String(tick.tick_number),
-            transactions: Array.isArray(tick.transactions)
-              ? tick.transactions.length
-              : 0,
-          },
-        },
-      );
+      processSequencerTickWire(tick);
     });
 
     activeCall.on('error', (err) => {
@@ -3225,6 +3991,141 @@ function startContinuumSequencerTickIngest(): void {
       clearActiveCall();
       scheduleReconnect('close');
     });
+  };
+
+  connect();
+}
+
+function startContinuumSequencerTickHttpIngest(): void {
+  const tickStreamUrl = activeSequencerTickStreamUrl;
+  if (!tickStreamUrl) {
+    return;
+  }
+
+  let reconnectTimer: NodeJS.Timeout | null = null;
+  let activeRequest: http.ClientRequest | null = null;
+  let activeResponse: IncomingMessage | null = null;
+  let pendingBuffer = '';
+
+  const scheduleReconnect = (reason: string) => {
+    if (reconnectTimer) {
+      return;
+    }
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      connect();
+    }, Math.max(100, HARNESS_SEQUENCER_GRPC_RECONNECT_MS));
+    recordRuntimeError('sequencer_tick_http_stream_reconnect', reason, {
+      url: tickStreamUrl,
+    });
+  };
+
+  const clearActiveHandles = () => {
+    activeRequest = null;
+    activeResponse = null;
+    pendingBuffer = '';
+  };
+
+  const connect = () => {
+    if (activeRequest || activeResponse) {
+      return;
+    }
+
+    let url: URL;
+    try {
+      url = new URL(tickStreamUrl);
+    } catch (err) {
+      recordRuntimeError('sequencer_tick_http_stream_url', err, {
+        url: tickStreamUrl,
+      });
+      return;
+    }
+
+    const request = http.request({
+      protocol: url.protocol,
+      hostname: url.hostname,
+      port: url.port,
+      path: `${url.pathname}${url.search}`,
+      method: 'GET',
+      headers: {
+        Accept: 'application/x-ndjson',
+      },
+    });
+
+    activeRequest = request;
+
+    request.on('response', (response) => {
+      activeRequest = null;
+      if (response.statusCode !== 200) {
+        response.resume();
+        clearActiveHandles();
+        recordRuntimeError(
+          'sequencer_tick_http_stream_status',
+          `unexpected_status_${response.statusCode || 0}`,
+          {
+            url: tickStreamUrl,
+            status_code: response.statusCode || 0,
+          },
+        );
+        scheduleReconnect(`status_${response.statusCode || 0}`);
+        return;
+      }
+
+      activeResponse = response;
+      response.setEncoding('utf8');
+
+      response.on('data', (chunk: string) => {
+        pendingBuffer += chunk;
+        while (true) {
+          const newlineIndex = pendingBuffer.indexOf('\n');
+          if (newlineIndex < 0) {
+            break;
+          }
+          const line = pendingBuffer.slice(0, newlineIndex).trim();
+          pendingBuffer = pendingBuffer.slice(newlineIndex + 1);
+          if (!line) {
+            continue;
+          }
+          try {
+            processSequencerTickWire(
+              JSON.parse(line) as ContinuumSequencerTickWire,
+            );
+          } catch (err) {
+            recordRuntimeError('sequencer_tick_http_stream_parse', err, {
+              url: tickStreamUrl,
+            });
+          }
+        }
+      });
+
+      response.on('error', (err) => {
+        clearActiveHandles();
+        recordRuntimeError('sequencer_tick_http_stream', err, {
+          url: tickStreamUrl,
+        });
+        scheduleReconnect('error');
+      });
+
+      response.on('end', () => {
+        clearActiveHandles();
+        scheduleReconnect('end');
+      });
+
+      response.on('close', () => {
+        clearActiveHandles();
+        scheduleReconnect('close');
+      });
+    });
+
+    request.on('error', (err) => {
+      clearActiveHandles();
+      recordRuntimeError('sequencer_tick_http_stream_connect', err, {
+        url: tickStreamUrl,
+      });
+      scheduleReconnect('error');
+    });
+
+    request.end();
   };
 
   connect();
@@ -3254,6 +4155,7 @@ function statsSnapshot() {
   let queueViews = 0;
   let intentsTotal = 0;
   let divergencesTotal = 0;
+  const laneGuardStats = laneGuard.getStats();
   try {
     const optimistic = engine.getSnapshot('optimistic');
     optimisticMarkets = Object.keys(optimistic.markets).length;
@@ -3274,8 +4176,20 @@ function statsSnapshot() {
     bind_addr: HARNESS_BIND_ADDR,
     process_started_ts_ms: HARNESS_PROCESS_STARTED_TS_MS,
     cwd: process.cwd(),
+    sequencer_grpc_addr: HARNESS_SEQUENCER_GRPC_ADDR || null,
+    sequencer_runtime_info_path: HARNESS_SEQUENCER_RUNTIME_INFO_PATH || null,
+    sequencer_prefer_internal_http: HARNESS_SEQUENCER_PREFER_INTERNAL_HTTP,
+    sequencer_accepted_transport: activeSequencerAcceptedTransport,
+    sequencer_accepted_stream_url: activeSequencerAcceptedStreamUrl,
+    sequencer_tick_transport: activeSequencerTickTransport,
+    sequencer_tick_stream_url: activeSequencerTickStreamUrl,
     intents_total: intentsTotal,
     divergences_total: divergencesTotal,
+    lane_guard_active_lanes: laneGuardStats.activeLanes,
+    lane_guard_tracked_intents: laneGuardStats.trackedIntents,
+    lane_guard_pending_intents: laneGuardStats.pendingIntents,
+    lane_guard_suppressed_markets: laneGuardStats.suppressedMarkets,
+    lane_guard_suppressed_intents_total: laneGuardStats.totalSuppressedIntents,
     markets_total: optimisticMarkets,
     users_total: optimisticUsers,
     queue_views_total: queueViews,
@@ -3303,6 +4217,16 @@ function metricsText(): string {
     `continuum_harness_intents_total ${stats.intents_total}`,
     '# TYPE continuum_harness_divergences_total gauge',
     `continuum_harness_divergences_total ${stats.divergences_total}`,
+    '# TYPE continuum_harness_lane_guard_active_lanes gauge',
+    `continuum_harness_lane_guard_active_lanes ${stats.lane_guard_active_lanes}`,
+    '# TYPE continuum_harness_lane_guard_tracked_intents gauge',
+    `continuum_harness_lane_guard_tracked_intents ${stats.lane_guard_tracked_intents}`,
+    '# TYPE continuum_harness_lane_guard_pending_intents gauge',
+    `continuum_harness_lane_guard_pending_intents ${stats.lane_guard_pending_intents}`,
+    '# TYPE continuum_harness_lane_guard_suppressed_markets gauge',
+    `continuum_harness_lane_guard_suppressed_markets ${stats.lane_guard_suppressed_markets}`,
+    '# TYPE continuum_harness_lane_guard_suppressed_intents_total gauge',
+    `continuum_harness_lane_guard_suppressed_intents_total ${stats.lane_guard_suppressed_intents_total}`,
     '# TYPE continuum_harness_markets_total gauge',
     `continuum_harness_markets_total ${stats.markets_total}`,
     '# TYPE continuum_harness_users_total gauge',
@@ -3458,12 +4382,21 @@ function replayEventLogIfPresent(): void {
         try {
           const event = JSON.parse(trimmed) as HarnessEvent;
           if (event.event_type === 'relay_intent_accepted') {
-            engine.ingestRelayIntent(parseRelayIntentEvent(event));
+            applyLaneGuardAccepted(parseRelayIntentEvent(event), {
+              source: 'replay_event_log',
+            });
           } else if (event.event_type === 'relay_intent_status') {
-            engine.ingestRelayIntentStatus(parseRelayIntentStatusEvent(event));
+            const parsed = parseRelayIntentStatusEvent(event);
+            applyLaneGuardStatus(parsed, {
+              source: 'replay_event_log',
+            });
+            engine.ingestRelayIntentStatus(parsed);
           } else if (event.event_type === 'queue_item_enqueued') {
             engine.ingestQueueEnqueued(event);
           } else if (event.event_type === 'queue_item_processed') {
+            applyLaneGuardProcessed(event, {
+              source: 'replay_event_log',
+            });
             engine.ingestQueueProcessed(event);
           }
         } catch (err) {
@@ -4686,7 +5619,7 @@ async function handleProgramLogs(
           tx_signature: logs.signature,
         });
       } else {
-        engine.ingestQueueProcessed({
+        const processedEvent = {
           event_type: 'queue_item_processed',
           ts_ms: Date.now(),
           group: decoded.group,
@@ -4696,7 +5629,13 @@ async function handleProgramLogs(
           slot: slot.toString(),
           tx_signature: logs.signature,
           processed_unix_ts: processedUnixTs,
+        } as QueueItemProcessedEvent;
+        applyLaneGuardProcessed(processedEvent, {
+          source: 'program_logs',
+          onchain,
+          onchainSync,
         });
+        engine.ingestQueueProcessed(processedEvent);
       }
     } catch (err) {
       recordRuntimeError('handle_program_logs', err, {
@@ -5486,10 +6425,15 @@ function deriveEventContext(event: HarnessEvent): {
       event.group && event.sequence !== null && event.kind !== null
         ? engine.findIntent(event.group, event.sequence, event.kind)
         : null;
+    const tracked =
+      event.group && event.sequence !== null && event.kind !== null
+        ? laneGuard.findTrackedIntent(event.group, event.sequence, event.kind)
+        : null;
     return {
-      market: event.market || intent?.market || null,
-      owner: event.user_owner || intent?.user_owner || null,
-      mangoAccount: event.mango_account || intent?.mango_account || null,
+      market: event.market || intent?.market || tracked?.market || null,
+      owner: event.user_owner || intent?.user_owner || tracked?.owner || null,
+      mangoAccount:
+        event.mango_account || intent?.mango_account || tracked?.mangoAccount || null,
     };
   }
   if (
@@ -5497,10 +6441,15 @@ function deriveEventContext(event: HarnessEvent): {
     event.event_type === 'queue_item_processed'
   ) {
     const intent = engine.findIntent(event.group, event.sequence, event.kind);
+    const tracked = laneGuard.findTrackedIntent(
+      event.group,
+      event.sequence,
+      event.kind,
+    );
     return {
-      market: intent?.market || null,
-      owner: intent?.user_owner || null,
-      mangoAccount: intent?.mango_account || null,
+      market: intent?.market || tracked?.market || null,
+      owner: intent?.user_owner || tracked?.owner || null,
+      mangoAccount: intent?.mango_account || tracked?.mangoAccount || null,
     };
   }
   return {
@@ -5620,11 +6569,17 @@ function buildFrontendPreconfirmIntent(
 function buildFrontendPreconfirmEvent(
   event: RelayIntentAcceptedEvent,
 ): FrontendPreconfirmEvent {
+  const emittedTsMs = event.harness_preconfirm_emit_ts_ms || Date.now();
   return {
     phase: 'pre_confirmed',
     source: 'sequencer_ack',
-    ts_ms: event.ts_ms || Date.now(),
+    ts_ms: emittedTsMs,
     view: 'optimistic',
+    accepted_source: event.accepted_source || null,
+    fast_lane: !!event.fast_lane_preconfirm_emitted,
+    sequencer_ingest_ts_ms: event.ts_ms || null,
+    harness_accept_received_ts_ms: event.harness_accept_received_ts_ms || null,
+    harness_preconfirm_emit_ts_ms: emittedTsMs,
     tracking_key: `${event.group}:${event.sequence}:${event.kind}`,
     request_id: event.request_id || null,
     group: event.group,
@@ -5717,19 +6672,29 @@ function notifyFrontendPreconfirmSubscribers(
 
 function buildFrontendValidatedLocalEvent(
   event: QueueItemProcessedEvent,
+  opts: {
+    includeOwnerState: boolean;
+    includeMarketState: boolean;
+    includeMarketOpenOrders: boolean;
+  },
 ): FrontendValidatedLocalEvent | null {
   const payload = engine.getValidatedLocalPayload(
     event.group,
     event.sequence,
     event.kind,
+    opts,
   );
   if (!payload) {
     return null;
   }
+  const emittedTsMs = Date.now();
+  event.harness_validated_local_emit_ts_ms = emittedTsMs;
   return {
     phase: 'validated_local',
     source: 'sequencer_tick',
     ts_ms: event.ts_ms || Date.now(),
+    harness_tick_received_ts_ms: event.harness_tick_received_ts_ms || null,
+    harness_validated_local_emit_ts_ms: emittedTsMs,
     view: 'confirmed',
     tracking_key: payload.tracking_key,
     request_id: payload.request_id || null,
@@ -5798,14 +6763,44 @@ function notifyFrontendValidatedLocalSubscribers(
   measureSync(
     'notify_frontend_validated_local_subscribers',
     () => {
-      const payload = buildFrontendValidatedLocalEvent(event);
+      const matchingSubscribers: FrontendStreamSubscriber[] = [];
+      let includeOwnerState = false;
+      let includeMarketState = false;
+      let includeMarketOpenOrders = false;
+      for (const subscriber of frontendStreamSubscribers.values()) {
+        if (!subscriber.include.has('validated_local')) {
+          continue;
+        }
+        if (subscriber.owner && subscriber.owner !== event.user_owner) {
+          continue;
+        }
+        if (
+          subscriber.mangoAccount &&
+          subscriber.mangoAccount !== event.mango_account
+        ) {
+          continue;
+        }
+        if (subscriber.market && subscriber.market !== event.market) {
+          continue;
+        }
+        matchingSubscribers.push(subscriber);
+        includeOwnerState ||= !!subscriber.owner || !!subscriber.mangoAccount;
+        includeMarketState ||= !!subscriber.market;
+        includeMarketOpenOrders ||=
+          !!subscriber.market && (!!subscriber.owner || !!subscriber.mangoAccount);
+      }
+      if (!matchingSubscribers.length) {
+        return;
+      }
+      const payload = buildFrontendValidatedLocalEvent(event, {
+        includeOwnerState,
+        includeMarketState,
+        includeMarketOpenOrders,
+      });
       if (!payload) {
         return;
       }
-      for (const subscriber of Array.from(frontendStreamSubscribers.values())) {
-        if (!subscriberShouldReceiveValidatedLocal(subscriber, payload)) {
-          continue;
-        }
+      for (const subscriber of matchingSubscribers) {
         if (
           !writeSseEvent(
             subscriber.res,
@@ -6326,6 +7321,9 @@ function buildHttpServer(
         } catch {
           /* engine error — report ok anyway */
         }
+        const effectiveDrift = buildEffectiveReconciliationSnapshot(
+          onchainSync.drift,
+        );
         const cachedMetadataCount = onchain?.cachedMarketMetadata
           ? Object.keys(onchain.cachedMarketMetadata).length
           : 0;
@@ -6337,9 +7335,10 @@ function buildHttpServer(
           airdrop_enabled: !!airdrop,
           airdrop_deposit_enabled: !!airdrop?.groupPk && !!airdrop?.mangoClient,
           reconcile_interval_ms: Math.max(1000, HARNESS_RECONCILE_INTERVAL_MS),
-          last_reconcile_ts_ms: onchainSync.drift?.ts_ms || null,
+          last_reconcile_ts_ms: effectiveDrift?.ts_ms || onchainSync.drift?.ts_ms || null,
           reconcile_markets_with_drift:
-            onchainSync.drift?.totals.markets_with_drift || 0,
+            effectiveDrift?.totals.markets_with_drift || 0,
+          lane_guard: laneGuard.getStats(),
           last_runtime_error: runtimeErrors[runtimeErrors.length - 1] || null,
           fatal_startup_error: fatalStartupError,
           generated_ts_ms: Date.now(),
@@ -6398,8 +7397,16 @@ function buildHttpServer(
 
       if (method === 'GET' && url.pathname === '/diagnostics/reconciliation') {
         writeJson(res, 200, {
-          data: onchainSync.drift,
+          data: buildEffectiveReconciliationSnapshot(onchainSync.drift),
           last_error: onchainSync.last_error,
+        });
+        return;
+      }
+
+      if (method === 'GET' && url.pathname === '/diagnostics/lane-guard') {
+        writeJson(res, 200, {
+          stats: laneGuard.getStats(),
+          markets: Array.from(laneGuard.getSuppressedMarkets().values()),
         });
         return;
       }
@@ -6439,9 +7446,19 @@ function buildHttpServer(
         const body = await readBody(req);
         const payload = parseRelayIngestEvent(JSON.parse(body));
         if (payload.event_type === 'relay_intent_status') {
+          applyLaneGuardStatus(payload, {
+            source: 'relay_ingest_http',
+            onchain,
+            onchainSync,
+          });
           engine.ingestRelayIntentStatus(payload);
         } else {
-          engine.ingestRelayIntent(payload);
+          applyLaneGuardAccepted(payload, {
+            source: 'relay_ingest_http',
+            persistSuppressedEvent: true,
+            onchain,
+            onchainSync,
+          });
         }
         writeJson(res, 202, {
           ok: true,
@@ -6736,10 +7753,38 @@ function buildHttpServer(
         const market = decodeURIComponent(
           url.pathname.slice('/state/markets/'.length),
         );
+        // Reject empty/undefined/non-numeric market index with a clear 400.
+        // This prevents callers (relayer margin precheck, frontends) from
+        // wasting work on a malformed request.
+        if (!market || market === 'undefined' || market === 'null') {
+          writeJson(res, 400, {
+            error: 'invalid_market_index',
+            message: `market index missing or undefined: '${market}'`,
+          });
+          return;
+        }
+        if (!/^[0-9]+$/.test(market) || Number(market) > 65535) {
+          writeJson(res, 400, {
+            error: 'invalid_market_index',
+            message: `market index must be a non-negative integer <= 65535, got '${market}'`,
+          });
+          return;
+        }
         const view = parseView(url);
+        const marketMetadata = await getMarketMetadataMapSafe(onchain);
+        const metadataOnly =
+          (
+            url.searchParams.get('metadata_only') || 'false'
+          ).toLowerCase() === 'true';
+        if (metadataOnly) {
+          writeJson(res, 200, {
+            view,
+            metadata: marketMetadata[market] || null,
+          });
+          return;
+        }
         const snapshot = getSnapshotForView(view, onchainSync);
         const responseView = snapshot.view;
-        const marketMetadata = await getMarketMetadataMapSafe(onchain);
         const data = getMarketStateForView(market, responseView, onchainSync);
         writeJson(res, 200, {
           view: responseView,
@@ -7207,15 +8252,12 @@ async function main(): Promise<void> {
         async () => await buildOnchainConfirmedSnapshot(onchain),
       );
       if (bootstrappedOnchainState) {
+        const snapshot = bootstrappedOnchainState.snapshot;
         measureSync('startup.bootstrap_from_onchain_snapshot', () => {
-          engine.bootstrapFromOnchainSnapshot(bootstrappedOnchainState.snapshot);
+          engine.bootstrapFromOnchainSnapshot(snapshot);
         });
-        const userCount = Object.keys(
-          bootstrappedOnchainState.snapshot.users,
-        ).length;
-        const marketCount = Object.keys(
-          bootstrappedOnchainState.snapshot.markets,
-        ).length;
+        const userCount = Object.keys(snapshot.users).length;
+        const marketCount = Object.keys(snapshot.markets).length;
         console.log(
           `On-chain bootstrap complete: ${userCount} users, ${marketCount} markets`,
         );
@@ -7244,7 +8286,10 @@ async function main(): Promise<void> {
         event.event_type === 'queue_item_processed' &&
         event.status === LOCAL_QUEUE_PROCESS_EXECUTED &&
         isSequencerLocalProcessedSignature(event.tx_signature);
-      if (event.event_type === 'relay_intent_accepted') {
+      if (
+        event.event_type === 'relay_intent_accepted' &&
+        !hasFastPreconfirm(event)
+      ) {
         notifyFrontendPreconfirmSubscribers(event);
       }
       if (isLocalValidatedEvent) {
@@ -7289,6 +8334,12 @@ async function main(): Promise<void> {
 
   startContinuumSequencerAcceptedIngest();
   startContinuumSequencerTickIngest();
+  console.info(
+    `Continuum sequencer ingest transports: accepted=${activeSequencerAcceptedTransport}` +
+      `${activeSequencerAcceptedStreamUrl ? `(${activeSequencerAcceptedStreamUrl})` : ''}, ` +
+      `tick=${activeSequencerTickTransport}` +
+      `${activeSequencerTickStreamUrl ? `(${activeSequencerTickStreamUrl})` : ''}`,
+  );
 
   await connection.onLogs(
     programId,

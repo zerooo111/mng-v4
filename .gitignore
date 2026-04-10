@@ -20,6 +20,12 @@ err-txs
 
 .localnet
 .localnet.bak.*
+.localnet-cu
 .devnet
 third-party
 .screen
+
+# validator/ledger logs
+test-ledger/*.log
+**/validator-*.log
+**/validator.log

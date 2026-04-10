@@ -95,12 +95,15 @@ import { Id } from './ids';
 import { IDL, MangoV4 } from './mango_v4';
 import { I80F48 } from './numbers/I80F48';
 import {
+  anchorInstructionDiscriminator,
   IntentSigner,
   buildExecutionQueueEnqueueCtmWithIntentIxs,
   buildExecutionQueueEnqueueLiquidityIx,
   buildExecutionQueueExecuteIx,
+  encodePerpBatchIntentQueuePayload,
   encodePerpCancelAllOrdersBySideQueuePayload,
   encodePerpCancelAllOrdersQueuePayload,
+  encodePerpCancelOrderBySlotQueuePayload,
   encodePerpCancelOrderByClientOrderIdQueuePayload,
   encodePerpCancelOrderQueuePayload,
   encodePerpPlaceOrderV2QueuePayload,
@@ -209,6 +212,21 @@ export type ExecutionQueuePerpCancelAllOrdersBySideWithIntentParams =
     limit: number;
   };
 
+export type ExecutionQueuePerpBatchIntentOp =
+  | {
+      kind: 'cancelBySlot';
+      slot: number;
+      expectedOrderId: bigint | BN | number;
+    }
+  | ({
+      kind: 'place';
+    } & Omit<ExecutionQueuePerpPlaceOrderV2WithIntentParams, keyof ExecutionQueueBaseCtmParams>);
+
+export type ExecutionQueuePerpBatchIntentWithIntentParams =
+  ExecutionQueueBaseCtmParams & {
+    operations: ExecutionQueuePerpBatchIntentOp[];
+  };
+
 export type TxCallbackOptions = {
   txid: string;
   txSignatureBlockHash: LatestBlockhash;
@@ -225,6 +243,7 @@ export class MangoClient {
   private prependedGlobalAdditionalInstructions: TransactionInstruction[] = [];
   private fallbackOracleConfig: FallbackOracleConfig = 'never';
   private fixedFallbacks: Map<string, [PublicKey, PublicKey]> = new Map();
+  private riskSidecarExistsCache: Map<string, boolean> = new Map();
   multipleConnections: Connection[] = [];
 
   constructor(
@@ -3986,6 +4005,11 @@ export class MangoClient {
         [group.getFirstBankForPerpSettlement()],
         [perpMarket],
       );
+    const riskSidecarAccounts = await this.existingRiskSidecarAccountMetas(
+      group.publicKey,
+      mangoAccount.publicKey,
+      true,
+    );
     return await this.program.methods
       .perpPlaceOrder(
         side,
@@ -4011,10 +4035,17 @@ export class MangoClient {
         owner: (this.program.provider as AnchorProvider).wallet.publicKey,
       })
       .remainingAccounts(
-        healthRemainingAccounts.map(
-          (pk) =>
-            ({ pubkey: pk, isWritable: false, isSigner: false } as AccountMeta),
-        ),
+        [
+          ...riskSidecarAccounts,
+          ...healthRemainingAccounts.map(
+            (pk) =>
+              ({
+                pubkey: pk,
+                isWritable: false,
+                isSigner: false,
+              } as AccountMeta),
+          ),
+        ],
       )
       .instruction();
   }
@@ -4043,6 +4074,11 @@ export class MangoClient {
         [group.getFirstBankForPerpSettlement()],
         [perpMarket],
       );
+    const riskSidecarAccounts = await this.existingRiskSidecarAccountMetas(
+      group.publicKey,
+      mangoAccount.publicKey,
+      true,
+    );
     return await this.program.methods
       .perpPlaceOrderV2(
         side,
@@ -4069,12 +4105,115 @@ export class MangoClient {
         owner: (this.program.provider as AnchorProvider).wallet.publicKey,
       })
       .remainingAccounts(
-        healthRemainingAccounts.map(
-          (pk) =>
-            ({ pubkey: pk, isWritable: false, isSigner: false } as AccountMeta),
-        ),
+        [
+          ...riskSidecarAccounts,
+          ...healthRemainingAccounts.map(
+            (pk) =>
+              ({
+                pubkey: pk,
+                isWritable: false,
+                isSigner: false,
+              } as AccountMeta),
+          ),
+        ],
       )
       .instruction();
+  }
+
+  public deriveRiskSidecarAddress(
+    group: PublicKey,
+    mangoAccount: PublicKey,
+  ): PublicKey {
+    return PublicKey.findProgramAddressSync(
+      [Buffer.from('RiskSidecar'), group.toBuffer(), mangoAccount.toBuffer()],
+      this.programId,
+    )[0];
+  }
+
+  public estimateRiskSidecarSnapshotCapacity(mangoAccount: MangoAccount): number {
+    const SERIALIZED_SNAPSHOT_PREFIX_BYTES = 2 + 2 + 2 + 1;
+    const SERIALIZED_TOKEN_INFO_BYTES = 2 + 16 * 6 + 16 * 2 + 16 + 1;
+    const SERIALIZED_SPOT_INFO_BYTES = 16 * 4 + 2 + 2 + 1 + 2 + 1;
+    const SERIALIZED_PERP_INFO_BYTES = 2 + 2 + 16 * 8 + 8 * 4 + 16 + 16 * 2 + 1 + 1;
+
+    return (
+      SERIALIZED_SNAPSHOT_PREFIX_BYTES +
+      mangoAccount.tokens.length * SERIALIZED_TOKEN_INFO_BYTES +
+      (mangoAccount.serum3.length + mangoAccount.openbookV2.length) *
+        SERIALIZED_SPOT_INFO_BYTES +
+      mangoAccount.perps.length * SERIALIZED_PERP_INFO_BYTES
+    );
+  }
+
+  public async riskSidecarCreateIx(
+    group: Group,
+    mangoAccount: MangoAccount,
+    healthRemainingAccounts: PublicKey[],
+    snapshotCapacity?: number,
+    payer: PublicKey = (this.program.provider as AnchorProvider).wallet.publicKey,
+  ): Promise<TransactionInstruction> {
+    const resolvedSnapshotCapacity =
+      snapshotCapacity ?? this.estimateRiskSidecarSnapshotCapacity(mangoAccount);
+    const riskSidecar = this.deriveRiskSidecarAddress(
+      group.publicKey,
+      mangoAccount.publicKey,
+    );
+    const data = Buffer.alloc(12);
+    anchorInstructionDiscriminator('risk_sidecar_create').copy(data, 0);
+    data.writeUInt32LE(resolvedSnapshotCapacity, 8);
+    this.riskSidecarExistsCache.delete(
+      this.riskSidecarCacheKey(group.publicKey, mangoAccount.publicKey),
+    );
+
+    return new TransactionInstruction({
+      programId: this.programId,
+      keys: [
+        { pubkey: group.publicKey, isSigner: false, isWritable: false },
+        { pubkey: mangoAccount.publicKey, isSigner: false, isWritable: true },
+        {
+          pubkey: (this.program.provider as AnchorProvider).wallet.publicKey,
+          isSigner: true,
+          isWritable: false,
+        },
+        { pubkey: riskSidecar, isSigner: false, isWritable: true },
+        { pubkey: payer, isSigner: true, isWritable: true },
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+        ...healthRemainingAccounts.map(
+          (pubkey) =>
+            ({ pubkey, isSigner: false, isWritable: false } as AccountMeta),
+        ),
+      ],
+      data,
+    });
+  }
+
+  public async riskSidecarRefreshIx(
+    group: Group,
+    mangoAccount: MangoAccount,
+    healthRemainingAccounts: PublicKey[],
+  ): Promise<TransactionInstruction> {
+    const riskSidecar = this.deriveRiskSidecarAddress(
+      group.publicKey,
+      mangoAccount.publicKey,
+    );
+    return new TransactionInstruction({
+      programId: this.programId,
+      keys: [
+        { pubkey: group.publicKey, isSigner: false, isWritable: false },
+        { pubkey: mangoAccount.publicKey, isSigner: false, isWritable: true },
+        {
+          pubkey: (this.program.provider as AnchorProvider).wallet.publicKey,
+          isSigner: true,
+          isWritable: false,
+        },
+        { pubkey: riskSidecar, isSigner: false, isWritable: true },
+        ...healthRemainingAccounts.map(
+          (pubkey) =>
+            ({ pubkey, isSigner: false, isWritable: false } as AccountMeta),
+        ),
+      ],
+      data: anchorInstructionDiscriminator('risk_sidecar_refresh'),
+    });
   }
 
   public async perpPlaceOrderPegged(
@@ -6420,6 +6559,11 @@ export class MangoClient {
         [group.getFirstBankForPerpSettlement()],
         [perpMarket],
       );
+    const riskSidecarAccounts = await this.existingRiskSidecarAccountMetas(
+      group.publicKey,
+      mangoAccount.publicKey,
+      true,
+    );
 
     return [
       { pubkey: group.publicKey, isSigner: false, isWritable: false },
@@ -6434,6 +6578,7 @@ export class MangoClient {
       { pubkey: perpMarket.asks, isSigner: false, isWritable: true },
       { pubkey: perpMarket.eventQueue, isSigner: false, isWritable: true },
       { pubkey: perpMarket.oracle, isSigner: false, isWritable: false },
+      ...riskSidecarAccounts,
       ...healthRemainingAccounts.map(
         (pubkey) =>
           ({
@@ -6443,6 +6588,32 @@ export class MangoClient {
           } as AccountMeta),
       ),
     ];
+  }
+
+  private riskSidecarCacheKey(group: PublicKey, mangoAccount: PublicKey): string {
+    return `${group.toBase58()}:${mangoAccount.toBase58()}`;
+  }
+
+  private async existingRiskSidecarAccountMetas(
+    group: PublicKey,
+    mangoAccount: PublicKey,
+    isWritable: boolean,
+  ): Promise<AccountMeta[]> {
+    const cacheKey = this.riskSidecarCacheKey(group, mangoAccount);
+    let exists = this.riskSidecarExistsCache.get(cacheKey);
+    const riskSidecar = this.deriveRiskSidecarAddress(group, mangoAccount);
+
+    if (exists === undefined) {
+      const ai = await this.connection.getAccountInfo(riskSidecar);
+      exists = !!ai && ai.owner.equals(this.programId);
+      this.riskSidecarExistsCache.set(cacheKey, exists);
+    }
+
+    if (!exists) {
+      return [];
+    }
+
+    return [{ pubkey: riskSidecar, isSigner: false, isWritable }];
   }
 
   public async executionQueueEnqueueCtmWithIntent(
@@ -6578,9 +6749,19 @@ export class MangoClient {
     params: ExecutionQueuePerpCancelOrderWithIntentParams,
     opts: SendTransactionOpts = {},
   ): Promise<MangoSignatureStatus> {
-    const payload = encodePerpCancelOrderQueuePayload({
-      orderId: BigInt(params.orderId.toString()),
-    });
+    const matchingSlot = mangoAccount.perpOpenOrders.findIndex(
+      (order) =>
+        order.orderMarket === perpMarketIndex && order.id.eq(params.orderId),
+    );
+    const payload =
+      matchingSlot >= 0
+        ? encodePerpCancelOrderBySlotQueuePayload({
+            slot: matchingSlot,
+            expectedOrderId: BigInt(params.orderId.toString()),
+          })
+        : encodePerpCancelOrderQueuePayload({
+            orderId: BigInt(params.orderId.toString()),
+          });
 
     return await this.executionQueueEnqueueCtmWithIntent(
       group,
@@ -6612,8 +6793,84 @@ export class MangoClient {
     params: ExecutionQueuePerpCancelOrderByClientIdWithIntentParams,
     opts: SendTransactionOpts = {},
   ): Promise<MangoSignatureStatus> {
-    const payload = encodePerpCancelOrderByClientOrderIdQueuePayload({
-      clientOrderId: BigInt(params.clientOrderId.toString()),
+    const matchingOrder = mangoAccount.perpOpenOrders.find(
+      (order) =>
+        order.orderMarket === perpMarketIndex &&
+        order.clientId.eq(params.clientOrderId),
+    );
+    const payload = matchingOrder
+      ? encodePerpCancelOrderBySlotQueuePayload({
+          slot: mangoAccount.perpOpenOrders.indexOf(matchingOrder),
+          expectedOrderId: BigInt(matchingOrder.id.toString()),
+        })
+      : encodePerpCancelOrderByClientOrderIdQueuePayload({
+          clientOrderId: BigInt(params.clientOrderId.toString()),
+        });
+
+    return await this.executionQueueEnqueueCtmWithIntent(
+      group,
+      {
+        executionQueue: params.executionQueue,
+        executionQueueBuffer: params.executionQueueBuffer,
+        remainingAccounts: await this.executionQueueCanonicalPerpRemainingAccounts(
+          group,
+          mangoAccount,
+          perpMarketIndex,
+        ),
+        payload,
+        sequence: params.sequence,
+        minExecuteSlot: params.minExecuteSlot,
+        expiresAtSlot: params.expiresAtSlot,
+        userOwner: mangoAccount.owner,
+        mangoAccount: mangoAccount.publicKey,
+        userSigner: params.userSigner,
+        ctmSigner: params.ctmSigner,
+      },
+      opts,
+    );
+  }
+
+  public async executionQueuePerpBatchIntentWithIntent(
+    group: Group,
+    mangoAccount: MangoAccount,
+    perpMarketIndex: PerpMarketIndex,
+    params: ExecutionQueuePerpBatchIntentWithIntentParams,
+    opts: SendTransactionOpts = {},
+  ): Promise<MangoSignatureStatus> {
+    const perpMarket = group.getPerpMarketByMarketIndex(perpMarketIndex);
+    const payload = encodePerpBatchIntentQueuePayload({
+      operations: params.operations.map((operation) => {
+        if (operation.kind === 'cancelBySlot') {
+          return {
+            kind: 'cancelBySlot' as const,
+            slot: operation.slot,
+            expectedOrderId: BigInt(operation.expectedOrderId.toString()),
+          };
+        }
+
+        const resolvedClientOrderId = operation.clientOrderId ?? Date.now();
+        const resolvedOrderType = operation.orderType ?? PerpOrderType.limit;
+        const resolvedSelfTradeBehavior =
+          operation.selfTradeBehavior ?? PerpSelfTradeBehavior.decrementTake;
+
+        return {
+          kind: 'place' as const,
+          side: operation.side,
+          priceLots: BigInt(perpMarket.uiPriceToLots(operation.price).toString()),
+          maxBaseLots: BigInt(
+            perpMarket.uiBaseToLots(operation.quantity).toString(),
+          ),
+          maxQuoteLots: operation.maxQuoteQuantity
+            ? BigInt(perpMarket.uiQuoteToLots(operation.maxQuoteQuantity).toString())
+            : BigInt(I64_MAX_BN.toString()),
+          clientOrderId: resolvedClientOrderId,
+          orderType: resolvedOrderType,
+          selfTradeBehavior: resolvedSelfTradeBehavior,
+          reduceOnly: operation.reduceOnly ?? false,
+          expiryTimestamp: operation.expiryTimestamp ?? 0,
+          limit: operation.limit ?? 10,
+        };
+      }),
     });
 
     return await this.executionQueueEnqueueCtmWithIntent(

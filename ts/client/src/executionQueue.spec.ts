@@ -4,6 +4,7 @@ import {
   QueueItemKind,
   QueuePlaceOrderType,
   QueuePayloadVariant,
+  PerpBatchSubOpVariant,
   QueueSelfTradeBehavior,
   QueueSide,
   buildCtmEnvelopeMessage,
@@ -16,6 +17,7 @@ import {
   encodeLiquidityWithdrawQueuePayload,
   encodePerpCancelAllOrdersBySideQueuePayload,
   encodePerpCancelAllOrdersQueuePayload,
+  encodePerpBatchIntentQueuePayload,
   encodePerpCancelOrderQueuePayload,
   encodePerpPlaceOrderV2QueuePayload,
   hashExecutionQueuePayload,
@@ -318,5 +320,40 @@ describe('Execution Queue Helpers', () => {
     const msgA = buildCtmEnvelopeMessage(group, envelopeA);
     const msgB = buildCtmEnvelopeMessage(group, envelopeB);
     expect(Buffer.compare(msgA, msgB)).not.eq(0);
+  });
+
+  it('encodes batch intent payloads deterministically', () => {
+    const payload = encodePerpBatchIntentQueuePayload({
+      operations: [
+        {
+          kind: 'cancelBySlot',
+          slot: 3,
+          expectedOrderId: 17n,
+        },
+        {
+          kind: 'place',
+          side: QueueSide.Bid,
+          priceLots: 12,
+          maxBaseLots: 4,
+          maxQuoteLots: 48,
+          clientOrderId: 99,
+          orderType: QueuePlaceOrderType.Limit,
+          selfTradeBehavior: QueueSelfTradeBehavior.DecrementTake,
+          reduceOnly: false,
+          expiryTimestamp: 0,
+          limit: 7,
+        },
+      ],
+    });
+
+    expect(Array.from(payload.slice(0, 5))).deep.eq([
+      1,
+      QueuePayloadVariant.PerpBatchIntent,
+      0,
+      0,
+      2,
+    ]);
+    expect(payload[5]).eq(PerpBatchSubOpVariant.PerpCancelOrderBySlot);
+    expect(payload[23]).eq(PerpBatchSubOpVariant.PerpPlaceOrderV2);
   });
 });
