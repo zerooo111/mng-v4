@@ -7,11 +7,15 @@ import {
   PerpBatchSubOpVariant,
   QueueSelfTradeBehavior,
   QueueSide,
+  UserIntentTargetKind,
+  UserIntentVersion,
   buildCtmEnvelopeMessage,
   buildExecutionQueueEnqueueCtmWithIntentIxs,
+  buildExecutionQueueEnqueueDirectWithIntentIxs,
   buildExecutionQueueEnqueueLiquidityIx,
   buildExecutionQueueUserIntent,
   buildExecutionQueueExecuteIx,
+  buildLegacyUserIntentMessage,
   buildUserIntentMessage,
   encodeLiquidityDepositQueuePayload,
   encodeLiquidityWithdrawQueuePayload,
@@ -74,8 +78,21 @@ describe('Execution Queue Helpers', () => {
       expiresAtSlot: 0n,
     };
 
-    const userA = await buildUserIntentMessage(group, mangoAccount, ownerA, envelope);
-    const userB = await buildUserIntentMessage(group, mangoAccount, ownerB, envelope);
+    const target = { kind: UserIntentTargetKind.PerpMarket, index: 7 };
+    const userA = await buildUserIntentMessage(
+      group,
+      mangoAccount,
+      ownerA,
+      envelope,
+      target,
+    );
+    const userB = await buildUserIntentMessage(
+      group,
+      mangoAccount,
+      ownerB,
+      envelope,
+      target,
+    );
     const ctmA = await buildCtmEnvelopeMessage(group, envelope);
     const ctmB = await buildCtmEnvelopeMessage(group, envelope);
 
@@ -113,6 +130,7 @@ describe('Execution Queue Helpers', () => {
       group,
       executionQueue,
       executionQueueBuffer,
+      marketIndex: 0,
       remainingAccounts,
       payload,
       sequence: 42,
@@ -140,6 +158,7 @@ describe('Execution Queue Helpers', () => {
       mangoAccount,
       userOwner: user.publicKey,
       payload,
+      target: { kind: UserIntentTargetKind.PerpMarket, index: 0 },
       remainingAccounts,
     }).accountsHash;
     expect(Buffer.compare(built.envelope.payloadHash, expectedPayloadHash)).eq(0);
@@ -169,6 +188,7 @@ describe('Execution Queue Helpers', () => {
       group,
       executionQueue,
       executionQueueBuffer,
+      marketIndex: 0,
       maxItems: 3,
       remainingAccounts: [
         {
@@ -181,7 +201,8 @@ describe('Execution Queue Helpers', () => {
 
     expect(enqueueLiquidityIx.keys.length).eq(3);
     expect(executeIx.keys.length).eq(3);
-    expect(executeIx.data.length).eq(10);
+    // v2 execute_ix data: 8 (discriminator) + 2 (market_index) + 2 (max_items) = 12
+    expect(executeIx.data.length).eq(12);
   });
 
   it('builds and signs a user intent payload for relayer submission', async () => {
@@ -199,7 +220,7 @@ describe('Execution Queue Helpers', () => {
       mangoAccount,
       userOwner: user.publicKey,
       payload,
-      remainingAccounts,
+      target: { kind: UserIntentTargetKind.PerpMarket, index: 3 },
     });
     const sig = signExecutionQueueIntentMessage(
       user.secretKey,
@@ -297,9 +318,123 @@ describe('Execution Queue Helpers', () => {
       expiresAtSlot: 0n,
     };
 
-    const msgA = buildUserIntentMessage(group, mangoAccountA, owner, envelope);
-    const msgB = buildUserIntentMessage(group, mangoAccountB, owner, envelope);
+    const msgA = buildUserIntentMessage(
+      group,
+      mangoAccountA,
+      owner,
+      envelope,
+      { kind: UserIntentTargetKind.PerpMarket, index: 7 },
+    );
+    const msgB = buildUserIntentMessage(
+      group,
+      mangoAccountB,
+      owner,
+      envelope,
+      { kind: UserIntentTargetKind.PerpMarket, index: 7 },
+    );
     expect(Buffer.compare(msgA, msgB)).not.eq(0);
+  });
+
+  it('v2 user intent message does not depend on accounts hash', () => {
+    const group = Keypair.generate().publicKey;
+    const mangoAccount = Keypair.generate().publicKey;
+    const owner = Keypair.generate().publicKey;
+    const envelopeA = {
+      sequence: 1n,
+      minExecuteSlot: 2n,
+      kind: QueueItemKind.CtmWrapped,
+      payloadHash: Buffer.alloc(32, 7),
+      accountsHash: Buffer.alloc(32, 9),
+      expiresAtSlot: 0n,
+    };
+    const envelopeB = {
+      ...envelopeA,
+      accountsHash: Buffer.alloc(32, 11),
+    };
+
+    const v2A = buildUserIntentMessage(
+      group,
+      mangoAccount,
+      owner,
+      envelopeA,
+      { kind: UserIntentTargetKind.PerpMarket, index: 7 },
+    );
+    const v2B = buildUserIntentMessage(
+      group,
+      mangoAccount,
+      owner,
+      envelopeB,
+      { kind: UserIntentTargetKind.PerpMarket, index: 7 },
+    );
+    const v1A = buildLegacyUserIntentMessage(group, mangoAccount, owner, envelopeA);
+    const v1B = buildLegacyUserIntentMessage(group, mangoAccount, owner, envelopeB);
+
+    expect(Buffer.compare(v2A, v2B)).eq(0);
+    expect(Buffer.compare(v1A, v1B)).not.eq(0);
+  });
+
+  it('v2 user intent message changes with target index', () => {
+    const group = Keypair.generate().publicKey;
+    const mangoAccount = Keypair.generate().publicKey;
+    const owner = Keypair.generate().publicKey;
+    const envelope = {
+      sequence: 1n,
+      minExecuteSlot: 2n,
+      kind: QueueItemKind.CtmWrapped,
+      payloadHash: Buffer.alloc(32, 7),
+      accountsHash: Buffer.alloc(32, 9),
+      expiresAtSlot: 0n,
+    };
+
+    const market0 = buildUserIntentMessage(
+      group,
+      mangoAccount,
+      owner,
+      envelope,
+      { kind: UserIntentTargetKind.PerpMarket, index: 0 },
+    );
+    const market1 = buildUserIntentMessage(
+      group,
+      mangoAccount,
+      owner,
+      envelope,
+      { kind: UserIntentTargetKind.PerpMarket, index: 1 },
+    );
+
+    expect(Buffer.compare(market0, market1)).not.eq(0);
+  });
+
+  it('builds direct enqueue with user-only preinstruction', () => {
+    const programId = Keypair.generate().publicKey;
+    const group = Keypair.generate().publicKey;
+    const executionQueue = Keypair.generate().publicKey;
+    const mangoAccount = Keypair.generate().publicKey;
+    const user = Keypair.generate();
+    const payload = encodePerpCancelAllOrdersQueuePayload({ limit: 10 });
+    const remainingAccounts = [
+      { pubkey: group, isWritable: false, isSigner: false },
+      { pubkey: mangoAccount, isWritable: true, isSigner: false },
+      { pubkey: user.publicKey, isWritable: false, isSigner: false },
+      { pubkey: Keypair.generate().publicKey, isWritable: true, isSigner: false },
+    ];
+
+    const built = buildExecutionQueueEnqueueDirectWithIntentIxs({
+      programId,
+      group,
+      executionQueue,
+      marketIndex: 2,
+      remainingAccounts,
+      payload,
+      intentVersion: UserIntentVersion.V2,
+      userOwner: user.publicKey,
+      mangoAccount,
+      userSigner: { kind: 'keypair', privateKey: user.secretKey },
+    });
+
+    expect(built.instructions.length).eq(2);
+    expect(built.instructions[0]).eq(built.userIntentPreInstruction);
+    expect(built.instructions[1]).eq(built.enqueueInstruction);
+    expect(built.envelope.sequence).eq(0n);
   });
 
   it('message_changes_with_sequence', () => {

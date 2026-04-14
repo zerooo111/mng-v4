@@ -19,6 +19,10 @@ message SubmitIntentRequest {
   string user_owner = 8;
   string mango_account = 9;
   bytes user_signature = 10;
+  string base_fee = 11;
+  uint32 intent_version = 12;
+  uint32 target_kind = 13;
+  uint32 target_index = 14;
 }
 
 message SubmitIntentResponse {

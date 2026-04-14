@@ -16,6 +16,16 @@ pub struct RelayIntentAcceptedEvent {
     pub group: String,
     pub execution_queue: String,
     pub market: String,
+    #[serde(default)]
+    pub intent_version: Option<u32>,
+    #[serde(default)]
+    pub target_kind: Option<u32>,
+    #[serde(default)]
+    pub target_index: Option<u32>,
+    #[serde(default)]
+    pub accounts_hash: Option<String>,
+    #[serde(default)]
+    pub remaining_accounts_source: Option<String>,
     pub sequence: String,
     pub kind: u8,
     pub payload_b64: String,
@@ -33,6 +43,10 @@ pub struct QueueItemEnqueuedEvent {
     pub event_type: String,
     pub ts_ms: u64,
     pub group: String,
+    /// v2 sub-queue: per-market sequence allocator. Default 0 keeps the
+    /// type wire-compatible with v1 events that don't carry market_index.
+    #[serde(default)]
+    pub market_index: u16,
     pub sequence: String,
     pub kind: u8,
     pub min_execute_slot: String,
@@ -45,6 +59,10 @@ pub struct QueueItemProcessedEvent {
     pub event_type: String,
     pub ts_ms: u64,
     pub group: String,
+    /// v2 sub-queue: per-market sequence allocator. Default 0 keeps the
+    /// type wire-compatible with v1 events that don't carry market_index.
+    #[serde(default)]
+    pub market_index: u16,
     pub sequence: String,
     pub kind: u8,
     pub status: u8,

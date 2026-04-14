@@ -245,6 +245,7 @@ async function submitIntentViaRelayer(params: {
     mangoAccount: params.mangoAccount,
     userOwner: params.user.publicKey,
     payload: params.payload,
+    target: { kind: 0, index: 0 },
     remainingAccounts: params.remainingAccounts,
   });
   const userSignature = signExecutionQueueIntentMessage(
@@ -283,6 +284,9 @@ async function submitIntentViaRelayer(params: {
         user_owner: params.user.publicKey.toBase58(),
         mango_account: params.mangoAccount.toBase58(),
         user_signature: Buffer.from(userSignature),
+        intent_version: 2,
+        target_kind: 0,
+        target_index: 0,
       },
       (err: Error | null, response: { sequence: string; tx_signature?: string }) => {
         if (err) {
@@ -508,7 +512,8 @@ async function main(): Promise<void> {
       userOwner: bot.user.publicKey,
     });
 
-    const priceLotsNum = Number(perpMarket.uiPriceToLots(capPriceUi).toString());
+    const priceLots = perpMarket.uiPriceToLotsForSide(capPriceUi, side);
+    const priceLotsNum = Number(priceLots.toString());
     if (!Number.isFinite(priceLotsNum) || priceLotsNum <= 0) {
       console.log(
         JSON.stringify({
@@ -527,7 +532,7 @@ async function main(): Promise<void> {
 
     const payload = encodePerpPlaceOrderV2QueuePayload({
       side,
-      priceLots: BigInt(perpMarket.uiPriceToLots(capPriceUi).toString()),
+      priceLots: BigInt(priceLots.toString()),
       maxBaseLots: BigInt(perpMarket.uiBaseToLots(SIZE_UI).toString()),
       maxQuoteLots: BigInt(I64_MAX_BN.toString()),
       clientOrderId,

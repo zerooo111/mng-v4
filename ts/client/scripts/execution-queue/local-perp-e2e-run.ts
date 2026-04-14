@@ -260,6 +260,7 @@ async function submitIntentViaRelayer(params: {
     mangoAccount: params.mangoAccount,
     userOwner: params.userOwner,
     payload: params.payload,
+    target: { kind: 0, index: params.market },
     remainingAccounts: params.remainingAccounts,
   });
   const userSignature = signExecutionQueueIntentMessage(
@@ -284,6 +285,9 @@ async function submitIntentViaRelayer(params: {
         user_owner: params.userOwner.toBase58(),
         mango_account: params.mangoAccount.toBase58(),
         user_signature: Buffer.from(userSignature),
+        intent_version: 2,
+        target_kind: 0,
+        target_index: params.market,
       },
       (err: Error | null, res: SubmitIntentResponse) => {
         if (err) {
@@ -506,6 +510,7 @@ async function main(): Promise<void> {
       makerGroup,
       executionQueuePk,
       executionQueueBufferPk,
+      0, // marketIndex (single-market localnet test)
       cancelRemainingAccounts,
       1,
     );
@@ -523,6 +528,7 @@ async function main(): Promise<void> {
         makerGroup,
         executionQueuePk,
         executionQueueBufferPk,
+        0, // marketIndex (single-market localnet test)
         cancelRemainingAccounts,
         1,
       );

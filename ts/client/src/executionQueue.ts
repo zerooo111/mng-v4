@@ -10,8 +10,13 @@ import {
 } from '@solana/web3.js';
 
 export const EXECUTION_QUEUE_DOMAIN = 'mango-v4-ctm-envelope-v1';
-export const USER_INTENT_DOMAIN = 'mango-v4-user-intent-v1';
+export const LEGACY_USER_INTENT_DOMAIN = 'mango-v4-user-intent-v1';
+export const USER_INTENT_DOMAIN = 'mango-v4-user-intent-v2';
 const EXECUTION_QUEUE_DOMAIN_BYTES = Buffer.from(EXECUTION_QUEUE_DOMAIN, 'utf-8');
+const LEGACY_USER_INTENT_DOMAIN_BYTES = Buffer.from(
+  LEGACY_USER_INTENT_DOMAIN,
+  'utf-8',
+);
 const USER_INTENT_DOMAIN_BYTES = Buffer.from(USER_INTENT_DOMAIN, 'utf-8');
 const EXECUTION_QUEUE_PAYLOAD_MAX = 256;
 const instructionDiscriminatorCache = new Map<string, Buffer>();
@@ -37,6 +42,16 @@ export enum QueueItemKind {
   CtmWrapped = 0,
   LiquidityDeposit = 1,
   LiquidityWithdraw = 2,
+}
+
+export enum UserIntentVersion {
+  V1 = 1,
+  V2 = 2,
+}
+
+export enum UserIntentTargetKind {
+  PerpMarket = 0,
+  Token = 1,
 }
 
 export enum QueueSide {
@@ -156,6 +171,9 @@ export type BuildExecutionQueueEnqueueCtmParams = {
   group: PublicKey;
   executionQueue: PublicKey;
   executionQueueBuffer?: PublicKey;
+  // Sub-queue routing (v2). Each market_index is bound to its own sub-queue
+  // inside the single ExecutionQueue account.
+  marketIndex: number;
   remainingAccounts: AccountMeta[];
   envelope: CtmEnvelopeWire;
   payload: Uint8Array;
@@ -176,8 +194,14 @@ export type BuildExecutionQueueExecuteParams = {
   group: PublicKey;
   executionQueue: PublicKey;
   executionQueueBuffer?: PublicKey;
+  marketIndex: number;
   remainingAccounts: AccountMeta[];
   maxItems: number;
+};
+
+export type ExecutionQueueIntentTarget = {
+  kind: UserIntentTargetKind;
+  index: number;
 };
 
 export type BuildExecutionQueueUserIntentParams = {
@@ -187,7 +211,9 @@ export type BuildExecutionQueueUserIntentParams = {
   userOwner: PublicKey;
   kind?: QueueItemKind;
   payload: Uint8Array;
-  remainingAccounts: AccountMeta[];
+  target: ExecutionQueueIntentTarget;
+  intentVersion?: UserIntentVersion;
+  remainingAccounts?: AccountMeta[];
 };
 
 export type BuildExecutionQueueEnqueueCtmWithIntentParams = {
@@ -195,6 +221,7 @@ export type BuildExecutionQueueEnqueueCtmWithIntentParams = {
   group: PublicKey;
   executionQueue: PublicKey;
   executionQueueBuffer?: PublicKey;
+  marketIndex: number;
   remainingAccounts: AccountMeta[];
   payload: Uint8Array;
   sequence: BigNumberish;
@@ -203,8 +230,37 @@ export type BuildExecutionQueueEnqueueCtmWithIntentParams = {
   kind?: QueueItemKind;
   userOwner: PublicKey;
   mangoAccount: PublicKey;
+  intentVersion?: UserIntentVersion;
   userSigner: IntentSigner;
   ctmSigner: IntentSigner;
+};
+
+export type BuildExecutionQueueEnqueueDirectParams = {
+  programId: PublicKey;
+  group: PublicKey;
+  executionQueue: PublicKey;
+  executionQueueBuffer?: PublicKey;
+  marketIndex: number;
+  remainingAccounts: AccountMeta[];
+  envelope: CtmEnvelopeWire;
+  payload: Uint8Array;
+};
+
+export type BuildExecutionQueueEnqueueDirectWithIntentParams = {
+  programId: PublicKey;
+  group: PublicKey;
+  executionQueue: PublicKey;
+  executionQueueBuffer?: PublicKey;
+  marketIndex: number;
+  remainingAccounts: AccountMeta[];
+  payload: Uint8Array;
+  minExecuteSlot?: BigNumberish;
+  expiresAtSlot?: BigNumberish;
+  kind?: QueueItemKind;
+  intentVersion?: UserIntentVersion;
+  userOwner: PublicKey;
+  mangoAccount: PublicKey;
+  userSigner: IntentSigner;
 };
 
 const U16_MAX = 0xffff;
@@ -598,10 +654,31 @@ export function buildUserIntentMessage(
   mangoAccount: PublicKey,
   userOwner: PublicKey,
   envelope: CtmEnvelopeWire,
+  target: ExecutionQueueIntentTarget,
 ): Buffer {
   return sha256(
     Buffer.concat([
       USER_INTENT_DOMAIN_BYTES,
+      Buffer.from(group.toBytes()),
+      Buffer.from(mangoAccount.toBytes()),
+      Buffer.from(userOwner.toBytes()),
+      u8(envelope.kind),
+      u8(target.kind),
+      u16ToLe(target.index),
+      Buffer.from(envelope.payloadHash),
+    ]),
+  );
+}
+
+export function buildLegacyUserIntentMessage(
+  group: PublicKey,
+  mangoAccount: PublicKey,
+  userOwner: PublicKey,
+  envelope: CtmEnvelopeWire,
+): Buffer {
+  return sha256(
+    Buffer.concat([
+      LEGACY_USER_INTENT_DOMAIN_BYTES,
       Buffer.from(group.toBytes()),
       Buffer.from(mangoAccount.toBytes()),
       Buffer.from(userOwner.toBytes()),
@@ -621,13 +698,15 @@ export function buildExecutionQueueUserIntent(
   userIntentMessage: Buffer;
 } {
   const payloadHash = hashExecutionQueuePayload(params.payload);
-  const accountsHash = params.executionQueue
+  const accountsHash = params.executionQueue && params.remainingAccounts
     ? hashExecutionQueueAccountsForCtmEnqueue(
         params.group,
         params.executionQueue,
         params.remainingAccounts,
       )
-    : hashExecutionQueueAccounts(params.remainingAccounts);
+    : params.remainingAccounts
+      ? hashExecutionQueueAccounts(params.remainingAccounts)
+      : Buffer.alloc(32);
   const envelopeLike: CtmEnvelopeWire = {
     sequence: 0n,
     minExecuteSlot: 0n,
@@ -636,12 +715,21 @@ export function buildExecutionQueueUserIntent(
     accountsHash,
     expiresAtSlot: 0n,
   };
-  const userIntentMessage = buildUserIntentMessage(
-    params.group,
-    params.mangoAccount,
-    params.userOwner,
-    envelopeLike,
-  );
+  const userIntentMessage =
+    (params.intentVersion ?? UserIntentVersion.V2) === UserIntentVersion.V1
+      ? buildLegacyUserIntentMessage(
+          params.group,
+          params.mangoAccount,
+          params.userOwner,
+          envelopeLike,
+        )
+      : buildUserIntentMessage(
+          params.group,
+          params.mangoAccount,
+          params.userOwner,
+          envelopeLike,
+          params.target,
+        );
   return { envelopeLike, payloadHash, accountsHash, userIntentMessage };
 }
 
@@ -688,8 +776,10 @@ export function buildExecutionQueueEnqueueCtmIx(
     'execution_queue_enqueue_ctm',
   );
 
+  // v2 instruction args order: market_index (u16), envelope (CtmEnvelope), payload (Vec<u8>)
   const data = Buffer.concat([
     discriminator,
+    u16ToLe(params.marketIndex),
     encodeEnvelope(params.envelope),
     u32ToLe(params.payload.length),
     Buffer.from(params.payload),
@@ -753,13 +843,55 @@ export function buildExecutionQueueEnqueueLiquidityIx(
   });
 }
 
+export function buildExecutionQueueEnqueueDirectIx(
+  params: BuildExecutionQueueEnqueueDirectParams,
+): TransactionInstruction {
+  const discriminator = anchorInstructionDiscriminator(
+    'execution_queue_enqueue_direct',
+  );
+  const data = Buffer.concat([
+    discriminator,
+    u16ToLe(params.marketIndex),
+    encodeEnvelope(params.envelope),
+    u32ToLe(params.payload.length),
+    Buffer.from(params.payload),
+  ]);
+
+  const keys: AccountMeta[] = [
+    { pubkey: params.group, isSigner: false, isWritable: true },
+    { pubkey: params.executionQueue, isSigner: false, isWritable: true },
+    {
+      pubkey: SYSVAR_INSTRUCTIONS_PUBKEY,
+      isSigner: false,
+      isWritable: false,
+    },
+    ...params.remainingAccounts,
+    {
+      pubkey: params.programId,
+      isSigner: false,
+      isWritable: false,
+    },
+  ];
+
+  return new TransactionInstruction({
+    programId: params.programId,
+    keys,
+    data,
+  });
+}
+
 export function buildExecutionQueueExecuteIx(
   params: BuildExecutionQueueExecuteParams,
 ): TransactionInstruction {
   const discriminator = anchorInstructionDiscriminator(
     'execution_queue_execute',
   );
-  const data = Buffer.concat([discriminator, u16ToLe(params.maxItems)]);
+  // v2 instruction args order: market_index (u16), max_items (u16)
+  const data = Buffer.concat([
+    discriminator,
+    u16ToLe(params.marketIndex),
+    u16ToLe(params.maxItems),
+  ]);
   return new TransactionInstruction({
     programId: params.programId,
     keys: [
@@ -802,12 +934,24 @@ export function buildExecutionQueueEnqueueCtmWithIntentIxs(
     expiresAtSlot: toBigInt(params.expiresAtSlot ?? 0),
   };
 
-  const userIntentMessage = buildUserIntentMessage(
-    params.group,
-    params.mangoAccount,
-    params.userOwner,
-    envelope,
-  );
+  const userIntentMessage =
+    (params.intentVersion ?? UserIntentVersion.V2) === UserIntentVersion.V1
+      ? buildLegacyUserIntentMessage(
+          params.group,
+          params.mangoAccount,
+          params.userOwner,
+          envelope,
+        )
+      : buildUserIntentMessage(
+          params.group,
+          params.mangoAccount,
+          params.userOwner,
+          envelope,
+          {
+            kind: UserIntentTargetKind.PerpMarket,
+            index: params.marketIndex,
+          },
+        );
   const ctmEnvelopeMessage = buildCtmEnvelopeMessage(params.group, envelope);
 
   const userIntentPreInstruction = buildIntentEd25519Instruction(
@@ -823,6 +967,7 @@ export function buildExecutionQueueEnqueueCtmWithIntentIxs(
     group: params.group,
     executionQueue: params.executionQueue,
     executionQueueBuffer: params.executionQueueBuffer,
+    marketIndex: params.marketIndex,
     remainingAccounts: params.remainingAccounts,
     envelope,
     payload: params.payload,
@@ -840,5 +985,77 @@ export function buildExecutionQueueEnqueueCtmWithIntentIxs(
       ctmEnvelopePreInstruction,
       enqueueInstruction,
     ],
+  };
+}
+
+export function buildExecutionQueueEnqueueDirectWithIntentIxs(
+  params: BuildExecutionQueueEnqueueDirectWithIntentParams,
+): {
+  envelope: CtmEnvelopeWire;
+  userIntentMessage: Buffer;
+  userIntentPreInstruction: TransactionInstruction;
+  enqueueInstruction: TransactionInstruction;
+  instructions: TransactionInstruction[];
+} {
+  const kind = params.kind ?? QueueItemKind.CtmWrapped;
+  if (kind !== QueueItemKind.CtmWrapped) {
+    throw new Error('enqueue_direct requires QueueItemKind.CtmWrapped');
+  }
+
+  const payloadHash = hashExecutionQueuePayload(params.payload);
+  const accountsHash = hashExecutionQueueAccountsForCtmEnqueue(
+    params.group,
+    params.executionQueue,
+    params.remainingAccounts,
+  );
+  const envelope: CtmEnvelopeWire = {
+    sequence: 0n,
+    minExecuteSlot: toBigInt(params.minExecuteSlot ?? 0),
+    kind,
+    payloadHash,
+    accountsHash,
+    expiresAtSlot: toBigInt(params.expiresAtSlot ?? 0),
+  };
+
+  const userIntentMessage =
+    (params.intentVersion ?? UserIntentVersion.V2) === UserIntentVersion.V1
+      ? buildLegacyUserIntentMessage(
+          params.group,
+          params.mangoAccount,
+          params.userOwner,
+          envelope,
+        )
+      : buildUserIntentMessage(
+          params.group,
+          params.mangoAccount,
+          params.userOwner,
+          envelope,
+          {
+            kind: UserIntentTargetKind.PerpMarket,
+            index: params.marketIndex,
+          },
+        );
+
+  const userIntentPreInstruction = buildIntentEd25519Instruction(
+    userIntentMessage,
+    params.userSigner,
+  );
+  const enqueueInstruction = buildExecutionQueueEnqueueDirectIx({
+    programId: params.programId,
+    group: params.group,
+    executionQueue: params.executionQueue,
+    executionQueueBuffer: params.executionQueueBuffer,
+    marketIndex: params.marketIndex,
+    remainingAccounts: params.remainingAccounts,
+    envelope,
+    payload: params.payload,
+  });
+
+  return {
+    envelope,
+    userIntentMessage,
+    userIntentPreInstruction,
+    enqueueInstruction,
+    instructions: [userIntentPreInstruction, enqueueInstruction],
   };
 }

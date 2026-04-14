@@ -34,6 +34,7 @@ pub struct CtmEnvelope {
 #[event]
 pub struct QueueItemEnqueued {
     pub group: Pubkey,
+    pub market_index: u16,
     pub sequence: u64,
     pub kind: u8,
     pub min_execute_slot: u64,
@@ -42,6 +43,7 @@ pub struct QueueItemEnqueued {
 #[event]
 pub struct QueueItemProcessed {
     pub group: Pubkey,
+    pub market_index: u16,
     pub sequence: u64,
     pub kind: u8,
     pub status: u8,
@@ -71,6 +73,13 @@ pub enum QueuePayloadVariant {
     PerpCancelAllOrdersBySide = 4,
     LiquidityDeposit = 5,
     LiquidityWithdraw = 6,
+}
+
+#[repr(u8)]
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq)]
+enum UserIntentTargetKind {
+    PerpMarket = 0,
+    Token = 1,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
@@ -254,7 +263,7 @@ fn canonical_envelope_message(group: Pubkey, envelope: &CtmEnvelope) -> [u8; 32]
     .to_bytes()
 }
 
-fn canonical_user_intent_message(
+fn canonical_user_intent_message_v1(
     group: Pubkey,
     mango_account: Pubkey,
     user_owner: Pubkey,
@@ -268,6 +277,28 @@ fn canonical_user_intent_message(
         &[envelope.kind],
         &envelope.payload_hash,
         &envelope.accounts_hash,
+    ])
+    .to_bytes()
+}
+
+fn canonical_user_intent_message_v2(
+    group: Pubkey,
+    mango_account: Pubkey,
+    user_owner: Pubkey,
+    kind: u8,
+    target_kind: UserIntentTargetKind,
+    target_index: u16,
+    payload_hash: &[u8; 32],
+) -> [u8; 32] {
+    hashv(&[
+        b"mango-v4-user-intent-v2",
+        group.as_ref(),
+        mango_account.as_ref(),
+        user_owner.as_ref(),
+        &[kind],
+        &[target_kind as u8],
+        &target_index.to_le_bytes(),
+        payload_hash,
     ])
     .to_bytes()
 }
@@ -642,6 +673,150 @@ fn dispatch_queue_payload(
     }
 }
 
+fn map_execution_queue_perp_health_validation_error(error: Error) -> Error {
+    error!(MangoError::ExecutionQueuePerpHealthAccountsInvalid).context(error)
+}
+
+fn validate_perp_place_order_health_accounts(
+    group_key: Pubkey,
+    dispatch_accounts: &[AccountInfo],
+    spec: QueueHealthRegionSpec,
+) -> Result<()> {
+    require!(
+        dispatch_accounts.len() > spec.account_index,
+        MangoError::ExecutionQueueDispatchAccountLayoutInvalid
+    );
+    require!(
+        dispatch_accounts.len() > 3,
+        MangoError::ExecutionQueueDispatchAccountLayoutInvalid
+    );
+    require!(
+        dispatch_accounts.len() > spec.health_accounts_start,
+        MangoError::ExecutionQueuePerpHealthAccountsInvalid
+    );
+
+    let account_loader = AccountLoader::<MangoAccountFixed>::try_from(&dispatch_accounts[spec.account_index])
+        .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?;
+    let account = account_loader
+        .load_full()
+        .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?;
+    require!(
+        account.fixed.group == group_key,
+        MangoError::ExecutionQueueInvalidUserAccount
+    );
+
+    let perp_market_loader = AccountLoader::<PerpMarket>::try_from(&dispatch_accounts[3])
+        .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?;
+    let perp_market = perp_market_loader
+        .load()
+        .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?;
+
+    let health_accounts = &dispatch_accounts[spec.health_accounts_start..];
+    let retriever = ScanningAccountRetriever::new(health_accounts, &group_key)
+        .map_err(map_execution_queue_perp_health_validation_error)
+        .context("create queue perp health account retriever")?;
+    let queued_perp_market_index = perp_market.perp_market_index;
+
+    for position in account.active_token_positions() {
+        let token_index = position.token_index;
+        retriever
+            .has_scanned_bank_and_oracle_key(token_index)
+            .map_err(map_execution_queue_perp_health_validation_error)
+            .with_context(|| format!("missing bank/oracle for token position {}", token_index))?;
+    }
+
+    for perp_position in account.active_perp_positions() {
+        let perp_market_index = perp_position.market_index;
+        retriever
+            .has_scanned_perp_market_and_oracle_key(perp_market_index)
+            .map_err(map_execution_queue_perp_health_validation_error)
+            .with_context(|| {
+                format!(
+                    "missing perp market/oracle for active perp position {}",
+                    perp_market_index
+                )
+            })?;
+    }
+
+    retriever
+        .has_scanned_perp_market_and_oracle_key(queued_perp_market_index)
+        .map_err(map_execution_queue_perp_health_validation_error)
+        .with_context(|| {
+            format!(
+                "missing perp market/oracle for queued perp market {}",
+                queued_perp_market_index
+            )
+        })?;
+
+    for serum3_orders in account.active_serum3_orders() {
+        retriever
+            .scanned_serum_oo(&serum3_orders.open_orders)
+            .map(|_| ())
+            .map_err(map_execution_queue_perp_health_validation_error)
+            .with_context(|| {
+                format!(
+                    "missing serum3 open orders {}",
+                    serum3_orders.open_orders
+                )
+            })?;
+    }
+
+    for openbook_v2_orders in account.active_openbook_v2_orders() {
+        retriever
+            .scanned_openbook_oo(&openbook_v2_orders.open_orders)
+            .map(|_| ())
+            .map_err(map_execution_queue_perp_health_validation_error)
+            .with_context(|| {
+                format!(
+                    "missing openbook v2 open orders {}",
+                    openbook_v2_orders.open_orders
+                )
+            })?;
+    }
+
+    Ok(())
+}
+
+fn validate_queue_payload_dispatch_accounts(
+    group_key: Pubkey,
+    payload: &DecodedQueuePayload,
+    dispatch_accounts: &[AccountInfo],
+) -> Result<()> {
+    if let Some(spec) = queue_health_region_spec(payload.variant) {
+        if payload.variant == QueuePayloadVariant::PerpPlaceOrderV2 {
+            validate_perp_place_order_health_accounts(group_key, dispatch_accounts, spec)?;
+        }
+    }
+    Ok(())
+}
+
+/// Verify that the perp_market account at canonical position [3] in the
+/// dispatch accounts has `perp_market_index == expected_market_index`.
+/// This binds the instruction's `market_index` parameter to the actual
+/// PerpMarket being dispatched against, so a relayer cannot route an order
+/// for market A into market B's sub-queue. Liquidity payloads have no perp
+/// market in the dispatch accounts and bypass this check (they go to the
+/// global liquidity ring).
+fn require_dispatch_market_index(
+    dispatch_accounts: &[AccountInfo],
+    expected_market_index: u16,
+) -> Result<()> {
+    require!(
+        dispatch_accounts.len() > 3,
+        MangoError::ExecutionQueueDispatchAccountLayoutInvalid
+    );
+    let perp_market_loader = AccountLoader::<PerpMarket>::try_from(&dispatch_accounts[3])
+        .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?;
+    let perp_market = perp_market_loader
+        .load()
+        .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?;
+    require!(
+        perp_market.perp_market_index == expected_market_index,
+        MangoError::ExecutionQueueSubQueueMarketIndexMismatch
+    );
+    Ok(())
+}
+
 fn extract_user_owner_for_ctm_payload(
     group_key: Pubkey,
     remaining_accounts: &[AccountInfo],
@@ -806,17 +981,21 @@ fn verify_ed25519_preinstruction(ixs: &AccountInfo, signer: Pubkey, message: &[u
 fn verify_user_ed25519_preinstruction(
     ixs: &AccountInfo,
     signer: Pubkey,
-    msg_hash: [u8; 32],
+    msg_hashes: &[[u8; 32]],
 ) -> Result<()> {
-    if has_ed25519_preinstruction(ixs, signer, msg_hash.as_ref())? {
-        return Ok(());
+    for msg_hash in msg_hashes {
+        if has_ed25519_preinstruction(ixs, signer, msg_hash.as_ref())? {
+            return Ok(());
+        }
+
+        // Frontend compatibility: some wallets sign utf8(hex(intent_hash)).
+        let msg_hex_utf8 = canonical_user_intent_message_hex_utf8(*msg_hash);
+        if has_ed25519_preinstruction(ixs, signer, msg_hex_utf8.as_ref())? {
+            return Ok(());
+        }
     }
 
-    // Frontend compatibility: some wallets sign utf8(hex(intent_hash)).
-    let msg_hex_utf8 = canonical_user_intent_message_hex_utf8(msg_hash);
-    let found_hex = has_ed25519_preinstruction(ixs, signer, msg_hex_utf8.as_ref())?;
-    require!(found_hex, MangoError::ExecutionQueueUserSignatureMissing);
-    Ok(())
+    err!(MangoError::ExecutionQueueUserSignatureMissing)
 }
 
 fn queue_health_region_begin(
@@ -936,8 +1115,9 @@ pub fn execution_queue_configure(
     params: ExecutionQueueConfigParams,
 ) -> Result<()> {
     let mut queue = ctx.accounts.execution_queue.load_mut()?;
-    queue.header.gap_wait_slots = params.gap_wait_slots;
-    queue.header.liquidity_delay_slots = params.liquidity_delay_slots;
+    queue.require_v2()?;
+    queue.global_header.gap_wait_slots = params.gap_wait_slots;
+    queue.global_header.liquidity_delay_slots = params.liquidity_delay_slots;
     queue.paused_ingress = u8::from(params.pause_ingress);
     queue.paused_execute = u8::from(params.pause_execute);
     Ok(())
@@ -954,24 +1134,125 @@ pub fn execution_queue_set_ctm_pending(
     Ok(())
 }
 
-pub fn execution_queue_drop_ctm(ctx: Context<ExecutionQueueAdmin>, sequence: u64) -> Result<()> {
+/// Migrate a v1 single-queue ExecutionQueue to the v2 sub-queue layout.
+///
+/// **Preconditions** (all enforced):
+/// - Caller is the queue admin (validated by `ExecutionQueueAdmin` constraint).
+/// - The queue is currently at v1 (layout_version == 0). Calling on a v2
+///   queue is a no-op success.
+/// - Both `paused_ingress` and `paused_execute` are set. The queue must be
+///   fully paused before migration to avoid concurrent state mutation.
+/// - `total_count == 0`. All in-flight items must be drained or admin-dropped
+///   before migration. We do not attempt to translate v1 ring buffer
+///   contents into v2 sub-queue contents in-place — the legacy `next_sequence`
+///   would map to sub-queue slot 0 but the per-market layout requires
+///   determining which market each pending item belongs to, which the v1
+///   layout doesn't track.
+///
+/// **What it does**:
+/// 1. Re-initializes `global_header` with the v1 `gap_wait_slots` and
+///    `liquidity_delay_slots` carried over.
+/// 2. Zeroes the legacy v1 ring buffer region and rewrites it as the v2
+///    sub-queue header array (16 slots, all inactive) followed by the v2
+///    flat item array.
+/// 3. Sets `layout_version = 2`.
+///
+/// After migration the queue is empty, paused, and ready to accept v2
+/// instructions. Admin must explicitly unpause via `execution_queue_configure`.
+pub fn execution_queue_migrate_v1_to_v2(ctx: Context<ExecutionQueueAdmin>) -> Result<()> {
+    let mut queue = ctx.accounts.execution_queue.load_mut()?;
+
+    if queue.layout_version == EXECUTION_QUEUE_LAYOUT_VERSION_V2 {
+        // Already migrated; idempotent success.
+        return Ok(());
+    }
+    require!(
+        queue.layout_version == EXECUTION_QUEUE_LAYOUT_VERSION_V1,
+        MangoError::ExecutionQueueSubQueueLayoutVersionMismatch
+    );
+    require!(
+        queue.paused_ingress != 0 && queue.paused_execute != 0,
+        MangoError::ExecutionQueueAdminActionRequiresPause
+    );
+    require!(
+        queue.global_header.total_count == 0,
+        MangoError::ExecutionQueueAdminActionRequiresPause
+    );
+
+    // Capture v1 tunables we want to carry over. The v1 header field layout
+    // and the v2 ExecutionQueueGlobalHeader field layout are intentionally
+    // different (v1 had per-queue sequence/count fields where v2 has only
+    // tunables); the realloc below moves bytes around. We rebuild the
+    // global header from scratch using the carried tunables.
+    let carry_gap_wait_slots = queue.global_header.gap_wait_slots;
+    let carry_liquidity_delay_slots = queue.global_header.liquidity_delay_slots;
+
+    queue.global_header = ExecutionQueueGlobalHeader {
+        gap_wait_slots: carry_gap_wait_slots,
+        liquidity_delay_slots: carry_liquidity_delay_slots,
+        liquidity_head: 0,
+        liquidity_count: 0,
+        total_count: 0,
+        _padding: 0,
+        reserved: [0; 32],
+    };
+
+    // Sub-queue headers all start inactive. They are bound to specific
+    // markets on the first enqueue per market via get_or_allocate_sub_queue_slot.
+    for header in queue.sub_queue_headers.iter_mut() {
+        *header = SubQueueHeader {
+            market_index: 0,
+            active: 0,
+            paused_ingress: 0,
+            paused_execute: 0,
+            _padding0: [0; 3],
+            ctm_count: 0,
+            _padding1: 0,
+            next_sequence_to_execute: 0,
+            max_seen_sequence: 0,
+            gap_observed_slot: 0,
+            first_failure_slot: 0,
+            reserved: [0; 16],
+        };
+    }
+
+    // Item arrays are zeroed at allocation by Solana; preconditions
+    // (total_count == 0) guarantee no pending items remain. We rezero
+    // explicitly to defend against partial-fail states from prior buggy
+    // sequences.
+    for item in queue.ctm_items.iter_mut() {
+        *item = QueueItem::default();
+    }
+
+    queue.layout_version = EXECUTION_QUEUE_LAYOUT_VERSION_V2;
+    queue._padding = [0; 4];
+    Ok(())
+}
+
+pub fn execution_queue_drop_ctm(
+    ctx: Context<ExecutionQueueAdmin>,
+    market_index: u16,
+    sequence: u64,
+) -> Result<()> {
     let clock = Clock::get()?;
     let mut queue = ctx.accounts.execution_queue.load_mut()?;
+    queue.require_v2()?;
     queue.maybe_activate_pending_ctm(clock.slot);
     require!(
         queue.paused_execute != 0,
         MangoError::ExecutionQueueAdminActionRequiresPause
     );
 
-    let item = *queue.ctm_item(sequence);
+    let item = *queue.ctm_item(market_index, sequence)?;
     require!(
         item.status == QueueItemStatus::Pending as u8 && item.sequence == sequence,
         MangoError::ExecutionQueueSequenceNotPending
     );
 
-    queue.clear_ctm_item_at(sequence);
+    queue.clear_ctm_item_at(market_index, sequence)?;
     emit!(QueueItemProcessed {
         group: ctx.accounts.group.key(),
+        market_index,
         sequence,
         kind: item.kind,
         status: QueueItemStatus::Failed as u8,
@@ -981,6 +1262,7 @@ pub fn execution_queue_drop_ctm(ctx: Context<ExecutionQueueAdmin>, sequence: u64
 
 pub fn execution_queue_enqueue_ctm(
     ctx: Context<ExecutionQueueEnqueueCtm>,
+    market_index: u16,
     envelope: CtmEnvelope,
     payload: Vec<u8>,
 ) -> Result<()> {
@@ -1000,14 +1282,30 @@ pub fn execution_queue_enqueue_ctm(
     let (dispatch_accounts, _) =
         split_dispatch_accounts(ctx.remaining_accounts, ctx.accounts.execution_queue.key())?;
 
+    // Bind market_index to the actual perp_market in dispatch_accounts.
+    // Done before any queue mutation so a mismatch fails fast.
+    require_dispatch_market_index(dispatch_accounts, market_index)?;
+
     let clock = Clock::get()?;
     let mut queue = ctx.accounts.execution_queue.load_mut()?;
+    queue.require_v2()?;
     queue.maybe_activate_pending_ctm(clock.slot);
 
     require!(
         queue.paused_ingress == 0,
         MangoError::ExecutionQueueIngressPaused
     );
+    // Per-market pause: respect the sub-queue's own pause flag if the slot
+    // is already bound. Newly-bound slots inherit unpaused state at allocation.
+    if let Some(sub) = queue
+        .find_sub_queue_slot(market_index)
+        .map(|i| &queue.sub_queue_headers[i])
+    {
+        require!(
+            sub.paused_ingress == 0,
+            MangoError::ExecutionQueueIngressPaused
+        );
+    }
 
     let payload_hash = hashv(&[&payload]).to_bytes();
     require!(
@@ -1029,6 +1327,11 @@ pub fn execution_queue_enqueue_ctm(
             == QueueItemKind::CtmWrapped as u8,
         MangoError::ExecutionQueuePayloadKindMismatch
     );
+    validate_queue_payload_dispatch_accounts(
+        ctx.accounts.group.key(),
+        &decoded_payload,
+        dispatch_accounts,
+    )?;
     if variant_uses_queue_owner_signer(decoded_payload.variant) {
         require!(
             dispatch_accounts.len() >= 3,
@@ -1059,8 +1362,13 @@ pub fn execution_queue_enqueue_ctm(
         envelope.expires_at_slot == 0 || clock.slot <= envelope.expires_at_slot,
         MangoError::ExecutionQueueEnvelopeExpired
     );
+    // Per-market sequence floor: an unbound market starts at 0.
+    let sequence_floor = queue
+        .find_sub_queue_slot(market_index)
+        .map(|i| queue.sub_queue_headers[i].next_sequence_to_execute)
+        .unwrap_or(0);
     require!(
-        envelope.sequence >= queue.header.next_sequence_to_execute,
+        envelope.sequence >= sequence_floor,
         MangoError::InvalidSequenceNumber
     );
 
@@ -1074,7 +1382,16 @@ pub fn execution_queue_enqueue_ctm(
     if variant_uses_user_signature(decoded_payload.variant) {
         let (mango_account_key, user_owner) =
             extract_user_owner_for_ctm_payload(ctx.accounts.group.key(), dispatch_accounts)?;
-        let user_intent_hash = canonical_user_intent_message(
+        let user_intent_hash_v2 = canonical_user_intent_message_v2(
+            ctx.accounts.group.key(),
+            mango_account_key,
+            user_owner,
+            envelope.kind,
+            UserIntentTargetKind::PerpMarket,
+            market_index,
+            &envelope.payload_hash,
+        );
+        let user_intent_hash_v1 = canonical_user_intent_message_v1(
             ctx.accounts.group.key(),
             mango_account_key,
             user_owner,
@@ -1083,7 +1400,7 @@ pub fn execution_queue_enqueue_ctm(
         verify_user_ed25519_preinstruction(
             ctx.accounts.instructions.as_ref(),
             user_owner,
-            user_intent_hash,
+            &[user_intent_hash_v2, user_intent_hash_v1],
         )?;
     }
 
@@ -1098,11 +1415,12 @@ pub fn execution_queue_enqueue_ctm(
     item.accounts_hash = envelope.accounts_hash;
     item.payload[..payload.len()].copy_from_slice(&payload);
 
-    queue.push_ctm(item)?;
-    queue.header.max_seen_sequence = queue.header.max_seen_sequence.max(envelope.sequence);
+    queue.push_ctm(market_index, item)?;
+    // push_ctm bumps max_seen_sequence internally.
 
     emit!(QueueItemEnqueued {
         group: ctx.accounts.group.key(),
+        market_index,
         sequence: envelope.sequence,
         kind: envelope.kind,
         min_execute_slot: envelope.min_execute_slot,
@@ -1117,6 +1435,7 @@ pub fn execution_queue_enqueue_ctm(
 /// sequenced relayer transactions.
 pub fn execution_queue_enqueue_direct(
     ctx: Context<ExecutionQueueEnqueueCtm>,
+    market_index: u16,
     envelope: CtmEnvelope,
     payload: Vec<u8>,
 ) -> Result<()> {
@@ -1136,14 +1455,26 @@ pub fn execution_queue_enqueue_direct(
     let (dispatch_accounts, _) =
         split_dispatch_accounts(ctx.remaining_accounts, ctx.accounts.execution_queue.key())?;
 
+    require_dispatch_market_index(dispatch_accounts, market_index)?;
+
     let clock = Clock::get()?;
     let mut queue = ctx.accounts.execution_queue.load_mut()?;
+    queue.require_v2()?;
     queue.maybe_activate_pending_ctm(clock.slot);
 
     require!(
         queue.paused_ingress == 0,
         MangoError::ExecutionQueueIngressPaused
     );
+    if let Some(sub) = queue
+        .find_sub_queue_slot(market_index)
+        .map(|i| &queue.sub_queue_headers[i])
+    {
+        require!(
+            sub.paused_ingress == 0,
+            MangoError::ExecutionQueueIngressPaused
+        );
+    }
 
     let payload_hash = hashv(&[&payload]).to_bytes();
     require!(
@@ -1165,6 +1496,11 @@ pub fn execution_queue_enqueue_direct(
             == QueueItemKind::CtmWrapped as u8,
         MangoError::ExecutionQueuePayloadKindMismatch
     );
+    validate_queue_payload_dispatch_accounts(
+        ctx.accounts.group.key(),
+        &decoded_payload,
+        dispatch_accounts,
+    )?;
 
     let account_hash = hash_accounts(
         &dispatch_accounts
@@ -1191,7 +1527,16 @@ pub fn execution_queue_enqueue_direct(
     if variant_uses_user_signature(decoded_payload.variant) {
         let (mango_account_key, user_owner) =
             extract_user_owner_for_ctm_payload(ctx.accounts.group.key(), dispatch_accounts)?;
-        let user_intent_hash = canonical_user_intent_message(
+        let user_intent_hash_v2 = canonical_user_intent_message_v2(
+            ctx.accounts.group.key(),
+            mango_account_key,
+            user_owner,
+            envelope.kind,
+            UserIntentTargetKind::PerpMarket,
+            market_index,
+            &envelope.payload_hash,
+        );
+        let user_intent_hash_v1 = canonical_user_intent_message_v1(
             ctx.accounts.group.key(),
             mango_account_key,
             user_owner,
@@ -1200,14 +1545,18 @@ pub fn execution_queue_enqueue_direct(
         verify_user_ed25519_preinstruction(
             ctx.accounts.instructions.as_ref(),
             user_owner,
-            user_intent_hash,
+            &[user_intent_hash_v2, user_intent_hash_v1],
         )?;
     }
 
-    // Assign sequence: use max_seen_sequence + 1 to avoid collisions with relayer sequences
-    let sequence = queue.header.max_seen_sequence.saturating_add(1);
+    // Per-market sequence allocator: max_seen_sequence + 1.
+    let prev_max_seen = queue
+        .find_sub_queue_slot(market_index)
+        .map(|i| queue.sub_queue_headers[i].max_seen_sequence)
+        .unwrap_or(0);
+    let sequence = prev_max_seen.saturating_add(1);
     require!(
-        queue.can_enqueue_ctm_sequence(sequence),
+        queue.can_enqueue_ctm_sequence(market_index, sequence),
         MangoError::ExecutionQueueFull
     );
 
@@ -1226,13 +1575,11 @@ pub fn execution_queue_enqueue_direct(
     item.accounts_hash = account_hash;
     item.payload[..payload.len()].copy_from_slice(&payload);
 
-    queue.push_ctm(item)?;
-    if sequence > queue.header.max_seen_sequence {
-        queue.header.max_seen_sequence = sequence;
-    }
+    queue.push_ctm(market_index, item)?;
 
     emit!(QueueItemEnqueued {
         group: ctx.accounts.group.key(),
+        market_index,
         sequence,
         kind: envelope.kind,
         min_execute_slot,
@@ -1274,6 +1621,7 @@ pub fn execution_queue_enqueue_liquidity(
 
     let clock = Clock::get()?;
     let mut queue = ctx.accounts.execution_queue.load_mut()?;
+    queue.require_v2()?;
     require!(
         queue.paused_ingress == 0,
         MangoError::ExecutionQueueIngressPaused
@@ -1281,7 +1629,7 @@ pub fn execution_queue_enqueue_liquidity(
 
     let payload_hash = hashv(&[&payload]).to_bytes();
     let accounts_hash = hash_accounts(&account_metas_from_infos(dispatch_accounts));
-    let min_execute_slot = clock.slot + queue.header.liquidity_delay_slots;
+    let min_execute_slot = clock.slot + queue.global_header.liquidity_delay_slots;
     let mut item = QueueItem::default();
     item.sequence = 0;
     item.min_execute_slot = min_execute_slot;
@@ -1295,8 +1643,11 @@ pub fn execution_queue_enqueue_liquidity(
 
     queue.push_liquidity(item)?;
 
+    // Liquidity items are not market-keyed; emit market_index = u16::MAX as
+    // a sentinel meaning "global liquidity ring".
     emit!(QueueItemEnqueued {
         group: ctx.accounts.group.key(),
+        market_index: u16::MAX,
         sequence: 0,
         kind,
         min_execute_slot,
@@ -1305,7 +1656,11 @@ pub fn execution_queue_enqueue_liquidity(
     Ok(())
 }
 
-pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u16) -> Result<()> {
+pub fn execution_queue_execute(
+    ctx: Context<ExecutionQueueExecute>,
+    market_index: u16,
+    max_items: u16,
+) -> Result<()> {
     require!(
         !ctx.remaining_accounts.is_empty(),
         MangoError::ExecutionQueueDispatchAccountLayoutInvalid
@@ -1313,18 +1668,37 @@ pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u
     let (dispatch_accounts, invoke_accounts) =
         split_dispatch_accounts(ctx.remaining_accounts, ctx.accounts.execution_queue.key())?;
 
+    // Bind market_index to the dispatched perp_market. Liquidity items are
+    // identified by sentinel u16::MAX (which has no perp_market in
+    // dispatch_accounts) and skip this check.
+    if market_index != u16::MAX {
+        require_dispatch_market_index(dispatch_accounts, market_index)?;
+    }
+
     let clock = Clock::get()?;
     let group_key = ctx.accounts.group.key();
     let execution_queue_key = ctx.accounts.execution_queue.key();
     let execution_queue_bump: u8;
     {
         let mut queue = ctx.accounts.execution_queue.load_mut()?;
+        queue.require_v2()?;
         execution_queue_bump = queue.bump;
         queue.maybe_activate_pending_ctm(clock.slot);
         require!(
             queue.paused_execute == 0,
             MangoError::ExecutionQueueExecutePaused
         );
+        if market_index != u16::MAX {
+            if let Some(sub) = queue
+                .find_sub_queue_slot(market_index)
+                .map(|i| &queue.sub_queue_headers[i])
+            {
+                require!(
+                    sub.paused_execute == 0,
+                    MangoError::ExecutionQueueExecutePaused
+                );
+            }
+        }
     }
 
     let provided_accounts_hash = hash_accounts(&account_metas_from_infos(dispatch_accounts));
@@ -1335,7 +1709,29 @@ pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u
 
         {
             let mut queue = ctx.accounts.execution_queue.load_mut()?;
-            if let Some(item) = queue.current_ctm_head().copied() {
+            // Snapshot per-market state once for this iteration. If the
+            // market is unbound (no slot allocated), all CTM-related fields
+            // are zero and we fall through to liquidity processing.
+            let sub_slot_opt = if market_index == u16::MAX {
+                None
+            } else {
+                queue.find_sub_queue_slot(market_index)
+            };
+            let (sub_ctm_count, sub_next_seq, sub_max_seen, sub_gap_obs) =
+                if let Some(slot) = sub_slot_opt {
+                    let h = &queue.sub_queue_headers[slot];
+                    (
+                        h.ctm_count,
+                        h.next_sequence_to_execute,
+                        h.max_seen_sequence,
+                        h.gap_observed_slot,
+                    )
+                } else {
+                    (0u32, 0u64, 0u64, 0u64)
+                };
+            let gap_wait_slots = queue.global_header.gap_wait_slots;
+
+            if let Some(item) = market_index_safe_current_ctm_head(&queue, market_index).copied() {
                 if clock.slot < item.min_execute_slot {
                     blocked = true;
                 } else {
@@ -1349,35 +1745,37 @@ pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u
                         is_ctm: true,
                     });
                 }
-            } else if queue.header.ctm_count > 0
-                && queue.header.max_seen_sequence >= queue.header.next_sequence_to_execute
-            {
-                if queue.header.gap_observed_slot == 0 {
-                    queue.header.gap_observed_slot = clock.slot;
-                }
-                if clock.slot
-                    >= queue
-                        .header
-                        .gap_observed_slot
-                        .saturating_add(queue.header.gap_wait_slots)
-                {
-                    let mut skipped = 0u16;
-                    while skipped < EXECUTION_QUEUE_GAP_SKIP_LIMIT_PER_EXECUTE
-                        && queue.header.ctm_count > 0
-                        && queue.header.max_seen_sequence >= queue.header.next_sequence_to_execute
-                        && queue.current_ctm_head().is_none()
-                    {
-                        emit!(QueueItemProcessed {
-                            group: ctx.accounts.group.key(),
-                            sequence: queue.header.next_sequence_to_execute,
-                            kind: QueueItemKind::CtmWrapped as u8,
-                            status: QueueItemStatus::Skipped as u8,
-                        });
-                        queue.header.next_sequence_to_execute =
-                            queue.header.next_sequence_to_execute.saturating_add(1);
-                        skipped = skipped.saturating_add(1);
+            } else if sub_ctm_count > 0 && sub_max_seen >= sub_next_seq {
+                let mut new_gap_obs = sub_gap_obs;
+                if new_gap_obs == 0 {
+                    new_gap_obs = clock.slot;
+                    if let Some(slot) = sub_slot_opt {
+                        queue.sub_queue_headers[slot].gap_observed_slot = new_gap_obs;
                     }
-                    queue.header.gap_observed_slot = 0;
+                }
+                if clock.slot >= new_gap_obs.saturating_add(gap_wait_slots) {
+                    if let Some(slot) = sub_slot_opt {
+                        let mut skipped = 0u16;
+                        while skipped < EXECUTION_QUEUE_GAP_SKIP_LIMIT_PER_EXECUTE
+                            && queue.sub_queue_headers[slot].ctm_count > 0
+                            && queue.sub_queue_headers[slot].max_seen_sequence
+                                >= queue.sub_queue_headers[slot].next_sequence_to_execute
+                            && market_index_safe_current_ctm_head(&queue, market_index).is_none()
+                        {
+                            let skip_seq = queue.sub_queue_headers[slot].next_sequence_to_execute;
+                            emit!(QueueItemProcessed {
+                                group: group_key,
+                                market_index,
+                                sequence: skip_seq,
+                                kind: QueueItemKind::CtmWrapped as u8,
+                                status: QueueItemStatus::Skipped as u8,
+                            });
+                            queue.sub_queue_headers[slot].next_sequence_to_execute =
+                                skip_seq.saturating_add(1);
+                            skipped = skipped.saturating_add(1);
+                        }
+                        queue.sub_queue_headers[slot].gap_observed_slot = 0;
+                    }
                     continue;
                 }
                 blocked = true;
@@ -1421,12 +1819,13 @@ pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u
             Err(_) => {
                 let mut queue = ctx.accounts.execution_queue.load_mut()?;
                 if candidate.is_ctm {
-                    queue.clear_ctm_item_at(candidate.sequence);
+                    queue.clear_ctm_item_at(market_index, candidate.sequence)?;
                 } else {
                     let _ = queue.pop_liquidity_head();
                 }
                 emit!(QueueItemProcessed {
-                    group: ctx.accounts.group.key(),
+                    group: group_key,
+                    market_index,
                     sequence: candidate.sequence,
                     kind: candidate.kind,
                     status: QueueItemStatus::Failed as u8,
@@ -1439,12 +1838,13 @@ pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u
         if payload_kind != candidate.kind {
             let mut queue = ctx.accounts.execution_queue.load_mut()?;
             if candidate.is_ctm {
-                queue.clear_ctm_item_at(candidate.sequence);
+                queue.clear_ctm_item_at(market_index, candidate.sequence)?;
             } else {
                 let _ = queue.pop_liquidity_head();
             }
             emit!(QueueItemProcessed {
-                group: ctx.accounts.group.key(),
+                group: group_key,
+                market_index,
                 sequence: candidate.sequence,
                 kind: candidate.kind,
                 status: QueueItemStatus::Failed as u8,
@@ -1457,9 +1857,10 @@ pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u
         if candidate.is_ctm {
             if let Some(reason) = prevalidate_terminal_ctm_payload(&decoded_payload, now_ts) {
                 let mut queue = ctx.accounts.execution_queue.load_mut()?;
-                queue.clear_ctm_item_at(candidate.sequence);
+                queue.clear_ctm_item_at(market_index, candidate.sequence)?;
                 emit!(QueueItemProcessed {
-                    group: ctx.accounts.group.key(),
+                    group: group_key,
+                    market_index,
                     sequence: candidate.sequence,
                     kind: candidate.kind,
                     status: QueueItemStatus::Failed as u8,
@@ -1474,18 +1875,15 @@ pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u
             }
         }
 
-        // Pre-dispatch check: if a health-gated item has exhausted retries, clear it
-        // WITHOUT dispatching. This prevents a permanently-failing health-gated item
-        // from blocking the queue (since post-dispatch health failures must roll back
-        // the entire tx and thus cannot increment the retry counter).
         if item_health_region.is_some()
             && candidate.is_ctm
             && candidate.retries >= EXECUTION_QUEUE_MAX_RETRIES
         {
             let mut queue = ctx.accounts.execution_queue.load_mut()?;
-            queue.clear_ctm_item_at(candidate.sequence);
+            queue.clear_ctm_item_at(market_index, candidate.sequence)?;
             emit!(QueueItemProcessed {
-                group: ctx.accounts.group.key(),
+                group: group_key,
+                market_index,
                 sequence: candidate.sequence,
                 kind: candidate.kind,
                 status: QueueItemStatus::Failed as u8,
@@ -1497,13 +1895,13 @@ pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u
             if queue_health_region_begin(dispatch_accounts, spec).is_err() {
                 let mut queue = ctx.accounts.execution_queue.load_mut()?;
                 if candidate.is_ctm {
-                    // Health region begin failed (e.g., account already in health region).
-                    // Increment retry so it eventually gets cleared by the pre-dispatch check above.
-                    let retries = queue.increment_ctm_retry(candidate.sequence, clock.slot);
+                    let retries =
+                        queue.increment_ctm_retry(market_index, candidate.sequence, clock.slot)?;
                     if retries >= EXECUTION_QUEUE_MAX_RETRIES {
-                        queue.clear_ctm_item_at(candidate.sequence);
+                        queue.clear_ctm_item_at(market_index, candidate.sequence)?;
                         emit!(QueueItemProcessed {
-                            group: ctx.accounts.group.key(),
+                            group: group_key,
+                            market_index,
                             sequence: candidate.sequence,
                             kind: candidate.kind,
                             status: QueueItemStatus::Failed as u8,
@@ -1537,12 +1935,13 @@ pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u
         if dispatch_result.is_ok() {
             let mut queue = ctx.accounts.execution_queue.load_mut()?;
             if candidate.is_ctm {
-                queue.clear_ctm_item_at(candidate.sequence);
+                queue.clear_ctm_item_at(market_index, candidate.sequence)?;
             } else {
                 let _ = queue.pop_liquidity_head();
             }
             emit!(QueueItemProcessed {
-                group: ctx.accounts.group.key(),
+                group: group_key,
+                market_index,
                 sequence: candidate.sequence,
                 kind: candidate.kind,
                 status: QueueItemStatus::Executed as u8,
@@ -1553,41 +1952,22 @@ pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u
         // Dispatch failed. Handle retries and clearing.
         if candidate.is_ctm {
             if item_health_region.is_some() {
-                // Health-gated items (PerpPlaceOrderV2) mutate perp book state
-                // directly before the health check, so a failed health check
-                // cannot be swallowed — the tx must roll back to undo book mutations.
-                //
-                // However, we MUST NOT let a permanently-failing item block the
-                // queue forever. If the item has already been retried enough times,
-                // clear it and return Ok. Otherwise, increment the retry counter
-                // (which persists across tx rollback only if we DON'T bubble the error)
-                // and roll back.
-                //
-                // Strategy: use a pre-dispatch retry check. If retries >= max,
-                // skip dispatch entirely and clear the item.
-                // Since we already dispatched and it failed, we must roll back.
-                // The retry counter was NOT incremented (would be rolled back anyway).
-                // The cranker's offchain skip-list handles this:
-                // after seeing repeated simulation failures for a sequence, the cranker
-                // should call execution_queue_drop_ctm or wait for gap_wait_slots to expire.
-                //
-                // For non-health-gated dispatch errors, clear immediately:
                 return dispatch_result;
             }
-            // Non-health-gated CTM (cancel orders, etc.): retry up to max, then discard.
             let mut queue = ctx.accounts.execution_queue.load_mut()?;
-            let retries = queue.increment_ctm_retry(candidate.sequence, clock.slot);
+            let retries =
+                queue.increment_ctm_retry(market_index, candidate.sequence, clock.slot)?;
             if retries >= EXECUTION_QUEUE_MAX_RETRIES {
-                queue.clear_ctm_item_at(candidate.sequence);
+                queue.clear_ctm_item_at(market_index, candidate.sequence)?;
                 emit!(QueueItemProcessed {
-                    group: ctx.accounts.group.key(),
+                    group: group_key,
+                    market_index,
                     sequence: candidate.sequence,
                     kind: candidate.kind,
                     status: QueueItemStatus::Failed as u8,
                 });
                 continue;
             }
-            // Item stays in queue with incremented retry; stop this execute call.
             break;
         }
 
@@ -1597,7 +1977,8 @@ pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u
             let mut queue = ctx.accounts.execution_queue.load_mut()?;
             let _ = queue.pop_liquidity_head();
             emit!(QueueItemProcessed {
-                group: ctx.accounts.group.key(),
+                group: group_key,
+                market_index,
                 sequence: candidate.sequence,
                 kind: candidate.kind,
                 status: QueueItemStatus::Failed as u8,
@@ -1613,12 +1994,26 @@ pub fn execution_queue_execute(ctx: Context<ExecutionQueueExecute>, max_items: u
     Ok(())
 }
 
+/// Helper used by execute paths: returns the current CTM head for a market
+/// safely (returns None if the market sentinel is u16::MAX or the market is
+/// unbound).
+fn market_index_safe_current_ctm_head<'a>(
+    queue: &'a std::cell::RefMut<'_, ExecutionQueue>,
+    market_index: u16,
+) -> Option<&'a QueueItem> {
+    if market_index == u16::MAX {
+        return None;
+    }
+    queue.current_ctm_head(market_index)
+}
+
 /// Multi-lane execute: process items from multiple lane account sets in one tx.
 /// `lane_count` account groups of `accounts_per_lane` accounts each are packed
 /// into remaining_accounts. The function pre-hashes each group and matches
 /// queue items against any lane, switching health regions as needed.
 pub fn execution_queue_execute_multi(
     ctx: Context<ExecutionQueueExecute>,
+    market_index: u16,
     max_items: u16,
     lane_count: u8,
     accounts_per_lane: u16,
@@ -1645,30 +2040,42 @@ pub fn execution_queue_execute_multi(
         .map(|i| &ctx.remaining_accounts[i * apl..(i + 1) * apl])
         .collect();
 
-    // Use lane hashes passed as instruction data (computed by the executor
-    // with the original pre-runtime flags, avoiding Solana flag OR mismatch).
+    // Bind market_index against the first lane's perp_market. All lanes for
+    // a single execute_multi call must target the same market because we
+    // operate on a single sub-queue per call.
+    require_dispatch_market_index(lane_slices[0], market_index)?;
+    for lane in lane_slices.iter().skip(1) {
+        require_dispatch_market_index(lane, market_index)?;
+    }
+
     require!(
         lane_hashes.len() == lane_count,
         MangoError::ExecutionQueueDispatchAccountLayoutInvalid
     );
-    // Note: lane_hashes parameter is deprecated and ignored. Hashes are now
-    // computed from actual remaining_accounts to prevent account substitution (C-1 fix).
     let execution_queue_bump: u8;
     {
         let mut queue = ctx.accounts.execution_queue.load_mut()?;
+        queue.require_v2()?;
         execution_queue_bump = queue.bump;
         queue.maybe_activate_pending_ctm(clock.slot);
         require!(
             queue.paused_execute == 0,
             MangoError::ExecutionQueueExecutePaused
         );
+        if let Some(sub) = queue
+            .find_sub_queue_slot(market_index)
+            .map(|i| &queue.sub_queue_headers[i])
+        {
+            require!(
+                sub.paused_execute == 0,
+                MangoError::ExecutionQueueExecutePaused
+            );
+        }
     }
 
     let now_ts: u64 = clock.unix_timestamp.try_into().unwrap_or(0);
 
     // HLT: Precompute lane hashes once before the item loop.
-    // This avoids O(lane_count × accounts_per_lane) SHA256 recomputation
-    // per item, replacing it with O(lane_count) byte comparisons.
     let precomputed_lane_hashes: Vec<[u8; 32]> = lane_slices
         .iter()
         .map(|lane| hash_accounts(&account_metas_from_infos(lane)))
@@ -1680,7 +2087,22 @@ pub fn execution_queue_execute_multi(
 
         {
             let mut queue = ctx.accounts.execution_queue.load_mut()?;
-            if let Some(item) = queue.current_ctm_head().copied() {
+            let sub_slot_opt = queue.find_sub_queue_slot(market_index);
+            let (sub_ctm_count, sub_next_seq, sub_max_seen, sub_gap_obs) =
+                if let Some(slot) = sub_slot_opt {
+                    let h = &queue.sub_queue_headers[slot];
+                    (
+                        h.ctm_count,
+                        h.next_sequence_to_execute,
+                        h.max_seen_sequence,
+                        h.gap_observed_slot,
+                    )
+                } else {
+                    (0u32, 0u64, 0u64, 0u64)
+                };
+            let gap_wait_slots = queue.global_header.gap_wait_slots;
+
+            if let Some(item) = market_index_safe_current_ctm_head(&queue, market_index).copied() {
                 if clock.slot < item.min_execute_slot {
                     blocked = true;
                 } else {
@@ -1694,35 +2116,37 @@ pub fn execution_queue_execute_multi(
                         is_ctm: true,
                     });
                 }
-            } else if queue.header.ctm_count > 0
-                && queue.header.max_seen_sequence >= queue.header.next_sequence_to_execute
-            {
-                if queue.header.gap_observed_slot == 0 {
-                    queue.header.gap_observed_slot = clock.slot;
-                }
-                if clock.slot
-                    >= queue
-                        .header
-                        .gap_observed_slot
-                        .saturating_add(queue.header.gap_wait_slots)
-                {
-                    let mut skipped = 0u16;
-                    while skipped < EXECUTION_QUEUE_GAP_SKIP_LIMIT_PER_EXECUTE
-                        && queue.header.ctm_count > 0
-                        && queue.header.max_seen_sequence >= queue.header.next_sequence_to_execute
-                        && queue.current_ctm_head().is_none()
-                    {
-                        emit!(QueueItemProcessed {
-                            group: group_key,
-                            sequence: queue.header.next_sequence_to_execute,
-                            kind: QueueItemKind::CtmWrapped as u8,
-                            status: QueueItemStatus::Skipped as u8,
-                        });
-                        queue.header.next_sequence_to_execute =
-                            queue.header.next_sequence_to_execute.saturating_add(1);
-                        skipped = skipped.saturating_add(1);
+            } else if sub_ctm_count > 0 && sub_max_seen >= sub_next_seq {
+                let mut new_gap_obs = sub_gap_obs;
+                if new_gap_obs == 0 {
+                    new_gap_obs = clock.slot;
+                    if let Some(slot) = sub_slot_opt {
+                        queue.sub_queue_headers[slot].gap_observed_slot = new_gap_obs;
                     }
-                    queue.header.gap_observed_slot = 0;
+                }
+                if clock.slot >= new_gap_obs.saturating_add(gap_wait_slots) {
+                    if let Some(slot) = sub_slot_opt {
+                        let mut skipped = 0u16;
+                        while skipped < EXECUTION_QUEUE_GAP_SKIP_LIMIT_PER_EXECUTE
+                            && queue.sub_queue_headers[slot].ctm_count > 0
+                            && queue.sub_queue_headers[slot].max_seen_sequence
+                                >= queue.sub_queue_headers[slot].next_sequence_to_execute
+                            && market_index_safe_current_ctm_head(&queue, market_index).is_none()
+                        {
+                            let skip_seq = queue.sub_queue_headers[slot].next_sequence_to_execute;
+                            emit!(QueueItemProcessed {
+                                group: group_key,
+                                market_index,
+                                sequence: skip_seq,
+                                kind: QueueItemKind::CtmWrapped as u8,
+                                status: QueueItemStatus::Skipped as u8,
+                            });
+                            queue.sub_queue_headers[slot].next_sequence_to_execute =
+                                skip_seq.saturating_add(1);
+                            skipped = skipped.saturating_add(1);
+                        }
+                        queue.sub_queue_headers[slot].gap_observed_slot = 0;
+                    }
                     continue;
                 }
                 blocked = true;
@@ -1737,7 +2161,7 @@ pub fn execution_queue_execute_multi(
             break;
         };
 
-        // C-1 fix: Use precomputed lane hashes (HLT) instead of recomputing per item.
+        // C-1 fix: Use precomputed lane hashes (HLT).
         // H-8 fix: Strict head-only FIFO — no scan-ahead for non-head items.
         let matched_lane = if candidate.accounts_hash == [0; 32] {
             Some(0)
@@ -1754,16 +2178,16 @@ pub fn execution_queue_execute_multi(
 
         let dispatch_accounts = lane_slices[lane_idx];
 
-        // Decode payload
         let decoded_payload = match decode_queue_payload(&candidate.payload) {
             Ok(p) => p,
             Err(_) => {
                 let mut queue = ctx.accounts.execution_queue.load_mut()?;
                 if candidate.is_ctm {
-                    queue.clear_ctm_item_at(candidate.sequence);
+                    queue.clear_ctm_item_at(market_index, candidate.sequence)?;
                 }
                 emit!(QueueItemProcessed {
                     group: group_key,
+                    market_index,
                     sequence: candidate.sequence,
                     kind: candidate.kind,
                     status: QueueItemStatus::Failed as u8,
@@ -1776,10 +2200,11 @@ pub fn execution_queue_execute_multi(
         if payload_kind != candidate.kind {
             let mut queue = ctx.accounts.execution_queue.load_mut()?;
             if candidate.is_ctm {
-                queue.clear_ctm_item_at(candidate.sequence);
+                queue.clear_ctm_item_at(market_index, candidate.sequence)?;
             }
             emit!(QueueItemProcessed {
                 group: group_key,
+                market_index,
                 sequence: candidate.sequence,
                 kind: candidate.kind,
                 status: QueueItemStatus::Failed as u8,
@@ -1792,9 +2217,10 @@ pub fn execution_queue_execute_multi(
         if candidate.is_ctm {
             if let Some(reason) = prevalidate_terminal_ctm_payload(&decoded_payload, now_ts) {
                 let mut queue = ctx.accounts.execution_queue.load_mut()?;
-                queue.clear_ctm_item_at(candidate.sequence);
+                queue.clear_ctm_item_at(market_index, candidate.sequence)?;
                 emit!(QueueItemProcessed {
                     group: group_key,
+                    market_index,
                     sequence: candidate.sequence,
                     kind: candidate.kind,
                     status: QueueItemStatus::Failed as u8,
@@ -1809,16 +2235,15 @@ pub fn execution_queue_execute_multi(
             }
         }
 
-        // Pre-dispatch check: if a health-gated item has exhausted retries, clear it
-        // WITHOUT dispatching (same logic as execute single-lane path).
         if item_health_region.is_some()
             && candidate.is_ctm
             && candidate.retries >= EXECUTION_QUEUE_MAX_RETRIES
         {
             let mut queue = ctx.accounts.execution_queue.load_mut()?;
-            queue.clear_ctm_item_at(candidate.sequence);
+            queue.clear_ctm_item_at(market_index, candidate.sequence)?;
             emit!(QueueItemProcessed {
                 group: group_key,
+                market_index,
                 sequence: candidate.sequence,
                 kind: candidate.kind,
                 status: QueueItemStatus::Failed as u8,
@@ -1830,11 +2255,13 @@ pub fn execution_queue_execute_multi(
             if queue_health_region_begin(dispatch_accounts, spec).is_err() {
                 let mut queue = ctx.accounts.execution_queue.load_mut()?;
                 if candidate.is_ctm {
-                    let retries = queue.increment_ctm_retry(candidate.sequence, clock.slot);
+                    let retries =
+                        queue.increment_ctm_retry(market_index, candidate.sequence, clock.slot)?;
                     if retries >= EXECUTION_QUEUE_MAX_RETRIES {
-                        queue.clear_ctm_item_at(candidate.sequence);
+                        queue.clear_ctm_item_at(market_index, candidate.sequence)?;
                         emit!(QueueItemProcessed {
                             group: group_key,
+                            market_index,
                             sequence: candidate.sequence,
                             kind: candidate.kind,
                             status: QueueItemStatus::Failed as u8,
@@ -1846,11 +2273,10 @@ pub fn execution_queue_execute_multi(
             }
         }
 
-        // Dispatch
         let dispatch_result = dispatch_queue_payload(
             &decoded_payload,
             dispatch_accounts,
-            dispatch_accounts, // invoke_accounts = dispatch for perp direct calls
+            dispatch_accounts,
             group_key,
             execution_queue_key,
             execution_queue_bump,
@@ -1867,10 +2293,11 @@ pub fn execution_queue_execute_multi(
         if dispatch_result.is_ok() {
             let mut queue = ctx.accounts.execution_queue.load_mut()?;
             if candidate.is_ctm {
-                queue.clear_ctm_item_at(candidate.sequence);
+                queue.clear_ctm_item_at(market_index, candidate.sequence)?;
             }
             emit!(QueueItemProcessed {
                 group: group_key,
+                market_index,
                 sequence: candidate.sequence,
                 kind: candidate.kind,
                 status: QueueItemStatus::Executed as u8,
@@ -1880,20 +2307,16 @@ pub fn execution_queue_execute_multi(
 
         if candidate.is_ctm {
             if item_health_region.is_some() {
-                // Health-gated CTM failures must roll back the entire tx because
-                // the direct dispatch mutates perp book state before the health check.
-                // The retry counter cannot be persisted (tx rolls back), so the
-                // cranker's offchain skip-list and the pre-dispatch retry check
-                // (above) handle repeated failures.
                 return dispatch_result;
             }
-            // Non-health-gated CTM: retry up to max, then discard.
             let mut queue = ctx.accounts.execution_queue.load_mut()?;
-            let retries = queue.increment_ctm_retry(candidate.sequence, clock.slot);
+            let retries =
+                queue.increment_ctm_retry(market_index, candidate.sequence, clock.slot)?;
             if retries >= EXECUTION_QUEUE_MAX_RETRIES {
-                queue.clear_ctm_item_at(candidate.sequence);
+                queue.clear_ctm_item_at(market_index, candidate.sequence)?;
                 emit!(QueueItemProcessed {
                     group: group_key,
+                    market_index,
                     sequence: candidate.sequence,
                     kind: candidate.kind,
                     status: QueueItemStatus::Failed as u8,
@@ -1929,7 +2352,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_user_intent_message_is_stable_and_binds_owner() {
+    fn canonical_user_intent_messages_are_stable_and_bind_owner() {
         let group = Pubkey::new_unique();
         let mango_account = Pubkey::new_unique();
         let owner_a = Pubkey::new_unique();
@@ -1943,12 +2366,85 @@ mod tests {
             expires_at_slot: 120,
         };
 
-        let one = canonical_user_intent_message(group, mango_account, owner_a, &env);
-        let two = canonical_user_intent_message(group, mango_account, owner_a, &env);
-        let different_owner = canonical_user_intent_message(group, mango_account, owner_b, &env);
+        let v1_one = canonical_user_intent_message_v1(group, mango_account, owner_a, &env);
+        let v1_two = canonical_user_intent_message_v1(group, mango_account, owner_a, &env);
+        let v1_different_owner =
+            canonical_user_intent_message_v1(group, mango_account, owner_b, &env);
+        let v2_one = canonical_user_intent_message_v2(
+            group,
+            mango_account,
+            owner_a,
+            env.kind,
+            UserIntentTargetKind::PerpMarket,
+            7,
+            &env.payload_hash,
+        );
+        let v2_two = canonical_user_intent_message_v2(
+            group,
+            mango_account,
+            owner_a,
+            env.kind,
+            UserIntentTargetKind::PerpMarket,
+            7,
+            &env.payload_hash,
+        );
+        let v2_different_owner = canonical_user_intent_message_v2(
+            group,
+            mango_account,
+            owner_b,
+            env.kind,
+            UserIntentTargetKind::PerpMarket,
+            7,
+            &env.payload_hash,
+        );
 
-        assert_eq!(one, two);
-        assert_ne!(one, different_owner);
+        assert_eq!(v1_one, v1_two);
+        assert_ne!(v1_one, v1_different_owner);
+        assert_eq!(v2_one, v2_two);
+        assert_ne!(v2_one, v2_different_owner);
+    }
+
+    #[test]
+    fn canonical_user_intent_v2_does_not_bind_accounts_hash() {
+        let group = Pubkey::new_unique();
+        let mango_account = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let env_a = CtmEnvelope {
+            sequence: 42,
+            min_execute_slot: 99,
+            kind: QueueItemKind::CtmWrapped as u8,
+            payload_hash: [7; 32],
+            accounts_hash: [9; 32],
+            expires_at_slot: 120,
+        };
+        let env_b = CtmEnvelope {
+            accounts_hash: [11; 32],
+            ..env_a
+        };
+
+        let v1_a = canonical_user_intent_message_v1(group, mango_account, owner, &env_a);
+        let v1_b = canonical_user_intent_message_v1(group, mango_account, owner, &env_b);
+        let v2_a = canonical_user_intent_message_v2(
+            group,
+            mango_account,
+            owner,
+            env_a.kind,
+            UserIntentTargetKind::PerpMarket,
+            7,
+            &env_a.payload_hash,
+        );
+        let v2_b = canonical_user_intent_message_v2(
+            group,
+            mango_account,
+            owner,
+            env_b.kind,
+            UserIntentTargetKind::PerpMarket,
+            7,
+            &env_b.payload_hash,
+        );
+
+        assert_ne!(v1_a, v1_b);
+        assert_eq!(v2_a, v2_b);
     }
 
     #[test]

@@ -625,29 +625,12 @@ async function executionQueueCanonicalPerpRemainingAccounts(params: {
   marketIndex: PerpMarketIndex;
   userOwner: PublicKey;
 }): Promise<AccountMeta[]> {
-  const perpMarket = params.group.getPerpMarketByMarketIndex(params.marketIndex);
-  const healthRemainingAccounts = await params.client.buildHealthRemainingAccounts(
+  return params.client.buildExecutionQueueCanonicalPerpRemainingAccounts(
     params.group,
-    [params.mangoAccount],
-    [params.group.getFirstBankForPerpSettlement()],
-    [perpMarket],
+    params.mangoAccount,
+    params.marketIndex,
+    params.userOwner,
   );
-
-  return [
-    { pubkey: params.group.publicKey, isSigner: false, isWritable: false },
-    { pubkey: params.mangoAccount.publicKey, isSigner: false, isWritable: true },
-    { pubkey: params.userOwner, isSigner: false, isWritable: false },
-    { pubkey: perpMarket.publicKey, isSigner: false, isWritable: true },
-    { pubkey: perpMarket.bids, isSigner: false, isWritable: true },
-    { pubkey: perpMarket.asks, isSigner: false, isWritable: true },
-    { pubkey: perpMarket.eventQueue, isSigner: false, isWritable: true },
-    { pubkey: perpMarket.oracle, isSigner: false, isWritable: false },
-    ...healthRemainingAccounts.map((pubkey) => ({
-      pubkey,
-      isSigner: false,
-      isWritable: false,
-    })),
-  ];
 }
 
 function randomFloat(min: number, max: number): number {
@@ -660,6 +643,7 @@ function randomSizeSol(): number {
 
 function randomQuotePrice(
   referencePrice: number,
+  perpMarket: PerpMarket,
   side: PerpOrderSide,
 ): number {
   const offsetBps =
@@ -667,17 +651,18 @@ function randomQuotePrice(
       ? randomFloat(QUOTER_BID_MIN_BPS, QUOTER_BID_MAX_BPS)
       : randomFloat(QUOTER_ASK_MIN_BPS, QUOTER_ASK_MAX_BPS);
   const multiplier = 1 + offsetBps / 10_000;
-  return Number((referencePrice * multiplier).toFixed(4));
+  return perpMarket.roundUiPriceToTick(referencePrice * multiplier, side);
 }
 
 function aggressiveClosePrice(
   referencePrice: number,
+  perpMarket: PerpMarket,
   side: PerpOrderSide,
 ): number {
   const fraction = PRICE_RANGE_BPS / 10_000;
   const multiplier =
     side === PerpOrderSide.bid ? 1 + fraction : 1 - fraction;
-  return Number((referencePrice * multiplier).toFixed(4));
+  return perpMarket.roundUiPriceToTick(referencePrice * multiplier, side);
 }
 
 function shouldAttemptClosePosition(): boolean {
@@ -719,7 +704,11 @@ function getCloseOrderPlan(params: {
     position.basePositionLots.gt(new BN(0))
       ? PerpOrderSide.ask
       : PerpOrderSide.bid;
-  const quotePrice = aggressiveClosePrice(params.referencePrice, side);
+  const quotePrice = aggressiveClosePrice(
+    params.referencePrice,
+    params.perpMarket,
+    side,
+  );
   const maxQuoteQty = Number(
     (quotePrice * basePositionUi * QUOTE_BUDGET_MULTIPLIER).toFixed(6),
   );
@@ -801,6 +790,7 @@ async function submitIntentViaRelayer(params: {
     mangoAccount: params.mangoAccount,
     userOwner: params.userOwner,
     payload: params.payload,
+    target: { kind: 0, index: params.market },
     remainingAccounts: params.remainingAccounts,
   });
   const userSignature = signExecutionQueueIntentMessage(
@@ -826,6 +816,9 @@ async function submitIntentViaRelayer(params: {
           user_owner: params.userOwner.toBase58(),
           mango_account: params.mangoAccount.toBase58(),
           user_signature: Buffer.from(userSignature),
+          intent_version: 2,
+          target_kind: 0,
+          target_index: params.market,
         },
         {
           deadline: Date.now() + RELAYER_RPC_TIMEOUT_MS,
@@ -1582,7 +1575,7 @@ async function main(): Promise<void> {
         const sizeSol = closePlan ? closePlan.sizeSol : randomSizeSol();
         const quotePrice = closePlan
           ? closePlan.quotePrice
-          : randomQuotePrice(referencePrice, side);
+          : randomQuotePrice(referencePrice, perpMarket, side);
         const maxQuoteQty = closePlan
           ? closePlan.maxQuoteQty
           : Number((quotePrice * sizeSol * QUOTE_BUDGET_MULTIPLIER).toFixed(6));
@@ -1590,10 +1583,11 @@ async function main(): Promise<void> {
         // Record the intended client id before submit so pipelined ticks can issue
         // a targeted cancel on the next cycle without waiting for the place RPC to return.
         bot.lastPlacedClientOrderId = clientOrderId;
+        const priceLots = perpMarket.uiPriceToLotsForSide(quotePrice, side);
 
         const payload = encodePerpPlaceOrderV2QueuePayload({
           side,
-          priceLots: BigInt(perpMarket.uiPriceToLots(quotePrice).toString()),
+          priceLots: BigInt(priceLots.toString()),
           maxBaseLots: BigInt(perpMarket.uiBaseToLots(sizeSol).toString()),
           maxQuoteLots: BigInt(perpMarket.uiQuoteToLots(maxQuoteQty).toString()),
           clientOrderId,

@@ -18,20 +18,18 @@ use mango_v4::{
     error::MangoError,
     health::{new_health_cache, FixedOrderAccountRetriever},
     instructions::{
-        CtmEnvelope, ExecutionQueueConfigParams, PerpCancelOrderBySlotPayload,
-        PerpPlaceOrderV2Payload, QueuePayloadVariant,
+        CtmEnvelope, ExecutionQueueConfigParams, PerpPlaceOrderV2Payload, QueuePayloadVariant,
     },
     state::{
-        pyth_mainnet_sol_oracle, pyth_mainnet_usdc_oracle, Bank, EventQueue, EventType,
-        FillEvent, MangoAccountValue, OutEvent, PerpMarket, PerpMarketIndex, Side,
-        EXECUTION_QUEUE_COUNT_OFFSET, EXECUTION_QUEUE_CTM_CAPACITY,
-        EXECUTION_QUEUE_CTM_ITEMS_OFFSET, EXECUTION_QUEUE_HEAD_OFFSET,
+        load_orca_pool_state, load_raydium_pool_state, pyth_mainnet_sol_oracle,
+        pyth_mainnet_usdc_oracle, Bank, EventQueue, EventType, FillEvent, MangoAccountValue,
+        OutEvent, PerpMarket, PerpMarketIndex, QueueItemKind, Side, TokenIndex,
+        EXECUTION_QUEUE_CTM_CAPACITY, EXECUTION_QUEUE_CTM_ITEMS_OFFSET,
         EXECUTION_QUEUE_ITEM_ACCOUNTS_HASH_OFFSET, EXECUTION_QUEUE_ITEM_KIND_OFFSET,
         EXECUTION_QUEUE_ITEM_PAYLOAD_LEN_OFFSET, EXECUTION_QUEUE_ITEM_PAYLOAD_OFFSET,
         EXECUTION_QUEUE_ITEM_SEQUENCE_OFFSET, EXECUTION_QUEUE_ITEM_SIZE,
         EXECUTION_QUEUE_ITEM_STATUS_OFFSET, EXECUTION_QUEUE_LIQUIDITY_CAPACITY,
-        EXECUTION_QUEUE_LIQUIDITY_ITEMS_OFFSET, EXECUTION_QUEUE_MAX_SEEN_SEQUENCE_OFFSET,
-        EXECUTION_QUEUE_NEXT_SEQUENCE_OFFSET,
+        EXECUTION_QUEUE_LIQUIDITY_ITEMS_OFFSET,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -83,7 +81,23 @@ const QUEUE_PAYLOAD_HEADER_LEN: usize = 4;
 const PERP_PLACE_ORDER_V2_PAYLOAD_LEN: usize = 45;
 const PERP_CANCEL_ORDER_BY_SLOT_PAYLOAD_LEN: usize = 17;
 const PERP_BATCH_INTENT_MAX_OPS: usize = 8;
+const INTENT_VERSION_V1: u32 = 1;
+const INTENT_VERSION_V2: u32 = 2;
+// Allow successor speculation to stay active under the actual live backlog.
+// We still cap it to avoid unbounded future-head spraying, but the previous
+// threshold (24) disabled the feature in exactly the mixed-width regime we are
+// trying to optimize.
+const EXECUTOR_SUCCESSOR_SPECULATION_MAX_QUEUE_COUNT: u32 = 128;
+// When backlog builds, exact head-matched planning is materially better than
+// free-running speculative batches, even if the static config says otherwise.
+const EXECUTOR_FORCE_HEAD_MATCH_QUEUE_COUNT: u32 = 8;
 static NEXT_RELAY_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UserIntentTargetKind {
+    PerpMarket = 0,
+    Token = 1,
+}
 
 #[derive(Clone)]
 struct Config {
@@ -253,6 +267,24 @@ struct Config {
     local_state_bootstrap_url: String,
     /// Per-request HTTP timeout for the bootstrap fetch (ms).
     local_state_bootstrap_timeout_ms: u64,
+
+    // ---- Ingress protection ----
+    /// When true, track per-user_owner consecutive signature failures and
+    /// short-circuit requests before harness calls once the threshold is hit.
+    ingress_failure_memo_enabled: bool,
+    /// How long (ms) a failure memo entry lives after the last failure.
+    /// After this TTL the entry is evicted and the user gets a fresh start.
+    ingress_failure_memo_ttl_ms: u64,
+    /// How many consecutive signature failures must be seen for a user_owner
+    /// before subsequent requests are rejected early (before harness calls).
+    ingress_failure_memo_threshold: u32,
+    /// When true, apply a per-user_owner token-bucket rate limiter on the
+    /// ingress path before any harness or RPC calls.
+    ingress_rate_limit_enabled: bool,
+    /// Burst capacity of the token bucket (max tokens in the bucket at once).
+    ingress_rate_limit_burst: u32,
+    /// Sustained token fill rate (tokens per second).
+    ingress_rate_limit_per_sec: u32,
 }
 
 impl Config {
@@ -420,11 +452,12 @@ impl Config {
             parse_u64_env("CTM_RELAYER_HEALTH_PROBE_INTERVAL_MS", 5_000)?;
         let balance_poll_interval_ms =
             parse_u64_env("CTM_RELAYER_BALANCE_POLL_INTERVAL_MS", 30_000)?;
-        let executor_stale_threshold_ms =
-            parse_u64_env("CTM_RELAYER_EXECUTOR_STALE_MS", 5_000)?;
+        let executor_stale_threshold_ms = parse_u64_env("CTM_RELAYER_EXECUTOR_STALE_MS", 5_000)?;
         let event_cranker_stale_threshold_ms = parse_u64_env(
             "CTM_RELAYER_EVENT_CRANKER_STALE_MS",
-            executor_perp_consume_interval_ms.saturating_mul(5).max(10_000),
+            executor_perp_consume_interval_ms
+                .saturating_mul(5)
+                .max(10_000),
         )?;
         // "Processed" tracker — uses the lightweight queue endpoint, which
         // doesn't trigger an upstream RPC fetch on the harness side. This
@@ -435,9 +468,7 @@ impl Config {
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
-            .or_else(|| {
-                Some("http://127.0.0.1:9091/state/queue/0?view=optimistic".to_string())
-            });
+            .or_else(|| Some("http://127.0.0.1:9091/state/queue/0?view=optimistic".to_string()));
         let latency_processed_field = std::env::var("CTM_RELAYER_LATENCY_PROCESSED_FIELD")
             .ok()
             .map(|v| v.trim().to_string())
@@ -452,9 +483,7 @@ impl Config {
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
-            .or_else(|| {
-                Some("http://127.0.0.1:9091/state/markets/0?view=optimistic".to_string())
-            });
+            .or_else(|| Some("http://127.0.0.1:9091/state/markets/0?view=optimistic".to_string()));
         let latency_optimistic_field = std::env::var("CTM_RELAYER_LATENCY_OPTIMISTIC_FIELD")
             .ok()
             .map(|v| v.trim().to_string())
@@ -464,8 +493,7 @@ impl Config {
         // have ≤25ms of polling jitter. The harness queue endpoint is ~200
         // bytes and doesn't trigger an upstream RPC fetch, so 10× the
         // polling rate adds negligible load.
-        let latency_probe_interval_ms =
-            parse_u64_env("CTM_RELAYER_LATENCY_PROBE_INTERVAL_MS", 25)?;
+        let latency_probe_interval_ms = parse_u64_env("CTM_RELAYER_LATENCY_PROBE_INTERVAL_MS", 25)?;
         let latency_probe_timeout_ms =
             parse_u64_env("CTM_RELAYER_LATENCY_PROBE_TIMEOUT_MS", 2_000)?;
         let latency_pending_max_size =
@@ -476,14 +504,10 @@ impl Config {
             parse_u64_env("CTM_RELAYER_LATENCY_SAMPLES_CAPACITY", 4_096)? as usize;
         let bg_submit_channel_cap =
             parse_u64_env("CTM_RELAYER_BG_SUBMIT_CHANNEL_CAP", 1_024)? as usize;
-        let bg_submit_workers =
-            parse_u64_env("CTM_RELAYER_BG_SUBMIT_WORKERS", 16)? as usize;
-        let bg_submit_max_retries =
-            parse_u64_env("CTM_RELAYER_BG_SUBMIT_MAX_RETRIES", 5)? as u32;
-        let bg_submit_retry_base_ms =
-            parse_u64_env("CTM_RELAYER_BG_SUBMIT_RETRY_BASE_MS", 50)?;
-        let margin_cache_ttl_ms =
-            parse_u64_env("CTM_RELAYER_MARGIN_CACHE_TTL_MS", 500)?;
+        let bg_submit_workers = parse_u64_env("CTM_RELAYER_BG_SUBMIT_WORKERS", 16)? as usize;
+        let bg_submit_max_retries = parse_u64_env("CTM_RELAYER_BG_SUBMIT_MAX_RETRIES", 5)? as u32;
+        let bg_submit_retry_base_ms = parse_u64_env("CTM_RELAYER_BG_SUBMIT_RETRY_BASE_MS", 50)?;
+        let margin_cache_ttl_ms = parse_u64_env("CTM_RELAYER_MARGIN_CACHE_TTL_MS", 500)?;
         let margin_cache_max_entries =
             parse_u64_env("CTM_RELAYER_MARGIN_CACHE_MAX_ENTRIES", 4096)? as usize;
         let local_state_enabled = parse_bool_env("CTM_RELAYER_LOCAL_STATE", false);
@@ -494,6 +518,18 @@ impl Config {
             .unwrap_or_else(|| "http://127.0.0.1:9091/state/full?view=confirmed".to_string());
         let local_state_bootstrap_timeout_ms =
             parse_u64_env("CTM_RELAYER_LOCAL_STATE_BOOTSTRAP_TIMEOUT_MS", 30_000)?;
+        let ingress_failure_memo_enabled =
+            parse_bool_env("CTM_RELAYER_INGRESS_FAILURE_MEMO_ENABLED", true);
+        let ingress_failure_memo_ttl_ms =
+            parse_u64_env("CTM_RELAYER_INGRESS_FAILURE_MEMO_TTL_MS", 30_000)?;
+        let ingress_failure_memo_threshold =
+            parse_u64_env("CTM_RELAYER_INGRESS_FAILURE_MEMO_THRESHOLD", 3)? as u32;
+        let ingress_rate_limit_enabled =
+            parse_bool_env("CTM_RELAYER_INGRESS_RATE_LIMIT_ENABLED", false);
+        let ingress_rate_limit_burst =
+            parse_u64_env("CTM_RELAYER_INGRESS_RATE_LIMIT_BURST", 20)? as u32;
+        let ingress_rate_limit_per_sec =
+            parse_u64_env("CTM_RELAYER_INGRESS_RATE_LIMIT_PER_SEC", 10)? as u32;
 
         Ok(Self {
             cluster_url,
@@ -587,6 +623,12 @@ impl Config {
             local_state_enabled,
             local_state_bootstrap_url,
             local_state_bootstrap_timeout_ms,
+            ingress_failure_memo_enabled,
+            ingress_failure_memo_ttl_ms,
+            ingress_failure_memo_threshold,
+            ingress_rate_limit_enabled,
+            ingress_rate_limit_burst,
+            ingress_rate_limit_per_sec,
         })
     }
 }
@@ -669,6 +711,17 @@ struct Metrics {
     margin_cache_evicted_total: AtomicU64,
     /// Current size of the cache.
     margin_cache_size: AtomicU64,
+
+    // ---- Ingress protection counters ----
+    /// Lifetime count of submit_intent calls short-circuited (before harness)
+    /// because the per-user_owner failure memo threshold was exceeded.
+    ingress_memo_rejected_total: AtomicU64,
+    /// Lifetime count of submit_intent calls rejected by the per-user_owner
+    /// token-bucket rate limiter before any harness or RPC calls.
+    ingress_rate_limited_total: AtomicU64,
+    /// Lifetime count of submit_intent calls where the final (post-harness)
+    /// verify_user_signature failed and a failure memo entry was recorded.
+    ingress_sig_fail_total: AtomicU64,
 
     // ---- Sampler-published rate / windowed values. Only the sampler task
     // writes these; the /metrics renderer only reads them.
@@ -796,6 +849,23 @@ struct Metrics {
     /// background submitter worker. This is no longer on the user-visible
     /// critical path after Phase 1.1; we keep it as a gauge for ops.
     stage_bg_rpc_submit_latency: LatencyHistogram,
+    /// **The** ingress→optimistic metric. Measures elapsed time from the
+    /// top of `submit_intent` (gRPC arrival) to the moment the in-process
+    /// rust-harness `ContinuumStateEngine` has been updated by
+    /// `apply_relay_intent_local`. After that point, any subsequent read of
+    /// the relayer's local state (HTTP/WS via the future axum read API,
+    /// or the existing in-process margin-check path) sees the new intent.
+    ///
+    /// This is the authoritative "time until the user's order is visible
+    /// in optimistic state" metric — measured in-process, no polling, no
+    /// external harness dependency. Supersedes the legacy polled
+    /// `latency_ingress_to_optimistic_*` values that came from the prober
+    /// hitting the Node.js harness's markets endpoint (which had a ~1.2 s
+    /// floor from the event loop + napi serde + lazy rebuild).
+    ///
+    /// Stamped in `submit_intent_inner` immediately after
+    /// `apply_relay_intent_to_local_state` returns with an UndoToken.
+    local_optimistic_latency: LatencyHistogram,
 }
 
 impl Metrics {
@@ -1144,6 +1214,27 @@ impl Metrics {
                 "execution_engine_margin_cache_size {}",
                 self.margin_cache_size.load(Ordering::Relaxed)
             ),
+
+            // ---------- Ingress protection ----------
+            "# HELP execution_engine_ingress_memo_rejected_total Requests rejected before harness by per-user failure memo".to_string(),
+            "# TYPE execution_engine_ingress_memo_rejected_total counter".to_string(),
+            format!(
+                "execution_engine_ingress_memo_rejected_total {}",
+                self.ingress_memo_rejected_total.load(Ordering::Relaxed)
+            ),
+            "# HELP execution_engine_ingress_rate_limited_total Requests rejected by per-user token-bucket rate limiter".to_string(),
+            "# TYPE execution_engine_ingress_rate_limited_total counter".to_string(),
+            format!(
+                "execution_engine_ingress_rate_limited_total {}",
+                self.ingress_rate_limited_total.load(Ordering::Relaxed)
+            ),
+            "# HELP execution_engine_ingress_sig_fail_total Requests that failed verify_user_signature (recorded in failure memo)".to_string(),
+            "# TYPE execution_engine_ingress_sig_fail_total counter".to_string(),
+            format!(
+                "execution_engine_ingress_sig_fail_total {}",
+                self.ingress_sig_fail_total.load(Ordering::Relaxed)
+            ),
+
             "# HELP execution_engine_ingress_tps_10s Ingress txns per second sampled over last 10s".to_string(),
             "# TYPE execution_engine_ingress_tps_10s gauge".to_string(),
             format!(
@@ -1617,10 +1708,7 @@ impl LatencyTracker {
                 return 0;
             };
             // Drain matched-by-watermark prefix.
-            let to_complete: Vec<u64> = guard
-                .range(..=watermark)
-                .map(|(&seq, _)| seq)
-                .collect();
+            let to_complete: Vec<u64> = guard.range(..=watermark).map(|(&seq, _)| seq).collect();
             let mut latencies = Vec::with_capacity(to_complete.len());
             for seq in to_complete {
                 if let Some(ingress_ts) = guard.remove(&seq) {
@@ -1835,6 +1923,81 @@ fn select_layout_compatible_lanes(
     (eligible_lanes, seen_hashes.len(), dropped_for_layout)
 }
 
+fn select_layout_compatible_lanes_with_required_head(
+    candidate_lanes: Vec<Lane>,
+    backoff_snapshot: &HashMap<String, u64>,
+    now_ms: u64,
+    target_lane_fanout: usize,
+    required_head_hash: [u8; 32],
+) -> (Vec<Lane>, usize, usize) {
+    let Some(required_lane) = candidate_lanes
+        .iter()
+        .find(|lane| lane.hash == required_head_hash)
+        .cloned()
+    else {
+        return select_layout_compatible_lanes(
+            candidate_lanes,
+            backoff_snapshot,
+            now_ms,
+            target_lane_fanout,
+        );
+    };
+
+    let required_width = lane_account_width(&required_lane);
+    let mut eligible_lanes = vec![required_lane];
+    let mut seen_hashes = HashSet::from([required_head_hash]);
+    let mut dropped_for_layout = 0usize;
+
+    for lane in candidate_lanes {
+        if lane.hash == required_head_hash {
+            continue;
+        }
+        let lane_key = bytes_to_hex(&lane.hash);
+        let blocked_until = backoff_snapshot.get(&lane_key).copied().unwrap_or(0);
+        if blocked_until > now_ms {
+            continue;
+        }
+        if !seen_hashes.insert(lane.hash) {
+            continue;
+        }
+        if lane_account_width(&lane) != required_width {
+            dropped_for_layout += 1;
+            continue;
+        }
+        eligible_lanes.push(lane);
+        if eligible_lanes.len() >= target_lane_fanout {
+            break;
+        }
+    }
+
+    (eligible_lanes, seen_hashes.len(), dropped_for_layout)
+}
+
+fn select_next_speculative_successor_sequence(
+    head_sequence: u64,
+    current_hash: [u8; 32],
+    near_head_lane_entries: &[(u64, [u8; 32])],
+    pending_dispatches: &[PendingHeadDispatch],
+) -> Option<u64> {
+    let mut seen_sequences = HashSet::new();
+    for (sequence, hash) in near_head_lane_entries.iter().copied() {
+        if sequence <= head_sequence || hash == current_hash {
+            continue;
+        }
+        if !seen_sequences.insert(sequence) {
+            continue;
+        }
+        if pending_dispatches
+            .iter()
+            .any(|pending| pending.sequence == sequence)
+        {
+            continue;
+        }
+        return Some(sequence);
+    }
+    None
+}
+
 #[derive(Clone, Debug, Default)]
 struct HarnessReadiness {
     drifted_markets: HashSet<String>,
@@ -1884,6 +2047,14 @@ struct HarnessMarketDrift {
 struct ExecutorState {
     group: Pubkey,
     execution_queue: Pubkey,
+    /// Phase 2B: which sub-queue this executor is responsible for. The
+    /// engine spawns one ExecutorState per active market_index.
+    market_index: u16,
+    /// PerpMarket pubkey bound to `market_index`. Used to filter shared
+    /// lanes down to those whose canonical position [3] points at this
+    /// market — only those lanes can build a valid execute_multi tx for
+    /// our sub-queue.
+    perp_market_pk: Pubkey,
     current_queue_count: AtomicU64,
     current_queue_next_sequence: AtomicU64,
     current_queue_max_seen_sequence: AtomicU64,
@@ -1906,6 +2077,10 @@ struct ExecutorState {
     /// Tracks the first slot at which the current head had no lane match.
     /// Tuple of (sequence, first_seen_slot). Reset when the head changes.
     no_lane_match_since: Arc<Mutex<Option<(u64, u64)>>>,
+    /// Highest speculative successor sequence that confirmed without moving
+    /// the head. While the observed head is at or below this sequence, skip
+    /// further successor speculation and focus on targeted current-head sends.
+    speculative_no_advance_block_sequence: AtomicU64,
     /// Adaptive max_items: starts at config.executor_max_items, reduced to 1
     /// when ProgramFailedToComplete (heap overflow) is detected, then ramped
     /// back up after consecutive successful head advancements.
@@ -1917,10 +2092,18 @@ struct ExecutorState {
 }
 
 impl ExecutorState {
-    fn new(group: Pubkey, execution_queue: Pubkey, lanes: HashMap<String, Lane>) -> Self {
+    fn new(
+        group: Pubkey,
+        execution_queue: Pubkey,
+        market_index: u16,
+        perp_market_pk: Pubkey,
+        lanes: HashMap<String, Lane>,
+    ) -> Self {
         Self {
             group,
             execution_queue,
+            market_index,
+            perp_market_pk,
             current_queue_count: AtomicU64::new(0),
             current_queue_next_sequence: AtomicU64::new(0),
             current_queue_max_seen_sequence: AtomicU64::new(0),
@@ -1935,9 +2118,19 @@ impl ExecutorState {
             last_progress_log_sequence: AtomicU64::new(0),
             sequence_failure_counts: Arc::new(Mutex::new(HashMap::new())),
             no_lane_match_since: Arc::new(Mutex::new(None)),
+            speculative_no_advance_block_sequence: AtomicU64::new(0),
             adaptive_max_items: AtomicU16::new(0), // 0 = use config default
             adaptive_success_streak: AtomicU32::new(0),
         }
+    }
+
+    /// Returns true if a lane's canonical-layout perp_market account matches
+    /// this executor's market. Used to filter shared lanes down to ours.
+    fn lane_matches_market(&self, lane: &Lane) -> bool {
+        lane.remaining_accounts
+            .get(3)
+            .map(|am| am.pubkey == self.perp_market_pk)
+            .unwrap_or(false)
     }
 
     /// Returns the effective max_items for execute instructions. When the
@@ -2089,6 +2282,16 @@ struct RelayIntentAcceptedEvent {
     group: String,
     execution_queue: String,
     market: String,
+    #[serde(default)]
+    intent_version: Option<u32>,
+    #[serde(default)]
+    target_kind: Option<u32>,
+    #[serde(default)]
+    target_index: Option<u32>,
+    #[serde(default)]
+    accounts_hash: Option<String>,
+    #[serde(default)]
+    remaining_accounts_source: Option<String>,
     sequence: String,
     user_owner: String,
     remaining_accounts: Vec<RelayEventAccountMeta>,
@@ -2100,6 +2303,9 @@ struct RelayIntentStatusContext {
     group: Option<String>,
     execution_queue: Option<String>,
     market: Option<String>,
+    intent_version: Option<u32>,
+    target_kind: Option<u32>,
+    target_index: Option<u32>,
     sequence: Option<String>,
     kind: Option<u32>,
     user_owner: Option<String>,
@@ -2118,6 +2324,9 @@ struct RelayIntentStatusEvent {
     group: Option<String>,
     execution_queue: Option<String>,
     market: Option<String>,
+    intent_version: Option<u32>,
+    target_kind: Option<u32>,
+    target_index: Option<u32>,
     sequence: Option<String>,
     kind: Option<u32>,
     user_owner: Option<String>,
@@ -2137,6 +2346,13 @@ impl RelayIntentStatusContext {
             execution_queue: (!request.execution_queue.is_empty())
                 .then(|| request.execution_queue.clone()),
             market: (!request.market.is_empty()).then(|| request.market.clone()),
+            intent_version: Some(if request.intent_version == 0 {
+                INTENT_VERSION_V1
+            } else {
+                request.intent_version
+            }),
+            target_kind: Some(request.target_kind),
+            target_index: Some(request.target_index),
             sequence: None,
             kind: None,
             user_owner: (!request.user_owner.is_empty()).then(|| request.user_owner.clone()),
@@ -2177,6 +2393,9 @@ impl RelayIntentStatusContext {
             group: self.group.clone(),
             execution_queue: self.execution_queue.clone(),
             market: self.market.clone(),
+            intent_version: self.intent_version,
+            target_kind: self.target_kind,
+            target_index: self.target_index,
             sequence: self.sequence.clone(),
             kind: self.kind,
             user_owner: self.user_owner.clone(),
@@ -2206,6 +2425,13 @@ struct ParsedSubmitIntentKeys {
     execution_queue: Pubkey,
     user_owner: Pubkey,
     mango_account: Pubkey,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ParsedSubmitIntentTarget {
+    intent_version: u32,
+    target_kind: UserIntentTargetKind,
+    target_index: u16,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -2384,17 +2610,10 @@ struct SequenceCursor {
 
 impl SequenceCursor {
     fn reserve(&mut self, now_ms: u64) -> u64 {
-        // Prefer recycling the lowest available abandoned sequence to keep the queue dense.
-        while let Some(&recycled) = self.recyclable.iter().next() {
-            self.recyclable.remove(&recycled);
-            // Only reuse if it's still within the valid enqueue window.
-            if recycled >= self.next_sequence && !self.pending.contains_key(&recycled) {
-                self.pending
-                    .insert(recycled, PendingSequenceState::reserved(now_ms));
-                return recycled;
-            }
-        }
-        // Fall back to the next unused sequence.
+        // Reserve the lowest dense candidate at or above the current floor.
+        // Recyclable sequences are only reused when they line up with that
+        // candidate; otherwise they remain parked for later so a stale
+        // far-ahead cursor cannot keep skipping the live queue window.
         let mut candidate = self.next_sequence;
         for pending in self.pending.keys().copied() {
             if pending < candidate {
@@ -2406,6 +2625,7 @@ impl SequenceCursor {
             }
             break;
         }
+        self.recyclable.remove(&candidate);
         self.pending
             .insert(candidate, PendingSequenceState::reserved(now_ms));
         candidate
@@ -2467,6 +2687,30 @@ impl SequenceCursor {
             .range(floor..)
             .filter(|(_, state)| state.phase == PendingSequencePhase::Submitted)
             .count()
+    }
+
+    fn rewind_to_queue_floor(&mut self, floor: u64) -> bool {
+        let mut changed = false;
+        if floor < self.next_sequence {
+            self.next_sequence = floor;
+            changed = true;
+        }
+        if !self.pending.is_empty() {
+            let to_drop: Vec<u64> = self
+                .pending
+                .range(..floor)
+                .map(|(sequence, _)| *sequence)
+                .collect();
+            if !to_drop.is_empty() {
+                changed = true;
+                for sequence in to_drop {
+                    self.pending.remove(&sequence);
+                }
+            }
+        }
+        let before = self.recyclable.len();
+        self.recyclable.retain(|&seq| seq >= floor);
+        changed || self.recyclable.len() != before
     }
 }
 
@@ -2553,6 +2797,19 @@ impl SequenceStore {
                 .entry(key.to_string())
                 .or_default()
                 .reset_after_failure(failed_sequence, fallback_next)
+        };
+        if changed {
+            self.schedule_flush().await;
+        }
+    }
+
+    async fn rewind_to_queue_floor(&self, key: &str, floor: u64) {
+        let changed = {
+            let mut guard = self.sequences.lock().await;
+            guard
+                .entry(key.to_string())
+                .or_default()
+                .rewind_to_queue_floor(floor)
         };
         if changed {
             self.schedule_flush().await;
@@ -2679,6 +2936,43 @@ struct Engine {
     /// optimization, not authoritative — false accepts are caught by the
     /// on-chain program and rolled back via Phase 3's `rollback_local`.
     margin_account_cache: Arc<StdMutex<HashMap<Pubkey, CachedMarginAccount>>>,
+    /// Long-lived account mirror for accounts that are effectively static in
+    /// the relayer model: group-scoped banks/perp markets/fallbacks and
+    /// bootstrapped mango accounts. Checked before the short TTL margin cache
+    /// so submit can derive accounts without repeated RPC.
+    static_account_cache: Arc<StdMutex<HashMap<Pubkey, KeyedAccountSharedData>>>,
+    /// Group-scoped static metadata mirror used to derive fixed perp accounts
+    /// and health-account pubkeys server-side.
+    group_account_mirrors: Arc<StdMutex<HashMap<Pubkey, GroupStaticAccountMirror>>>,
+    /// Per-mango-account summary mirror. Populated from a one-time RPC fetch
+    /// on first use, then reused to derive the health-account sections.
+    mango_account_mirrors: Arc<StdMutex<HashMap<Pubkey, MangoAccountMirror>>>,
+    /// Per-user_owner failure memo. Keyed by the 32-byte pubkey bytes.
+    /// Populated on `verify_user_signature` failures; checked (and expired)
+    /// before harness calls so repeat bad-key bots never load the harness.
+    ingress_failure_memo: Arc<StdMutex<HashMap<[u8; 32], IngressFailureMemo>>>,
+    /// Per-user_owner token-bucket rate-limiter slots. Keyed by the 32-byte
+    /// pubkey bytes. Only active when `ingress_rate_limit_enabled=true`.
+    ingress_rate_slots: Arc<StdMutex<HashMap<[u8; 32], IngressRateSlot>>>,
+}
+
+/// Per-user_owner failure tracking. Populated when `verify_user_signature`
+/// fails; read before harness calls to short-circuit early.
+#[derive(Clone)]
+struct IngressFailureMemo {
+    /// How many consecutive signature failures we have seen.
+    count: u32,
+    /// Wall-clock ms of the most recent failure.
+    last_seen_ms: u64,
+}
+
+/// Per-user_owner token-bucket slot for the ingress rate limiter.
+#[derive(Clone)]
+struct IngressRateSlot {
+    /// Tokens remaining (integer; max = burst config value).
+    tokens: u32,
+    /// Wall-clock ms when `tokens` was last refilled.
+    last_refill_ms: u64,
 }
 
 /// One entry in the margin-check account cache. Holds a clone of the
@@ -2688,6 +2982,37 @@ struct Engine {
 struct CachedMarginAccount {
     account: KeyedAccountSharedData,
     cached_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct GroupStaticAccountMirror {
+    banks_by_token_index: HashMap<TokenIndex, StaticBankAccountMeta>,
+    perps_by_market_index: HashMap<PerpMarketIndex, StaticPerpMarketMeta>,
+}
+
+#[derive(Clone, Debug)]
+struct StaticBankAccountMeta {
+    bank: Pubkey,
+    oracle: Pubkey,
+    fallback_oracles: Vec<Pubkey>,
+}
+
+#[derive(Clone, Debug)]
+struct StaticPerpMarketMeta {
+    market: Pubkey,
+    bids: Pubkey,
+    asks: Pubkey,
+    event_queue: Pubkey,
+    oracle: Pubkey,
+    settle_token_index: TokenIndex,
+}
+
+#[derive(Clone, Debug, Default)]
+struct MangoAccountMirror {
+    token_indices: Vec<TokenIndex>,
+    perp_market_indices: Vec<PerpMarketIndex>,
+    serum_open_orders: Vec<Pubkey>,
+    openbook_open_orders: Vec<Pubkey>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2767,6 +3092,7 @@ enum TerminalHeadFailureReason {
     WrongProgramOwner,
     PerpOrderSlotsFull,
     HealthCheckFailed,
+    HealthAccountsMismatch,
 }
 
 impl LaneFailureClass {
@@ -2822,6 +3148,98 @@ impl Engine {
         }
     }
 
+    /// Check the per-user_owner token-bucket rate limiter. O(1) StdMutex
+    /// acquire; no I/O. Returns `Err` with RESOURCE_EXHAUSTED if the bucket
+    /// is empty, increments `ingress_rate_limited_total`.
+    fn check_ingress_rate_limit(&self, user_key: [u8; 32], now_ms: u64) -> Result<(), Status> {
+        if !self.config.ingress_rate_limit_enabled {
+            return Ok(());
+        }
+        let burst = self.config.ingress_rate_limit_burst;
+        let per_sec = self.config.ingress_rate_limit_per_sec;
+        if burst == 0 || per_sec == 0 {
+            return Ok(());
+        }
+        let mut guard = self
+            .ingress_rate_slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let slot = guard.entry(user_key).or_insert_with(|| IngressRateSlot {
+            tokens: burst,
+            last_refill_ms: now_ms,
+        });
+        let elapsed_ms = now_ms.saturating_sub(slot.last_refill_ms);
+        // Refill: elapsed_ms * per_sec / 1000 new tokens, capped at burst.
+        let new_tokens = ((elapsed_ms * per_sec as u64) / 1000).min(burst as u64) as u32;
+        slot.tokens = slot.tokens.saturating_add(new_tokens).min(burst);
+        slot.last_refill_ms = now_ms;
+        if slot.tokens == 0 {
+            self.metrics
+                .ingress_rate_limited_total
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(Status::resource_exhausted(
+                "ingress rate limit exceeded; slow down",
+            ));
+        }
+        slot.tokens -= 1;
+        Ok(())
+    }
+
+    /// Check the per-user_owner failure memo. O(1) StdMutex acquire; no I/O.
+    /// Returns `Err` with PERMISSION_DENIED if the memo threshold is exceeded
+    /// and the entry has not yet expired, increments `ingress_memo_rejected_total`.
+    fn check_ingress_failure_memo(&self, user_key: [u8; 32], now_ms: u64) -> Result<(), Status> {
+        if !self.config.ingress_failure_memo_enabled {
+            return Ok(());
+        }
+        let ttl_ms = self.config.ingress_failure_memo_ttl_ms;
+        let threshold = self.config.ingress_failure_memo_threshold;
+        let mut guard = self
+            .ingress_failure_memo
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = guard.get(&user_key) {
+            if entry.last_seen_ms + ttl_ms < now_ms {
+                // TTL expired — evict and allow.
+                guard.remove(&user_key);
+                return Ok(());
+            }
+            if entry.count >= threshold {
+                self.metrics
+                    .ingress_memo_rejected_total
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(Status::permission_denied(
+                    "repeated signature failures; check signing keypair",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Record a `verify_user_signature` failure for `user_key` in the memo.
+    /// Upserts the entry (incrementing count, updating last_seen_ms) and bumps
+    /// the `ingress_sig_fail_total` counter.
+    fn record_ingress_sig_failure(&self, user_key: [u8; 32], now_ms: u64) {
+        self.metrics
+            .ingress_sig_fail_total
+            .fetch_add(1, Ordering::Relaxed);
+        if !self.config.ingress_failure_memo_enabled {
+            return;
+        }
+        let mut guard = self
+            .ingress_failure_memo
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let entry = guard
+            .entry(user_key)
+            .or_insert_with(|| IngressFailureMemo {
+                count: 0,
+                last_seen_ms: now_ms,
+            });
+        entry.count = entry.count.saturating_add(1);
+        entry.last_seen_ms = now_ms;
+    }
+
     fn reject_submit_request(
         &self,
         request: &SubmitIntentRequest,
@@ -2834,6 +3252,9 @@ impl Engine {
             group = %request.group,
             execution_queue = %request.execution_queue,
             market = %request.market,
+            intent_version = request.intent_version,
+            target_kind = request.target_kind,
+            target_index = request.target_index,
             user_owner = %request.user_owner,
             mango_account = %request.mango_account,
             remaining_accounts_count = request.remaining_accounts.len(),
@@ -2853,6 +3274,388 @@ impl Engine {
             user_owner: parse_pubkey(&request.user_owner)?,
             mango_account: parse_pubkey(&request.mango_account)?,
         })
+    }
+
+    fn parse_submit_intent_target(
+        &self,
+        request: &SubmitIntentRequest,
+        market_index: u16,
+    ) -> Result<ParsedSubmitIntentTarget, Status> {
+        let intent_version = if request.intent_version == 0 {
+            INTENT_VERSION_V1
+        } else {
+            request.intent_version
+        };
+        match intent_version {
+            INTENT_VERSION_V1 => Ok(ParsedSubmitIntentTarget {
+                intent_version,
+                target_kind: UserIntentTargetKind::PerpMarket,
+                target_index: market_index,
+            }),
+            INTENT_VERSION_V2 => {
+                let target_kind = match request.target_kind {
+                    0 => UserIntentTargetKind::PerpMarket,
+                    1 => UserIntentTargetKind::Token,
+                    other => {
+                        return Err(self.reject_submit_request(
+                            request,
+                            Code::InvalidArgument,
+                            format!("unsupported target_kind for v2 intent: {other}"),
+                        ))
+                    }
+                };
+                if target_kind != UserIntentTargetKind::PerpMarket {
+                    return Err(self.reject_submit_request(
+                        request,
+                        Code::InvalidArgument,
+                        "v2 relayer submit currently only supports perp market targets",
+                    ));
+                }
+                if request.target_index != market_index as u32 {
+                    return Err(self.reject_submit_request(
+                        request,
+                        Code::InvalidArgument,
+                        format!(
+                            "v2 target_index mismatch: request.target_index={} request.market={market_index}",
+                            request.target_index
+                        ),
+                    ));
+                }
+                Ok(ParsedSubmitIntentTarget {
+                    intent_version,
+                    target_kind,
+                    target_index: market_index,
+                })
+            }
+            other => Err(self.reject_submit_request(
+                request,
+                Code::InvalidArgument,
+                format!("unsupported intent_version: {other}"),
+            )),
+        }
+    }
+
+    fn seed_static_account_cache<I>(&self, accounts: I)
+    where
+        I: IntoIterator<Item = KeyedAccountSharedData>,
+    {
+        if let Ok(mut cache) = self.static_account_cache.lock() {
+            for account in accounts {
+                cache.insert(account.key, account);
+            }
+        }
+    }
+
+    fn cached_static_account(&self, pubkey: &Pubkey) -> Option<KeyedAccountSharedData> {
+        self.static_account_cache
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(pubkey).cloned())
+    }
+
+    fn note_mango_account_target_market(
+        &self,
+        mango_account: Pubkey,
+        target_market_index: PerpMarketIndex,
+    ) {
+        if let Ok(mut mirrors) = self.mango_account_mirrors.lock() {
+            if let Some(mirror) = mirrors.get_mut(&mango_account) {
+                if !mirror.perp_market_indices.contains(&target_market_index) {
+                    mirror.perp_market_indices.push(target_market_index);
+                }
+            }
+        }
+    }
+
+    async fn ensure_group_static_account_mirror(
+        &self,
+        request: &SubmitIntentRequest,
+        group: Pubkey,
+    ) -> Result<GroupStaticAccountMirror, Status> {
+        if let Ok(cache) = self.group_account_mirrors.lock() {
+            if let Some(mirror) = cache.get(&group) {
+                return Ok(mirror.clone());
+            }
+        }
+
+        let accounts = self
+            .rpc
+            .get_program_accounts(&self.config.program_id)
+            .await
+            .map_err(|err| {
+                self.reject_submit_request(
+                    request,
+                    Code::Unavailable,
+                    format!("group account mirror bootstrap failed for group={group}: {err}"),
+                )
+            })?;
+
+        let mut mirror = GroupStaticAccountMirror::default();
+        let mut static_accounts = Vec::new();
+        let mut fallback_pubkeys = Vec::new();
+        let mut market_metadata = HashMap::new();
+
+        for (pubkey, account) in accounts {
+            let keyed = KeyedAccountSharedData::new(pubkey, account.into());
+            if let Ok(bank) = keyed.load::<Bank>() {
+                if bank.group == group {
+                    let fallback_oracles = if bank.fallback_oracle == Pubkey::default() {
+                        Vec::new()
+                    } else {
+                        vec![bank.fallback_oracle]
+                    };
+                    mirror.banks_by_token_index.insert(
+                        bank.token_index,
+                        StaticBankAccountMeta {
+                            bank: pubkey,
+                            oracle: bank.oracle,
+                            fallback_oracles: fallback_oracles.clone(),
+                        },
+                    );
+                    if let Some(fallback) = fallback_oracles.first().copied() {
+                        fallback_pubkeys.push(fallback);
+                    }
+                    static_accounts.push(keyed);
+                    continue;
+                }
+            }
+            if let Ok(perp_market) = keyed.load::<PerpMarket>() {
+                if perp_market.group == group {
+                    mirror.perps_by_market_index.insert(
+                        perp_market.perp_market_index,
+                        StaticPerpMarketMeta {
+                            market: pubkey,
+                            bids: perp_market.bids,
+                            asks: perp_market.asks,
+                            event_queue: perp_market.event_queue,
+                            oracle: perp_market.oracle,
+                            settle_token_index: perp_market.settle_token_index,
+                        },
+                    );
+                    market_metadata.insert(
+                        perp_market.perp_market_index,
+                        HarnessMarketMetadata {
+                            market_index: perp_market.perp_market_index,
+                            perp_market: pubkey.to_string(),
+                            oracle: perp_market.oracle.to_string(),
+                        },
+                    );
+                    static_accounts.push(keyed);
+                }
+            }
+        }
+
+        if mirror.banks_by_token_index.is_empty() && mirror.perps_by_market_index.is_empty() {
+            return Err(self.reject_submit_request(
+                request,
+                Code::Unavailable,
+                format!("group account mirror bootstrap found no bank/perp accounts for group={group}"),
+            ));
+        }
+
+        let mut fallback_extras = HashMap::<Pubkey, Vec<Pubkey>>::new();
+        let mut quote_oracle_pubkeys = Vec::new();
+        let mut seen_fallbacks = HashSet::new();
+        let unique_fallback_pubkeys: Vec<Pubkey> = fallback_pubkeys
+            .into_iter()
+            .filter(|pubkey| seen_fallbacks.insert(*pubkey))
+            .collect();
+        if !unique_fallback_pubkeys.is_empty() {
+            let fetched = self
+                .rpc
+                .get_multiple_accounts(&unique_fallback_pubkeys)
+                .await
+                .map_err(|err| {
+                    self.reject_submit_request(
+                        request,
+                        Code::Unavailable,
+                        format!("fallback oracle bootstrap failed for group={group}: {err}"),
+                    )
+                })?;
+            for (fallback_pubkey, maybe_account) in
+                unique_fallback_pubkeys.iter().copied().zip(fetched.into_iter())
+            {
+                let mut accounts = vec![fallback_pubkey];
+                if let Some(account) = maybe_account {
+                    let keyed = KeyedAccountSharedData::new(fallback_pubkey, account.into());
+                    static_accounts.push(keyed.clone());
+                    let quote_oracle = load_orca_pool_state(&keyed)
+                        .or_else(|_| load_raydium_pool_state(&keyed))
+                        .and_then(|pool| pool.get_quote_oracle())
+                        .ok();
+                    if let Some(quote_oracle) = quote_oracle {
+                        if quote_oracle != Pubkey::default() && !accounts.contains(&quote_oracle) {
+                            accounts.push(quote_oracle);
+                            quote_oracle_pubkeys.push(quote_oracle);
+                        }
+                    }
+                }
+                fallback_extras.insert(fallback_pubkey, accounts);
+            }
+        }
+
+        let mut seen_quote_oracles = HashSet::new();
+        let unique_quote_oracle_pubkeys: Vec<Pubkey> = quote_oracle_pubkeys
+            .into_iter()
+            .filter(|pubkey| seen_quote_oracles.insert(*pubkey))
+            .collect();
+        if !unique_quote_oracle_pubkeys.is_empty() {
+            let fetched = self
+                .rpc
+                .get_multiple_accounts(&unique_quote_oracle_pubkeys)
+                .await
+                .map_err(|err| {
+                    self.reject_submit_request(
+                        request,
+                        Code::Unavailable,
+                        format!("quote oracle bootstrap failed for group={group}: {err}"),
+                    )
+                })?;
+            for (quote_oracle_pubkey, maybe_account) in unique_quote_oracle_pubkeys
+                .iter()
+                .copied()
+                .zip(fetched.into_iter())
+            {
+                if let Some(account) = maybe_account {
+                    static_accounts.push(KeyedAccountSharedData::new(
+                        quote_oracle_pubkey,
+                        account.into(),
+                    ));
+                }
+            }
+        }
+
+        for bank in mirror.banks_by_token_index.values_mut() {
+            let Some(base_fallback) = bank.fallback_oracles.first().copied() else {
+                continue;
+            };
+            if let Some(extra_accounts) = fallback_extras.get(&base_fallback) {
+                bank.fallback_oracles = extra_accounts.clone();
+            }
+        }
+
+        self.seed_static_account_cache(static_accounts);
+        if let Ok(mut cache) = self.market_metadata_cache.lock() {
+            for (market_index, metadata) in market_metadata {
+                cache.insert(market_index, metadata);
+            }
+        }
+        if let Ok(mut cache) = self.group_account_mirrors.lock() {
+            let entry = cache.entry(group).or_insert_with(|| mirror.clone());
+            return Ok(entry.clone());
+        }
+        Ok(mirror)
+    }
+
+    async fn ensure_mango_account_mirror(
+        &self,
+        request: &SubmitIntentRequest,
+        mango_account: Pubkey,
+    ) -> Result<MangoAccountMirror, Status> {
+        if let Ok(cache) = self.mango_account_mirrors.lock() {
+            if let Some(mirror) = cache.get(&mango_account) {
+                return Ok(mirror.clone());
+            }
+        }
+
+        let keyed_account = if let Some(account) = self.cached_static_account(&mango_account) {
+            account
+        } else {
+            let account = self.rpc.get_account(&mango_account).await.map_err(|err| {
+                self.reject_submit_request(
+                    request,
+                    Code::Unavailable,
+                    format!("mango account mirror bootstrap failed for {mango_account}: {err}"),
+                )
+            })?;
+            let keyed = KeyedAccountSharedData::new(mango_account, account.into());
+            self.seed_static_account_cache(std::iter::once(keyed.clone()));
+            keyed
+        };
+
+        let mirror =
+            build_mango_account_mirror_from_keyed_account(mango_account, &keyed_account).map_err(
+                |err| {
+                    self.reject_submit_request(
+                        request,
+                        Code::FailedPrecondition,
+                        format!(
+                            "failed to build mango account mirror for {mango_account}: {err}"
+                        ),
+                    )
+                },
+            )?;
+        if let Ok(mut cache) = self.mango_account_mirrors.lock() {
+            let entry = cache.entry(mango_account).or_insert_with(|| mirror.clone());
+            return Ok(entry.clone());
+        }
+        Ok(mirror)
+    }
+
+    async fn derive_submit_remaining_accounts(
+        &self,
+        request: &SubmitIntentRequest,
+        keys: ParsedSubmitIntentKeys,
+        target: ParsedSubmitIntentTarget,
+    ) -> Result<Vec<AccountMeta>, Status> {
+        if target.target_kind != UserIntentTargetKind::PerpMarket {
+            return Err(self.reject_submit_request(
+                request,
+                Code::InvalidArgument,
+                "relayer account derivation currently only supports perp market targets",
+            ));
+        }
+        let group_mirror = self
+            .ensure_group_static_account_mirror(request, keys.group)
+            .await?;
+        let mango_account_mirror = self
+            .ensure_mango_account_mirror(request, keys.mango_account)
+            .await?;
+        let remaining_accounts = build_derived_perp_remaining_accounts(
+            keys.group,
+            keys.mango_account,
+            keys.user_owner,
+            target.target_index,
+            &group_mirror,
+            &mango_account_mirror,
+        )
+        .map_err(|err| {
+            self.reject_submit_request(
+                request,
+                Code::FailedPrecondition,
+                format!("failed to derive remaining accounts in relayer: {err}"),
+            )
+        })?;
+
+        if !request.remaining_accounts.is_empty() {
+            let matches = supplied_account_metas_match(&request.remaining_accounts, &remaining_accounts);
+            if target.intent_version == INTENT_VERSION_V1 && !matches {
+                return Err(self.reject_submit_request(
+                    request,
+                    Code::InvalidArgument,
+                    "v1 intent remaining_accounts do not match relayer canonical accounts",
+                ));
+            }
+            if target.intent_version == INTENT_VERSION_V2 && !matches {
+                warn!(
+                    group = %request.group,
+                    market = %request.market,
+                    user_owner = %request.user_owner,
+                    mango_account = %request.mango_account,
+                    supplied_accounts = request.remaining_accounts.len(),
+                    derived_accounts = remaining_accounts.len(),
+                    "overriding caller-supplied remaining_accounts with relayer-derived accounts"
+                );
+            }
+        } else if target.intent_version == INTENT_VERSION_V1 {
+            return Err(self.reject_submit_request(
+                request,
+                Code::InvalidArgument,
+                "v1 intent requires caller-supplied remaining_accounts",
+            ));
+        }
+
+        Ok(remaining_accounts)
     }
 
     fn harness_reject_status(&self, message: impl Into<String>, drift_related: bool) -> Status {
@@ -3003,6 +3806,7 @@ impl Engine {
         &self,
         request: &SubmitIntentRequest,
         keys: ParsedSubmitIntentKeys,
+        remaining_accounts: &[AccountMeta],
     ) -> Result<(), Status> {
         if !self.config.enable_health_check {
             return Ok(());
@@ -3017,7 +3821,6 @@ impl Engine {
         else {
             return Ok(());
         };
-        let remaining_accounts = parse_remaining_accounts(&request.remaining_accounts)?;
         if remaining_accounts.len() < 4 {
             return Err(self.reject_submit_request(
                 request,
@@ -3044,13 +3847,13 @@ impl Engine {
             .fetch_margin_check_account_map(
                 request,
                 keys.mango_account,
-                &remaining_accounts,
+                remaining_accounts,
                 &extra_market_metadata,
             )
             .await?;
         self.evaluate_submit_margin_precheck(
             request,
-            &remaining_accounts,
+            remaining_accounts,
             &margin_ops,
             margin_snapshot,
             &extra_market_metadata,
@@ -3063,23 +3866,41 @@ impl Engine {
         request: &SubmitIntentRequest,
         keys: ParsedSubmitIntentKeys,
     ) -> Result<Option<HarnessUserState>, Status> {
-        // Phase 2 fast path: in-process state. Single parking_lot Mutex
-        // acquisition; no HTTP, no JSON, no FFI. The lock is held for the
-        // duration of get_user_state which may trigger an internal lazy
-        // rebuild — bounded by the active intent count.
+        // Phase 4-lite fast path: read a SINGLE mango account's perp
+        // positions directly from the live rust-harness projection's
+        // in-memory MangoAccount struct. No orderbook walks, no full
+        // EngineSnapshot rebuild, no string serialization beyond the
+        // one quote_position_native field that margin check needs.
+        //
+        // `account_positions_fast` returns in ~5-20 µs; conversion to
+        // HarnessUserState is another ~10 µs of field re-packing. Lock
+        // is held briefly, never across an `.await`.
         if let Some(state) = &self.state {
-            let owner = keys.user_owner.to_string();
-            let user_state = state
-                .lock()
-                .get_user_state(&owner, QueueView::Optimistic)
-                .map_err(|err| {
-                    self.reject_submit_request(
-                        request,
-                        Code::Internal,
-                        format!("local state get_user_state failed owner={owner}: {err}"),
-                    )
-                })?;
-            return Ok(Some(harness_user_state_from_rust_harness(user_state)));
+            let mango_account = keys.mango_account;
+            let positions_opt =
+                state
+                    .lock()
+                    .account_positions_fast(mango_account)
+                    .map_err(|err| {
+                        self.reject_submit_request(
+                            request,
+                            Code::Internal,
+                            format!(
+                                "local state account_positions_fast failed mango_account={}: {err}",
+                                mango_account
+                            ),
+                        )
+                    })?;
+            if let Some(positions) = positions_opt {
+                return Ok(Some(harness_user_state_from_fast_positions(
+                    mango_account,
+                    positions,
+                )));
+            }
+            // Account not known to local state — fall through to the
+            // (slower) HTTP path below. This handles the warmup case
+            // where a new mango account hasn't been seen by any prior
+            // intent.
         }
 
         let Some(harness_base_url) = self.config.harness_base_url.as_deref() else {
@@ -3272,24 +4093,34 @@ impl Engine {
         let mut accounts: HashMap<Pubkey, KeyedAccountSharedData> =
             HashMap::with_capacity(pubkeys.len());
         let mut misses: Vec<Pubkey> = Vec::new();
+        let mut remaining_after_static = Vec::new();
+        if let Ok(static_cache) = self.static_account_cache.lock() {
+            for &pubkey in &pubkeys {
+                if let Some(account) = static_cache.get(&pubkey) {
+                    accounts.insert(pubkey, account.clone());
+                } else {
+                    remaining_after_static.push(pubkey);
+                }
+            }
+        } else {
+            remaining_after_static.extend(pubkeys.iter().copied());
+        }
         if ttl_ms > 0 {
             if let Ok(cache) = self.margin_account_cache.lock() {
-                for &pubkey in &pubkeys {
+                for pubkey in remaining_after_static {
                     match cache.get(&pubkey) {
-                        Some(entry)
-                            if now_ms.saturating_sub(entry.cached_at_ms) <= ttl_ms =>
-                        {
+                        Some(entry) if now_ms.saturating_sub(entry.cached_at_ms) <= ttl_ms => {
                             accounts.insert(pubkey, entry.account.clone());
                         }
                         _ => misses.push(pubkey),
                     }
                 }
             } else {
-                misses.extend(pubkeys.iter().copied());
+                misses.extend(remaining_after_static);
             }
         } else {
-            // Cache disabled — every pubkey is a miss.
-            misses.extend(pubkeys.iter().copied());
+            // Cache disabled — every non-static pubkey is a miss.
+            misses.extend(remaining_after_static);
         }
 
         let hits = (pubkeys.len() - misses.len()) as u64;
@@ -3650,7 +4481,6 @@ impl Engine {
     }
 
     fn terminal_head_failure_reason(
-        &self,
         err: &TransactionError,
         logs: &[String],
     ) -> Option<TerminalHeadFailureReason> {
@@ -3697,6 +4527,31 @@ impl Engine {
             return Some(TerminalHeadFailureReason::HealthCheckFailed);
         }
 
+        let custom_code = match err {
+            TransactionError::InstructionError(_, InstructionError::Custom(code)) => Some(*code),
+            _ => None,
+        };
+        let fixed_health_account_mismatch = logs.iter().any(|line| {
+            (line.contains("perp market index") && line.contains("not found"))
+                || (line.contains("token index") && line.contains("not found"))
+                || line.contains("bank for token index")
+                || line.contains("no serum3 open orders for key")
+                || line.contains("no openbook open orders for key")
+                || line.contains("execution queue perp health accounts invalid")
+        });
+        if fixed_health_account_mismatch
+            && matches!(
+                custom_code,
+                Some(code)
+                    if code == MangoError::SomeError.error_code()
+                        || code == MangoError::ExecutionQueuePerpHealthAccountsInvalid.error_code()
+                        || code == MangoError::ExecutionQueueDispatchAccountLayoutInvalid.error_code()
+                        || code == MangoError::InvalidHealthAccountCount.error_code()
+            )
+        {
+            return Some(TerminalHeadFailureReason::HealthAccountsMismatch);
+        }
+
         None
     }
 
@@ -3706,6 +4561,7 @@ impl Engine {
             TerminalHeadFailureReason::WrongProgramOwner => "account_owned_by_wrong_program",
             TerminalHeadFailureReason::PerpOrderSlotsFull => "perp_order_slots_full",
             TerminalHeadFailureReason::HealthCheckFailed => "health_check_failed",
+            TerminalHeadFailureReason::HealthAccountsMismatch => "health_accounts_mismatch",
         }
     }
 
@@ -3728,7 +4584,7 @@ impl Engine {
                 return false;
             }
         };
-        let Some(reason) = self.terminal_head_failure_reason(err, &logs) else {
+        let Some(reason) = Self::terminal_head_failure_reason(err, &logs) else {
             return false;
         };
 
@@ -3825,6 +4681,76 @@ impl Engine {
         }
     }
 
+    async fn maybe_auto_drop_blocked_head_after_threshold(
+        &self,
+        executor: &Arc<ExecutorState>,
+        sequence: u64,
+        reason_label: &str,
+        context: &str,
+        head_hash: Option<[u8; 32]>,
+    ) -> bool {
+        let drop_slots = self.config.executor_no_lane_match_drop_slots;
+        if drop_slots == 0 {
+            return false;
+        }
+
+        let now_ms = unix_timestamp_ms();
+        let threshold_ms = drop_slots.saturating_mul(400);
+        let should_drop = {
+            let mut tracker = executor.no_lane_match_since.lock().await;
+            match *tracker {
+                Some((tracked_sequence, first_ms)) if tracked_sequence == sequence => {
+                    now_ms.saturating_sub(first_ms) >= threshold_ms
+                }
+                _ => {
+                    *tracker = Some((sequence, now_ms));
+                    false
+                }
+            }
+        };
+
+        if !should_drop {
+            return false;
+        }
+
+        if let Some(hash) = head_hash {
+            warn!(
+                "executor auto-dropping blocked head sequence={} reason={} head_hash={} after {}ms threshold",
+                sequence,
+                context,
+                bytes_to_hex(&hash),
+                threshold_ms,
+            );
+        } else {
+            warn!(
+                "executor auto-dropping blocked head sequence={} reason={} after {}ms threshold",
+                sequence, context, threshold_ms,
+            );
+        }
+
+        match self
+            .drop_ctm_head_with_admin_tx(executor, sequence, reason_label)
+            .await
+        {
+            Ok(sig) => {
+                info!(
+                    "executor blocked-head admin-drop succeeded sequence={} reason={} tx={}",
+                    sequence, context, sig
+                );
+                *executor.no_lane_match_since.lock().await = None;
+                executor.last_inspect_ms.store(0, Ordering::Relaxed);
+                true
+            }
+            Err(err) => {
+                warn!(
+                    "executor blocked-head admin-drop failed sequence={} reason={} err={err:?}",
+                    sequence, context
+                );
+                false
+            }
+        }
+    }
+
     fn current_unix_timestamp_secs(&self) -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -3835,9 +4761,10 @@ impl Engine {
     fn inspect_expired_head_batch(
         &self,
         queue_data: &[u8],
+        market_index: u16,
         expected_sequence: u64,
     ) -> QueueExpiredHeadBatch {
-        let queue_state = inspect_queue_admin_state(queue_data);
+        let queue_state = inspect_queue_admin_state_for_market(queue_data, market_index);
         if queue_state.head.reason != "ctm_pending"
             || queue_state.head.next_sequence != expected_sequence
         {
@@ -3848,6 +4775,8 @@ impl Engine {
         let now_ts = self.current_unix_timestamp_secs();
         let expiry_cutoff =
             now_ts.saturating_sub(self.config.executor_expired_head_drop_grace_secs);
+        // v2 sub-queue: resolve slot once so we read from the right window.
+        let slot_idx = find_sub_queue_slot(queue_data, market_index).unwrap_or(0);
         let mut sequences = Vec::new();
         let start = queue_state.head.next_sequence;
         let end = queue_state
@@ -3857,8 +4786,7 @@ impl Engine {
             .min(start.saturating_add(self.config.executor_expired_head_drop_batch_max as u64));
         let mut sequence = start;
         while sequence < end {
-            let item_offset = EXECUTION_QUEUE_CTM_ITEMS_OFFSET
-                + (sequence as usize % EXECUTION_QUEUE_CTM_CAPACITY) * EXECUTION_QUEUE_ITEM_SIZE;
+            let item_offset = ctm_item_offset(slot_idx, sequence);
             if item_offset + EXECUTION_QUEUE_ITEM_SIZE > queue_data.len() {
                 break;
             }
@@ -3985,7 +4913,8 @@ impl Engine {
         reason: &str,
     ) -> Result<Signature> {
         let queue_account = self.rpc.get_account(&executor.execution_queue).await?;
-        let queue_state = inspect_queue_admin_state(&queue_account.data);
+        let queue_state =
+            inspect_queue_admin_state_for_market(&queue_account.data, executor.market_index);
         let head_matches = queue_state.head.next_sequence == sequence;
         let head_is_pending = head_matches && queue_state.head.reason == "ctm_pending";
         let head_is_gap = head_matches && queue_state.head.is_ctm_gap_state();
@@ -4002,11 +4931,13 @@ impl Engine {
         } else {
             "gap_span_drop"
         };
-        let expired_batch = self.inspect_expired_head_batch(&queue_account.data, sequence);
+        let expired_batch =
+            self.inspect_expired_head_batch(&queue_account.data, executor.market_index, sequence);
         let sequences_to_drop = if head_is_pending {
             if matches!(reason, "no_lane_match_stale" | "sequence_failure_threshold") {
                 let batch = inspect_no_lane_match_batch(
                     &queue_account.data,
+                    executor.market_index,
                     &queue_state.head,
                     self.config.executor_no_lane_match_drop_batch_max,
                 );
@@ -4023,6 +4954,7 @@ impl Engine {
         } else {
             let gap_batch = inspect_gap_recovery_batch(
                 &queue_account.data,
+                executor.market_index,
                 &queue_state.head,
                 self.config.executor_gap_recovery_drop_batch_max,
             );
@@ -4057,6 +4989,7 @@ impl Engine {
                 executor.group,
                 executor.execution_queue,
                 self.config.executor_admin.pubkey(),
+                executor.market_index,
                 *sequence,
             ));
         }
@@ -4360,17 +5293,19 @@ impl Engine {
                     "market index missing: request.market is empty or undefined",
                 ));
             }
-            if request.market.trim().parse::<u16>().is_err() {
-                return Err(self.reject_submit_request(
-                    &request,
-                    Code::InvalidArgument,
-                    format!(
-                        "market index invalid: '{}' is not a valid u16 perp market index",
-                        request.market
-                    ),
-                ));
-            }
+            let market_index: u16 =
+                request.market.trim().parse::<u16>().map_err(|_| {
+                    self.reject_submit_request(
+                        &request,
+                        Code::InvalidArgument,
+                        format!(
+                            "market index invalid: '{}' is not a valid u16 perp market index",
+                            request.market
+                        ),
+                    )
+                })?;
             let keys = self.parse_submit_intent_keys(&request)?;
+            let target = self.parse_submit_intent_target(&request, market_index)?;
             // Phase 0: stamp parse-stage latency. Anything that early-returns
             // before this point is excluded from the histogram, which is what
             // we want — we're measuring the happy path.
@@ -4408,8 +5343,64 @@ impl Engine {
                     }
                 }
             }
+            // ---- Ingress protection (O(1), no I/O) ----
+            // These checks run after the cheap queue-depth gates but before any
+            // harness or RPC calls.  Goal: prevent a misbehaving / wrong-key
+            // bot from loading the harness on every rejected intent.
+            let ingress_now_ms = unix_timestamp_ms();
+            let ingress_user_key = keys.user_owner.to_bytes();
+            // 1. Per-user token-bucket rate limiter.
+            self.check_ingress_rate_limit(ingress_user_key, ingress_now_ms)?;
+            // 2. Per-user failure memo: short-circuit if this user_owner has
+            //    repeatedly failed signature verification.
+            self.check_ingress_failure_memo(ingress_user_key, ingress_now_ms)?;
+            // 3. Early v2 signature verify — ~50 µs CPU, no I/O.
+            //    canonical_user_intent_message_v2 uses only payload_hash and
+            //    kind (both available now).  If v2 passes we save the result
+            //    and skip the re-verify after harness calls.  If v2 fails we
+            //    fall through (client might be on the older v1 format); the
+            //    full verify later will catch and memo it.
+            let early_payload_hash = hashv(&[&request.payload]).to_bytes();
+            let early_v2_msg = canonical_user_intent_message_v2(
+                keys.group,
+                keys.mango_account,
+                keys.user_owner,
+                QueueItemKind::CtmWrapped as u8,
+                target.target_kind,
+                target.target_index,
+                &early_payload_hash,
+            );
+            let early_v2_result: Option<UserSignatureMessage> =
+                if self.config.verify_user_signature && target.intent_version == INTENT_VERSION_V2 {
+                    let early_sig = parse_signature_bytes(&request.user_signature)?;
+                    let early_signature = Signature::try_from(early_sig.as_slice())
+                        .map_err(|err| Status::invalid_argument(err.to_string()))?;
+                    if early_signature.verify(keys.user_owner.as_ref(), &early_v2_msg) {
+                        Some(UserSignatureMessage::raw(early_v2_msg))
+                    } else {
+                        let hex = canonical_user_intent_message_hex_utf8(early_v2_msg);
+                        if early_signature.verify(keys.user_owner.as_ref(), &hex) {
+                            Some(UserSignatureMessage {
+                                canonical_hash: early_v2_msg,
+                                payload: UserSignaturePayload::HexUtf8(hex),
+                            })
+                        } else {
+                            None // v1 client or bad sig — full check below decides
+                        }
+                    }
+                } else {
+                    None
+                };
+            // ---- End ingress protection ----
+
             self.ensure_harness_ready(&request.market).await?;
-            self.ensure_submit_margin_ready(&request, keys).await?;
+            let remaining_accounts = self
+                .derive_submit_remaining_accounts(&request, keys, target)
+                .await?;
+            let mut resolved_request = request.clone();
+            resolved_request.remaining_accounts = account_metas_to_proto(&remaining_accounts);
+            self.ensure_submit_margin_ready(&resolved_request, keys, &remaining_accounts)
+                .await?;
             // Phase 0: stamp margin-check stage latency, computed against the
             // parse stage end so it's strictly the time spent in
             // ensure_harness_ready + ensure_submit_margin_ready.
@@ -4441,7 +5432,6 @@ impl Engine {
                     )));
                 }
             }
-            let remaining_accounts = parse_remaining_accounts(&request.remaining_accounts)?;
             let user_signature = parse_signature_bytes(&request.user_signature)?;
             let chain = self.blockhashes.snapshot().await;
             let parse_elapsed = parse_started.elapsed();
@@ -4489,14 +5479,44 @@ impl Engine {
             };
             status_ctx.with_kind(envelope.kind as u32);
 
-            let user_intent_message =
-                canonical_user_intent_message(group, mango_account, user_owner, &envelope);
+            let user_intent_message_v2 = canonical_user_intent_message_v2(
+                group,
+                mango_account,
+                user_owner,
+                envelope.kind,
+                target.target_kind,
+                target.target_index,
+                &envelope.payload_hash,
+            );
+            let user_intent_message_v1 =
+                canonical_user_intent_message_v1(group, mango_account, user_owner, &envelope);
             let ctm_envelope_message = canonical_envelope_message(group, &envelope);
 
-            let user_message_variant = if self.config.verify_user_signature {
-                verify_user_signature(user_owner, &user_signature, &user_intent_message)?
+            let user_message_variant = if let Some(early) = early_v2_result {
+                // v2 was already verified before harness calls — skip re-verify.
+                early
+            } else if self.config.verify_user_signature {
+                let messages: Vec<[u8; 32]> = if target.intent_version == INTENT_VERSION_V2 {
+                    vec![user_intent_message_v2]
+                } else {
+                    vec![user_intent_message_v1]
+                };
+                match verify_user_signature(user_owner, &user_signature, &messages) {
+                    Ok(variant) => variant,
+                    Err(e) => {
+                        self.record_ingress_sig_failure(
+                            ingress_user_key,
+                            unix_timestamp_ms(),
+                        );
+                        return Err(e);
+                    }
+                }
             } else {
-                UserSignatureMessage::Raw(user_intent_message)
+                if target.intent_version == INTENT_VERSION_V2 {
+                    UserSignatureMessage::raw(user_intent_message_v2)
+                } else {
+                    UserSignatureMessage::raw(user_intent_message_v1)
+                }
             };
 
             let user_preinstruction = build_presigned_ed25519_instruction(
@@ -4518,6 +5538,7 @@ impl Engine {
                 group,
                 execution_queue,
                 &remaining_accounts,
+                market_index,
                 envelope.clone(),
                 request.payload.clone(),
             );
@@ -4589,7 +5610,22 @@ impl Engine {
             // UndoToken travels with the PendingSubmit so the bg worker
             // can roll it back on hard ingress failure.
             let undo_token =
-                self.apply_relay_intent_to_local_state(&request, &envelope, &tx_signature);
+                self.apply_relay_intent_to_local_state(&resolved_request, &envelope, &tx_signature);
+
+            // Phase 4-lite: stamp the authoritative ingress→optimistic
+            // latency metric RIGHT HERE — at the moment the in-process
+            // state has been updated. Any subsequent read of the local
+            // state sees the new intent. This is measured from
+            // `parse_started` which is captured at the very top of
+            // submit_intent_inner's inner async block, so it includes
+            // parse + margin check + sign + apply. We only record when
+            // the apply actually happened (local state enabled +
+            // successful); otherwise the metric is not meaningful.
+            if undo_token.is_some() {
+                self.metrics
+                    .local_optimistic_latency
+                    .record(parse_started.elapsed().as_millis() as u64);
+            }
 
             let dispatch_started = Instant::now();
             let pending = PendingSubmit {
@@ -4617,8 +5653,10 @@ impl Engine {
                         .fetch_add(1, Ordering::Relaxed);
                     self.recover_sequence_after_submit_error(
                         &sequence_key,
+                        market_index,
                         sequence,
                         execution_queue,
+                        false,
                     )
                     .await;
                     // Phase 3: roll back the local state apply since the
@@ -4635,8 +5673,10 @@ impl Engine {
                 Err(mpsc::error::TrySendError::Closed(rejected)) => {
                     self.recover_sequence_after_submit_error(
                         &sequence_key,
+                        market_index,
                         sequence,
                         execution_queue,
+                        false,
                     )
                     .await;
                     if let (Some(state), Some(undo)) =
@@ -4680,13 +5720,21 @@ impl Engine {
                 None,
             ))
             .await;
-            self.maybe_emit_event(&request, &envelope, &tx_signature, &status_ctx.request_id)
+            if target.target_kind == UserIntentTargetKind::PerpMarket {
+                self.note_mango_account_target_market(mango_account, target.target_index);
+            }
+            self.maybe_emit_event(
+                &resolved_request,
+                &envelope,
+                &tx_signature,
+                &status_ctx.request_id,
+            )
                 .await;
 
             Ok(SubmitIntentResponse {
                 sequence,
                 tx_signature: tx_signature.to_string(),
-                user_intent_message: user_intent_message.to_vec(),
+                user_intent_message: user_message_variant.canonical_hash().to_vec(),
                 ctm_envelope_message: ctm_envelope_message.to_vec(),
             })
         }
@@ -4710,8 +5758,10 @@ impl Engine {
     async fn recover_sequence_after_submit_error(
         &self,
         sequence_key: &str,
+        market_index: u16,
         failed_sequence: u64,
         execution_queue: Pubkey,
+        rewind_to_queue_floor: bool,
     ) {
         let account = match self.rpc.get_account(&execution_queue).await {
             Ok(account) => account,
@@ -4723,11 +5773,20 @@ impl Engine {
                 return;
             }
         };
-        let fallback_next = inspect_next_enqueue_sequence(&account.data);
+        let fallback_next = inspect_next_enqueue_sequence_for_market(&account.data, market_index);
+        if rewind_to_queue_floor {
+            self.sequences
+                .rewind_to_queue_floor(sequence_key, fallback_next)
+                .await;
+        }
         self.sequences
             .observe_queue_floor(sequence_key, fallback_next)
             .await;
-        match inspect_queue_sequence_presence(&account.data, failed_sequence) {
+        match inspect_queue_sequence_presence_for_market(
+            &account.data,
+            market_index,
+            failed_sequence,
+        ) {
             QueueSequencePresence::PastFloor => {}
             QueueSequencePresence::Pending => {
                 self.sequences
@@ -4739,6 +5798,12 @@ impl Engine {
                     .reset_after_failure(sequence_key, failed_sequence, fallback_next)
                     .await;
             }
+        }
+        if rewind_to_queue_floor {
+            warn!(
+                "sequence cursor rewound after enqueue window conflict key={} failed_sequence={} fallback_next={} queue={}",
+                sequence_key, failed_sequence, fallback_next, execution_queue
+            );
         }
     }
 
@@ -4785,7 +5850,9 @@ impl Engine {
                 pending.attempts = pending.attempts.saturating_add(1);
                 let shift = pending.attempts.min(6) as u64;
                 let backoff = Duration::from_millis(
-                    self.config.bg_submit_retry_base_ms.saturating_mul(1u64 << shift),
+                    self.config
+                        .bg_submit_retry_base_ms
+                        .saturating_mul(1u64 << shift),
                 );
                 debug!(
                     "bg submitter transient error sequence={} attempt={} backoff_ms={} err={err:?}",
@@ -4805,9 +5872,7 @@ impl Engine {
                         metrics
                             .bg_submit_failed_total
                             .fetch_add(1, Ordering::Relaxed);
-                        metrics
-                            .bg_submit_inflight
-                            .fetch_sub(1, Ordering::Relaxed);
+                        metrics.bg_submit_inflight.fetch_sub(1, Ordering::Relaxed);
                     }
                 });
             }
@@ -4827,18 +5892,23 @@ impl Engine {
                     pending.sequence, pending.tx_signature, pending.attempts, inflight_ms
                 );
                 if !is_execution_queue_duplicate_sequence_error(&err) {
+                    let pending_market_index =
+                        parse_market_from_sequence_key(&pending.sequence_key);
+                    let rewind_to_queue_floor = is_execution_queue_full_error(&err)
+                        || is_invalid_sequence_number_error(&err);
                     self.recover_sequence_after_submit_error(
                         &pending.sequence_key,
+                        pending_market_index,
                         pending.sequence,
                         pending.execution_queue,
+                        rewind_to_queue_floor,
                     )
                     .await;
                 }
                 // Phase 3: roll back the in-process optimistic state apply
                 // since the tx never landed on chain. The reconciler is a
                 // second safety net for any state we miss here.
-                if let (Some(state), Some(undo)) =
-                    (self.state.as_ref(), pending.undo_token.take())
+                if let (Some(state), Some(undo)) = (self.state.as_ref(), pending.undo_token.take())
                 {
                     if let Err(rb_err) = state.lock().rollback_local(undo) {
                         warn!(
@@ -4867,8 +5937,15 @@ impl Engine {
                     "submit watcher timed out sequence={} sig={} queue={}",
                     sequence, tx_signature, execution_queue
                 );
-                self.recover_sequence_after_submit_error(&sequence_key, sequence, execution_queue)
-                    .await;
+                let watcher_market_index = parse_market_from_sequence_key(&sequence_key);
+                self.recover_sequence_after_submit_error(
+                    &sequence_key,
+                    watcher_market_index,
+                    sequence,
+                    execution_queue,
+                    false,
+                )
+                .await;
                 return;
             }
 
@@ -4882,10 +5959,13 @@ impl Engine {
                             "submit watcher observed failed enqueue sequence={} sig={} err={:?}",
                             sequence, tx_signature, status.err
                         );
+                        let watcher_market_index = parse_market_from_sequence_key(&sequence_key);
                         self.recover_sequence_after_submit_error(
                             &sequence_key,
+                            watcher_market_index,
                             sequence,
                             execution_queue,
+                            false,
                         )
                         .await;
                         return;
@@ -4930,6 +6010,21 @@ impl Engine {
             group: request.group.clone(),
             execution_queue: request.execution_queue.clone(),
             market: request.market.clone(),
+            intent_version: Some(if request.intent_version == 0 {
+                INTENT_VERSION_V1
+            } else {
+                request.intent_version
+            }),
+            target_kind: Some(request.target_kind),
+            target_index: Some(request.target_index),
+            accounts_hash: Some(bytes_to_hex(&envelope.accounts_hash)),
+            remaining_accounts_source: Some(
+                if request.intent_version == INTENT_VERSION_V2 {
+                    "relayer_derived".to_string()
+                } else {
+                    "legacy_caller_supplied".to_string()
+                },
+            ),
             sequence: envelope.sequence.to_string(),
             kind: envelope.kind,
             payload_b64: base64::engine::general_purpose::STANDARD.encode(&request.payload),
@@ -4994,6 +6089,11 @@ impl Engine {
             group: String,
             execution_queue: String,
             market: String,
+            intent_version: u32,
+            target_kind: u32,
+            target_index: u32,
+            accounts_hash: String,
+            remaining_accounts_source: String,
             sequence: String,
             kind: u32,
             payload_b64: String,
@@ -5020,6 +6120,19 @@ impl Engine {
             group: request.group.clone(),
             execution_queue: request.execution_queue.clone(),
             market: request.market.clone(),
+            intent_version: if request.intent_version == 0 {
+                INTENT_VERSION_V1
+            } else {
+                request.intent_version
+            },
+            target_kind: request.target_kind,
+            target_index: request.target_index,
+            accounts_hash: bytes_to_hex(&envelope.accounts_hash),
+            remaining_accounts_source: if request.intent_version == INTENT_VERSION_V2 {
+                "relayer_derived".to_string()
+            } else {
+                "legacy_caller_supplied".to_string()
+            },
             sequence: envelope.sequence.to_string(),
             kind: envelope.kind as u32,
             payload_b64,
@@ -5117,12 +6230,7 @@ impl Engine {
             // only one tx so this stays cheap even with many markets.
             for (perp_market_pk, event_queue_pk) in markets {
                 match self
-                    .consume_perp_events_once(
-                        executor.group,
-                        perp_market_pk,
-                        event_queue_pk,
-                        limit,
-                    )
+                    .consume_perp_events_once(executor.group, perp_market_pk, event_queue_pk, limit)
                     .await
                 {
                     Ok(0) => {
@@ -5400,6 +6508,11 @@ impl Engine {
                                 self.metrics
                                     .execute_confirmed_no_advance
                                     .fetch_add(1, Ordering::Relaxed);
+                                if !retained[index].targeted {
+                                    executor
+                                        .speculative_no_advance_block_sequence
+                                        .fetch_max(retained[index].sequence, Ordering::Relaxed);
+                                }
                                 debug!(
                                     "executor tx confirmed but queue head unchanged sequence={} mode={:?} sig={}",
                                     retained[index].sequence,
@@ -5528,9 +6641,10 @@ impl Engine {
         let mut near_head_exact_hashes = Vec::new();
         let head = if now_ms.saturating_sub(last_inspect) >= effective_inspect_ms {
             let accounts = self.rpc.get_account(&executor.execution_queue).await?;
-            let head = inspect_queue_head(&accounts.data);
+            let head = inspect_queue_head_for_market(&accounts.data, executor.market_index);
             near_head_lane_entries = inspect_near_head_lane_entries(
                 &accounts.data,
+                executor.market_index,
                 &head,
                 self.config.executor_head_scan_items,
                 planner_lane_fanout,
@@ -5551,6 +6665,16 @@ impl Engine {
                 if head.next_sequence > prev.next_sequence {
                     // Head moved — reset no-lane-match tracker
                     *executor.no_lane_match_since.lock().await = None;
+                    let blocked_speculative_sequence = executor
+                        .speculative_no_advance_block_sequence
+                        .load(Ordering::Relaxed);
+                    if blocked_speculative_sequence != 0
+                        && head.next_sequence > blocked_speculative_sequence
+                    {
+                        executor
+                            .speculative_no_advance_block_sequence
+                            .store(0, Ordering::Relaxed);
+                    }
                     let advanced = head.next_sequence.saturating_sub(prev.next_sequence);
                     self.metrics
                         .execute_head_advanced
@@ -5619,6 +6743,15 @@ impl Engine {
             .map(|pending| pending.sent_at_ms)
             .max()
             .unwrap_or(0);
+        let blocked_speculative_sequence = executor
+            .speculative_no_advance_block_sequence
+            .load(Ordering::Relaxed);
+        let force_head_matched_planning = !self.config.executor_match_head_only
+            && (head.count >= EXECUTOR_FORCE_HEAD_MATCH_QUEUE_COUNT
+                || same_head_pending_count > 0
+                || blocked_speculative_sequence != 0);
+        let effective_match_head_only =
+            self.config.executor_match_head_only || force_head_matched_planning;
         // In optimistic mode we still only allow one in-flight execute per
         // observed head. The execute instruction always starts from the
         // current on-chain head, so broadcasting multiple txs before the head
@@ -5631,6 +6764,10 @@ impl Engine {
                 self.metrics
                     .execute_send_suppressed_pending
                     .fetch_add(1, Ordering::Relaxed);
+                return Ok(ExecuteLoopOutcome::Busy);
+            }
+            if same_head_pending_count > 0 && !effective_match_head_only {
+                executor.last_inspect_ms.store(0, Ordering::Relaxed);
                 return Ok(ExecuteLoopOutcome::Busy);
             }
         } else {
@@ -5658,10 +6795,18 @@ impl Engine {
             let _ = self.refresh_dynamic_lanes_from_event_log(executor).await;
             lanes = executor.lanes_snapshot().await;
         }
+        // Phase 2B: filter to only lanes whose canonical-position [3]
+        // perp_market matches THIS executor's market. The lanes map is
+        // shared across all sub-executors so we always need to filter.
+        // The default Pubkey is a sentinel from market discovery fallback;
+        // when set, treat all lanes as matching (legacy behavior).
+        if executor.perp_market_pk != Pubkey::default() {
+            lanes.retain(|lane| executor.lane_matches_market(lane));
+        }
         if lanes.is_empty() {
             debug!(
-                "executor skipped: queue_count={} next_sequence={} reason=no_lanes",
-                head.count, head.next_sequence,
+                "executor skipped: queue_count={} next_sequence={} market={} reason=no_lanes",
+                head.count, head.next_sequence, executor.market_index,
             );
             return Ok(ExecuteLoopOutcome::Busy);
         }
@@ -5673,138 +6818,94 @@ impl Engine {
                 "ctm_gap_or_empty_slot" | "ctm_sequence_mismatch"
             );
 
-        let (mut candidate_lanes, mut speculative_mode, mut planned_sequence) = if self
-            .config
-            .executor_match_head_only
-        {
-            match head.head_accounts_hash {
-                Some(hash) => {
-                    let mut ordered_hashes = if near_head_exact_hashes.is_empty() {
-                        vec![hash]
-                    } else {
-                        near_head_exact_hashes.clone()
-                    };
-                    if ordered_hashes.first().copied() != Some(hash) {
-                        ordered_hashes.retain(|lane_hash| *lane_hash != hash);
-                        ordered_hashes.insert(0, hash);
-                    }
-                    ordered_hashes.truncate(planner_lane_fanout);
+        let (mut candidate_lanes, mut speculative_mode, mut planned_sequence) =
+            if effective_match_head_only {
+                match head.head_accounts_hash {
+                    Some(hash) => {
+                        let mut ordered_hashes = if near_head_exact_hashes.is_empty() {
+                            vec![hash]
+                        } else {
+                            near_head_exact_hashes.clone()
+                        };
+                        if ordered_hashes.first().copied() != Some(hash) {
+                            ordered_hashes.retain(|lane_hash| *lane_hash != hash);
+                            ordered_hashes.insert(0, hash);
+                        }
+                        ordered_hashes.truncate(planner_lane_fanout);
 
-                    let mut lanes_by_hash: HashMap<[u8; 32], Lane> = lanes
-                        .iter()
-                        .cloned()
-                        .map(|lane| (lane.hash, lane))
-                        .collect();
-                    let mut matched: Vec<Lane> = ordered_hashes
-                        .iter()
-                        .filter_map(|lane_hash| lanes_by_hash.remove(lane_hash))
-                        .collect();
-                    let mut matched_hashes: HashSet<[u8; 32]> =
-                        matched.iter().map(|lane| lane.hash).collect();
-                    if !matched_hashes.contains(&hash) || matched.len() < ordered_hashes.len() {
-                        let _ = self.refresh_dynamic_lanes_from_event_log(executor).await;
-                        lanes = executor.lanes_snapshot().await;
-                        lanes_by_hash = lanes
+                        let mut lanes_by_hash: HashMap<[u8; 32], Lane> = lanes
                             .iter()
                             .cloned()
                             .map(|lane| (lane.hash, lane))
                             .collect();
-                        matched = ordered_hashes
+                        let mut matched: Vec<Lane> = ordered_hashes
                             .iter()
                             .filter_map(|lane_hash| lanes_by_hash.remove(lane_hash))
                             .collect();
-                        matched_hashes = matched.iter().map(|lane| lane.hash).collect();
-                    }
-                    if !matched_hashes.contains(&hash) {
-                        self.metrics
-                            .execute_no_lane_match
-                            .fetch_add(1, Ordering::Relaxed);
-
-                        // Auto-drop heads stuck with no lane match for too long.
-                        // Uses wall-clock ms; 2 slots ≈ 800ms, we use slot_count * 400ms.
-                        let drop_slots = self.config.executor_no_lane_match_drop_slots;
-                        if drop_slots > 0 {
-                            let now_ms = unix_timestamp_ms();
-                            let threshold_ms = drop_slots * 400;
-                            let mut tracker = executor.no_lane_match_since.lock().await;
-                            let should_drop = match *tracker {
-                                Some((seq, first_ms)) if seq == head.next_sequence => {
-                                    now_ms.saturating_sub(first_ms) >= threshold_ms
-                                }
-                                _ => {
-                                    *tracker = Some((head.next_sequence, now_ms));
-                                    false
-                                }
-                            };
-                            drop(tracker);
-
-                            if should_drop {
-                                warn!(
-                                    "executor auto-dropping no_lane_match head sequence={} head_hash={} after {}ms threshold",
+                        let mut matched_hashes: HashSet<[u8; 32]> =
+                            matched.iter().map(|lane| lane.hash).collect();
+                        if !matched_hashes.contains(&hash) || matched.len() < ordered_hashes.len() {
+                            let _ = self.refresh_dynamic_lanes_from_event_log(executor).await;
+                            lanes = executor.lanes_snapshot().await;
+                            lanes_by_hash = lanes
+                                .iter()
+                                .cloned()
+                                .map(|lane| (lane.hash, lane))
+                                .collect();
+                            matched = ordered_hashes
+                                .iter()
+                                .filter_map(|lane_hash| lanes_by_hash.remove(lane_hash))
+                                .collect();
+                            matched_hashes = matched.iter().map(|lane| lane.hash).collect();
+                        }
+                        if !matched_hashes.contains(&hash) {
+                            self.metrics
+                                .execute_no_lane_match
+                                .fetch_add(1, Ordering::Relaxed);
+                            if self
+                                .maybe_auto_drop_blocked_head_after_threshold(
+                                    executor,
                                     head.next_sequence,
-                                    bytes_to_hex(&hash),
-                                    threshold_ms,
-                                );
-                                match self
-                                    .drop_ctm_head_with_admin_tx(
-                                        executor,
-                                        head.next_sequence,
-                                        "no_lane_match_stale",
-                                    )
-                                    .await
-                                {
-                                    Ok(sig) => {
-                                        info!(
-                                            "executor no_lane_match admin-drop succeeded sequence={} tx={}",
-                                            head.next_sequence, sig
-                                        );
-                                        // Reset tracker — head will change on next inspect
-                                        *executor.no_lane_match_since.lock().await = None;
-                                        // Force re-inspect on next iteration
-                                        executor.last_inspect_ms.store(0, Ordering::Relaxed);
-                                    }
-                                    Err(err) => {
-                                        warn!(
-                                            "executor no_lane_match admin-drop failed sequence={} err={err:?}",
-                                            head.next_sequence
-                                        );
-                                    }
-                                }
+                                    "no_lane_match_stale",
+                                    "no_lane_match",
+                                    Some(hash),
+                                )
+                                .await
+                            {
                                 return Ok(ExecuteLoopOutcome::Busy);
                             }
-                        }
 
-                        debug!(
+                            debug!(
                             "executor skipped: queue_count={} next_sequence={} reason=no_lane_match head_hash={}",
                             head.count,
                             head.next_sequence,
                             bytes_to_hex(&hash),
                         );
-                        return Ok(ExecuteLoopOutcome::Busy);
-                    }
+                            return Ok(ExecuteLoopOutcome::Busy);
+                        }
 
-                    if matched.len() > 1 {
-                        debug!(
+                        if matched.len() > 1 {
+                            debug!(
                             "executor near-head lane plan sequence={} scan_items={} candidate_hashes={} matched_lanes={}",
                             head.next_sequence,
                             self.config.executor_head_scan_items,
                             ordered_hashes.len(),
                             matched.len(),
                         );
+                        }
+                        (matched, false, head.next_sequence)
                     }
-                    (matched, false, head.next_sequence)
-                }
-                None => {
-                    self.metrics
-                        .execute_head_missing
-                        .fetch_add(1, Ordering::Relaxed);
-                    let speculative_lanes = if gap_skip_mode {
-                        select_gap_speculative_lanes(lanes.clone())
-                    } else {
-                        Vec::new()
-                    };
-                    if !speculative_lanes.is_empty() {
-                        debug!(
+                    None => {
+                        self.metrics
+                            .execute_head_missing
+                            .fetch_add(1, Ordering::Relaxed);
+                        let speculative_lanes = if gap_skip_mode {
+                            select_gap_speculative_lanes(lanes.clone())
+                        } else {
+                            Vec::new()
+                        };
+                        if !speculative_lanes.is_empty() {
+                            debug!(
                             "executor head hash unavailable: queue_count={} next_sequence={} max_seen_sequence={} {} fallback=gap_speculative lanes={}",
                             head.count,
                             head.next_sequence,
@@ -5812,73 +6913,72 @@ impl Engine {
                             head.blocked_reason(),
                             speculative_lanes.len(),
                         );
-                        (speculative_lanes, true, head.next_sequence)
-                    } else {
-                        self.metrics
-                            .execute_head_blocked
-                            .fetch_add(1, Ordering::Relaxed);
-                        debug!(
+                            (speculative_lanes, true, head.next_sequence)
+                        } else {
+                            self.metrics
+                                .execute_head_blocked
+                                .fetch_add(1, Ordering::Relaxed);
+                            debug!(
                             "executor blocked: queue_count={} next_sequence={} max_seen_sequence={} {}",
                             head.count,
                             head.next_sequence,
                             head.max_seen_sequence,
                             head.blocked_reason(),
                         );
-                        return Ok(ExecuteLoopOutcome::Busy);
+                            return Ok(ExecuteLoopOutcome::Busy);
+                        }
                     }
                 }
-            }
-        } else {
-            (lanes.clone(), true, head.next_sequence)
-        };
+            } else {
+                (lanes.clone(), true, head.next_sequence)
+            };
+
+        let successor_speculation_allowed = head.count
+            <= EXECUTOR_SUCCESSOR_SPECULATION_MAX_QUEUE_COUNT
+            && (blocked_speculative_sequence == 0
+                || head.next_sequence > blocked_speculative_sequence);
 
         if self.config.executor_optimistic_advance
             && same_head_pending_count > 0
             && !speculative_mode
             && head.reason == "ctm_pending"
+            && successor_speculation_allowed
         {
             if let Some(current_hash) = head.head_accounts_hash {
-                if let Some((successor_sequence, _)) =
-                    near_head_lane_entries
+                if let Some(successor_sequence) = select_next_speculative_successor_sequence(
+                    head.next_sequence,
+                    current_hash,
+                    &near_head_lane_entries,
+                    &pending_snapshot,
+                ) {
+                    let successor_hashes: Vec<[u8; 32]> = near_head_lane_entries
                         .iter()
                         .copied()
-                        .find(|(sequence, hash)| {
-                            *sequence > head.next_sequence && *hash != current_hash
-                        })
-                {
-                    let speculative_already_pending = pending_snapshot
-                        .iter()
-                        .any(|pending| !pending.targeted && pending.sequence == successor_sequence);
-                    if !speculative_already_pending {
-                        let successor_hashes: Vec<[u8; 32]> = near_head_lane_entries
+                        .filter(|(sequence, _)| *sequence >= successor_sequence)
+                        .map(|(_, hash)| hash)
+                        .take(planner_lane_fanout)
+                        .collect();
+                    if !successor_hashes.is_empty() {
+                        let mut lanes_by_hash: HashMap<[u8; 32], Lane> = lanes
                             .iter()
-                            .copied()
-                            .filter(|(sequence, _)| *sequence >= successor_sequence)
-                            .map(|(_, hash)| hash)
-                            .take(planner_lane_fanout)
+                            .cloned()
+                            .map(|lane| (lane.hash, lane))
                             .collect();
-                        if !successor_hashes.is_empty() {
-                            let mut lanes_by_hash: HashMap<[u8; 32], Lane> = lanes
-                                .iter()
-                                .cloned()
-                                .map(|lane| (lane.hash, lane))
-                                .collect();
-                            let successor_lanes: Vec<Lane> = successor_hashes
-                                .iter()
-                                .filter_map(|lane_hash| lanes_by_hash.remove(lane_hash))
-                                .collect();
-                            if !successor_lanes.is_empty() {
-                                debug!(
-                                    "executor speculative successor plan base_sequence={} successor_sequence={} hashes={} lanes={}",
-                                    head.next_sequence,
-                                    successor_sequence,
-                                    successor_hashes.len(),
-                                    successor_lanes.len(),
-                                );
-                                candidate_lanes = successor_lanes;
-                                speculative_mode = true;
-                                planned_sequence = successor_sequence;
-                            }
+                        let successor_lanes: Vec<Lane> = successor_hashes
+                            .iter()
+                            .filter_map(|lane_hash| lanes_by_hash.remove(lane_hash))
+                            .collect();
+                        if !successor_lanes.is_empty() {
+                            debug!(
+                                "executor speculative successor plan base_sequence={} successor_sequence={} hashes={} lanes={}",
+                                head.next_sequence,
+                                successor_sequence,
+                                successor_hashes.len(),
+                                successor_lanes.len(),
+                            );
+                            candidate_lanes = successor_lanes;
+                            speculative_mode = true;
+                            planned_sequence = successor_sequence;
                         }
                     }
                 }
@@ -5965,15 +7065,36 @@ impl Engine {
         }
 
         // Collect eligible lanes (de-dup by hash, skip backed-off lanes).
-        // execute_multi requires a fixed accounts_per_lane width, so only lanes
-        // compatible with the first selected lane can be batched together.
+        // execute_multi requires a fixed accounts_per_lane width. For targeted
+        // current-head execution, always anchor the batch on the actual head
+        // lane even if that hash is currently in backoff; otherwise one failed
+        // head can sideline the market for the full backoff window.
         let target_lane_fanout = planner_lane_fanout;
-        let (eligible_lanes, unique_hashes, dropped_for_layout) = select_layout_compatible_lanes(
-            candidate_lanes,
-            &backoff_snapshot,
-            now_ms,
-            target_lane_fanout,
-        );
+        let (eligible_lanes, unique_hashes, dropped_for_layout) = if !speculative_mode {
+            if let Some(head_hash) = head.head_accounts_hash {
+                select_layout_compatible_lanes_with_required_head(
+                    candidate_lanes,
+                    &backoff_snapshot,
+                    now_ms,
+                    target_lane_fanout,
+                    head_hash,
+                )
+            } else {
+                select_layout_compatible_lanes(
+                    candidate_lanes,
+                    &backoff_snapshot,
+                    now_ms,
+                    target_lane_fanout,
+                )
+            }
+        } else {
+            select_layout_compatible_lanes(
+                candidate_lanes,
+                &backoff_snapshot,
+                now_ms,
+                target_lane_fanout,
+            )
+        };
 
         if eligible_lanes.is_empty() {
             return Ok(ExecuteLoopOutcome::Busy);
@@ -5982,9 +7103,22 @@ impl Engine {
         if !speculative_mode {
             if let Some(head_hash) = head.head_accounts_hash {
                 if eligible_lanes.first().map(|lane| lane.hash) != Some(head_hash) {
+                    let _ = self.refresh_dynamic_lanes_from_event_log(executor).await;
                     self.metrics
                         .execute_lane_suppressed
                         .fetch_add(1, Ordering::Relaxed);
+                    if self
+                        .maybe_auto_drop_blocked_head_after_threshold(
+                            executor,
+                            head.next_sequence,
+                            "head_lane_unavailable_after_filtering",
+                            "head_lane_unavailable_after_filtering",
+                            Some(head_hash),
+                        )
+                        .await
+                    {
+                        return Ok(ExecuteLoopOutcome::Busy);
+                    }
                     debug!(
                         "executor targeted lane suppressed sequence={} reason=head_lane_unavailable_after_filtering head_hash={} queue_count={}",
                         planned_sequence,
@@ -6038,10 +7172,20 @@ impl Engine {
                             let batch_max = self.config.executor_expired_head_drop_batch_max.max(8);
                             match self.rpc.get_account(&executor.execution_queue).await {
                                 Ok(queue_account) => {
-                                    let qs = inspect_queue_admin_state(&queue_account.data);
+                                    let qs = inspect_queue_admin_state_for_market(
+                                        &queue_account.data,
+                                        executor.market_index,
+                                    );
                                     if qs.head.reason == "ctm_pending"
                                         && qs.head.next_sequence == head.next_sequence
                                     {
+                                        // v2 sub-queue: resolve per-market slot once
+                                        // and read from the right window.
+                                        let slot_idx = find_sub_queue_slot(
+                                            &queue_account.data,
+                                            executor.market_index,
+                                        )
+                                        .unwrap_or(0);
                                         // Collect consecutive pending sequences
                                         let mut seqs = Vec::new();
                                         let start = qs.head.next_sequence;
@@ -6051,9 +7195,7 @@ impl Engine {
                                             .saturating_add(1)
                                             .min(start + batch_max as u64);
                                         for seq in start..end {
-                                            let off = EXECUTION_QUEUE_CTM_ITEMS_OFFSET
-                                                + (seq as usize % EXECUTION_QUEUE_CTM_CAPACITY)
-                                                    * EXECUTION_QUEUE_ITEM_SIZE;
+                                            let off = ctm_item_offset(slot_idx, seq);
                                             if off + EXECUTION_QUEUE_ITEM_SIZE
                                                 > queue_account.data.len()
                                             {
@@ -6093,6 +7235,7 @@ impl Engine {
                                                         executor.group,
                                                         executor.execution_queue,
                                                         self.config.executor_admin.pubkey(),
+                                                        executor.market_index,
                                                         *seq,
                                                     ),
                                                 );
@@ -6445,6 +7588,7 @@ impl Engine {
                 executor.group,
                 executor.execution_queue,
                 &lane.remaining_accounts,
+                executor.market_index,
                 executor.effective_max_items(self.config.executor_max_items),
             ),
         ];
@@ -6500,6 +7644,7 @@ impl Engine {
                 &lane_accounts,
                 accounts_per_lane,
                 lane_hashes,
+                executor.market_index,
                 executor.effective_max_items(self.config.executor_max_items),
             ),
         ];
@@ -6548,6 +7693,7 @@ impl Engine {
                 executor.group,
                 executor.execution_queue,
                 &lane.remaining_accounts,
+                executor.market_index,
                 executor
                     .effective_max_items(self.config.executor_max_items)
                     .max(1),
@@ -6581,17 +7727,33 @@ impl Engine {
     }
 }
 
-enum UserSignatureMessage {
+struct UserSignatureMessage {
+    canonical_hash: [u8; 32],
+    payload: UserSignaturePayload,
+}
+
+enum UserSignaturePayload {
     Raw([u8; 32]),
     HexUtf8([u8; 64]),
 }
 
 impl UserSignatureMessage {
-    fn as_bytes(&self) -> &[u8] {
-        match self {
-            Self::Raw(bytes) => bytes.as_ref(),
-            Self::HexUtf8(bytes) => bytes.as_ref(),
+    fn raw(canonical_hash: [u8; 32]) -> Self {
+        Self {
+            canonical_hash,
+            payload: UserSignaturePayload::Raw(canonical_hash),
         }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        match &self.payload {
+            UserSignaturePayload::Raw(bytes) => bytes.as_ref(),
+            UserSignaturePayload::HexUtf8(bytes) => bytes.as_ref(),
+        }
+    }
+
+    fn canonical_hash(&self) -> [u8; 32] {
+        self.canonical_hash
     }
 }
 
@@ -6712,17 +7874,6 @@ fn decode_margin_check_ops(payload: &[u8]) -> Result<Option<Vec<MarginCheckOp>>>
             let place = decode_perp_place_order_margin_op(body)?;
             Ok(Some(vec![place]).filter(|ops| !ops.is_empty()))
         }
-        QueuePayloadVariant::PerpBatchIntent => {
-            let ops = decode_perp_batch_margin_ops(body)?;
-            if ops
-                .iter()
-                .any(|op| matches!(op, MarginCheckOp::Place { .. }))
-            {
-                Ok(Some(ops))
-            } else {
-                Ok(None)
-            }
-        }
         _ => Ok(None),
     }
 }
@@ -6736,8 +7887,6 @@ fn queue_payload_variant_from_byte(value: u8) -> Result<QueuePayloadVariant> {
         4 => Ok(QueuePayloadVariant::PerpCancelAllOrdersBySide),
         5 => Ok(QueuePayloadVariant::LiquidityDeposit),
         6 => Ok(QueuePayloadVariant::LiquidityWithdraw),
-        7 => Ok(QueuePayloadVariant::PerpCancelOrderBySlot),
-        8 => Ok(QueuePayloadVariant::PerpBatchIntent),
         _ => Err(anyhow!("unknown queue payload variant: {value}")),
     }
 }
@@ -6757,61 +7906,6 @@ fn decode_perp_place_order_margin_op(body: &[u8]) -> Result<MarginCheckOp> {
         max_base_lots: order.max_base_lots,
         reduce_only: order.reduce_only,
     })
-}
-
-fn decode_perp_batch_margin_ops(body: &[u8]) -> Result<Vec<MarginCheckOp>> {
-    if body.is_empty() {
-        return Err(anyhow!("empty perp batch payload"));
-    }
-    let op_count = body[0] as usize;
-    if op_count == 0 || op_count > PERP_BATCH_INTENT_MAX_OPS {
-        return Err(anyhow!("invalid perp batch op count: {op_count}"));
-    }
-
-    let mut offset = 1usize;
-    let mut ops = Vec::with_capacity(op_count);
-    for _ in 0..op_count {
-        if offset >= body.len() {
-            return Err(anyhow!("perp batch payload ended before op header"));
-        }
-        let variant = body[offset];
-        offset += 1;
-        match variant {
-            0 => {
-                if offset + PERP_CANCEL_ORDER_BY_SLOT_PAYLOAD_LEN > body.len() {
-                    return Err(anyhow!("perp batch cancel-by-slot payload truncated"));
-                }
-                let cancel = PerpCancelOrderBySlotPayload::try_from_slice(
-                    &body[offset..offset + PERP_CANCEL_ORDER_BY_SLOT_PAYLOAD_LEN],
-                )
-                .map_err(|err| {
-                    anyhow!("failed to deserialize batch cancel-by-slot payload: {err}")
-                })?;
-                ops.push(MarginCheckOp::CancelByOrderId {
-                    expected_order_id: cancel.expected_order_id,
-                });
-                offset += PERP_CANCEL_ORDER_BY_SLOT_PAYLOAD_LEN;
-            }
-            1 => {
-                if offset + PERP_PLACE_ORDER_V2_PAYLOAD_LEN > body.len() {
-                    return Err(anyhow!("perp batch place payload truncated"));
-                }
-                let place = decode_perp_place_order_margin_op(
-                    &body[offset..offset + PERP_PLACE_ORDER_V2_PAYLOAD_LEN],
-                )?;
-                ops.push(place);
-                offset += PERP_PLACE_ORDER_V2_PAYLOAD_LEN;
-            }
-            _ => return Err(anyhow!("unknown perp batch op variant: {variant}")),
-        }
-    }
-    if offset != body.len() {
-        return Err(anyhow!(
-            "perp batch payload had {} trailing bytes",
-            body.len().saturating_sub(offset)
-        ));
-    }
-    Ok(ops)
 }
 
 fn build_harness_margin_snapshot(
@@ -7101,6 +8195,147 @@ fn append_margin_health_account(
     Ok(())
 }
 
+fn account_metas_to_proto(accounts: &[AccountMeta]) -> Vec<AccountMetaProto> {
+    accounts
+        .iter()
+        .map(|account| AccountMetaProto {
+            pubkey: account.pubkey.to_string(),
+            is_signer: account.is_signer,
+            is_writable: account.is_writable,
+        })
+        .collect()
+}
+
+fn supplied_account_metas_match(
+    supplied: &[AccountMetaProto],
+    derived: &[AccountMeta],
+) -> bool {
+    supplied.len() == derived.len()
+        && supplied.iter().zip(derived.iter()).all(|(left, right)| {
+            left.pubkey == right.pubkey.to_string()
+                && left.is_signer == right.is_signer
+                && left.is_writable == right.is_writable
+        })
+}
+
+fn build_mango_account_mirror_from_keyed_account(
+    mango_account: Pubkey,
+    account: &KeyedAccountSharedData,
+) -> Result<MangoAccountMirror> {
+    let data = account.data.data();
+    if data.len() < 8 {
+        return Err(anyhow!(
+            "mango account {} data too short: {} bytes",
+            mango_account,
+            data.len()
+        ));
+    }
+    let account = MangoAccountValue::from_bytes(&data[8..]).with_context(|| {
+        format!("failed to deserialize mango account {}", mango_account)
+    })?;
+
+    Ok(MangoAccountMirror {
+        token_indices: account
+            .active_token_positions()
+            .map(|position| position.token_index)
+            .collect(),
+        perp_market_indices: account
+            .active_perp_positions()
+            .map(|position| position.market_index)
+            .collect(),
+        serum_open_orders: account
+            .active_serum3_orders()
+            .map(|orders| orders.open_orders)
+            .collect(),
+        openbook_open_orders: account
+            .active_openbook_v2_orders()
+            .map(|orders| orders.open_orders)
+            .collect(),
+    })
+}
+
+fn build_derived_perp_remaining_accounts(
+    group: Pubkey,
+    mango_account: Pubkey,
+    user_owner: Pubkey,
+    target_market_index: PerpMarketIndex,
+    group_mirror: &GroupStaticAccountMirror,
+    mango_account_mirror: &MangoAccountMirror,
+) -> Result<Vec<AccountMeta>> {
+    let target_market = group_mirror
+        .perps_by_market_index
+        .get(&target_market_index)
+        .with_context(|| format!("perp market index {target_market_index} not found in group mirror"))?;
+
+    let mut token_indices = mango_account_mirror.token_indices.clone();
+    let mut perp_market_indices = mango_account_mirror.perp_market_indices.clone();
+    if !perp_market_indices.contains(&target_market_index) {
+        perp_market_indices.push(target_market_index);
+    }
+
+    let health_accounts = build_canonical_health_account_metas(
+        &token_indices,
+        &perp_market_indices,
+        &mango_account_mirror.serum_open_orders,
+        &mango_account_mirror.openbook_open_orders,
+        group_mirror,
+    )?;
+
+    let mut remaining_accounts = vec![
+        AccountMeta::new_readonly(group, false),
+        AccountMeta::new(mango_account, false),
+        AccountMeta::new_readonly(user_owner, false),
+        AccountMeta::new(target_market.market, false),
+        AccountMeta::new(target_market.bids, false),
+        AccountMeta::new(target_market.asks, false),
+        AccountMeta::new(target_market.event_queue, false),
+        AccountMeta::new_readonly(target_market.oracle, false),
+    ];
+    remaining_accounts.extend(health_accounts);
+    Ok(remaining_accounts)
+}
+
+fn build_canonical_health_account_metas(
+    token_indices: &[TokenIndex],
+    perp_market_indices: &[PerpMarketIndex],
+    serum_open_orders: &[Pubkey],
+    openbook_open_orders: &[Pubkey],
+    group_mirror: &GroupStaticAccountMirror,
+) -> Result<Vec<AccountMeta>> {
+    let mut sections: Vec<Vec<Pubkey>> = vec![Vec::new(); 7];
+
+    for token_index in token_indices {
+        let bank = group_mirror
+            .banks_by_token_index
+            .get(token_index)
+            .with_context(|| format!("bank for token index {} not found in group mirror", token_index))?;
+        sections[0].push(bank.bank);
+        sections[1].push(bank.oracle);
+        sections[6].extend(bank.fallback_oracles.iter().copied());
+    }
+    for market_index in perp_market_indices {
+        let market = group_mirror
+            .perps_by_market_index
+            .get(market_index)
+            .with_context(|| format!("perp market {} not found in group mirror", market_index))?;
+        sections[2].push(market.market);
+        sections[3].push(market.oracle);
+    }
+    sections[4].extend(serum_open_orders.iter().copied());
+    sections[5].extend(openbook_open_orders.iter().copied());
+
+    let mut seen = HashSet::new();
+    let mut ordered = Vec::new();
+    for section in sections {
+        for pubkey in section {
+            if seen.insert(pubkey) {
+                ordered.push(AccountMeta::new_readonly(pubkey, false));
+            }
+        }
+    }
+    Ok(ordered)
+}
+
 fn merge_effective_runtime_flags(
     remaining_accounts: &[AccountMeta],
     fixed_accounts: &[AccountMeta],
@@ -7335,6 +8570,65 @@ fn load_executor_lanes(config: &Config) -> Result<HashMap<String, Lane>> {
     Ok(lanes)
 }
 
+/// Phase 2B: scan a lane map for unique perp_market pubkeys at the
+/// canonical position [3], then fetch each PerpMarket account to extract
+/// `perp_market_index`. Returns a Vec of (market_index, perp_market_pk).
+async fn discover_markets_from_lanes(
+    rpc: &RpcClient,
+    lanes: &HashMap<String, Lane>,
+) -> Result<Vec<(u16, Pubkey)>> {
+    let mut unique_perp_markets: Vec<Pubkey> = Vec::new();
+    for lane in lanes.values() {
+        if lane.remaining_accounts.len() < 4 {
+            continue;
+        }
+        let perp_market_pk = lane.remaining_accounts[3].pubkey;
+        if !unique_perp_markets.contains(&perp_market_pk) {
+            unique_perp_markets.push(perp_market_pk);
+        }
+    }
+    if unique_perp_markets.is_empty() {
+        // Fallback: no lanes loaded yet (dynamic-only). Return a single
+        // entry for market_index = 0 with a sentinel pubkey so the
+        // executor still spawns and discovers lanes at runtime.
+        return Ok(vec![(0u16, Pubkey::default())]);
+    }
+    let mut markets: Vec<(u16, Pubkey)> = Vec::new();
+    for pm_pk in unique_perp_markets {
+        match rpc.get_account(&pm_pk).await {
+            Ok(account) => {
+                let keyed = KeyedAccountSharedData::new(pm_pk, account.into());
+                match keyed.load::<PerpMarket>() {
+                    Ok(perp_market) => {
+                        let market_index = perp_market.perp_market_index;
+                        info!(
+                            "discovered market_index={} -> perp_market={}",
+                            market_index, pm_pk
+                        );
+                        markets.push((market_index, pm_pk));
+                    }
+                    Err(err) => {
+                        warn!(
+                            "failed to load PerpMarket {} for market discovery: {err:?}",
+                            pm_pk
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                warn!(
+                    "failed to fetch PerpMarket account {} for discovery: {err:?}",
+                    pm_pk
+                );
+            }
+        }
+    }
+    if markets.is_empty() {
+        return Ok(vec![(0u16, Pubkey::default())]);
+    }
+    Ok(markets)
+}
+
 fn hash_execution_queue_accounts_for_ctm_enqueue(
     group: Pubkey,
     execution_queue: Pubkey,
@@ -7371,7 +8665,7 @@ fn canonical_envelope_message(group: Pubkey, envelope: &CtmEnvelope) -> [u8; 32]
     .to_bytes()
 }
 
-fn canonical_user_intent_message(
+fn canonical_user_intent_message_v1(
     group: Pubkey,
     mango_account: Pubkey,
     user_owner: Pubkey,
@@ -7385,6 +8679,28 @@ fn canonical_user_intent_message(
         &[envelope.kind],
         &envelope.payload_hash,
         &envelope.accounts_hash,
+    ])
+    .to_bytes()
+}
+
+fn canonical_user_intent_message_v2(
+    group: Pubkey,
+    mango_account: Pubkey,
+    user_owner: Pubkey,
+    kind: u8,
+    target_kind: UserIntentTargetKind,
+    target_index: u16,
+    payload_hash: &[u8; 32],
+) -> [u8; 32] {
+    hashv(&[
+        b"mango-v4-user-intent-v2",
+        group.as_ref(),
+        mango_account.as_ref(),
+        user_owner.as_ref(),
+        &[kind],
+        &[target_kind as u8],
+        &target_index.to_le_bytes(),
+        payload_hash,
     ])
     .to_bytes()
 }
@@ -7405,16 +8721,21 @@ fn canonical_user_intent_message_hex_utf8(message: [u8; 32]) -> [u8; 64] {
 fn verify_user_signature(
     owner: Pubkey,
     signature_bytes: &[u8; 64],
-    message: &[u8; 32],
+    message_hashes: &[[u8; 32]],
 ) -> Result<UserSignatureMessage, Status> {
     let signature = Signature::try_from(signature_bytes.as_slice())
         .map_err(|err| Status::invalid_argument(err.to_string()))?;
-    if signature.verify(owner.as_ref(), message) {
-        return Ok(UserSignatureMessage::Raw(*message));
-    }
-    let hex_utf8 = canonical_user_intent_message_hex_utf8(*message);
-    if signature.verify(owner.as_ref(), &hex_utf8) {
-        return Ok(UserSignatureMessage::HexUtf8(hex_utf8));
+    for message_hash in message_hashes {
+        if signature.verify(owner.as_ref(), message_hash) {
+            return Ok(UserSignatureMessage::raw(*message_hash));
+        }
+        let hex_utf8 = canonical_user_intent_message_hex_utf8(*message_hash);
+        if signature.verify(owner.as_ref(), &hex_utf8) {
+            return Ok(UserSignatureMessage {
+                canonical_hash: *message_hash,
+                payload: UserSignaturePayload::HexUtf8(hex_utf8),
+            });
+        }
     }
     Err(Status::invalid_argument(
         "user_signature verification failed",
@@ -7454,6 +8775,7 @@ fn build_enqueue_instruction(
     group: Pubkey,
     execution_queue: Pubkey,
     remaining_accounts: &[AccountMeta],
+    market_index: u16,
     envelope: CtmEnvelope,
     payload: Vec<u8>,
 ) -> Instruction {
@@ -7467,7 +8789,12 @@ fn build_enqueue_instruction(
     Instruction {
         program_id,
         accounts,
-        data: mango_v4::instruction::ExecutionQueueEnqueueCtm { envelope, payload }.data(),
+        data: mango_v4::instruction::ExecutionQueueEnqueueCtm {
+            market_index,
+            envelope,
+            payload,
+        }
+        .data(),
     }
 }
 
@@ -7476,6 +8803,7 @@ fn build_execute_instruction(
     group: Pubkey,
     execution_queue: Pubkey,
     remaining_accounts: &[AccountMeta],
+    market_index: u16,
     max_items: u16,
 ) -> Instruction {
     let mut accounts = vec![
@@ -7486,7 +8814,11 @@ fn build_execute_instruction(
     Instruction {
         program_id,
         accounts,
-        data: mango_v4::instruction::ExecutionQueueExecute { max_items }.data(),
+        data: mango_v4::instruction::ExecutionQueueExecute {
+            market_index,
+            max_items,
+        }
+        .data(),
     }
 }
 
@@ -7497,6 +8829,7 @@ fn build_execute_multi_instruction(
     lane_accounts: &[Vec<AccountMeta>],
     accounts_per_lane: u16,
     lane_hashes: Vec<[u8; 32]>,
+    market_index: u16,
     max_items: u16,
 ) -> Instruction {
     let lane_count = lane_accounts.len() as u8;
@@ -7511,6 +8844,7 @@ fn build_execute_multi_instruction(
         program_id,
         accounts,
         data: mango_v4::instruction::ExecutionQueueExecuteMulti {
+            market_index,
             max_items,
             lane_count,
             accounts_per_lane,
@@ -7560,6 +8894,7 @@ fn build_execution_queue_drop_ctm_instruction(
     group: Pubkey,
     execution_queue: Pubkey,
     admin: Pubkey,
+    market_index: u16,
     sequence: u64,
 ) -> Instruction {
     Instruction {
@@ -7569,16 +8904,116 @@ fn build_execution_queue_drop_ctm_instruction(
             AccountMeta::new(execution_queue, false),
             AccountMeta::new_readonly(admin, true),
         ],
-        data: mango_v4::instruction::ExecutionQueueDropCtm { sequence }.data(),
+        data: mango_v4::instruction::ExecutionQueueDropCtm {
+            market_index,
+            sequence,
+        }
+        .data(),
     }
 }
 
-const EXECUTION_QUEUE_GAP_WAIT_SLOTS_OFFSET: usize = 184;
-const EXECUTION_QUEUE_PAUSED_INGRESS_OFFSET: usize = 146;
-const EXECUTION_QUEUE_PAUSED_EXECUTE_OFFSET: usize = 147;
-const EXECUTION_QUEUE_LIQUIDITY_DELAY_SLOTS_OFFSET: usize = 192;
-const EXECUTION_QUEUE_CTM_COUNT_OFFSET: usize = 200;
-const EXECUTION_QUEUE_LIQUIDITY_COUNT_OFFSET: usize = 204;
+// Re-export raw account offsets from the program crate. These are RAW
+// offsets including the 8-byte Anchor discriminator, suitable for indexing
+// into a fetched account's `data` slice.
+use mango_v4::state::{
+    EXECUTION_QUEUE_GAP_WAIT_SLOTS_OFFSET, EXECUTION_QUEUE_LAYOUT_VERSION_OFFSET,
+    EXECUTION_QUEUE_LIQUIDITY_COUNT_OFFSET, EXECUTION_QUEUE_LIQUIDITY_DELAY_SLOTS_OFFSET,
+    EXECUTION_QUEUE_LIQUIDITY_HEAD_OFFSET,
+    EXECUTION_QUEUE_LIQUIDITY_ITEMS_OFFSET as REQ_LIQ_ITEMS_OFFSET, EXECUTION_QUEUE_N_MAX_MARKETS,
+    EXECUTION_QUEUE_PAUSED_EXECUTE_OFFSET, EXECUTION_QUEUE_PAUSED_INGRESS_OFFSET,
+    EXECUTION_QUEUE_PER_MARKET_CTM_CAPACITY, EXECUTION_QUEUE_SUB_QUEUE_HEADERS_OFFSET,
+    EXECUTION_QUEUE_SUB_QUEUE_HEADER_STRIDE, EXECUTION_QUEUE_TOTAL_COUNT_OFFSET,
+    SUB_QUEUE_HEADER_ACTIVE_OFFSET, SUB_QUEUE_HEADER_CTM_COUNT_OFFSET,
+    SUB_QUEUE_HEADER_GAP_OBSERVED_SLOT_OFFSET, SUB_QUEUE_HEADER_MARKET_INDEX_OFFSET,
+    SUB_QUEUE_HEADER_MAX_SEEN_SEQUENCE_OFFSET, SUB_QUEUE_HEADER_NEXT_SEQUENCE_OFFSET,
+};
+
+/// Find the physical slot index for a given market_index by scanning the
+/// sub_queue_headers array. Returns None if no slot is bound to the market.
+/// Phase 2A defaults to market_index = 0 for all traffic; once a slot is
+/// bound the scan finds it on every subsequent call.
+fn find_sub_queue_slot(queue_data: &[u8], market_index: u16) -> Option<usize> {
+    for i in 0..EXECUTION_QUEUE_N_MAX_MARKETS {
+        let slot_off =
+            EXECUTION_QUEUE_SUB_QUEUE_HEADERS_OFFSET + i * EXECUTION_QUEUE_SUB_QUEUE_HEADER_STRIDE;
+        if slot_off + EXECUTION_QUEUE_SUB_QUEUE_HEADER_STRIDE > queue_data.len() {
+            return None;
+        }
+        let active = queue_data
+            .get(slot_off + SUB_QUEUE_HEADER_ACTIVE_OFFSET)
+            .copied()
+            .unwrap_or(0);
+        if active == 0 {
+            continue;
+        }
+        let mi_bytes: [u8; 2] = queue_data[slot_off + SUB_QUEUE_HEADER_MARKET_INDEX_OFFSET
+            ..slot_off + SUB_QUEUE_HEADER_MARKET_INDEX_OFFSET + 2]
+            .try_into()
+            .unwrap_or([0; 2]);
+        if u16::from_le_bytes(mi_bytes) == market_index {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Read a u32 field from a sub-queue header at slot `slot_idx`.
+fn read_sub_queue_u32(queue_data: &[u8], slot_idx: usize, field_offset: usize) -> u32 {
+    let slot_off = EXECUTION_QUEUE_SUB_QUEUE_HEADERS_OFFSET
+        + slot_idx * EXECUTION_QUEUE_SUB_QUEUE_HEADER_STRIDE;
+    let off = slot_off + field_offset;
+    if off + 4 > queue_data.len() {
+        return 0;
+    }
+    u32::from_le_bytes(queue_data[off..off + 4].try_into().unwrap_or([0; 4]))
+}
+
+/// Read a u64 field from a sub-queue header at slot `slot_idx`.
+fn read_sub_queue_u64(queue_data: &[u8], slot_idx: usize, field_offset: usize) -> u64 {
+    let slot_off = EXECUTION_QUEUE_SUB_QUEUE_HEADERS_OFFSET
+        + slot_idx * EXECUTION_QUEUE_SUB_QUEUE_HEADER_STRIDE;
+    let off = slot_off + field_offset;
+    if off + 8 > queue_data.len() {
+        return 0;
+    }
+    u64::from_le_bytes(queue_data[off..off + 8].try_into().unwrap_or([0; 8]))
+}
+
+/// Compute the byte offset of a CTM item's slot within `queue_data` for
+/// a given (slot_idx, sequence) pair. Slots are flat: slot_idx * cap items
+/// then `sequence % cap` within that slot.
+fn ctm_item_offset(slot_idx: usize, sequence: u64) -> usize {
+    use mango_v4::state::{
+        EXECUTION_QUEUE_CTM_ITEMS_OFFSET as REQ_CTM_ITEMS_OFFSET, EXECUTION_QUEUE_ITEM_SIZE,
+    };
+    REQ_CTM_ITEMS_OFFSET
+        + (slot_idx * EXECUTION_QUEUE_PER_MARKET_CTM_CAPACITY
+            + (sequence as usize % EXECUTION_QUEUE_PER_MARKET_CTM_CAPACITY))
+            * EXECUTION_QUEUE_ITEM_SIZE
+}
+
+/// Phase 2A: legacy single-market helpers default to sub-queue slot 0.
+/// All v1-style `sequence % EXECUTION_QUEUE_CTM_CAPACITY` math is replaced
+/// by this helper. Phase 2B will pass real market_index through.
+fn ctm_item_offset_legacy(queue_data: &[u8], sequence: u64) -> usize {
+    let slot_idx = find_sub_queue_slot(queue_data, 0).unwrap_or(0);
+    ctm_item_offset(slot_idx, sequence)
+}
+
+/// Phase 2A: per-market sequence enqueue window cap. Items per market is
+/// PER_MARKET_CTM_CAPACITY, not the legacy aggregate CTM_CAPACITY.
+const PER_MARKET_CTM_WINDOW: u64 = EXECUTION_QUEUE_PER_MARKET_CTM_CAPACITY as u64;
+
+/// Parse the market_index out of a sequence_key formatted as "{group}:{market}".
+/// Returns 0 if the format is unexpected. Used in async paths where the
+/// market_index isn't explicitly threaded but the sequence_key is.
+fn parse_market_from_sequence_key(sequence_key: &str) -> u16 {
+    sequence_key
+        .rsplit(':')
+        .next()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(0)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum QueueHeadSource {
@@ -7636,44 +9071,21 @@ impl QueueHead {
 }
 
 fn inspect_queue_head(queue_data: &[u8]) -> QueueHead {
-    let count = if queue_data.len() >= EXECUTION_QUEUE_COUNT_OFFSET + 4 {
-        u32::from_le_bytes(
-            queue_data[EXECUTION_QUEUE_COUNT_OFFSET..EXECUTION_QUEUE_COUNT_OFFSET + 4]
-                .try_into()
-                .unwrap_or([0; 4]),
-        )
-    } else {
-        0
+    inspect_queue_head_for_market(queue_data, 0)
+}
+
+fn inspect_queue_head_for_market(queue_data: &[u8], market_index: u16) -> QueueHead {
+    // Per-market state from sub-queue header (or zero if market unbound).
+    let sub_slot = find_sub_queue_slot(queue_data, market_index);
+    let (ctm_count, next_sequence, max_seen_sequence) = match sub_slot {
+        Some(slot) => (
+            read_sub_queue_u32(queue_data, slot, SUB_QUEUE_HEADER_CTM_COUNT_OFFSET),
+            read_sub_queue_u64(queue_data, slot, SUB_QUEUE_HEADER_NEXT_SEQUENCE_OFFSET),
+            read_sub_queue_u64(queue_data, slot, SUB_QUEUE_HEADER_MAX_SEEN_SEQUENCE_OFFSET),
+        ),
+        None => (0u32, 0u64, 0u64),
     };
-    let next_sequence = if queue_data.len() >= EXECUTION_QUEUE_NEXT_SEQUENCE_OFFSET + 8 {
-        u64::from_le_bytes(
-            queue_data
-                [EXECUTION_QUEUE_NEXT_SEQUENCE_OFFSET..EXECUTION_QUEUE_NEXT_SEQUENCE_OFFSET + 8]
-                .try_into()
-                .unwrap_or([0; 8]),
-        )
-    } else {
-        0
-    };
-    let max_seen_sequence = if queue_data.len() >= EXECUTION_QUEUE_MAX_SEEN_SEQUENCE_OFFSET + 8 {
-        u64::from_le_bytes(
-            queue_data[EXECUTION_QUEUE_MAX_SEEN_SEQUENCE_OFFSET
-                ..EXECUTION_QUEUE_MAX_SEEN_SEQUENCE_OFFSET + 8]
-                .try_into()
-                .unwrap_or([0; 8]),
-        )
-    } else {
-        0
-    };
-    let ctm_count = if queue_data.len() >= EXECUTION_QUEUE_CTM_COUNT_OFFSET + 4 {
-        u32::from_le_bytes(
-            queue_data[EXECUTION_QUEUE_CTM_COUNT_OFFSET..EXECUTION_QUEUE_CTM_COUNT_OFFSET + 4]
-                .try_into()
-                .unwrap_or([0; 4]),
-        )
-    } else {
-        0
-    };
+    // Global liquidity state.
     let liquidity_count = if queue_data.len() >= EXECUTION_QUEUE_LIQUIDITY_COUNT_OFFSET + 4 {
         u32::from_le_bytes(
             queue_data[EXECUTION_QUEUE_LIQUIDITY_COUNT_OFFSET
@@ -7684,6 +9096,10 @@ fn inspect_queue_head(queue_data: &[u8]) -> QueueHead {
     } else {
         0
     };
+    // For backwards-compatibility with the existing engine logic that checks
+    // `count == 0`, treat this market's CTM count + global liquidity as the
+    // "queue size" the executor cares about.
+    let count = ctm_count + liquidity_count;
     if count == 0 {
         return QueueHead {
             count,
@@ -7700,9 +9116,10 @@ fn inspect_queue_head(queue_data: &[u8]) -> QueueHead {
         };
     }
 
-    let liquidity_head = if queue_data.len() >= EXECUTION_QUEUE_HEAD_OFFSET + 4 {
+    let liquidity_head = if queue_data.len() >= EXECUTION_QUEUE_LIQUIDITY_HEAD_OFFSET + 4 {
         u32::from_le_bytes(
-            queue_data[EXECUTION_QUEUE_HEAD_OFFSET..EXECUTION_QUEUE_HEAD_OFFSET + 4]
+            queue_data
+                [EXECUTION_QUEUE_LIQUIDITY_HEAD_OFFSET..EXECUTION_QUEUE_LIQUIDITY_HEAD_OFFSET + 4]
                 .try_into()
                 .unwrap_or([0; 4]),
         ) as usize
@@ -7713,8 +9130,8 @@ fn inspect_queue_head(queue_data: &[u8]) -> QueueHead {
     let mut ctm_kind = None;
     let mut ctm_status = None;
     if ctm_count > 0 {
-        let ctm_offset = EXECUTION_QUEUE_CTM_ITEMS_OFFSET
-            + (next_sequence as usize % EXECUTION_QUEUE_CTM_CAPACITY) * EXECUTION_QUEUE_ITEM_SIZE;
+        let slot_idx = sub_slot.unwrap_or(0);
+        let ctm_offset = ctm_item_offset(slot_idx, next_sequence);
         if ctm_offset + EXECUTION_QUEUE_ITEM_SIZE <= queue_data.len() {
             let sequence = u64::from_le_bytes(
                 queue_data[ctm_offset + EXECUTION_QUEUE_ITEM_SEQUENCE_OFFSET
@@ -7834,6 +9251,10 @@ fn inspect_queue_head(queue_data: &[u8]) -> QueueHead {
 }
 
 fn inspect_queue_admin_state(queue_data: &[u8]) -> QueueAdminState {
+    inspect_queue_admin_state_for_market(queue_data, 0)
+}
+
+fn inspect_queue_admin_state_for_market(queue_data: &[u8], market_index: u16) -> QueueAdminState {
     let gap_wait_slots = if queue_data.len() >= EXECUTION_QUEUE_GAP_WAIT_SLOTS_OFFSET + 8 {
         u64::from_le_bytes(
             queue_data
@@ -7870,22 +9291,25 @@ fn inspect_queue_admin_state(queue_data: &[u8]) -> QueueAdminState {
         pause_execute,
         gap_wait_slots,
         liquidity_delay_slots,
-        head: inspect_queue_head(queue_data),
+        head: inspect_queue_head_for_market(queue_data, market_index),
     }
 }
 
 fn inspect_next_enqueue_sequence(queue_data: &[u8]) -> u64 {
-    let head = inspect_queue_head(queue_data);
+    inspect_next_enqueue_sequence_for_market(queue_data, 0)
+}
+
+fn inspect_next_enqueue_sequence_for_market(queue_data: &[u8], market_index: u16) -> u64 {
+    let head = inspect_queue_head_for_market(queue_data, market_index);
     if head.count == 0 {
         head.next_sequence
     } else {
+        // v2 sub-queue: walk the per-market window.
+        let slot_idx = find_sub_queue_slot(queue_data, market_index).unwrap_or(0);
         let start = head.next_sequence;
-        let end = head
-            .next_sequence
-            .saturating_add(EXECUTION_QUEUE_CTM_CAPACITY as u64);
+        let end = head.next_sequence.saturating_add(PER_MARKET_CTM_WINDOW);
         for sequence in start..end {
-            let ctm_offset = EXECUTION_QUEUE_CTM_ITEMS_OFFSET
-                + (sequence as usize % EXECUTION_QUEUE_CTM_CAPACITY) * EXECUTION_QUEUE_ITEM_SIZE;
+            let ctm_offset = ctm_item_offset(slot_idx, sequence);
             if ctm_offset + EXECUTION_QUEUE_ITEM_SIZE > queue_data.len() {
                 break;
             }
@@ -7906,6 +9330,7 @@ fn inspect_next_enqueue_sequence(queue_data: &[u8]) -> u64 {
 
 fn find_next_pending_ctm_sequence(
     queue_data: &[u8],
+    market_index: u16,
     next_sequence: u64,
     max_seen_sequence: u64,
 ) -> Option<u64> {
@@ -7914,7 +9339,9 @@ fn find_next_pending_ctm_sequence(
     }
     let mut sequence = next_sequence;
     while sequence <= max_seen_sequence {
-        if inspect_queue_sequence_presence(queue_data, sequence) == QueueSequencePresence::Pending {
+        if inspect_queue_sequence_presence_for_market(queue_data, market_index, sequence)
+            == QueueSequencePresence::Pending
+        {
             return Some(sequence);
         }
         sequence = sequence.saturating_add(1);
@@ -7922,13 +9349,21 @@ fn find_next_pending_ctm_sequence(
     None
 }
 
-fn inspect_gap_recovery_batch(queue_data: &[u8], head: &QueueHead, max_batch: usize) -> Vec<u64> {
+fn inspect_gap_recovery_batch(
+    queue_data: &[u8],
+    market_index: u16,
+    head: &QueueHead,
+    max_batch: usize,
+) -> Vec<u64> {
     if max_batch == 0 || !head.is_ctm_gap_state() {
         return Vec::new();
     }
-    let Some(first_pending_sequence) =
-        find_next_pending_ctm_sequence(queue_data, head.next_sequence, head.max_seen_sequence)
-    else {
+    let Some(first_pending_sequence) = find_next_pending_ctm_sequence(
+        queue_data,
+        market_index,
+        head.next_sequence,
+        head.max_seen_sequence,
+    ) else {
         return Vec::new();
     };
 
@@ -7938,7 +9373,9 @@ fn inspect_gap_recovery_batch(queue_data: &[u8], head: &QueueHead, max_batch: us
         .min(head.max_seen_sequence);
     let mut sequence = first_pending_sequence;
     while sequence <= end_sequence {
-        if inspect_queue_sequence_presence(queue_data, sequence) != QueueSequencePresence::Pending {
+        if inspect_queue_sequence_presence_for_market(queue_data, market_index, sequence)
+            != QueueSequencePresence::Pending
+        {
             break;
         }
         sequences.push(sequence);
@@ -7949,6 +9386,7 @@ fn inspect_gap_recovery_batch(queue_data: &[u8], head: &QueueHead, max_batch: us
 
 fn inspect_near_head_lane_entries(
     queue_data: &[u8],
+    market_index: u16,
     head: &QueueHead,
     max_scan_items: usize,
     max_unique_hashes: usize,
@@ -7957,7 +9395,12 @@ fn inspect_near_head_lane_entries(
         return Vec::new();
     }
 
-    let max_scan_items = max_scan_items.min(64);
+    // v2 sub-queue: resolve the per-market slot once, then index into the
+    // correct per-market ctm_items window. Using the legacy flat offset here
+    // was a bug — it sent the non-zero-market sub-executors to scan market 0's
+    // slots and left their real sub-queue undrained.
+    let slot_idx = find_sub_queue_slot(queue_data, market_index).unwrap_or(0);
+    let max_scan_items = max_scan_items.min(EXECUTION_QUEUE_PER_MARKET_CTM_CAPACITY);
     let max_unique_hashes = max_unique_hashes.min(20);
     let end_sequence = head
         .next_sequence
@@ -7968,8 +9411,7 @@ fn inspect_near_head_lane_entries(
     let mut seen = HashSet::new();
     let mut sequence = head.next_sequence;
     while sequence <= end_sequence {
-        let ctm_offset = EXECUTION_QUEUE_CTM_ITEMS_OFFSET
-            + (sequence as usize % EXECUTION_QUEUE_CTM_CAPACITY) * EXECUTION_QUEUE_ITEM_SIZE;
+        let ctm_offset = ctm_item_offset(slot_idx, sequence);
         if ctm_offset + EXECUTION_QUEUE_ITEM_SIZE > queue_data.len() {
             break;
         }
@@ -8004,17 +9446,29 @@ fn inspect_near_head_lane_entries(
 
 fn inspect_near_head_lane_hashes(
     queue_data: &[u8],
+    market_index: u16,
     head: &QueueHead,
     max_scan_items: usize,
     max_unique_hashes: usize,
 ) -> Vec<[u8; 32]> {
-    inspect_near_head_lane_entries(queue_data, head, max_scan_items, max_unique_hashes)
-        .into_iter()
-        .map(|(_, hash)| hash)
-        .collect()
+    inspect_near_head_lane_entries(
+        queue_data,
+        market_index,
+        head,
+        max_scan_items,
+        max_unique_hashes,
+    )
+    .into_iter()
+    .map(|(_, hash)| hash)
+    .collect()
 }
 
-fn inspect_no_lane_match_batch(queue_data: &[u8], head: &QueueHead, max_batch: usize) -> Vec<u64> {
+fn inspect_no_lane_match_batch(
+    queue_data: &[u8],
+    market_index: u16,
+    head: &QueueHead,
+    max_batch: usize,
+) -> Vec<u64> {
     if max_batch == 0 || head.reason != "ctm_pending" {
         return Vec::new();
     }
@@ -8022,6 +9476,9 @@ fn inspect_no_lane_match_batch(queue_data: &[u8], head: &QueueHead, max_batch: u
         return Vec::new();
     };
 
+    // v2 sub-queue: read from the per-market window so non-zero markets scan
+    // their own pending items.
+    let slot_idx = find_sub_queue_slot(queue_data, market_index).unwrap_or(0);
     let mut sequences = Vec::new();
     let end_sequence = head
         .next_sequence
@@ -8029,8 +9486,7 @@ fn inspect_no_lane_match_batch(queue_data: &[u8], head: &QueueHead, max_batch: u
         .min(head.max_seen_sequence);
     let mut sequence = head.next_sequence;
     while sequence <= end_sequence {
-        let ctm_offset = EXECUTION_QUEUE_CTM_ITEMS_OFFSET
-            + (sequence as usize % EXECUTION_QUEUE_CTM_CAPACITY) * EXECUTION_QUEUE_ITEM_SIZE;
+        let ctm_offset = ctm_item_offset(slot_idx, sequence);
         if ctm_offset + EXECUTION_QUEUE_ITEM_SIZE > queue_data.len() {
             break;
         }
@@ -8060,19 +9516,23 @@ fn inspect_no_lane_match_batch(queue_data: &[u8], head: &QueueHead, max_batch: u
 }
 
 fn inspect_queue_sequence_presence(queue_data: &[u8], sequence: u64) -> QueueSequencePresence {
-    let head = inspect_queue_head(queue_data);
+    inspect_queue_sequence_presence_for_market(queue_data, 0, sequence)
+}
+
+fn inspect_queue_sequence_presence_for_market(
+    queue_data: &[u8],
+    market_index: u16,
+    sequence: u64,
+) -> QueueSequencePresence {
+    let head = inspect_queue_head_for_market(queue_data, market_index);
     if sequence < head.next_sequence {
         return QueueSequencePresence::PastFloor;
     }
-    if sequence
-        >= head
-            .next_sequence
-            .saturating_add(EXECUTION_QUEUE_CTM_CAPACITY as u64)
-    {
+    if sequence >= head.next_sequence.saturating_add(PER_MARKET_CTM_WINDOW) {
         return QueueSequencePresence::Absent;
     }
-    let ctm_offset = EXECUTION_QUEUE_CTM_ITEMS_OFFSET
-        + (sequence as usize % EXECUTION_QUEUE_CTM_CAPACITY) * EXECUTION_QUEUE_ITEM_SIZE;
+    let slot_idx = find_sub_queue_slot(queue_data, market_index).unwrap_or(0);
+    let ctm_offset = ctm_item_offset(slot_idx, sequence);
     if ctm_offset + EXECUTION_QUEUE_ITEM_SIZE > queue_data.len() {
         return QueueSequencePresence::Absent;
     }
@@ -8137,6 +9597,35 @@ fn is_execution_queue_duplicate_sequence_error(
     rendered.contains("custom program error: 0x17c3")
         || rendered.contains("custom program error: 6083")
         || rendered.contains("Custom(6083)")
+}
+
+fn is_execution_queue_full_error(err: &solana_client::client_error::ClientError) -> bool {
+    let rendered = err.to_string();
+    rendered.contains("custom program error: 0x17bc")
+        || rendered.contains("custom program error: 6076")
+        || rendered.contains("Custom(6076)")
+        || rendered.contains("ExecutionQueueFull")
+}
+
+fn is_invalid_sequence_number_error(err: &solana_client::client_error::ClientError) -> bool {
+    let invalid_sequence_code = MangoError::InvalidSequenceNumber.error_code();
+    if let ClientErrorKind::RpcError(RpcError::RpcResponseError { data, .. }) = err.kind() {
+        if let RpcResponseErrorData::SendTransactionPreflightFailure(sim) = data {
+            if let Some(TransactionError::InstructionError(
+                _,
+                InstructionError::Custom(custom_code),
+            )) = &sim.err
+            {
+                if *custom_code == invalid_sequence_code {
+                    return true;
+                }
+            }
+        }
+    }
+    let rendered = err.to_string();
+    rendered.contains("InvalidSequenceNumber")
+        || rendered.contains(&format!("custom program error: {invalid_sequence_code}"))
+        || rendered.contains(&format!("Custom({invalid_sequence_code})"))
 }
 
 /// Legacy mapper from RPC client error → gRPC Status. The submit_intent
@@ -8269,8 +9758,7 @@ async fn run_metrics_sampler(
         let ingress_delta_10s = snapshot.ingress_total.saturating_sub(s10.ingress_total);
         let executed_delta_10s = snapshot.executed_total.saturating_sub(s10.executed_total);
         let ingress_tps_milli = ingress_delta_10s.saturating_mul(1_000_000) / span_10s_secs_milli;
-        let executed_tps_milli =
-            executed_delta_10s.saturating_mul(1_000_000) / span_10s_secs_milli;
+        let executed_tps_milli = executed_delta_10s.saturating_mul(1_000_000) / span_10s_secs_milli;
 
         let accepted_60s = snapshot
             .ingress_accepted_total
@@ -8368,8 +9856,21 @@ async fn run_metrics_sampler(
             .latency_ingress_to_submitted_samples
             .store(submit_summary.count, Ordering::Relaxed);
 
-        // (2) Optimistic latency.
-        let opt_summary = latency_optimistic.compute_summary();
+        // (2) Optimistic latency — Phase 4-lite: publish the in-process
+        // hot-path histogram (`local_optimistic_latency`) as the
+        // authoritative `latency_ingress_to_optimistic_*` values. This is
+        // the time from gRPC arrival to the moment the in-process
+        // `ContinuumStateEngine` has applied the intent. Previously these
+        // gauges were sourced from the prober polling the legacy Node.js
+        // harness (which had a ~1.2 s floor from the event loop + napi
+        // serde + lazy rebuild).
+        //
+        // The prober's LatencyTracker still runs and its state counters
+        // (completed_total, expired_total, pending_inflight,
+        // harness_optimistic_watermark_seq) are still published below —
+        // they provide the comparison view against the legacy harness's
+        // watermark propagation.
+        let opt_summary = metrics.local_optimistic_latency.compute_summary();
         metrics
             .latency_ingress_to_optimistic_p50_ms
             .store(opt_summary.p50_ms, Ordering::Relaxed);
@@ -8382,6 +9883,7 @@ async fn run_metrics_sampler(
         metrics
             .latency_ingress_to_optimistic_samples
             .store(opt_summary.count, Ordering::Relaxed);
+        // Legacy harness prober state (useful for comparison).
         metrics.latency_optimistic_completed_total.store(
             latency_optimistic.completed_total.load(Ordering::Relaxed),
             Ordering::Relaxed,
@@ -8540,14 +10042,120 @@ fn harness_user_state_from_rust_harness(user: rust_harness::UserState) -> Harnes
     }
 }
 
+/// Phase 4-lite **fastest** converter: build a `HarnessUserState` from
+/// just the per-market perp position aggregates returned by
+/// `ContinuumStateEngine::account_positions_fast`. Skips open_orders
+/// entirely because the single-account codepath in
+/// `build_harness_margin_snapshot` overwrites the bids/asks aggregates
+/// from `per_market` anyway — the open_orders loop was redundant for
+/// this case.
+fn harness_user_state_from_fast_positions(
+    mango_account: Pubkey,
+    positions: Vec<rust_harness::FastPerpPosition>,
+) -> HarnessUserState {
+    let mango_account_str = mango_account.to_string();
+    let per_market: Vec<HarnessUserPerMarket> = positions
+        .into_iter()
+        .map(|p| HarnessUserPerMarket {
+            market: p.market_index.to_string(),
+            open_order_base_lots_bid: p.open_bid_base_lots.to_string(),
+            open_order_base_lots_ask: p.open_ask_base_lots.to_string(),
+            base_position_lots: p.base_position_lots.to_string(),
+            quote_position_native: p.quote_position_native,
+        })
+        .collect();
+    HarnessUserState {
+        mango_accounts: vec![mango_account_str],
+        open_orders: Vec::new(),
+        per_market,
+    }
+}
+
+/// Phase 4-lite fast-path converter: build a `HarnessUserState` from a
+/// single-account `AccountSnapshot` returned by
+/// `ContinuumStateEngine::account_snapshot_fast`. Only used by the margin
+/// check path which needs data for exactly one mango account — no need
+/// to materialize any other owner or account.
+///
+/// Produces the same `HarnessUserState` shape that
+/// `build_harness_margin_snapshot` consumes downstream: mango_accounts
+/// (just the one), open_orders (walked from the snapshot's orders),
+/// per_market (aggregated from the snapshot's perp_positions +
+/// open-order overlays).
+fn harness_user_state_from_account_snapshot(
+    owner: Pubkey,
+    snapshot: rust_harness::AccountSnapshot,
+) -> HarnessUserState {
+    let mango_account_str = snapshot.mango_account.to_string();
+
+    let open_orders = snapshot
+        .open_orders
+        .iter()
+        .map(|order| {
+            // Reconstruct the canonical (price_lots << 64 | key_low) order_id
+            // the way rust-harness's `snapshot_from_projection` does when
+            // building UserState, so downstream margin logic that parses
+            // this back as u128 works identically.
+            HarnessOpenOrder {
+                order_id: order.order_id.to_string(),
+                mango_account: mango_account_str.clone(),
+                market: order.market_index.to_string(),
+                side: match order.side {
+                    Side::Bid => "bid".to_string(),
+                    Side::Ask => "ask".to_string(),
+                },
+                base_lots: order.base_lots.to_string(),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    // Build per-market entries from perp_positions + open-order overlay.
+    // Each perp position becomes one HarnessUserPerMarket; we then fold
+    // in any open-order base_lots that happened to have no matching
+    // perp position (rare but possible for an account that just placed
+    // its first order).
+    let mut per_market: HashMap<PerpMarketIndex, HarnessUserPerMarket> = HashMap::new();
+    for position in &snapshot.perp_positions {
+        let market_index = position.market_index;
+        per_market.insert(
+            market_index,
+            HarnessUserPerMarket {
+                market: market_index.to_string(),
+                open_order_base_lots_bid: position.open_bid_base_lots.to_string(),
+                open_order_base_lots_ask: position.open_ask_base_lots.to_string(),
+                base_position_lots: position.base_position_lots.to_string(),
+                quote_position_native: position.quote_position_native.clone(),
+            },
+        );
+    }
+    for order in &snapshot.open_orders {
+        let market_index = order.market_index;
+        per_market
+            .entry(market_index)
+            .or_insert_with(|| HarnessUserPerMarket {
+                market: market_index.to_string(),
+                open_order_base_lots_bid: "0".to_string(),
+                open_order_base_lots_ask: "0".to_string(),
+                base_position_lots: "0".to_string(),
+                quote_position_native: "0".to_string(),
+            });
+    }
+    let mut per_market_vec: Vec<HarnessUserPerMarket> = per_market.into_values().collect();
+    per_market_vec.sort_by(|a, b| a.market.cmp(&b.market));
+
+    let _ = owner; // owner currently unused in HarnessUserState itself
+    HarnessUserState {
+        mango_accounts: vec![mango_account_str],
+        open_orders,
+        per_market: per_market_vec,
+    }
+}
+
 /// One-time startup fetch of an EngineSnapshot from the legacy harness so
 /// the relayer can populate its in-process ContinuumStateEngine. NOT on the
 /// hot path — this runs once during main(), with a long timeout. Phase 5
 /// will replace this with a Rust on-chain reader.
-async fn bootstrap_local_state(
-    url: &str,
-    timeout_ms: u64,
-) -> anyhow::Result<ContinuumStateEngine> {
+async fn bootstrap_local_state(url: &str, timeout_ms: u64) -> anyhow::Result<ContinuumStateEngine> {
     info!("local-state bootstrap: fetching {url} timeout_ms={timeout_ms}");
     let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(timeout_ms))
@@ -8570,8 +10178,8 @@ async fn bootstrap_local_state(
         .text()
         .await
         .context("read local-state bootstrap body")?;
-    let snapshot: EngineSnapshot = serde_json::from_str(&body)
-        .context("decode local-state bootstrap EngineSnapshot")?;
+    let snapshot: EngineSnapshot =
+        serde_json::from_str(&body).context("decode local-state bootstrap EngineSnapshot")?;
     let mut engine = ContinuumStateEngine::new();
     engine
         .bootstrap_from_onchain_snapshot(snapshot)
@@ -8758,14 +10366,38 @@ async fn async_main() -> Result<()> {
         Arc::new(SequenceStore::new(config.sequence_state_path.clone(), metrics.clone()).await?);
     let blockhashes =
         Arc::new(BlockhashManager::new(rpc.clone(), config.blockhash_refresh_ms).await?);
-    let executor = if config.executor_enabled {
-        Some(Arc::new(ExecutorState::new(
-            config.executor_group.expect("executor group"),
-            config.executor_queue.expect("executor queue"),
-            load_executor_lanes(config.as_ref())?,
-        )))
+    // Phase 2B: build one ExecutorState per active market_index. The lanes
+    // map is shared across all per-market executors (each filters lanes by
+    // perp_market pubkey internally). The first executor (lowest
+    // market_index) is the "primary" used by metrics and the perp event
+    // consumer entrypoint, since the consumer iterates lanes itself.
+    let (executor, executors) = if config.executor_enabled {
+        let static_lanes = load_executor_lanes(config.as_ref())?;
+        let group_pk = config.executor_group.expect("executor group");
+        let queue_pk = config.executor_queue.expect("executor queue");
+        let markets = discover_markets_from_lanes(rpc.as_ref(), &static_lanes).await?;
+        let mut all = Vec::with_capacity(markets.len());
+        for (market_index, perp_market_pk) in markets {
+            all.push(Arc::new(ExecutorState::new(
+                group_pk,
+                queue_pk,
+                market_index,
+                perp_market_pk,
+                static_lanes.clone(),
+            )));
+        }
+        let primary = all.first().cloned();
+        info!(
+            "executor enabled with {} sub-executor(s): {}",
+            all.len(),
+            all.iter()
+                .map(|e| format!("market={}", e.market_index))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        (primary, all)
     } else {
-        None
+        (None, Vec::new())
     };
     let secondary_rpc = std::env::var("CTM_RELAYER_SECONDARY_RPC_URL")
         .ok()
@@ -8810,12 +10442,14 @@ async fn async_main() -> Result<()> {
     metrics
         .stage_bg_rpc_submit_latency
         .set_capacity(config.latency_samples_capacity);
+    metrics
+        .local_optimistic_latency
+        .set_capacity(config.latency_samples_capacity);
 
     // Background submitter pool wiring (Phase 1.1). The mpsc channel feeds
     // a pool of `bg_submit_workers` worker tasks; submit_intent uses the
     // sender's try_send so the hot path never blocks on backpressure.
-    let (bg_submit_tx, bg_submit_rx) =
-        mpsc::channel::<PendingSubmit>(config.bg_submit_channel_cap);
+    let (bg_submit_tx, bg_submit_rx) = mpsc::channel::<PendingSubmit>(config.bg_submit_channel_cap);
     let bg_submit_rx = Arc::new(Mutex::new(bg_submit_rx));
 
     // Phase 2: optional in-process optimistic state. If
@@ -8838,9 +10472,7 @@ async fn async_main() -> Result<()> {
                 Some(Arc::new(PlMutex::new(engine)))
             }
             Err(err) => {
-                warn!(
-                    "local-state bootstrap failed; falling back to legacy HTTP path: {err:#}"
-                );
+                warn!("local-state bootstrap failed; falling back to legacy HTTP path: {err:#}");
                 None
             }
         }
@@ -8868,6 +10500,11 @@ async fn async_main() -> Result<()> {
         state: local_state,
         market_metadata_cache: Arc::new(StdMutex::new(HashMap::new())),
         margin_account_cache: Arc::new(StdMutex::new(HashMap::new())),
+        static_account_cache: Arc::new(StdMutex::new(HashMap::new())),
+        group_account_mirrors: Arc::new(StdMutex::new(HashMap::new())),
+        mango_account_mirrors: Arc::new(StdMutex::new(HashMap::new())),
+        ingress_failure_memo: Arc::new(StdMutex::new(HashMap::new())),
+        ingress_rate_slots: Arc::new(StdMutex::new(HashMap::new())),
     });
 
     // Spawn the bg submitter worker pool. Each worker shares the receiver
@@ -8896,8 +10533,7 @@ async fn async_main() -> Result<()> {
     // Background metrics sampler — derives all rate / 60s window / queue
     // depth / unique address / heartbeat-derived health gauges. Single
     // owner of historical state; never contends with the hot path.
-    let event_cranker_enabled =
-        executor.is_some() && config.executor_perp_consume_interval_ms > 0;
+    let event_cranker_enabled = executor.is_some() && config.executor_perp_consume_interval_ms > 0;
     tokio::spawn(run_metrics_sampler(
         metrics.clone(),
         executor.clone(),
@@ -8959,9 +10595,16 @@ async fn async_main() -> Result<()> {
         config.balance_poll_interval_ms,
     ));
 
-    if let Some(executor) = executor {
-        tokio::spawn(engine.clone().run_executor(executor.clone()));
-        tokio::spawn(engine.clone().run_perp_event_consumer(executor));
+    // Phase 2B: spawn one run_executor task per per-market sub-executor.
+    // The perp event consumer runs once against the primary executor and
+    // discovers all unique perp_market accounts via lane snapshots, so a
+    // single instance covers every market regardless of how many
+    // sub-executors we have.
+    for sub_executor in &executors {
+        tokio::spawn(engine.clone().run_executor(sub_executor.clone()));
+    }
+    if let Some(primary) = executor.clone() {
+        tokio::spawn(engine.clone().run_perp_event_consumer(primary));
     }
 
     info!(
@@ -9057,7 +10700,11 @@ mod tests {
 
     #[test]
     fn shared_lane_account_width_accepts_uniform_batches() {
-        let lanes = vec![make_test_lane(3, 1), make_test_lane(3, 2), make_test_lane(3, 3)];
+        let lanes = vec![
+            make_test_lane(3, 1),
+            make_test_lane(3, 2),
+            make_test_lane(3, 3),
+        ];
         assert_eq!(shared_lane_account_width(&lanes).unwrap(), 3);
     }
 
@@ -9065,10 +10712,205 @@ mod tests {
     fn shared_lane_account_width_rejects_mixed_batches() {
         let lanes = vec![make_test_lane(3, 1), make_test_lane(4, 2)];
         let err = shared_lane_account_width(&lanes).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("incompatible execute_multi lane account widths")
+        assert!(err
+            .to_string()
+            .contains("incompatible execute_multi lane account widths"));
+    }
+
+    #[test]
+    fn terminal_head_failure_detects_fixed_health_account_mismatch() {
+        let err = TransactionError::InstructionError(
+            0,
+            InstructionError::Custom(MangoError::SomeError.error_code()),
         );
+        let logs = vec![
+            "Program log: pre_init_health: 14500000000".to_string(),
+            "Program log: AnchorError thrown in programs/mango-v4/src/health/account_retriever.rs:570. Error Code: SomeError. Error Message: perp market index 1 not found.".to_string(),
+        ];
+
+        let reason = Engine::terminal_head_failure_reason(&err, &logs);
+
+        assert_eq!(
+            reason,
+            Some(TerminalHeadFailureReason::HealthAccountsMismatch)
+        );
+        assert_eq!(
+            Engine::terminal_head_failure_label(reason.unwrap()),
+            "health_accounts_mismatch"
+        );
+    }
+
+    #[test]
+    fn terminal_head_failure_ignores_generic_some_error_without_health_account_signal() {
+        let err = TransactionError::InstructionError(
+            0,
+            InstructionError::Custom(MangoError::SomeError.error_code()),
+        );
+        let logs = vec![
+            "Program log: AnchorError thrown in programs/mango-v4/src/instructions/perp_place_order.rs:54. Error Code: SomeError. Error Message: some other failure.".to_string(),
+        ];
+
+        let reason = Engine::terminal_head_failure_reason(&err, &logs);
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn derived_remaining_accounts_group_health_sections_canonically() {
+        let group = Pubkey::new_unique();
+        let mango_account = Pubkey::new_unique();
+        let user_owner = Pubkey::new_unique();
+
+        let usdc_bank = Pubkey::new_unique();
+        let usdc_oracle = Pubkey::new_unique();
+        let usdc_fallback = Pubkey::new_unique();
+
+        let sol_market = StaticPerpMarketMeta {
+            market: Pubkey::new_unique(),
+            bids: Pubkey::new_unique(),
+            asks: Pubkey::new_unique(),
+            event_queue: Pubkey::new_unique(),
+            oracle: Pubkey::new_unique(),
+            settle_token_index: 0,
+        };
+        let btc_market = StaticPerpMarketMeta {
+            market: Pubkey::new_unique(),
+            bids: Pubkey::new_unique(),
+            asks: Pubkey::new_unique(),
+            event_queue: Pubkey::new_unique(),
+            oracle: Pubkey::new_unique(),
+            settle_token_index: 0,
+        };
+
+        let mut group_mirror = GroupStaticAccountMirror::default();
+        group_mirror.banks_by_token_index.insert(
+            0,
+            StaticBankAccountMeta {
+                bank: usdc_bank,
+                oracle: usdc_oracle,
+                fallback_oracles: vec![usdc_fallback],
+            },
+        );
+        group_mirror.perps_by_market_index.insert(0, sol_market.clone());
+        group_mirror.perps_by_market_index.insert(1, btc_market.clone());
+
+        let mango_mirror = MangoAccountMirror {
+            token_indices: vec![0],
+            perp_market_indices: vec![0],
+            serum_open_orders: Vec::new(),
+            openbook_open_orders: Vec::new(),
+        };
+
+        let derived = build_derived_perp_remaining_accounts(
+            group,
+            mango_account,
+            user_owner,
+            1,
+            &group_mirror,
+            &mango_mirror,
+        )
+        .unwrap();
+
+        let expected_pubkeys = vec![
+            group,
+            mango_account,
+            user_owner,
+            btc_market.market,
+            btc_market.bids,
+            btc_market.asks,
+            btc_market.event_queue,
+            btc_market.oracle,
+            usdc_bank,
+            usdc_oracle,
+            sol_market.market,
+            btc_market.market,
+            sol_market.oracle,
+            btc_market.oracle,
+            usdc_fallback,
+        ];
+        assert_eq!(
+            derived.iter().map(|account| account.pubkey).collect::<Vec<_>>(),
+            expected_pubkeys
+        );
+        assert!(!derived[0].is_writable);
+        assert!(derived[1].is_writable);
+        assert!(derived[3].is_writable);
+        assert!(!derived[8].is_writable);
+        assert!(!derived[11].is_writable);
+    }
+
+    #[test]
+    fn user_intent_v2_hash_ignores_accounts_hash() {
+        let group = Pubkey::new_unique();
+        let mango_account = Pubkey::new_unique();
+        let user_owner = Pubkey::new_unique();
+        let envelope_a = CtmEnvelope {
+            sequence: 1,
+            min_execute_slot: 2,
+            kind: 0,
+            payload_hash: [7; 32],
+            accounts_hash: [9; 32],
+            expires_at_slot: 0,
+        };
+        let envelope_b = CtmEnvelope {
+            accounts_hash: [11; 32],
+            ..envelope_a.clone()
+        };
+
+        let v1_a =
+            canonical_user_intent_message_v1(group, mango_account, user_owner, &envelope_a);
+        let v1_b =
+            canonical_user_intent_message_v1(group, mango_account, user_owner, &envelope_b);
+        let v2_a = canonical_user_intent_message_v2(
+            group,
+            mango_account,
+            user_owner,
+            envelope_a.kind,
+            UserIntentTargetKind::PerpMarket,
+            7,
+            &envelope_a.payload_hash,
+        );
+        let v2_b = canonical_user_intent_message_v2(
+            group,
+            mango_account,
+            user_owner,
+            envelope_b.kind,
+            UserIntentTargetKind::PerpMarket,
+            7,
+            &envelope_b.payload_hash,
+        );
+
+        assert_ne!(v1_a, v1_b);
+        assert_eq!(v2_a, v2_b);
+    }
+
+    #[test]
+    fn user_intent_v2_hash_binds_target_index() {
+        let group = Pubkey::new_unique();
+        let mango_account = Pubkey::new_unique();
+        let user_owner = Pubkey::new_unique();
+        let payload_hash = [7; 32];
+
+        let market_0 = canonical_user_intent_message_v2(
+            group,
+            mango_account,
+            user_owner,
+            0,
+            UserIntentTargetKind::PerpMarket,
+            0,
+            &payload_hash,
+        );
+        let market_1 = canonical_user_intent_message_v2(
+            group,
+            mango_account,
+            user_owner,
+            0,
+            UserIntentTargetKind::PerpMarket,
+            1,
+            &payload_hash,
+        );
+
+        assert_ne!(market_0, market_1);
     }
 
     #[test]
@@ -9109,6 +10951,33 @@ mod tests {
     }
 
     #[test]
+    fn select_layout_compatible_lanes_with_required_head_bypasses_head_backoff() {
+        let lanes = vec![
+            make_test_lane(5, 1),
+            make_test_lane(2, 2),
+            make_test_lane(2, 3),
+            make_test_lane(5, 4),
+        ];
+        let mut backoff_snapshot = HashMap::new();
+        backoff_snapshot.insert(bytes_to_hex(&[1u8; 32]), 200);
+
+        let (eligible, unique_hashes, dropped_for_layout) =
+            select_layout_compatible_lanes_with_required_head(
+                lanes,
+                &backoff_snapshot,
+                100,
+                4,
+                [1u8; 32],
+            );
+
+        assert_eq!(eligible.len(), 2);
+        assert_eq!(eligible[0].hash, [1u8; 32]);
+        assert!(eligible.iter().all(|lane| lane_account_width(lane) == 5));
+        assert_eq!(unique_hashes, 4);
+        assert_eq!(dropped_for_layout, 2);
+    }
+
+    #[test]
     fn decode_margin_check_ops_decodes_perp_place_order_payload() {
         let body = PerpPlaceOrderV2Payload {
             side: Side::Bid,
@@ -9134,50 +11003,6 @@ mod tests {
                 max_base_lots: 7,
                 reduce_only: false,
             }]
-        );
-    }
-
-    #[test]
-    fn decode_margin_check_ops_decodes_batch_cancel_then_place() {
-        let cancel = PerpCancelOrderBySlotPayload {
-            slot: 3,
-            expected_order_id: 55,
-        }
-        .try_to_vec()
-        .unwrap();
-        let place = PerpPlaceOrderV2Payload {
-            side: Side::Ask,
-            price_lots: 101,
-            max_base_lots: 9,
-            max_quote_lots: 909,
-            client_order_id: 9,
-            order_type: mango_v4::state::PlaceOrderType::Limit,
-            self_trade_behavior: mango_v4::state::SelfTradeBehavior::AbortTransaction,
-            reduce_only: true,
-            expiry_timestamp: 11,
-            limit: 12,
-        }
-        .try_to_vec()
-        .unwrap();
-        let mut body = vec![2, 0];
-        body.extend_from_slice(&cancel);
-        body.push(1);
-        body.extend_from_slice(&place);
-        let payload = encode_queue_payload(QueuePayloadVariant::PerpBatchIntent, &body);
-
-        let ops = decode_margin_check_ops(&payload).unwrap().unwrap();
-        assert_eq!(
-            ops,
-            vec![
-                MarginCheckOp::CancelByOrderId {
-                    expected_order_id: 55,
-                },
-                MarginCheckOp::Place {
-                    side: Side::Ask,
-                    max_base_lots: 9,
-                    reduce_only: true,
-                },
-            ]
         );
     }
 
@@ -9278,8 +11103,7 @@ mod tests {
     }
 
     fn queue_item_offset(sequence: u64) -> usize {
-        EXECUTION_QUEUE_CTM_ITEMS_OFFSET
-            + (sequence as usize % EXECUTION_QUEUE_CTM_CAPACITY) * EXECUTION_QUEUE_ITEM_SIZE
+        ctm_item_offset_legacy(queue_data, sequence)
     }
 
     fn liquidity_item_offset(head: u32) -> usize {
@@ -9543,6 +11367,32 @@ mod tests {
     }
 
     #[test]
+    fn select_next_speculative_successor_sequence_skips_pending_future_head() {
+        let entries = vec![
+            (100_u64, [0x10; 32]),
+            (101_u64, [0x20; 32]),
+            (101_u64, [0x21; 32]),
+            (104_u64, [0x30; 32]),
+            (105_u64, [0x40; 32]),
+        ];
+        let pending = vec![PendingHeadDispatch {
+            sequence: 101,
+            accounts_hash: Some([0x20; 32]),
+            lane_hash: [0x20; 32],
+            dispatch_kind: PendingDispatchKind::Execute,
+            sent_at_ms: 0,
+            last_status_check_ms: 0,
+            no_advance_recorded: false,
+            targeted: false,
+            signature: Signature::default(),
+        }];
+        assert_eq!(
+            select_next_speculative_successor_sequence(100, [0x10; 32], &entries, &pending),
+            Some(104)
+        );
+    }
+
+    #[test]
     fn inspect_queue_head_reports_liquidity_status_mismatch() {
         let mut data =
             vec![0u8; EXECUTION_QUEUE_LIQUIDITY_ITEMS_OFFSET + EXECUTION_QUEUE_ITEM_SIZE];
@@ -9649,6 +11499,34 @@ mod tests {
         assert!(!cursor.pending.contains_key(&1));
         assert!(cursor.recyclable.contains(&2));
         assert_eq!(cursor.reserve(200), 2);
+    }
+
+    #[test]
+    fn sequence_cursor_rewind_to_queue_floor_moves_floor_backward() {
+        let mut cursor = SequenceCursor {
+            next_sequence: 25,
+            pending: BTreeMap::new(),
+            recyclable: BTreeSet::new(),
+        };
+
+        assert!(cursor.rewind_to_queue_floor(10));
+        assert_eq!(cursor.next_sequence, 10);
+        assert_eq!(cursor.reserve(200), 10);
+    }
+
+    #[test]
+    fn sequence_cursor_rewind_keeps_dense_allocation_before_far_recyclable() {
+        let mut cursor = SequenceCursor {
+            next_sequence: 25,
+            pending: BTreeMap::from([(25, PendingSequenceState::submitted(111))]),
+            recyclable: BTreeSet::from([40]),
+        };
+
+        assert!(cursor.rewind_to_queue_floor(10));
+        assert!(cursor.reset_after_failure(25, 10));
+        assert_eq!(cursor.reserve(200), 10);
+        assert!(cursor.recyclable.contains(&25));
+        assert!(cursor.recyclable.contains(&40));
     }
 
     #[test]

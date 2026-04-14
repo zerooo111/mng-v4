@@ -145,7 +145,9 @@ async function main(): Promise<void> {
 
   const payload = encodePerpPlaceOrderV2QueuePayload({
     side,
-    priceLots: BigInt(perpMarket.uiPriceToLots(Math.abs(PRICE)).toString()),
+    priceLots: BigInt(
+      perpMarket.uiPriceToLotsForSide(Math.abs(PRICE), side).toString(),
+    ),
     maxBaseLots: BigInt(perpMarket.uiBaseToLots(QUANTITY).toString()),
     maxQuoteLots: MAX_QUOTE_QTY
       ? BigInt(perpMarket.uiQuoteToLots(MAX_QUOTE_QTY).toString())
@@ -164,6 +166,7 @@ async function main(): Promise<void> {
     mangoAccount: mangoAccount.publicKey,
     userOwner: user.publicKey,
     payload,
+    target: { kind: 0, index: PERP_MARKET_INDEX },
     remainingAccounts,
   });
   const userSignature = signExecutionQueueIntentMessage(
@@ -202,6 +205,9 @@ async function main(): Promise<void> {
         user_owner: user.publicKey.toBase58(),
         mango_account: mangoAccount.publicKey.toBase58(),
         user_signature: Buffer.from(userSignature),
+        intent_version: 2,
+        target_kind: 0,
+        target_index: PERP_MARKET_INDEX,
       },
       (err: Error | null, res: any) => {
         if (err) {

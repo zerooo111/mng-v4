@@ -7,6 +7,7 @@ import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 import { MangoClient } from '../../src/client';
 import {
+  PerpMarket,
   PerpMarketIndex,
   PerpOrderSide,
   PerpOrderType,
@@ -64,13 +65,16 @@ type DispatchTarget = {
 };
 
 const RUNTIME_ROOT = path.resolve(__dirname, '../../../..');
+// v2 sub-queue deploy: defaults point at the 9200 group bootstrapped by
+// `v2-multi-market-bootstrap.ts`. Override via TAKER_CONFIG_PATH /
+// TAKER_BOTS_CONFIG_PATH for other groups.
 const DEFAULT_CONFIG_PATH = path.resolve(
   RUNTIME_ROOT,
-  '.devnet/run/execution-queue-e2e-9126.json',
+  '.devnet/run/execution-queue-e2e-9200.json',
 );
 const DEFAULT_BOTS_CONFIG_PATH = path.resolve(
   RUNTIME_ROOT,
-  '.devnet/run/taker-bots-9126.json',
+  '.devnet/run/taker-bots-9200.json',
 );
 const CONFIG_PATH = path.resolve(
   process.env.TAKER_CONFIG_PATH || DEFAULT_CONFIG_PATH,
@@ -95,7 +99,9 @@ const HARNESS_URL = process.env.TAKER_HARNESS_URL || 'http://127.0.0.1:9091';
 const HARNESS_POLL_MS = Number(process.env.TAKER_HARNESS_POLL_MS || '20000');
 const SKEW_SOFT_LIMIT_UI = Number(process.env.TAKER_SKEW_SOFT_LIMIT_UI || '5');
 const SKEW_HARD_LIMIT_UI = Number(process.env.TAKER_SKEW_HARD_LIMIT_UI || '50');
-const DEFAULT_MARKET_INDEXES = '0,1,2';
+// v2 sub-queue deploy bootstraps SOL-PERP (idx 0) and BTC-PERP (idx 1).
+// Override via TAKER_MARKET_INDEXES for other deploys.
+const DEFAULT_MARKET_INDEXES = '0,1';
 const MARKET_INDEXES = parseMarketIndexes(
   process.env.TAKER_MARKET_INDEXES || DEFAULT_MARKET_INDEXES,
 );
@@ -160,6 +166,25 @@ function ensureMarketRuntime(marketIndex: number): MarketRuntimeState {
   return created;
 }
 
+function hydrateMarketRuntimeFromPerpMarket(perpMarket: PerpMarket): void {
+  const runtime = ensureMarketRuntime(Number(perpMarket.perpMarketIndex));
+  runtime.name = perpMarket.name;
+  runtime.baseLotSizeUi =
+    Number(perpMarket.baseLotSize.toString()) / 10 ** perpMarket.baseDecimals;
+}
+
+function hydrateMarketMetadataFromGroup(group: Awaited<ReturnType<MangoClient['getGroup']>>): void {
+  for (const marketIndex of MARKET_INDEXES) {
+    const perpMarket = group.perpMarketsMapByMarketIndex.get(
+      marketIndex as PerpMarketIndex,
+    );
+    if (!perpMarket) {
+      continue;
+    }
+    hydrateMarketRuntimeFromPerpMarket(perpMarket);
+  }
+}
+
 function currentPositionUi(bot: TakerBotRuntime, marketIndex: number): number {
   const marketRuntime = ensureMarketRuntime(marketIndex);
   const lots = bot.cachedBasePositionLotsByMarket.get(marketIndex) ?? 0n;
@@ -203,6 +228,27 @@ function computeCapPriceUi(params: {
     const price = base * (1 - slip);
     return price > 0 && Number.isFinite(price) ? price : params.oraclePriceUi * (1 - slip);
   }
+}
+
+function clampCapPriceToInsideLimit(params: {
+  perpMarket: {
+    maintBaseAssetWeight: { toNumber(): number };
+    maintBaseLiabWeight: { toNumber(): number };
+    uiPrice: number;
+  };
+  side: PerpOrderSide;
+  capPriceUi: number;
+}): number {
+  const lowerBoundUi =
+    params.perpMarket.maintBaseAssetWeight.toNumber() * params.perpMarket.uiPrice;
+  const upperBoundUi =
+    params.perpMarket.maintBaseLiabWeight.toNumber() * params.perpMarket.uiPrice;
+
+  if (params.side === PerpOrderSide.bid) {
+    return Math.min(params.capPriceUi, upperBoundUi);
+  }
+
+  return Math.max(params.capPriceUi, lowerBoundUi);
 }
 
 function computeOrderBaseLots(params: {
@@ -280,31 +326,12 @@ async function executionQueueCanonicalPerpRemainingAccounts(params: {
   marketIndex: number;
   userOwner: PublicKey;
 }): Promise<AccountMeta[]> {
-  const perpMarket = params.group.getPerpMarketByMarketIndex(
+  return params.client.buildExecutionQueueCanonicalPerpRemainingAccounts(
+    params.group,
+    params.mangoAccount,
     params.marketIndex as PerpMarketIndex,
+    params.userOwner,
   );
-  return params.client
-    .buildHealthRemainingAccounts(
-      params.group,
-      [params.mangoAccount],
-      [params.group.getFirstBankForPerpSettlement()],
-      [perpMarket],
-    )
-    .then((healthRemainingAccounts) => [
-      { pubkey: params.group.publicKey, isSigner: false, isWritable: false },
-      { pubkey: params.mangoAccount.publicKey, isSigner: false, isWritable: true },
-      { pubkey: params.userOwner, isSigner: false, isWritable: false },
-      { pubkey: perpMarket.publicKey, isSigner: false, isWritable: true },
-      { pubkey: perpMarket.bids, isSigner: false, isWritable: true },
-      { pubkey: perpMarket.asks, isSigner: false, isWritable: true },
-      { pubkey: perpMarket.eventQueue, isSigner: false, isWritable: true },
-      { pubkey: perpMarket.oracle, isSigner: false, isWritable: false },
-      ...healthRemainingAccounts.map((pubkey) => ({
-        pubkey,
-        isSigner: false,
-        isWritable: false,
-      })),
-    ]);
 }
 
 async function submitIntentViaRelayer(params: {
@@ -323,6 +350,7 @@ async function submitIntentViaRelayer(params: {
     mangoAccount: params.mangoAccount,
     userOwner: params.user.publicKey,
     payload: params.payload,
+    target: { kind: 0, index: params.marketIndex },
     remainingAccounts: params.remainingAccounts,
   });
   const userSignature = signExecutionQueueIntentMessage(
@@ -361,6 +389,9 @@ async function submitIntentViaRelayer(params: {
         user_owner: params.user.publicKey.toBase58(),
         mango_account: params.mangoAccount.toBase58(),
         user_signature: Buffer.from(userSignature),
+        intent_version: 2,
+        target_kind: 0,
+        target_index: params.marketIndex,
       },
       (err: Error | null, response: { sequence: string; tx_signature?: string }) => {
         if (err) {
@@ -553,6 +584,12 @@ async function main(): Promise<void> {
     }),
   );
 
+  // Prime startup metadata from the on-chain group/perp definitions so the
+  // first startup banner does not depend on the harness refresh path.
+  const startupMangoAccount = await bots[0].client.getMangoAccount(bots[0].mangoAccountPk);
+  const startupGroup = await bots[0].client.getGroup(startupMangoAccount.group);
+  hydrateMarketMetadataFromGroup(startupGroup);
+
   console.log(
     JSON.stringify({
       event: 'taker_bot_v3_start',
@@ -594,12 +631,16 @@ async function main(): Promise<void> {
     const target = selectDispatchTarget(bots);
     const bot = target.bot;
     const marketIndex = target.marketIndex;
-    const marketRuntime = ensureMarketRuntime(marketIndex);
     const mangoAccount = await bot.client.getMangoAccount(bot.mangoAccountPk);
     const group = await bot.client.getGroup(mangoAccount.group);
     const perpMarket = group.getPerpMarketByMarketIndex(
       marketIndex as PerpMarketIndex,
     );
+    // Refresh runtime metadata from the live market definition before any
+    // position math or logging so stale harness/default metadata cannot skew
+    // size or labels.
+    hydrateMarketRuntimeFromPerpMarket(perpMarket);
+    const marketRuntime = ensureMarketRuntime(marketIndex);
     const [bids, asks] = await Promise.all([
       perpMarket.loadBids(bot.client, true),
       perpMarket.loadAsks(bot.client, true),
@@ -608,12 +649,17 @@ async function main(): Promise<void> {
     const bestAskUi = asks.best()?.uiPrice;
     const side = chooseSide(bot, marketIndex);
     const sideLabel = side === PerpOrderSide.bid ? 'buy' : 'sell';
-    const capPriceUi = computeCapPriceUi({
+    const rawCapPriceUi = computeCapPriceUi({
       side,
       oraclePriceUi: perpMarket.uiPrice,
       bestBidUi,
       bestAskUi,
       slippageBps: SLIPPAGE_BPS,
+    });
+    const capPriceUi = clampCapPriceToInsideLimit({
+      perpMarket,
+      side,
+      capPriceUi: rawCapPriceUi,
     });
     const orderSizing = computeOrderBaseLots({
       perpUiPrice: perpMarket.uiPrice,
@@ -630,7 +676,8 @@ async function main(): Promise<void> {
       userOwner: bot.user.publicKey,
     });
 
-    const priceLotsNum = Number(perpMarket.uiPriceToLots(capPriceUi).toString());
+    const priceLots = perpMarket.uiPriceToLotsForSide(capPriceUi, side);
+    const priceLotsNum = Number(priceLots.toString());
     if (!Number.isFinite(priceLotsNum) || priceLotsNum <= 0) {
       console.log(
         JSON.stringify({
@@ -675,7 +722,7 @@ async function main(): Promise<void> {
 
     const payload = encodePerpPlaceOrderV2QueuePayload({
       side,
-      priceLots: BigInt(perpMarket.uiPriceToLots(capPriceUi).toString()),
+      priceLots: BigInt(priceLots.toString()),
       maxBaseLots: orderSizing.baseLots,
       maxQuoteLots: BigInt(I64_MAX_BN.toString()),
       clientOrderId,
@@ -704,7 +751,12 @@ async function main(): Promise<void> {
         oracle_price_ui: perpMarket.uiPrice,
         best_bid_ui: bestBidUi ?? null,
         best_ask_ui: bestAskUi ?? null,
+        raw_cap_price_ui: rawCapPriceUi,
         cap_price_ui: capPriceUi,
+        price_limit_lower_ui:
+          perpMarket.maintBaseAssetWeight.toNumber() * perpMarket.uiPrice,
+        price_limit_upper_ui:
+          perpMarket.maintBaseLiabWeight.toNumber() * perpMarket.uiPrice,
         inside_price_limit: perpMarket.insidePriceLimit(side, capPriceUi),
         client_order_id: clientOrderId,
         base_position_ui: currentPosUi,

@@ -88,6 +88,7 @@ async function main(): Promise<void> {
     mangoAccount,
     userOwner: user.publicKey,
     payload,
+    target: { kind: 0, index: Number(MARKET) },
     remainingAccounts,
   });
   const userSignature = signExecutionQueueIntentMessage(
@@ -126,6 +127,9 @@ async function main(): Promise<void> {
         user_owner: user.publicKey.toBase58(),
         mango_account: mangoAccount.toBase58(),
         user_signature: Buffer.from(userSignature),
+        intent_version: 2,
+        target_kind: 0,
+        target_index: Number(MARKET),
       },
       (err: Error | null, res: any) => {
         if (err) {

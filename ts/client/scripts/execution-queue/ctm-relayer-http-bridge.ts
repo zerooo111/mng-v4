@@ -46,6 +46,9 @@ type SubmitIntentHttpBody = {
   user_owner: string;
   mango_account: string;
   user_signature_b64: string;
+  intent_version?: number;
+  target_kind?: number;
+  target_index?: number;
 };
 
 type DepositContextResponse = {
@@ -234,6 +237,9 @@ async function submitIntentViaGrpc(
         user_owner: body.user_owner,
         mango_account: body.mango_account,
         user_signature: signature,
+        intent_version: body.intent_version,
+        target_kind: body.target_kind,
+        target_index: body.target_index,
       },
       (err: Error | null, res: any) => {
         if (err) {

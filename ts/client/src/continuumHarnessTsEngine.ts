@@ -53,6 +53,11 @@ export type RelayIntentAcceptedEvent = {
   group: string;
   execution_queue: string;
   market: string;
+  intent_version?: number;
+  target_kind?: number;
+  target_index?: number;
+  accounts_hash?: string;
+  remaining_accounts_source?: string;
   sequence: string;
   kind: number;
   payload_b64: string;
@@ -88,6 +93,8 @@ export type QueueItemEnqueuedEvent = {
   event_type: 'queue_item_enqueued';
   ts_ms: number;
   group: string;
+  /** v2 sub-queue: per-market sequence allocator. Defaults to 0 for v1 events. */
+  market_index?: number;
   sequence: string;
   kind: number;
   min_execute_slot: string;
@@ -99,6 +106,8 @@ export type QueueItemProcessedEvent = {
   event_type: 'queue_item_processed';
   ts_ms: number;
   group: string;
+  /** v2 sub-queue: per-market sequence allocator. Defaults to 0 for v1 events. */
+  market_index?: number;
   sequence: string;
   kind: number;
   status: number;
@@ -527,7 +536,20 @@ function ensureMinLength(buffer: Buffer, expected: number, label: string): void 
   }
 }
 
-export function queueItemKey(group: string, sequence: string | bigint, kind: string | number): string {
+/**
+ * v2 sub-queue: when `marketIndex` is provided the key embeds it so events
+ * across markets that happen to share a sequence number do not collide. Pass
+ * `null`/`undefined` for legacy v1 (single-stream) callers.
+ */
+export function queueItemKey(
+  group: string,
+  sequence: string | bigint,
+  kind: string | number,
+  marketIndex?: number | null,
+): string {
+  if (marketIndex !== null && marketIndex !== undefined) {
+    return `${group}:m${marketIndex}:${sequence.toString()}:${kind.toString()}`;
+  }
   return `${group}:${sequence.toString()}:${kind.toString()}`;
 }
 
@@ -598,6 +620,7 @@ export function decodeQueueAnchorEvent(
   | {
       type: 'QueueItemEnqueued';
       group: string;
+      market_index: number;
       sequence: bigint;
       kind: number;
       min_execute_slot: bigint;
@@ -605,6 +628,7 @@ export function decodeQueueAnchorEvent(
   | {
       type: 'QueueItemProcessed';
       group: string;
+      market_index: number;
       sequence: bigint;
       kind: number;
       status: number;
@@ -614,29 +638,37 @@ export function decodeQueueAnchorEvent(
     return null;
   }
   const disc = encoded.subarray(0, 8);
+  // v2 event layouts (with leading market_index: u16):
+  //   QueueItemEnqueued: group(32) | market_index(2) | sequence(8) | kind(1) | min_execute_slot(8)
+  //   QueueItemProcessed: group(32) | market_index(2) | sequence(8) | kind(1) | status(1)
+  // After the 8-byte Anchor event discriminator.
   if (disc.equals(ENQUEUE_EVENT_DISCRIMINATOR)) {
-    ensureMinLength(encoded, 57, 'QueueItemEnqueued event');
+    ensureMinLength(encoded, 8 + 32 + 2 + 8 + 1 + 8, 'QueueItemEnqueued event');
     const groupBytes = encoded.subarray(8, 40);
-    const sequence = readU64(encoded, 40);
-    const kind = encoded.readUInt8(48);
-    const minExecuteSlot = readU64(encoded, 49);
+    const marketIndex = encoded.readUInt16LE(40);
+    const sequence = readU64(encoded, 42);
+    const kind = encoded.readUInt8(50);
+    const minExecuteSlot = readU64(encoded, 51);
     return {
       type: 'QueueItemEnqueued',
       group: toPubkeyBase58(groupBytes),
+      market_index: marketIndex,
       sequence,
       kind,
       min_execute_slot: minExecuteSlot,
     };
   }
   if (disc.equals(PROCESSED_EVENT_DISCRIMINATOR)) {
-    ensureMinLength(encoded, 50, 'QueueItemProcessed event');
+    ensureMinLength(encoded, 8 + 32 + 2 + 8 + 1 + 1, 'QueueItemProcessed event');
     const groupBytes = encoded.subarray(8, 40);
-    const sequence = readU64(encoded, 40);
-    const kind = encoded.readUInt8(48);
-    const status = encoded.readUInt8(49);
+    const marketIndex = encoded.readUInt16LE(40);
+    const sequence = readU64(encoded, 42);
+    const kind = encoded.readUInt8(50);
+    const status = encoded.readUInt8(51);
     return {
       type: 'QueueItemProcessed',
       group: toPubkeyBase58(groupBytes),
+      market_index: marketIndex,
       sequence,
       kind,
       status,
@@ -912,8 +944,33 @@ export class ContinuumStateEngine {
     group: string,
     sequence: string | bigint,
     kind: string | number,
+    marketIndex?: number | null,
   ): CanonicalIntent | null {
-    return this.intentsByKey.get(queueItemKey(group, sequence, kind)) || null;
+    const direct = this.intentsByKey.get(
+      queueItemKey(group, sequence, kind, marketIndex),
+    );
+    if (direct) return direct;
+    // v1/v2 fallback: legacy callers that pass no marketIndex still get a
+    // best-effort match. First try the v1-shaped key for v1 queues, then
+    // scan the intent map for any (group, sequence, kind) match — useful for
+    // status enrichment paths that don't know which sub-queue an event came
+    // from.
+    if (marketIndex === null || marketIndex === undefined) {
+      const v1Key = this.intentsByKey.get(queueItemKey(group, sequence, kind));
+      if (v1Key) return v1Key;
+      const seqStr = sequence.toString();
+      const kindNum = Number(kind);
+      for (const intent of this.intentsByKey.values()) {
+        if (
+          intent.group === group &&
+          intent.sequence.toString() === seqStr &&
+          intent.kind === kindNum
+        ) {
+          return intent;
+        }
+      }
+    }
+    return null;
   }
 
   getValidatedLocalPayload(
@@ -924,9 +981,12 @@ export class ContinuumStateEngine {
       includeOwnerState?: boolean;
       includeMarketState?: boolean;
       includeMarketOpenOrders?: boolean;
+      // v2 sub-queue: pass the per-market index hint to keep the lookup
+      // O(1). null/undefined falls back to a v1-shaped key + scan.
+      marketIndex?: number | null;
     },
   ): ValidatedLocalPayload | null {
-    const intent = this.findIntent(group, sequence, kind);
+    const intent = this.findIntent(group, sequence, kind, opts?.marketIndex ?? null);
     if (!intent || !intent.payload_b64 || intent.market === 'unknown') {
       return null;
     }
@@ -976,7 +1036,15 @@ export class ContinuumStateEngine {
       decodedPayload = null;
     }
 
-    const key = queueItemKey(event.group, event.sequence, event.kind);
+    // v2 sub-queue: derive market_index from event.market (relayer sends
+    // it as a stringified u16). Falls back to undefined for v1 events.
+    const eventMarketIndex = (() => {
+      const parsed = Number(event.market);
+      return Number.isInteger(parsed) && parsed >= 0 && parsed < 65536
+        ? parsed
+        : undefined;
+    })();
+    const key = queueItemKey(event.group, event.sequence, event.kind, eventMarketIndex);
     const existing = this.intentsByKey.get(key);
 
     const canonical: CanonicalIntent = {
@@ -1024,7 +1092,7 @@ export class ContinuumStateEngine {
     }
     this.enqueuedEventIds.add(id);
 
-    const key = queueItemKey(event.group, event.sequence, event.kind);
+    const key = queueItemKey(event.group, event.sequence, event.kind, event.market_index);
     const existing = this.intentsByKey.get(key);
     const slot = BigInt(event.slot || '0');
     if (slot > this.lastSeenSlot) {
@@ -1041,7 +1109,7 @@ export class ContinuumStateEngine {
   }
 
   ingestQueueProcessed(event: QueueItemProcessedEvent): void {
-    const key = queueItemKey(event.group, event.sequence, event.kind);
+    const key = queueItemKey(event.group, event.sequence, event.kind, event.market_index);
     const intent = this.intentsByKey.get(key);
     const slot = BigInt(event.slot || '0');
     if (slot > this.lastSeenSlot) {
@@ -1088,10 +1156,18 @@ export class ContinuumStateEngine {
       });
       const placeholder: CanonicalIntent = {
         key,
-        request_id: queueItemKey(event.group, event.sequence, event.kind),
+        request_id: queueItemKey(
+          event.group,
+          event.sequence,
+          event.kind,
+          event.market_index,
+        ),
         group: event.group,
         execution_queue: 'unknown',
-        market: 'unknown',
+        market:
+          event.market_index !== undefined
+            ? String(event.market_index)
+            : 'unknown',
         sequence: BigInt(event.sequence),
         kind: event.kind,
         payload: Buffer.alloc(0),

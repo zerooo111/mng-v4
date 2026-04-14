@@ -243,6 +243,11 @@ export type RelayIntentAcceptedRequest = {
   group: string;
   execution_queue: string;
   market: string;
+  intent_version?: number;
+  target_kind?: number;
+  target_index?: number;
+  accounts_hash?: string;
+  remaining_accounts_source?: string;
   sequence: string;
   kind?: number;
   payload_b64: string;

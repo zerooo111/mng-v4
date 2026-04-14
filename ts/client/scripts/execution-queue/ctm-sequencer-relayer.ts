@@ -149,6 +149,10 @@ type SubmitIntentRequest = {
   user_owner: string;
   mango_account: string;
   user_signature: Buffer;
+  base_fee?: string;
+  intent_version?: number;
+  target_kind?: number;
+  target_index?: number;
 };
 
 type SubmitIntentResponse = {
@@ -752,6 +756,13 @@ async function main(): Promise<void> {
             : RELAYER_DEFAULT_EXPIRES_AT_SLOT;
 
         const sequenceKey = `${group.toBase58()}:${req.market}`;
+        const marketIndex = Number.parseInt(String(req.market ?? '0'), 10);
+        if (Number.isNaN(marketIndex) || marketIndex < 0 || marketIndex > 0xffff) {
+          throw new RelayerError(
+            grpc.status.INVALID_ARGUMENT,
+            `invalid market_index: '${req.market}'`,
+          );
+        }
         const userSigner: IntentSigner = {
           kind: 'presigned',
           publicKey: userOwner,
@@ -767,6 +778,7 @@ async function main(): Promise<void> {
             executionQueue,
             executionQueueBuffer:
               configuredExecutionQueueBuffer || executionQueue,
+            marketIndex,
             remainingAccounts,
             payload,
             sequence: nextSequence,
