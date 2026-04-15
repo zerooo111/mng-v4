@@ -146,6 +146,7 @@ async function main() {
       group: GROUP,
       executionQueue: EXEC_QUEUE,
       executionQueueBuffer: EXEC_QUEUE,
+      marketIndex: 0, // devnet e2e single-market test
       remainingAccounts: remaining,
       payload,
       sequence: seq,
@@ -194,6 +195,7 @@ async function main() {
       group: GROUP,
       executionQueue: EXEC_QUEUE,
       executionQueueBuffer: EXEC_QUEUE,
+      marketIndex: 0, // devnet e2e single-market test
       maxItems: 10,
       remainingAccounts: remaining,
     });
@@ -233,6 +235,7 @@ async function main() {
       group: GROUP,
       executionQueue: EXEC_QUEUE,
       executionQueueBuffer: EXEC_QUEUE,
+      marketIndex: 0, // devnet e2e single-market test
       remainingAccounts: remaining,
       payload,
       sequence: seq,
@@ -264,6 +267,7 @@ async function main() {
       group: GROUP,
       executionQueue: EXEC_QUEUE,
       executionQueueBuffer: EXEC_QUEUE,
+      marketIndex: 0, // devnet e2e single-market test
       maxItems: 10,
       remainingAccounts: remaining,
     });

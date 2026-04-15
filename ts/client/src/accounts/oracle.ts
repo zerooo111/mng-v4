@@ -1,5 +1,5 @@
 import { AnchorProvider, Wallet } from '@coral-xyz/anchor';
-import { Magic as PythMagic } from '@pythnetwork/client';
+import { Magic as PythMagic, parsePriceData } from '@pythnetwork/client';
 import { AccountInfo, Connection, Keypair, PublicKey } from '@solana/web3.js';
 import {
   ON_DEMAND_MAINNET_PID,
@@ -18,6 +18,12 @@ const SBV1_DEVNET_PID = new PublicKey(
 const SBV1_MAINNET_PID = new PublicKey(
   'DtmE9D2CSB4L5D6A15mraeEjrGMm6auWVzgaD8hK2tZM',
 );
+const PYTH_RECEIVER_PROGRAM = new PublicKey(
+  'rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ',
+);
+const PRICE_UPDATE_V2_DISCRIMINATOR = Buffer.from([
+  0x22, 0xf1, 0x23, 0x63, 0x9d, 0x7e, 0xf4, 0xcd,
+]);
 
 const ORCA_MAINNET_PID = new PublicKey(
   'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc',
@@ -254,7 +260,81 @@ export function isSwitchboardOracle(accountInfo: AccountInfo<Buffer>): boolean {
 }
 
 export function isPythOracle(accountInfo: AccountInfo<Buffer>): boolean {
-  return accountInfo.data.readUInt32LE(0) === PythMagic;
+  if (
+    accountInfo.owner.equals(PYTH_RECEIVER_PROGRAM) &&
+    accountInfo.data.length >= 8 &&
+    accountInfo.data.subarray(0, 8).equals(PRICE_UPDATE_V2_DISCRIMINATOR)
+  ) {
+    return true;
+  }
+
+  return accountInfo.data.length >= 4 && accountInfo.data.readUInt32LE(0) === PythMagic;
+}
+
+function bigintWithExponentToNumber(value: bigint, exponent: number): number {
+  if (exponent >= 0) {
+    return new Big(value.toString())
+      .mul(new Big(10).pow(exponent))
+      .toNumber();
+  }
+  return new Big(value.toString())
+    .div(new Big(10).pow(-exponent))
+    .toNumber();
+}
+
+export function parsePythOracle(accountInfo: AccountInfo<Buffer>): {
+  price: number;
+  lastUpdatedSlot: number;
+  uiDeviation: number;
+} {
+  if (
+    accountInfo.owner.equals(PYTH_RECEIVER_PROGRAM) &&
+    accountInfo.data.length >= 8 &&
+    accountInfo.data.subarray(0, 8).equals(PRICE_UPDATE_V2_DISCRIMINATOR)
+  ) {
+    const verificationTag = accountInfo.data[40];
+    let off: number;
+    if (verificationTag === 1) {
+      off = 41;
+    } else if (verificationTag === 0) {
+      off = 42;
+    } else {
+      throw new Error(`unknown Pyth PriceUpdateV2 verification tag ${verificationTag}`);
+    }
+
+    const requiredLen = off + 32 + 8 + 8 + 4 + 8 + 8 + 8 + 8 + 8;
+    if (accountInfo.data.length < requiredLen) {
+      throw new Error(
+        `short Pyth PriceUpdateV2 account: have ${accountInfo.data.length}, need ${requiredLen}`,
+      );
+    }
+
+    off += 32; // feed id
+    const price = accountInfo.data.readBigInt64LE(off);
+    off += 8;
+    const conf = accountInfo.data.readBigUInt64LE(off);
+    off += 8;
+    const exponent = accountInfo.data.readInt32LE(off);
+    off += 4;
+    off += 8; // publish_time
+    off += 8; // prev_publish_time
+    off += 8; // ema_price
+    off += 8; // ema_conf
+    const postedSlot = accountInfo.data.readBigUInt64LE(off);
+
+    return {
+      price: bigintWithExponentToNumber(price, exponent),
+      lastUpdatedSlot: Number(postedSlot),
+      uiDeviation: bigintWithExponentToNumber(BigInt.asIntN(64, conf), exponent),
+    };
+  }
+
+  const priceData = parsePriceData(accountInfo.data);
+  return {
+    price: priceData.previousPrice,
+    lastUpdatedSlot: parseInt(priceData.lastSlot.toString()),
+    uiDeviation: priceData.previousConfidence ?? 0,
+  };
 }
 
 export function isOrcaOracle(accountInfo: AccountInfo<Buffer>): boolean {

@@ -77,9 +77,16 @@ function buildConfigureIx(
   });
 }
 
-function buildDropCtmIx(admin: PublicKey, sequence: bigint): TransactionInstruction {
+function buildDropCtmIx(
+  admin: PublicKey,
+  marketIndex: number,
+  sequence: bigint,
+): TransactionInstruction {
   const discriminator = anchorInstructionDiscriminator('execution_queue_drop_ctm');
-  const ixData = Buffer.concat([discriminator, u64ToLe(sequence)]);
+  // v2 args: market_index (u16), sequence (u64)
+  const marketBytes = Buffer.alloc(2);
+  marketBytes.writeUInt16LE(marketIndex & 0xffff, 0);
+  const ixData = Buffer.concat([discriminator, marketBytes, u64ToLe(sequence)]);
   return new TransactionInstruction({
     programId: PROGRAM_ID,
     keys: [
@@ -173,8 +180,13 @@ async function main() {
   const instructions: TransactionInstruction[] = [
     buildConfigureIx(adminKey.publicKey, gapWaitSlots, liquidityDelaySlots, pauseIngress, true),
   ];
+  // v2: drop targets a specific sub-queue. Read MARKET_INDEX env var, default 0.
+  const dropMarketIndex = Number.parseInt(process.env.MARKET_INDEX ?? '0', 10);
+  if (Number.isNaN(dropMarketIndex) || dropMarketIndex < 0 || dropMarketIndex > 0xffff) {
+    throw new Error(`invalid MARKET_INDEX env: '${process.env.MARKET_INDEX}'`);
+  }
   for (const seq of sequencesToDrop) {
-    instructions.push(buildDropCtmIx(adminKey.publicKey, seq));
+    instructions.push(buildDropCtmIx(adminKey.publicKey, dropMarketIndex, seq));
   }
   instructions.push(
     buildConfigureIx(

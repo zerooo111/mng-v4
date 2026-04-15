@@ -69,10 +69,6 @@ const CLUSTER: Cluster =
   (process.env.CLUSTER_OVERRIDE as Cluster) || 'mainnet-beta';
 const CLUSTER_URL =
   process.env.CLUSTER_URL_OVERRIDE || process.env.MB_CLUSTER_URL;
-const CLUSTER_WS_URL =
-  process.env.CLUSTER_WS_URL_OVERRIDE || process.env.MB_CLUSTER_WS_URL || '';
-const TRITON_RPC_URL = process.env.TRITON_RPC_URL || '';
-const TRITON_WS_URL = process.env.TRITON_WS_URL || '';
 const PROGRAM_ID_OVERRIDE = process.env.CONTINUUM_HARNESS_PROGRAM_ID;
 const HARNESS_BIND_ADDR =
   process.env.CONTINUUM_HARNESS_BIND_ADDR || '0.0.0.0:9091';
@@ -158,59 +154,6 @@ const HARNESS_DIRECT_ONCHAIN_REBASE_DEBOUNCE_MS = Number(
 );
 const HARNESS_QUEUE_SYNC_DEBOUNCE_MS = Number(
   process.env.CONTINUUM_HARNESS_QUEUE_SYNC_DEBOUNCE_MS || '250',
-);
-// Periodic fallback for onchainSync.queue when the WebSocket log subscription
-// doesn't deliver QueueItemEnqueued events (e.g. Helius WS instability).
-// Only reads the queue account — no getAllMangoAccounts() — so it's safe
-// to run at 2 s. Set to 0 to disable.
-const HARNESS_QUEUE_REFRESH_INTERVAL_MS = Number(
-  process.env.CONTINUUM_HARNESS_QUEUE_REFRESH_INTERVAL_MS || '2000',
-);
-const HARNESS_FRONTEND_REFRESH_INTERVAL_MS = Number(
-  process.env.CONTINUUM_HARNESS_FRONTEND_REFRESH_INTERVAL_MS ||
-    `${Math.max(HARNESS_ONCHAIN_CACHE_TTL_MS, 10000)}`,
-);
-const HARNESS_READ_FAILURE_WINDOW_MS = Math.max(
-  1000,
-  Number(process.env.CONTINUUM_HARNESS_READ_FAILURE_WINDOW_MS || '60000'),
-);
-const HARNESS_READ_FAILURE_MIN_SAMPLES = Math.max(
-  1,
-  Number(process.env.CONTINUUM_HARNESS_READ_FAILURE_MIN_SAMPLES || '8'),
-);
-const HARNESS_READ_FAILURE_RATE_THRESHOLD = Math.min(
-  1,
-  Math.max(
-    0,
-    Number(process.env.CONTINUUM_HARNESS_READ_FAILURE_RATE_THRESHOLD || '0.35'),
-  ),
-);
-const HARNESS_READ_SLOW_THRESHOLD_MS = Math.max(
-  1,
-  Number(process.env.CONTINUUM_HARNESS_READ_SLOW_THRESHOLD_MS || '350'),
-);
-const HARNESS_READ_SLOW_MIN_SAMPLES = Math.max(
-  1,
-  Number(process.env.CONTINUUM_HARNESS_READ_SLOW_MIN_SAMPLES || '8'),
-);
-const HARNESS_READ_SLOW_RATE_THRESHOLD = Math.min(
-  1,
-  Math.max(
-    0,
-    Number(process.env.CONTINUUM_HARNESS_READ_SLOW_RATE_THRESHOLD || '0.35'),
-  ),
-);
-const HARNESS_PRIMARY_WS_ERROR_WINDOW_MS = Math.max(
-  1000,
-  Number(process.env.CONTINUUM_HARNESS_PRIMARY_WS_ERROR_WINDOW_MS || '60000'),
-);
-const HARNESS_PRIMARY_WS_ERROR_THRESHOLD = Math.max(
-  1,
-  Number(process.env.CONTINUUM_HARNESS_PRIMARY_WS_ERROR_THRESHOLD || '1'),
-);
-const HARNESS_WS_ERROR_BODY_MAX_BYTES = Math.max(
-  256,
-  Number(process.env.CONTINUUM_HARNESS_WS_ERROR_BODY_MAX_BYTES || '4096'),
 );
 const HARNESS_PROGRAM_LOG_BLOCK_TIME_CACHE_LIMIT = 4096;
 const HARNESS_EVENT_LOG_MAX_BYTES = Number(
@@ -386,15 +329,6 @@ type HarnessMarketMetadata = {
   open_interest: string;
 };
 
-type ReadProviderKey = 'primary' | 'fallback';
-
-type OnchainReadOutcome = {
-  ts_ms: number;
-  ok: boolean;
-  latency_ms: number;
-  slow: boolean;
-};
-
 type OnchainContext = {
   connection: Connection;
   groupPk: PublicKey | null;
@@ -406,19 +340,6 @@ type OnchainContext = {
   cachedGroupFetchedAtMs: number;
   cachedMarketMetadata: Record<string, HarnessMarketMetadata> | null;
   cachedMarketMetadataFetchedAtMs: number;
-  primaryConnection: Connection;
-  primaryRpcUrl: string;
-  primaryWsUrl: string | null;
-  fallbackConnection: Connection | null;
-  fallbackRpcUrl: string | null;
-  fallbackWsUrl: string | null;
-  activeReadProvider: ReadProviderKey;
-  primaryReadOutcomes: OnchainReadOutcome[];
-  primaryWsUnexpectedResponses: number[];
-  lastReadProviderSwitchTsMs: number | null;
-  lastReadProviderSwitchReason: string | null;
-  lastReadError: string | null;
-  lastReadErrorTsMs: number | null;
 };
 
 type AirdropContext = OnchainContext & {
@@ -1015,491 +936,6 @@ function sanitizeLogContext(
       truncateForLog(String(value), 1_000),
     ]),
   );
-}
-
-function sanitizeStringForLogs(value: string, limit = 1_000): string {
-  return truncateForLog(
-    value.replace(
-      /((?:api[-_]?key|token|authorization|auth|signature)=)[^&\s]+/gi,
-      '$1<redacted>',
-    ),
-    limit,
-  );
-}
-
-function sanitizeUrlForLogs(value?: string | null): string {
-  if (!value) {
-    return '';
-  }
-  try {
-    const parsed = new URL(value);
-    for (const key of parsed.searchParams.keys()) {
-      if (/(?:api[-_]?key|token|authorization|auth|signature)/i.test(key)) {
-        parsed.searchParams.set(key, '<redacted>');
-      }
-    }
-    return truncateForLog(parsed.toString(), 1_000);
-  } catch {
-    return sanitizeStringForLogs(value, 1_000);
-  }
-}
-
-function sanitizeHeadersForLogs(headers: Record<string, unknown> | undefined): string {
-  if (!headers) {
-    return '{}';
-  }
-  const sanitized = Object.fromEntries(
-    Object.entries(headers).map(([key, rawValue]) => {
-      const value = Array.isArray(rawValue)
-        ? rawValue.join(', ')
-        : rawValue == null
-          ? ''
-          : String(rawValue);
-      return [
-        key,
-        /(?:api[-_]?key|token|authorization|auth|signature|cookie)/i.test(key)
-          ? '<redacted>'
-          : sanitizeStringForLogs(value, 1_000),
-      ];
-    }),
-  );
-  return truncateForLog(JSON.stringify(sanitized), 2_000);
-}
-
-function inferRpcProviderLabel(url: string, fallback: string): string {
-  const lower = url.toLowerCase();
-  if (lower.includes('helius')) {
-    return 'helius';
-  }
-  if (lower.includes('rpcpool') || lower.includes('triton')) {
-    return 'triton';
-  }
-  if (lower.includes('quicknode')) {
-    return 'quicknode';
-  }
-  return fallback;
-}
-
-function createReadConnection(rpcUrl: string, wsUrl: string | null): Connection {
-  return new Connection(rpcUrl, {
-    commitment:
-      HARNESS_COMMITMENT === 'processed' ? 'confirmed' : HARNESS_COMMITMENT,
-    wsEndpoint: wsUrl || undefined,
-  });
-}
-
-function getReadProviderLabel(
-  onchain: OnchainContext,
-  provider: ReadProviderKey = onchain.activeReadProvider,
-): string {
-  if (provider === 'primary') {
-    return inferRpcProviderLabel(onchain.primaryRpcUrl, 'primary');
-  }
-  return inferRpcProviderLabel(onchain.fallbackRpcUrl || '', 'fallback');
-}
-
-function getReadProviderUrls(
-  onchain: OnchainContext,
-  provider: ReadProviderKey = onchain.activeReadProvider,
-): { rpcUrl: string; wsUrl: string | null } {
-  if (provider === 'primary') {
-    return {
-      rpcUrl: onchain.primaryRpcUrl,
-      wsUrl: onchain.primaryWsUrl,
-    };
-  }
-  return {
-    rpcUrl: onchain.fallbackRpcUrl || '',
-    wsUrl: onchain.fallbackWsUrl,
-  };
-}
-
-function prunePrimaryReadOutcomes(onchain: OnchainContext, now = Date.now()): void {
-  const minTs = now - HARNESS_READ_FAILURE_WINDOW_MS;
-  while (
-    onchain.primaryReadOutcomes.length > 0 &&
-    onchain.primaryReadOutcomes[0]!.ts_ms < minTs
-  ) {
-    onchain.primaryReadOutcomes.shift();
-  }
-}
-
-function getPrimaryReadFailureStats(onchain: OnchainContext): {
-  samples: number;
-  failures: number;
-  failureRate: number;
-} {
-  prunePrimaryReadOutcomes(onchain);
-  const samples = onchain.primaryReadOutcomes.length;
-  const failures = onchain.primaryReadOutcomes.filter((item) => !item.ok).length;
-  return {
-    samples,
-    failures,
-    failureRate: samples > 0 ? failures / samples : 0,
-  };
-}
-
-function getPrimaryReadSlowStats(onchain: OnchainContext): {
-  samples: number;
-  slowSamples: number;
-  slowRate: number;
-} {
-  prunePrimaryReadOutcomes(onchain);
-  const samples = onchain.primaryReadOutcomes.length;
-  const slowSamples = onchain.primaryReadOutcomes.filter((item) => item.slow).length;
-  return {
-    samples,
-    slowSamples,
-    slowRate: samples > 0 ? slowSamples / samples : 0,
-  };
-}
-
-function prunePrimaryWsUnexpectedResponses(
-  onchain: OnchainContext,
-  now = Date.now(),
-): void {
-  const minTs = now - HARNESS_PRIMARY_WS_ERROR_WINDOW_MS;
-  while (
-    onchain.primaryWsUnexpectedResponses.length > 0 &&
-    onchain.primaryWsUnexpectedResponses[0]! < minTs
-  ) {
-    onchain.primaryWsUnexpectedResponses.shift();
-  }
-}
-
-function getPrimaryWsUnexpectedResponseStats(onchain: OnchainContext): {
-  count: number;
-} {
-  prunePrimaryWsUnexpectedResponses(onchain);
-  return {
-    count: onchain.primaryWsUnexpectedResponses.length,
-  };
-}
-
-function notePrimaryWsUnexpectedResponse(
-  onchain: OnchainContext,
-  statusCode: number | null,
-  statusMessage: string,
-): void {
-  onchain.primaryWsUnexpectedResponses.push(Date.now());
-  prunePrimaryWsUnexpectedResponses(onchain);
-  maybeActivateFallbackProvider(
-    onchain,
-    `websocket unexpected response ${statusCode ?? 'unknown'} ${statusMessage}`.trim(),
-  );
-}
-
-function switchReadProviderToFallback(
-  onchain: OnchainContext,
-  reason: string,
-): boolean {
-  if (!onchain.fallbackConnection || onchain.activeReadProvider === 'fallback') {
-    return false;
-  }
-  onchain.activeReadProvider = 'fallback';
-  onchain.connection = onchain.fallbackConnection;
-  onchain.mangoClient = null;
-  onchain.cachedGroup = null;
-  onchain.cachedGroupFetchedAtMs = 0;
-  onchain.cachedMarketMetadata = null;
-  onchain.cachedMarketMetadataFetchedAtMs = 0;
-  onchain.lastReadProviderSwitchTsMs = Date.now();
-  onchain.lastReadProviderSwitchReason = reason;
-  console.warn(
-    `[harness:onchain_read_failover] switching reads to ${getReadProviderLabel(
-      onchain,
-    )}: ${reason}`,
-  );
-  return true;
-}
-
-function maybeActivateFallbackProvider(
-  onchain: OnchainContext,
-  operation: string,
-): boolean {
-  if (!onchain.fallbackConnection || onchain.activeReadProvider === 'fallback') {
-    return false;
-  }
-  const wsStats = getPrimaryWsUnexpectedResponseStats(onchain);
-  if (wsStats.count >= HARNESS_PRIMARY_WS_ERROR_THRESHOLD) {
-    return switchReadProviderToFallback(
-      onchain,
-      `primary websocket unexpected responses ${wsStats.count} ` +
-        `within ${HARNESS_PRIMARY_WS_ERROR_WINDOW_MS}ms during ${operation}`,
-    );
-  }
-  const stats = getPrimaryReadFailureStats(onchain);
-  if (
-    stats.samples >= HARNESS_READ_FAILURE_MIN_SAMPLES &&
-    stats.failureRate >= HARNESS_READ_FAILURE_RATE_THRESHOLD
-  ) {
-    return switchReadProviderToFallback(
-      onchain,
-      `primary read failure rate ${stats.failureRate.toFixed(2)} ` +
-        `(${stats.failures}/${stats.samples}) during ${operation}`,
-    );
-  }
-  const slowStats = getPrimaryReadSlowStats(onchain);
-  if (
-    slowStats.samples >= HARNESS_READ_SLOW_MIN_SAMPLES &&
-    slowStats.slowRate >= HARNESS_READ_SLOW_RATE_THRESHOLD
-  ) {
-    return switchReadProviderToFallback(
-      onchain,
-      `primary read slow rate ${slowStats.slowRate.toFixed(2)} ` +
-        `(${slowStats.slowSamples}/${slowStats.samples}) over ` +
-        `${HARNESS_READ_SLOW_THRESHOLD_MS}ms during ${operation}`,
-    );
-  }
-  return false;
-}
-
-async function withOnchainRead<T>(
-  onchain: OnchainContext | null,
-  operation: string,
-  read: () => Promise<T>,
-): Promise<T> {
-  if (!onchain) {
-    return await read();
-  }
-  const startedAt = performance.now();
-
-  try {
-    const result = await read();
-    if (onchain.activeReadProvider === 'primary') {
-      const latencyMs = performance.now() - startedAt;
-      onchain.primaryReadOutcomes.push({
-        ts_ms: Date.now(),
-        ok: true,
-        latency_ms: latencyMs,
-        slow: latencyMs >= HARNESS_READ_SLOW_THRESHOLD_MS,
-      });
-      prunePrimaryReadOutcomes(onchain);
-      maybeActivateFallbackProvider(onchain, operation);
-    }
-    return result;
-  } catch (err) {
-    const provider = onchain.activeReadProvider;
-    const urls = getReadProviderUrls(onchain, provider);
-    const normalized = normalizeError(err);
-    const latencyMs = performance.now() - startedAt;
-    onchain.lastReadError = normalized.message;
-    onchain.lastReadErrorTsMs = Date.now();
-    if (provider === 'primary') {
-      onchain.primaryReadOutcomes.push({
-        ts_ms: onchain.lastReadErrorTsMs,
-        ok: false,
-        latency_ms: latencyMs,
-        slow: latencyMs >= HARNESS_READ_SLOW_THRESHOLD_MS,
-      });
-      prunePrimaryReadOutcomes(onchain);
-    }
-    recordRuntimeError('onchain_read_failure', err, {
-      operation,
-      provider: getReadProviderLabel(onchain, provider),
-      rpc_url: sanitizeUrlForLogs(urls.rpcUrl),
-      ws_url: sanitizeUrlForLogs(urls.wsUrl),
-      active_provider: getReadProviderLabel(onchain),
-      latency_ms: latencyMs.toFixed(3),
-    });
-    if (provider === 'primary' && maybeActivateFallbackProvider(onchain, operation)) {
-      return await withOnchainRead(onchain, `${operation}:fallback_retry`, read);
-    }
-    throw err;
-  }
-}
-
-function getReadProviderDiagnostics(
-  onchain: OnchainContext | null,
-): Record<string, unknown> | null {
-  if (!onchain) {
-    return null;
-  }
-  const primaryFailureStats = getPrimaryReadFailureStats(onchain);
-  const primarySlowStats = getPrimaryReadSlowStats(onchain);
-  const primaryWsStats = getPrimaryWsUnexpectedResponseStats(onchain);
-  return {
-    active_provider: getReadProviderLabel(onchain),
-    active_provider_key: onchain.activeReadProvider,
-    primary_provider: getReadProviderLabel(onchain, 'primary'),
-    primary_rpc_url: sanitizeUrlForLogs(onchain.primaryRpcUrl),
-    primary_ws_url: sanitizeUrlForLogs(onchain.primaryWsUrl),
-    fallback_provider: onchain.fallbackConnection
-      ? getReadProviderLabel(onchain, 'fallback')
-      : null,
-    fallback_rpc_url: sanitizeUrlForLogs(onchain.fallbackRpcUrl),
-    fallback_ws_url: sanitizeUrlForLogs(onchain.fallbackWsUrl),
-    fallback_configured: !!onchain.fallbackConnection,
-    primary_failure_window_ms: HARNESS_READ_FAILURE_WINDOW_MS,
-    primary_failure_min_samples: HARNESS_READ_FAILURE_MIN_SAMPLES,
-    primary_failure_rate_threshold: HARNESS_READ_FAILURE_RATE_THRESHOLD,
-    primary_failure_stats: primaryFailureStats,
-    primary_slow_threshold_ms: HARNESS_READ_SLOW_THRESHOLD_MS,
-    primary_slow_min_samples: HARNESS_READ_SLOW_MIN_SAMPLES,
-    primary_slow_rate_threshold: HARNESS_READ_SLOW_RATE_THRESHOLD,
-    primary_slow_stats: primarySlowStats,
-    primary_ws_error_window_ms: HARNESS_PRIMARY_WS_ERROR_WINDOW_MS,
-    primary_ws_error_threshold: HARNESS_PRIMARY_WS_ERROR_THRESHOLD,
-    primary_ws_error_stats: primaryWsStats,
-    last_switch_ts_ms: onchain.lastReadProviderSwitchTsMs,
-    last_switch_reason: onchain.lastReadProviderSwitchReason,
-    last_error: onchain.lastReadError,
-    last_error_ts_ms: onchain.lastReadErrorTsMs,
-  };
-}
-
-function attachUnexpectedResponseDiagnostics(
-  socket: {
-    on?: (event: string, listener: (...args: any[]) => void) => void;
-    __continuumUnexpectedResponseAttached?: boolean;
-  },
-  providerLabel: string,
-  rpcUrl: string,
-  wsUrl: string | null,
-  onUnexpectedResponse?: (details: {
-    statusCode: number | null;
-    statusMessage: string;
-    bodySnippet: string;
-  }) => void,
-): void {
-  if (
-    !socket ||
-    typeof socket.on !== 'function' ||
-    socket.__continuumUnexpectedResponseAttached
-  ) {
-    return;
-  }
-  socket.__continuumUnexpectedResponseAttached = true;
-  socket.on('unexpected-response', (request: any, response: any) => {
-    const chunks: Buffer[] = [];
-    let emitted = false;
-    const flush = (phase: string) => {
-      if (emitted) {
-        return;
-      }
-      emitted = true;
-      const bodySnippet = sanitizeStringForLogs(
-        Buffer.concat(chunks).toString('utf-8'),
-        HARNESS_WS_ERROR_BODY_MAX_BYTES,
-      );
-      onUnexpectedResponse?.({
-        statusCode:
-          typeof response?.statusCode === 'number' ? response.statusCode : null,
-        statusMessage: sanitizeStringForLogs(
-          String(response?.statusMessage || ''),
-          256,
-        ),
-        bodySnippet,
-      });
-      recordRuntimeError(
-        'rpc_websocket_unexpected_response',
-        new Error(
-          `WebSocket unexpected response ${response?.statusCode || 'unknown'} ${
-            response?.statusMessage || ''
-          }`.trim(),
-        ),
-        {
-          provider: providerLabel,
-          phase,
-          rpc_url: sanitizeUrlForLogs(rpcUrl),
-          ws_url: sanitizeUrlForLogs(wsUrl),
-          request_path: sanitizeStringForLogs(
-            String(request?.path || request?.url || ''),
-            1_000,
-          ),
-          status_code: response?.statusCode ?? '',
-          status_message: sanitizeStringForLogs(
-            String(response?.statusMessage || ''),
-            256,
-          ),
-          headers: sanitizeHeadersForLogs(response?.headers),
-          body_snippet: bodySnippet || '<empty>',
-        },
-      );
-    };
-    response?.on?.('data', (chunk: Buffer | string) => {
-      if (Buffer.concat(chunks).length >= HARNESS_WS_ERROR_BODY_MAX_BYTES) {
-        return;
-      }
-      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
-      const remaining = HARNESS_WS_ERROR_BODY_MAX_BYTES - Buffer.concat(chunks).length;
-      chunks.push(buffer.subarray(0, Math.max(0, remaining)));
-    });
-    response?.on?.('end', () => flush('end'));
-    response?.on?.('close', () => flush('close'));
-    response?.on?.('aborted', () => flush('aborted'));
-    setTimeout(() => flush('timeout'), 250).unref?.();
-  });
-}
-
-function attachRpcWebSocketDiagnostics(
-  connection: Connection,
-  providerLabel: string,
-  rpcUrl: string,
-  wsUrl: string | null,
-  onUnexpectedResponse?: (details: {
-    statusCode: number | null;
-    statusMessage: string;
-    bodySnippet: string;
-  }) => void,
-): void {
-  const rpcWebSocket = (connection as Connection & {
-    _rpcWebSocket?: {
-      on?: (event: string, listener: (...args: any[]) => void) => void;
-      socket?: {
-        on?: (event: string, listener: (...args: any[]) => void) => void;
-        __continuumUnexpectedResponseAttached?: boolean;
-      };
-      webSocketFactory?: (...args: any[]) => any;
-      __continuumDiagnosticsAttached?: boolean;
-    };
-  })._rpcWebSocket;
-  if (
-    !rpcWebSocket ||
-    typeof rpcWebSocket.on !== 'function' ||
-    rpcWebSocket.__continuumDiagnosticsAttached
-  ) {
-    return;
-  }
-  rpcWebSocket.__continuumDiagnosticsAttached = true;
-  rpcWebSocket.on('error', (err: unknown) => {
-    recordRuntimeError('rpc_websocket_error', err, {
-      provider: providerLabel,
-      rpc_url: sanitizeUrlForLogs(rpcUrl),
-      ws_url: sanitizeUrlForLogs(wsUrl),
-    });
-  });
-  rpcWebSocket.on('close', (code: number, reason: Buffer | string) => {
-    console.warn(
-      `[harness:rpc_websocket_close] provider=${providerLabel} code=${code} reason=${sanitizeStringForLogs(
-        Buffer.isBuffer(reason) ? reason.toString('utf-8') : String(reason || ''),
-        512,
-      )}`,
-    );
-  });
-  if (typeof rpcWebSocket.webSocketFactory === 'function') {
-    const originalFactory = rpcWebSocket.webSocketFactory.bind(rpcWebSocket);
-    rpcWebSocket.webSocketFactory = (...args: any[]) => {
-      const socket = originalFactory(...args);
-      attachUnexpectedResponseDiagnostics(
-        socket,
-        providerLabel,
-        rpcUrl,
-        wsUrl,
-        onUnexpectedResponse,
-      );
-      return socket;
-    };
-  }
-  if (rpcWebSocket.socket) {
-    attachUnexpectedResponseDiagnostics(
-      rpcWebSocket.socket,
-      providerLabel,
-      rpcUrl,
-      wsUrl,
-      onUnexpectedResponse,
-    );
-  }
 }
 
 function appendLineWithRotation(
@@ -2259,132 +1695,127 @@ async function getFreshGroup(
   if (!onchain?.groupPk) {
     return null;
   }
-  const groupPk = onchain.groupPk;
-  try {
-    return await withOnchainRead(onchain, 'get_fresh_group', async () => {
-      if (!onchain.mangoClient) {
-        const provider = new AnchorProvider(
-          onchain.connection,
-          new Wallet(Keypair.generate()),
-          AnchorProvider.defaultOptions(),
-        );
-        onchain.mangoClient = await MangoClient.connect(
-          provider,
-          CLUSTER,
-          onchain.programId,
-          {
-            idsSource: 'get-program-accounts',
-          },
-        );
-        onchain.cachedGroup = await onchain.mangoClient.getGroup(groupPk);
-        await onchain.cachedGroup.reloadAll(onchain.mangoClient);
-        onchain.cachedGroupFetchedAtMs = Date.now();
-        if (!onchain.usdcMint) {
-          try {
-            onchain.usdcMint =
-              onchain.cachedGroup.getFirstBankForPerpSettlement().mint;
-          } catch {
-            // Leave unset when the settlement bank cannot be resolved.
-          }
-        }
-        console.log(
-          `Onchain read context recovered: provider=${getReadProviderLabel(
-            onchain,
-          )}, group=${groupPk.toBase58()}, usdc_mint=${
-            onchain.usdcMint?.toBase58() || 'unresolved'
-          }`,
-        );
-      }
 
-      if (
-        onchain.cachedGroup &&
-        Date.now() - onchain.cachedGroupFetchedAtMs < HARNESS_ONCHAIN_CACHE_TTL_MS
-      ) {
-        return onchain.cachedGroup;
-      }
-
-      const group = await onchain.mangoClient.getGroup(groupPk);
-      await group.reloadAll(onchain.mangoClient);
-      onchain.cachedGroup = group;
+  if (!onchain.mangoClient) {
+    try {
+      const provider = new AnchorProvider(
+        onchain.connection,
+        new Wallet(Keypair.generate()),
+        AnchorProvider.defaultOptions(),
+      );
+      onchain.mangoClient = await MangoClient.connect(
+        provider,
+        CLUSTER,
+        onchain.programId,
+        {
+          idsSource: 'get-program-accounts',
+        },
+      );
+      onchain.cachedGroup = await onchain.mangoClient.getGroup(onchain.groupPk);
+      await onchain.cachedGroup.reloadAll(onchain.mangoClient);
       onchain.cachedGroupFetchedAtMs = Date.now();
       if (!onchain.usdcMint) {
         try {
-          onchain.usdcMint = group.getFirstBankForPerpSettlement().mint;
+          onchain.usdcMint =
+            onchain.cachedGroup.getFirstBankForPerpSettlement().mint;
         } catch {
           // Leave unset when the settlement bank cannot be resolved.
         }
       }
-      return group;
-    });
-  } catch (err) {
-    console.warn(`onchain read context recovery failed: ${err}`);
-    onchain.mangoClient = null;
-    onchain.cachedGroup = null;
-    onchain.cachedGroupFetchedAtMs = 0;
-    onchain.cachedMarketMetadata = null;
-    onchain.cachedMarketMetadataFetchedAtMs = 0;
-    return null;
+      console.log(
+        `Onchain read context recovered: group=${onchain.groupPk.toBase58()}, usdc_mint=${
+          onchain.usdcMint?.toBase58() || 'unresolved'
+        }`,
+      );
+    } catch (err) {
+      console.warn(`onchain read context recovery failed: ${err}`);
+      onchain.mangoClient = null;
+      onchain.cachedGroup = null;
+      onchain.cachedGroupFetchedAtMs = 0;
+      onchain.cachedMarketMetadata = null;
+      onchain.cachedMarketMetadataFetchedAtMs = 0;
+      return null;
+    }
   }
+
+  if (
+    onchain.cachedGroup &&
+    Date.now() - onchain.cachedGroupFetchedAtMs < HARNESS_ONCHAIN_CACHE_TTL_MS
+  ) {
+    return onchain.cachedGroup;
+  }
+
+  const group = await onchain.mangoClient.getGroup(onchain.groupPk);
+  await group.reloadAll(onchain.mangoClient);
+  onchain.cachedGroup = group;
+  onchain.cachedGroupFetchedAtMs = Date.now();
+  if (!onchain.usdcMint) {
+    try {
+      onchain.usdcMint = group.getFirstBankForPerpSettlement().mint;
+    } catch {
+      // Leave unset when the settlement bank cannot be resolved.
+    }
+  }
+  return group;
 }
 
 async function getMarketMetadataMap(
   onchain: OnchainContext | null,
 ): Promise<Record<string, HarnessMarketMetadata>> {
-  if (!onchain?.groupPk) {
+  if (!onchain?.mangoClient || !onchain.groupPk) {
     return {};
   }
-  return await withOnchainRead(onchain, 'get_market_metadata_map', async () => {
-    if (
-      onchain.cachedMarketMetadata &&
-      Date.now() - onchain.cachedMarketMetadataFetchedAtMs <
-        HARNESS_MARKET_METADATA_CACHE_TTL_MS
-    ) {
-      return onchain.cachedMarketMetadata;
+
+  if (
+    onchain.cachedMarketMetadata &&
+    Date.now() - onchain.cachedMarketMetadataFetchedAtMs <
+      HARNESS_MARKET_METADATA_CACHE_TTL_MS
+  ) {
+    return onchain.cachedMarketMetadata;
+  }
+
+  const group = await getFreshGroup(onchain);
+  if (!group) {
+    return {};
+  }
+
+  const metadata: Record<string, HarnessMarketMetadata> = {};
+  for (const [
+    marketIndex,
+    perpMarket,
+  ] of group.perpMarketsMapByMarketIndex.entries()) {
+    let settleBank;
+    try {
+      settleBank = group.getFirstBankByTokenIndex(perpMarket.settleTokenIndex);
+    } catch {
+      continue;
     }
 
-    const group = await getFreshGroup(onchain);
-    if (!group) {
-      return {};
-    }
+    const marketKey = Number(marketIndex).toString();
+    const baseSymbol = baseSymbolFromPerpName(perpMarket.name);
+    metadata[marketKey] = {
+      market_index: Number(marketIndex),
+      name: perpMarket.name,
+      base_symbol: baseSymbol,
+      quote_symbol: settleBank.name,
+      base_mint: symbolToCanonicalMint(baseSymbol, onchain.usdcMint),
+      quote_mint: settleBank.mint.toBase58(),
+      perp_market: perpMarket.publicKey.toBase58(),
+      oracle: perpMarket.oracle.toBase58(),
+      bids: perpMarket.bids.toBase58(),
+      asks: perpMarket.asks.toBase58(),
+      event_queue: perpMarket.eventQueue.toBase58(),
+      base_decimals: perpMarket.baseDecimals,
+      quote_decimals: settleBank.mintDecimals,
+      base_lot_size: perpMarket.baseLotSize.toString(),
+      quote_lot_size: perpMarket.quoteLotSize.toString(),
+      open_interest: perpMarket.openInterest.toString(),
+    };
+  }
 
-    const metadata: Record<string, HarnessMarketMetadata> = {};
-    for (const [
-      marketIndex,
-      perpMarket,
-    ] of group.perpMarketsMapByMarketIndex.entries()) {
-      let settleBank;
-      try {
-        settleBank = group.getFirstBankByTokenIndex(perpMarket.settleTokenIndex);
-      } catch {
-        continue;
-      }
-
-      const marketKey = Number(marketIndex).toString();
-      const baseSymbol = baseSymbolFromPerpName(perpMarket.name);
-      metadata[marketKey] = {
-        market_index: Number(marketIndex),
-        name: perpMarket.name,
-        base_symbol: baseSymbol,
-        quote_symbol: settleBank.name,
-        base_mint: symbolToCanonicalMint(baseSymbol, onchain.usdcMint),
-        quote_mint: settleBank.mint.toBase58(),
-        perp_market: perpMarket.publicKey.toBase58(),
-        oracle: perpMarket.oracle.toBase58(),
-        bids: perpMarket.bids.toBase58(),
-        asks: perpMarket.asks.toBase58(),
-        event_queue: perpMarket.eventQueue.toBase58(),
-        base_decimals: perpMarket.baseDecimals,
-        quote_decimals: settleBank.mintDecimals,
-        base_lot_size: perpMarket.baseLotSize.toString(),
-        quote_lot_size: perpMarket.quoteLotSize.toString(),
-        open_interest: perpMarket.openInterest.toString(),
-      };
-    }
-
-    onchain.cachedMarketMetadata = metadata;
-    onchain.cachedMarketMetadataFetchedAtMs = Date.now();
-    return metadata;
-  });
+  onchain.cachedMarketMetadata = metadata;
+  onchain.cachedMarketMetadataFetchedAtMs = Date.now();
+  return metadata;
 }
 
 async function getMarketMetadataMapSafe(
@@ -3006,55 +2437,30 @@ async function getMarketRuntimeMetrics(
   metadata: HarnessMarketMetadata | null,
   onchain: OnchainContext | null,
 ): Promise<MarketRuntimeMetrics | null> {
-  const bestBidUi = priceLotsToUi(
-    marketState?.bids?.[0]?.price_lots || null,
-    metadata,
-  );
-  const bestAskUi = priceLotsToUi(
-    marketState?.asks?.[0]?.price_lots || null,
-    metadata,
-  );
-  const withDynamicOrderbookMetrics = (
-    metrics: MarketRuntimeMetrics | null,
-  ): MarketRuntimeMetrics | null => {
-    if (!metrics) {
-      return null;
-    }
-    return {
-      ...metrics,
-      best_bid_ui: bestBidUi,
-      best_ask_ui: bestAskUi,
-      mark_price_ui:
-        bestBidUi !== null && bestAskUi !== null
-          ? (bestBidUi + bestAskUi) / 2
-          : metrics.oracle_price_ui,
-      updated_ts_ms: Date.now(),
-    };
-  };
   const cached = marketRuntimeMetricsCache.get(market);
   if (
     cached &&
     Date.now() - cached.fetchedAtMs < HARNESS_ONCHAIN_CACHE_TTL_MS
   ) {
-    return withDynamicOrderbookMetrics(cached.data);
+    return cached.data;
   }
 
   const group = await getFreshGroup(onchain);
   if (!group) {
     marketRuntimeMetricsCache.set(market, {
       fetchedAtMs: Date.now(),
-      data: cached?.data || null,
+      data: null,
     });
-    return withDynamicOrderbookMetrics(cached?.data || null);
+    return null;
   }
 
   const marketIndex = Number(market);
   if (!Number.isInteger(marketIndex)) {
     marketRuntimeMetricsCache.set(market, {
       fetchedAtMs: Date.now(),
-      data: cached?.data || null,
+      data: null,
     });
-    return withDynamicOrderbookMetrics(cached?.data || null);
+    return null;
   }
 
   const perpMarket = group.perpMarketsMapByMarketIndex.get(
@@ -3063,11 +2469,19 @@ async function getMarketRuntimeMetrics(
   if (!perpMarket) {
     marketRuntimeMetricsCache.set(market, {
       fetchedAtMs: Date.now(),
-      data: cached?.data || null,
+      data: null,
     });
-    return withDynamicOrderbookMetrics(cached?.data || null);
+    return null;
   }
 
+  const bestBidUi = priceLotsToUi(
+    marketState?.bids?.[0]?.price_lots || null,
+    metadata,
+  );
+  const bestAskUi = priceLotsToUi(
+    marketState?.asks?.[0]?.price_lots || null,
+    metadata,
+  );
   const bidImpactUi = getImpactPriceUiFromLevels(
     marketState?.bids || [],
     perpMarket.impactQuantity,
@@ -3114,7 +2528,7 @@ async function getMarketRuntimeMetrics(
     fetchedAtMs: data.updated_ts_ms,
     data,
   });
-  return withDynamicOrderbookMetrics(data);
+  return data;
 }
 
 function resolveOwnerFromSnapshot(
@@ -4945,316 +4359,93 @@ function metricsText(): string {
   ].join('\n');
 }
 
-type MonitoringMarketItem = {
-  market: string;
-  market_name: string;
-  last_collected_ms: number | null;
-  volume_24h_base_lots: string;
-  volume_24h_quote_lots: string;
-  volume_24h_base_ui: number | null;
-  volume_24h_quote_ui: number | null;
-  trade_count_24h: number | null;
-  change_24h_pct: number | null;
-  last_price_ui: number | null;
-  cumulative_volume_base_lots: string;
-  cumulative_volume_quote_lots: string;
-  cumulative_volume_base_ui: number | null;
-  cumulative_volume_quote_ui: number | null;
-  open_interest_base_lots: string | null;
-  open_interest_base_ui: number | null;
-  fees_accrued_native: string | null;
-  fees_settled_native: string | null;
-  active_unique_users: number;
-  all_time_unique_users: number;
-  current_funding_hourly_pct: number | null;
-  current_funding_daily_pct: number | null;
-  current_oracle_price_ui: number | null;
-  funding_rate_history: any[];
-};
-
-async function buildMonitoringItems(
-  onchain: OnchainContext | null,
-  fullHistory: boolean,
-): Promise<MonitoringMarketItem[]> {
-  const monitoringMetadata = await getMarketMetadataMapSafe(onchain);
-  const monitoringSnapshot = engine.getSnapshot('confirmed');
-
-  const monitoringMarketKeys = new Set([
-    ...Object.keys(monitoringSnapshot.markets),
-    ...Object.keys(monitoringMetadata),
-    ...Object.keys(marketStatsStore.markets),
-  ]);
-
-  return Array.from(monitoringMarketKeys).map((marketKey) => {
-    const stats = marketStatsStore.markets[marketKey] ?? null;
-    const meta = monitoringMetadata[marketKey] ?? null;
-    const marketName = meta?.name ?? stats?.market_name ?? marketKey;
-
-    const tradesFor24h = engine.getTrades(marketKey, 'confirmed', 50_000);
-    const tradeSummary24h = buildTradeSummary(
-      marketKey,
-      'confirmed',
-      tradesFor24h,
-      meta,
-      TRADE_SUMMARY_WINDOW_MS,
-    );
-
-    let activeUniqueUsers = 0;
-    for (const user of Object.values(monitoringSnapshot.users)) {
-      if (user.per_market.some((p) => p.market === marketKey)) {
-        activeUniqueUsers += 1;
-      }
-    }
-
-    const latestFunding =
-      stats?.funding_rate_history?.length
-        ? stats.funding_rate_history[stats.funding_rate_history.length - 1]
-        : null;
-
-    const fundingHistory = fullHistory
-      ? (stats?.funding_rate_history ?? [])
-      : (stats?.funding_rate_history ?? []).slice(-48);
-
-    return {
-      market: marketKey,
-      market_name: marketName,
-      last_collected_ms: stats?.last_collected_ms ?? null,
-      volume_24h_base_lots: tradeSummary24h.volume_base_lots,
-      volume_24h_quote_lots: tradeSummary24h.volume_quote_lots,
-      volume_24h_base_ui: tradeSummary24h.volume_base_ui,
-      volume_24h_quote_ui: tradeSummary24h.volume_quote_ui,
-      trade_count_24h: tradeSummary24h.trade_count,
-      change_24h_pct: tradeSummary24h.change_24h_pct,
-      last_price_ui: tradeSummary24h.last_price_ui,
-      cumulative_volume_base_lots: stats?.cumulative_volume_base_lots ?? '0',
-      cumulative_volume_quote_lots: stats?.cumulative_volume_quote_lots ?? '0',
-      cumulative_volume_base_ui: baseLotsToUi(
-        stats?.cumulative_volume_base_lots ?? '0',
-        meta,
-      ),
-      cumulative_volume_quote_ui: quoteLotsToUi(
-        stats?.cumulative_volume_quote_lots ?? '0',
-        meta,
-      ),
-      open_interest_base_lots: stats?.open_interest_base_lots ?? null,
-      open_interest_base_ui: stats?.open_interest_base_ui ?? null,
-      fees_accrued_native: stats?.fees_accrued_native ?? null,
-      fees_settled_native: stats?.fees_settled_native ?? null,
-      active_unique_users: activeUniqueUsers,
-      all_time_unique_users: stats?.all_time_unique_users?.length ?? 0,
-      current_funding_hourly_pct: latestFunding?.hourly_pct ?? null,
-      current_funding_daily_pct: latestFunding?.daily_pct ?? null,
-      current_oracle_price_ui: latestFunding?.oracle_price_ui ?? null,
-      funding_rate_history: fundingHistory,
-    };
-  });
-}
-
-async function buildMonitoringResponse(
-  onchain: OnchainContext | null,
-  fullHistory: boolean,
-): Promise<{
-  generated_ts_ms: number;
-  collection_interval_ms: number;
-  stats_file: string;
-  last_collection_ms: number | null;
-  markets: MonitoringMarketItem[];
-}> {
-  return {
-    generated_ts_ms: Date.now(),
-    collection_interval_ms: HARNESS_MARKET_STATS_INTERVAL_MS,
-    stats_file: HARNESS_MARKET_STATS_PATH,
-    last_collection_ms: marketStatsStore.written_ts_ms,
-    markets: await buildMonitoringItems(onchain, fullHistory),
-  };
-}
-
-function escapePrometheusLabelValue(value: string): string {
-  return value
-    .replace(/\\/g, '\\\\')
-    .replace(/\n/g, '\\n')
-    .replace(/"/g, '\\"');
-}
-
-function pushPrometheusGauge(
-  lines: string[],
-  name: string,
-  value: unknown,
-  labels?: Record<string, string>,
-): void {
-  const numeric =
-    typeof value === 'number'
-      ? value
-      : typeof value === 'string'
-        ? Number(value)
-        : NaN;
-  if (!Number.isFinite(numeric)) return;
-  const renderedLabels =
-    labels && Object.keys(labels).length
-      ? `{${Object.entries(labels)
-          .map(
-            ([key, labelValue]) =>
-              `${key}="${escapePrometheusLabelValue(labelValue)}"`,
-          )
-          .join(',')}}`
-      : '';
-  lines.push(`# TYPE ${name} gauge`);
-  lines.push(`${name}${renderedLabels} ${numeric}`);
-}
-
-async function monitoringPrometheusText(
-  onchain: OnchainContext | null,
-): Promise<string> {
-  const snapshot = await buildMonitoringResponse(onchain, false);
-  const lines: string[] = [];
-
-  pushPrometheusGauge(
-    lines,
-    'continuum_harness_monitoring_generated_timestamp_seconds',
-    snapshot.generated_ts_ms / 1000,
-  );
-  pushPrometheusGauge(
-    lines,
-    'continuum_harness_monitoring_collection_interval_seconds',
-    snapshot.collection_interval_ms / 1000,
-  );
-  if (snapshot.last_collection_ms != null) {
-    pushPrometheusGauge(
-      lines,
-      'continuum_harness_monitoring_last_collection_timestamp_seconds',
-      snapshot.last_collection_ms / 1000,
-    );
-  }
-
-  for (const item of snapshot.markets) {
-    const labels = {
-      market: item.market,
-      market_name: item.market_name,
-    };
-
-    pushPrometheusGauge(
-      lines,
-      'continuum_harness_monitoring_market_info',
-      1,
-      labels,
-    );
-    if (item.last_collected_ms != null) {
-      pushPrometheusGauge(
-        lines,
-        'continuum_harness_monitoring_market_last_collected_timestamp_seconds',
-        item.last_collected_ms / 1000,
-        labels,
-      );
-    }
-    pushPrometheusGauge(lines, 'continuum_harness_monitoring_volume_24h_base_ui', item.volume_24h_base_ui, labels);
-    pushPrometheusGauge(lines, 'continuum_harness_monitoring_volume_24h_quote_ui', item.volume_24h_quote_ui, labels);
-    pushPrometheusGauge(lines, 'continuum_harness_monitoring_trade_count_24h', item.trade_count_24h, labels);
-    pushPrometheusGauge(lines, 'continuum_harness_monitoring_change_24h_pct', item.change_24h_pct, labels);
-    pushPrometheusGauge(lines, 'continuum_harness_monitoring_last_price_ui', item.last_price_ui, labels);
-    pushPrometheusGauge(lines, 'continuum_harness_monitoring_cumulative_volume_base_ui', item.cumulative_volume_base_ui, labels);
-    pushPrometheusGauge(lines, 'continuum_harness_monitoring_cumulative_volume_quote_ui', item.cumulative_volume_quote_ui, labels);
-    pushPrometheusGauge(lines, 'continuum_harness_monitoring_open_interest_base_ui', item.open_interest_base_ui, labels);
-    pushPrometheusGauge(lines, 'continuum_harness_monitoring_fees_accrued_native', item.fees_accrued_native, labels);
-    pushPrometheusGauge(lines, 'continuum_harness_monitoring_fees_settled_native', item.fees_settled_native, labels);
-    pushPrometheusGauge(lines, 'continuum_harness_monitoring_active_unique_users', item.active_unique_users, labels);
-    pushPrometheusGauge(lines, 'continuum_harness_monitoring_all_time_unique_users', item.all_time_unique_users, labels);
-    pushPrometheusGauge(lines, 'continuum_harness_monitoring_current_funding_hourly_pct', item.current_funding_hourly_pct, labels);
-    pushPrometheusGauge(lines, 'continuum_harness_monitoring_current_funding_daily_pct', item.current_funding_daily_pct, labels);
-    pushPrometheusGauge(lines, 'continuum_harness_monitoring_current_oracle_price_ui', item.current_oracle_price_ui, labels);
-  }
-
-  return `${lines.join('\n')}\n`;
-}
-
 async function runOnchainBalanceSanityCheck(
   onchain: OnchainContext | null,
 ): Promise<void> {
-  await withOnchainRead(onchain, 'run_onchain_balance_sanity_check', async () => {
-    const group = await getFreshGroup(onchain);
-    if (!group || !onchain?.mangoClient || !onchain.usdcMint) {
-      return;
+  const group = await getFreshGroup(onchain);
+  if (!group || !onchain?.mangoClient || !onchain.usdcMint) {
+    return;
+  }
+
+  const allAccounts = await onchain.mangoClient.getAllMangoAccounts(group);
+  const snapshot = engine.getSnapshot('confirmed');
+  const usdcMint = onchain.usdcMint.toBase58();
+
+  const ownerToOnchain = new Map<
+    string,
+    { mangoAccounts: string[]; usdcUiBalance: number }
+  >();
+  for (const account of allAccounts) {
+    const owner = account.owner.toBase58();
+    let row = ownerToOnchain.get(owner);
+    if (!row) {
+      row = { mangoAccounts: [], usdcUiBalance: 0 };
+      ownerToOnchain.set(owner, row);
     }
-
-    const allAccounts = await onchain.mangoClient.getAllMangoAccounts(group);
-    const snapshot = engine.getSnapshot('confirmed');
-    const usdcMint = onchain.usdcMint.toBase58();
-
-    const ownerToOnchain = new Map<
-      string,
-      { mangoAccounts: string[]; usdcUiBalance: number }
-    >();
-    for (const account of allAccounts) {
-      const owner = account.owner.toBase58();
-      let row = ownerToOnchain.get(owner);
-      if (!row) {
-        row = { mangoAccounts: [], usdcUiBalance: 0 };
-        ownerToOnchain.set(owner, row);
-      }
-      row.mangoAccounts.push(account.publicKey.toBase58());
-      for (const tokenPos of account.tokensActive()) {
-        const bank = group.getFirstBankByTokenIndex(tokenPos.tokenIndex);
-        if (bank.mint.toBase58() === usdcMint) {
-          row.usdcUiBalance += tokenPos.balanceUi(bank);
-        }
+    row.mangoAccounts.push(account.publicKey.toBase58());
+    for (const tokenPos of account.tokensActive()) {
+      const bank = group.getFirstBankByTokenIndex(tokenPos.tokenIndex);
+      if (bank.mint.toBase58() === usdcMint) {
+        row.usdcUiBalance += tokenPos.balanceUi(bank);
       }
     }
+  }
 
-    const owners = new Set<string>([
-      ...Object.keys(snapshot.users),
-      ...Array.from(ownerToOnchain.keys()),
-    ]);
+  const owners = new Set<string>([
+    ...Object.keys(snapshot.users),
+    ...Array.from(ownerToOnchain.keys()),
+  ]);
 
-    for (const owner of owners) {
-      const harnessUser = engine.getUserState(owner, 'confirmed');
-      const onchainRow = ownerToOnchain.get(owner) || {
-        mangoAccounts: [],
-        usdcUiBalance: 0,
-      };
+  for (const owner of owners) {
+    const harnessUser = engine.getUserState(owner, 'confirmed');
+    const onchain = ownerToOnchain.get(owner) || {
+      mangoAccounts: [],
+      usdcUiBalance: 0,
+    };
 
-      const harnessAccounts = [...harnessUser.mango_accounts].sort();
-      const onchainAccounts = [...onchainRow.mangoAccounts].sort();
-      const harnessUsdcUiBalance = 0; // queue replay does not yet model token collateral.
-      const usdcDelta = onchainRow.usdcUiBalance - harnessUsdcUiBalance;
-      const accountsMatch =
-        harnessAccounts.length === onchainAccounts.length &&
-        harnessAccounts.every((v, i) => v === onchainAccounts[i]);
-      const usdcMatch = Math.abs(usdcDelta) < 1e-9;
+    const harnessAccounts = [...harnessUser.mango_accounts].sort();
+    const onchainAccounts = [...onchain.mangoAccounts].sort();
+    const harnessUsdcUiBalance = 0; // queue replay does not yet model token collateral.
+    const usdcDelta = onchain.usdcUiBalance - harnessUsdcUiBalance;
+    const accountsMatch =
+      harnessAccounts.length === onchainAccounts.length &&
+      harnessAccounts.every((v, i) => v === onchainAccounts[i]);
+    const usdcMatch = Math.abs(usdcDelta) < 1e-9;
 
-      const stateSig = JSON.stringify({
-        accountsMatch,
-        usdcMatch,
-        harnessAccounts,
-        onchainAccounts,
-        harnessUsdcUiBalance,
-        onchainUsdcUiBalance: onchainRow.usdcUiBalance,
-      });
-      if (sanityStateByOwner.get(owner) === stateSig) {
-        continue;
-      }
-      sanityStateByOwner.set(owner, stateSig);
-
-      if (!accountsMatch || !usdcMatch) {
-        engine.reportExternalDivergence(
-          'onchain_balance_sanity_mismatch',
-          `owner:${owner}`,
-          {
-            owner,
-            harness_mango_accounts: harnessAccounts.join(','),
-            onchain_mango_accounts: onchainAccounts.join(','),
-            harness_usdc_ui_balance: harnessUsdcUiBalance.toString(),
-            onchain_usdc_ui_balance: onchainRow.usdcUiBalance.toString(),
-            usdc_delta: usdcDelta.toString(),
-          },
-        );
-      }
+    const stateSig = JSON.stringify({
+      accountsMatch,
+      usdcMatch,
+      harnessAccounts,
+      onchainAccounts,
+      harnessUsdcUiBalance,
+      onchainUsdcUiBalance: onchain.usdcUiBalance,
+    });
+    if (sanityStateByOwner.get(owner) === stateSig) {
+      continue;
     }
+    sanityStateByOwner.set(owner, stateSig);
 
-    for (const owner of Array.from(sanityStateByOwner.keys())) {
-      if (!owners.has(owner)) {
-        sanityStateByOwner.delete(owner);
-      }
+    if (!accountsMatch || !usdcMatch) {
+      engine.reportExternalDivergence(
+        'onchain_balance_sanity_mismatch',
+        `owner:${owner}`,
+        {
+          owner,
+          harness_mango_accounts: harnessAccounts.join(','),
+          onchain_mango_accounts: onchainAccounts.join(','),
+          harness_usdc_ui_balance: harnessUsdcUiBalance.toString(),
+          onchain_usdc_ui_balance: onchain.usdcUiBalance.toString(),
+          usdc_delta: usdcDelta.toString(),
+        },
+      );
     }
-  });
+  }
+
+  for (const owner of Array.from(sanityStateByOwner.keys())) {
+    if (!owners.has(owner)) {
+      sanityStateByOwner.delete(owner);
+    }
+  }
 }
 
 function replayEventLogIfPresent(): void {
@@ -5574,61 +4765,55 @@ async function enrichOwnerStateWithOnchain(
   onchain: OnchainContext | null,
   view: QueueView,
 ): Promise<any> {
+  const group = await getFreshGroup(onchain);
+  if (!group || !onchain?.mangoClient) {
+    return baseState;
+  }
+
+  let owner: PublicKey;
   try {
-    return await withOnchainRead(
-      onchain,
-      'enrich_owner_state_with_onchain',
-      async () => {
-        const group = await getFreshGroup(onchain);
-        if (!group || !onchain?.mangoClient) {
-          return baseState;
-        }
+    owner = new PublicKey(ownerRaw);
+  } catch {
+    return baseState;
+  }
 
-        let owner: PublicKey;
-        try {
-          owner = new PublicKey(ownerRaw);
-        } catch {
-          return baseState;
-        }
-
-        const ownerAccounts = await onchain.mangoClient.getMangoAccountsForOwner(
-          group,
-          owner,
-        );
-        if (!ownerAccounts.length) {
-          return {
-            ...baseState,
-            margin_summary: buildEmptyOnchainMarginSummary(),
-          };
-        }
-
-        const tokens = buildOwnerTokenTotals(group, ownerAccounts);
-        const usdcMint = onchain.usdcMint?.toBase58() || tokens[0]?.mint || '';
-        const usdcToken = tokens.find((t) => t.mint === usdcMint);
-        const marginSummary = buildOnchainMarginSummaryFromAccounts(
-          group,
-          ownerAccounts,
-        );
-
-        const collateralPayload = {
-          source: view === 'optimistic' ? 'onchain-baseline' : 'onchain',
-          usdc_mint: usdcMint,
-          usdc_ui_balance: usdcToken?.ui_balance || 0,
-          tokens,
-        };
-
-        return {
-          ...baseState,
-          mango_accounts: baseState.mango_accounts?.length
-            ? baseState.mango_accounts
-            : ownerAccounts.map((a) => a.publicKey.toBase58()),
-          margin_summary: marginSummary,
-          ...(view === 'confirmed'
-            ? { confirmed_collateral: collateralPayload }
-            : { optimistic_collateral: collateralPayload }),
-        };
-      },
+  try {
+    const ownerAccounts = await onchain.mangoClient.getMangoAccountsForOwner(
+      group,
+      owner,
     );
+    if (!ownerAccounts.length) {
+      return {
+        ...baseState,
+        margin_summary: buildEmptyOnchainMarginSummary(),
+      };
+    }
+
+    const tokens = buildOwnerTokenTotals(group, ownerAccounts);
+    const usdcMint = onchain.usdcMint?.toBase58() || tokens[0]?.mint || '';
+    const usdcToken = tokens.find((t) => t.mint === usdcMint);
+    const marginSummary = buildOnchainMarginSummaryFromAccounts(
+      group,
+      ownerAccounts,
+    );
+
+    const collateralPayload = {
+      source: view === 'optimistic' ? 'onchain-baseline' : 'onchain',
+      usdc_mint: usdcMint,
+      usdc_ui_balance: usdcToken?.ui_balance || 0,
+      tokens,
+    };
+
+    return {
+      ...baseState,
+      mango_accounts: baseState.mango_accounts?.length
+        ? baseState.mango_accounts
+        : ownerAccounts.map((a) => a.publicKey.toBase58()),
+      margin_summary: marginSummary,
+      ...(view === 'confirmed'
+        ? { confirmed_collateral: collateralPayload }
+        : { optimistic_collateral: collateralPayload }),
+    };
   } catch (err) {
     console.warn(`failed to enrich ${view} balances for ${ownerRaw}: ${err}`);
     return baseState;
@@ -5659,60 +4844,58 @@ async function resolveExecutionQueuePk(
 async function buildOnchainQueueSnapshot(
   onchain: OnchainContext | null,
 ): Promise<OnchainQueueSnapshot | null> {
-  return await withOnchainRead(onchain, 'build_onchain_queue_snapshot', async () => {
-    const executionQueuePk = await resolveExecutionQueuePk(onchain);
-    if (!executionQueuePk || !onchain?.groupPk) {
-      return null;
-    }
+  const executionQueuePk = await resolveExecutionQueuePk(onchain);
+  if (!executionQueuePk || !onchain?.groupPk) {
+    return null;
+  }
 
-    const queueAccount = await onchain.connection.getAccountInfoAndContext(
-      executionQueuePk,
-      HARNESS_COMMITMENT,
-    );
-    if (!queueAccount.value?.data) {
-      return null;
-    }
+  const queueAccount = await onchain.connection.getAccountInfoAndContext(
+    executionQueuePk,
+    HARNESS_COMMITMENT,
+  );
+  if (!queueAccount.value?.data) {
+    return null;
+  }
 
-    const data = Buffer.from(queueAccount.value.data);
-    const header = decodeExecutionQueueHeader(data);
-    const group = onchain.groupPk.toBase58();
-    const items = decodeExecutionQueuePendingItems(data).map((item) => {
-      // v2 sub-queue: items decoded from a per-market window carry the
-      // market_index of their owning sub-queue. Pass it through to the engine
-      // so the lookup hits the right (group, market, sequence, kind) key.
-      const intent =
-        item.section === 'ctm'
-          ? engine.findIntent(
-              group,
-              item.sequence.toString(),
-              item.kind,
-              item.marketIndex ?? null,
-            )
-          : null;
-      return {
-        market:
-          intent?.market ||
-          (item.section === 'liquidity'
-            ? 'liquidity'
-            : item.marketIndex !== null
-              ? String(item.marketIndex)
-              : 'unknown'),
-        sequence: item.sequence.toString(),
-        kind: item.kind,
-        min_execute_slot: item.minExecuteSlot.toString(),
-        section: item.section,
-      } satisfies OnchainQueuePendingItem;
-    });
-
+  const data = Buffer.from(queueAccount.value.data);
+  const header = decodeExecutionQueueHeader(data);
+  const group = onchain.groupPk.toBase58();
+  const items = decodeExecutionQueuePendingItems(data).map((item) => {
+    // v2 sub-queue: items decoded from a per-market window carry the
+    // market_index of their owning sub-queue. Pass it through to the engine
+    // so the lookup hits the right (group, market, sequence, kind) key.
+    const intent =
+      item.section === 'ctm'
+        ? engine.findIntent(
+            group,
+            item.sequence.toString(),
+            item.kind,
+            item.marketIndex ?? null,
+          )
+        : null;
     return {
-      generated_ts_ms: Date.now(),
-      observed_slot: queueAccount.context.slot,
-      next_sequence: header.nextSequence.toString(),
-      max_seen_sequence: header.maxSeenSequence.toString(),
-      total_count: header.totalCount,
-      items,
-    };
+      market:
+        intent?.market ||
+        (item.section === 'liquidity'
+          ? 'liquidity'
+          : item.marketIndex !== null
+            ? String(item.marketIndex)
+            : 'unknown'),
+      sequence: item.sequence.toString(),
+      kind: item.kind,
+      min_execute_slot: item.minExecuteSlot.toString(),
+      section: item.section,
+    } satisfies OnchainQueuePendingItem;
   });
+
+  return {
+    generated_ts_ms: Date.now(),
+    observed_slot: queueAccount.context.slot,
+    next_sequence: header.nextSequence.toString(),
+    max_seen_sequence: header.maxSeenSequence.toString(),
+    total_count: header.totalCount,
+    items,
+  };
 }
 
 /** Yield to the event loop so HTTP/SSE handlers can run between heavy RPC calls. */
@@ -5726,18 +4909,17 @@ async function buildOnchainConfirmedSnapshot(
   snapshot: EngineSnapshot;
   queue: OnchainQueueSnapshot | null;
 } | null> {
-  return await withOnchainRead(onchain, 'build_onchain_confirmed_snapshot', async () => {
-    const group = await getFreshGroup(onchain);
-    if (!group || !onchain?.mangoClient) {
-      return null;
-    }
+  const group = await getFreshGroup(onchain);
+  if (!group || !onchain?.mangoClient) {
+    return null;
+  }
 
-    await yieldToEventLoop();
-    const replayConfirmed = engine.getSnapshot('confirmed');
-    const onchainQueue = await buildOnchainQueueSnapshot(onchain);
-    await yieldToEventLoop();
-    const allAccounts = await onchain.mangoClient.getAllMangoAccounts(group);
-    await yieldToEventLoop();
+  await yieldToEventLoop();
+  const replayConfirmed = engine.getSnapshot('confirmed');
+  const onchainQueue = await buildOnchainQueueSnapshot(onchain);
+  await yieldToEventLoop();
+  const allAccounts = await onchain.mangoClient.getAllMangoAccounts(group);
+  await yieldToEventLoop();
   const ownerByMangoAccount = new Map<string, string>();
   const ownerAccountsMap = new Map<
     string,
@@ -6112,7 +5294,6 @@ async function buildOnchainConfirmedSnapshot(
     },
     queue: onchainQueue,
   };
-  });
 }
 
 async function runOnchainReconciliation(
@@ -6187,46 +5368,6 @@ async function refreshOnchainQueueState(
   onchainSync: OnchainSyncState,
 ): Promise<void> {
   onchainSync.queue = await buildOnchainQueueSnapshot(onchain);
-  if (onchainSync.queue) {
-    sweepLaneGuardFromOnchain(onchainSync.queue);
-  }
-}
-
-// Sweep the lane guard after each periodic queue refresh: any tracked
-// intent whose sequence is below the on-chain next-to-execute watermark
-// and is no longer in the pending item list has been crankered on-chain.
-// Mark it executed so the lane guard releases its pending slot immediately
-// rather than waiting for the 8 s stale timeout.
-function sweepLaneGuardFromOnchain(queue: OnchainQueueSnapshot): void {
-  const nextSequence = maybeToBigInt(queue.next_sequence) || 0n;
-  if (nextSequence === 0n) return;
-  const pendingSeqKinds = new Set<string>();
-  for (const item of queue.items) {
-    if (item.section === 'ctm') {
-      pendingSeqKinds.add(`${item.sequence}:${item.kind}`);
-    }
-  }
-  const swept = laneGuard.sweepProcessedBelow(nextSequence, pendingSeqKinds);
-  if (swept.length === 0) return;
-  const nowMs = Date.now();
-  for (const intent of swept) {
-    const processedEvent: QueueItemProcessedEvent = {
-      event_type: 'queue_item_processed',
-      ts_ms: nowMs,
-      group: intent.group,
-      sequence: intent.sequence,
-      kind: intent.kind,
-      status: LOCAL_QUEUE_PROCESS_EXECUTED,
-      slot: '0',
-      tx_signature: `onchain_queue_sweep:${intent.sequence}:${intent.kind}`,
-      market: intent.market || null,
-      user_owner: intent.owner || null,
-      mango_account: intent.mangoAccount || null,
-    };
-    if (HARNESS_BACKEND === 'rust-backend') {
-      engine.ingestQueueProcessed(processedEvent);
-    }
-  }
 }
 
 function scheduleDirectOnchainRebase(
@@ -6234,7 +5375,7 @@ function scheduleDirectOnchainRebase(
   onchainSync: OnchainSyncState,
   context: Record<string, string>,
 ): void {
-  if (!onchain?.groupPk) {
+  if (!onchain?.mangoClient || !onchain.groupPk) {
     return;
   }
   if (directOnchainRebaseTimer) {
@@ -6253,6 +5394,9 @@ function scheduleDirectOnchainRebase(
       async () => {
         await refreshOnchainConfirmedState(onchain, onchainSync);
         marketRuntimeMetricsCache.clear();
+        scheduleFrontendStreamNotification(onchain, onchainSync, {
+          forceAll: true,
+        });
       },
       context,
     )
@@ -6292,6 +5436,9 @@ function scheduleQueueSync(
       'onchain_queue_sync',
       async () => {
         await refreshOnchainQueueState(onchain, onchainSync);
+        scheduleFrontendStreamNotification(onchain, onchainSync, {
+          forceAll: true,
+        });
       },
       context,
     )
@@ -6313,43 +5460,36 @@ async function buildAirdropContext(
   if (!HARNESS_ENABLE_AIRDROP) {
     return null;
   }
-  try {
-    return await withOnchainRead(onchain, 'build_airdrop_context', async () => {
-      await getFreshGroup(onchain);
-      if (!onchain.usdcMint || !HARNESS_AIRDROP_KEYPAIR.length) {
-        console.warn(
-          'airdrop endpoint disabled: unable to resolve USDC mint or faucet keypair',
-        );
-        return null;
-      }
-
-      const usdcMint = onchain.usdcMint;
-      const faucet = readKeypair(HARNESS_AIRDROP_KEYPAIR);
-      const mintInfo = await getMint(onchain.connection, usdcMint);
-
-      if (
-        !mintInfo.mintAuthority ||
-        !mintInfo.mintAuthority.equals(faucet.publicKey)
-      ) {
-        console.warn(
-          `airdrop endpoint warning: faucet keypair may not be mint authority for ${usdcMint.toBase58()}`,
-        );
-      }
-
-      return {
-        ...onchain,
-        usdcMint,
-        decimals: mintInfo.decimals,
-        faucet,
-        defaultUiAmount: HARNESS_AIRDROP_DEFAULT_UI_AMOUNT,
-        maxUiAmount: HARNESS_AIRDROP_MAX_UI_AMOUNT,
-        depositUiAmount: HARNESS_AIRDROP_DEPOSIT_UI_AMOUNT,
-      };
-    });
-  } catch (err) {
-    console.warn(`failed to build airdrop context: ${err}`);
+  await getFreshGroup(onchain);
+  if (!onchain.usdcMint || !HARNESS_AIRDROP_KEYPAIR.length) {
+    console.warn(
+      'airdrop endpoint disabled: unable to resolve USDC mint or faucet keypair',
+    );
     return null;
   }
+
+  const usdcMint = onchain.usdcMint;
+  const faucet = readKeypair(HARNESS_AIRDROP_KEYPAIR);
+  const mintInfo = await getMint(onchain.connection, usdcMint);
+
+  if (
+    !mintInfo.mintAuthority ||
+    !mintInfo.mintAuthority.equals(faucet.publicKey)
+  ) {
+    console.warn(
+      `airdrop endpoint warning: faucet keypair may not be mint authority for ${usdcMint.toBase58()}`,
+    );
+  }
+
+  return {
+    ...onchain,
+    usdcMint,
+    decimals: mintInfo.decimals,
+    faucet,
+    defaultUiAmount: HARNESS_AIRDROP_DEFAULT_UI_AMOUNT,
+    maxUiAmount: HARNESS_AIRDROP_MAX_UI_AMOUNT,
+    depositUiAmount: HARNESS_AIRDROP_DEPOSIT_UI_AMOUNT,
+  };
 }
 
 async function buildOnchainContext(
@@ -6359,10 +5499,6 @@ async function buildOnchainContext(
   const groupPk = HARNESS_GROUP_PK.length
     ? new PublicKey(HARNESS_GROUP_PK)
     : null;
-  const fallbackConnection =
-    TRITON_RPC_URL.length > 0
-      ? createReadConnection(TRITON_RPC_URL, TRITON_WS_URL || null)
-      : null;
   let mangoClient: MangoClient | null = null;
   let cachedGroup: HarnessGroup | null = null;
   let usdcMint: PublicKey | null = HARNESS_USDC_MINT.length
@@ -6431,19 +5567,6 @@ async function buildOnchainContext(
     cachedGroupFetchedAtMs: cachedGroup ? Date.now() : 0,
     cachedMarketMetadata: null,
     cachedMarketMetadataFetchedAtMs: 0,
-    primaryConnection: connection,
-    primaryRpcUrl: CLUSTER_URL || '',
-    primaryWsUrl: CLUSTER_WS_URL || null,
-    fallbackConnection,
-    fallbackRpcUrl: TRITON_RPC_URL || null,
-    fallbackWsUrl: TRITON_WS_URL || null,
-    activeReadProvider: 'primary',
-    primaryReadOutcomes: [],
-    primaryWsUnexpectedResponses: [],
-    lastReadProviderSwitchTsMs: null,
-    lastReadProviderSwitchReason: null,
-    lastReadError: null,
-    lastReadErrorTsMs: null,
   };
 }
 
@@ -6970,52 +6093,71 @@ async function processDepositContextRequest(
   health_remaining_accounts: string[];
   default_ui_amount: number;
 }> {
-  if (!onchain?.groupPk) {
+  if (!onchain?.mangoClient || !onchain.groupPk) {
     throw new Error('deposit context unavailable: group/client not configured');
   }
-  return await withOnchainRead(onchain, 'process_deposit_context_request', async () => {
-    const ownerRaw = decodeURIComponent(
-      url.pathname.split('/').pop() || '',
-    ).trim();
-    if (!ownerRaw.length) {
-      throw new Error('owner is required');
-    }
-    const owner = new PublicKey(ownerRaw);
-    const group = await getFreshGroup(onchain);
-    if (!group || !onchain.mangoClient) {
-      throw new Error('deposit context unavailable: group could not be loaded');
-    }
 
-    const quoteMint =
-      onchain.usdcMint ?? group.getFirstBankForPerpSettlement().mint;
-    const quoteBank = group.getFirstBankByMint(quoteMint);
-    const requestedAccountNumRaw = url.searchParams.get('account_num');
-    const requestedAccountNum = requestedAccountNumRaw
-      ? Number(requestedAccountNumRaw)
-      : 0;
-    if (
-      !Number.isInteger(requestedAccountNum) ||
-      requestedAccountNum < 0 ||
-      requestedAccountNum > 0xffffffff
-    ) {
-      throw new Error('account_num must be a valid u32');
+  const ownerRaw = decodeURIComponent(
+    url.pathname.split('/').pop() || '',
+  ).trim();
+  if (!ownerRaw.length) {
+    throw new Error('owner is required');
+  }
+  const owner = new PublicKey(ownerRaw);
+  const group = await getFreshGroup(onchain);
+  if (!group) {
+    throw new Error('deposit context unavailable: group could not be loaded');
+  }
+
+  const quoteMint =
+    onchain.usdcMint ?? group.getFirstBankForPerpSettlement().mint;
+  const quoteBank = group.getFirstBankByMint(quoteMint);
+  const requestedAccountNumRaw = url.searchParams.get('account_num');
+  const requestedAccountNum = requestedAccountNumRaw
+    ? Number(requestedAccountNumRaw)
+    : 0;
+  if (
+    !Number.isInteger(requestedAccountNum) ||
+    requestedAccountNum < 0 ||
+    requestedAccountNum > 0xffffffff
+  ) {
+    throw new Error('account_num must be a valid u32');
+  }
+
+  let mangoAccountPk: PublicKey;
+  let mangoAccountExists = false;
+  let healthRemainingAccounts: PublicKey[] = [];
+
+  const requestedMangoAccountRaw = url.searchParams.get('mango_account') || '';
+  if (requestedMangoAccountRaw.length) {
+    const mangoAccount = await onchain.mangoClient.getMangoAccount(
+      new PublicKey(requestedMangoAccountRaw),
+    );
+    if (!mangoAccount.owner.equals(owner)) {
+      throw new Error('mango_account owner mismatch');
     }
-
-    let mangoAccountPk: PublicKey;
-    let mangoAccountExists = false;
-    let healthRemainingAccounts: PublicKey[] = [];
-
-    const requestedMangoAccountRaw = url.searchParams.get('mango_account') || '';
-    if (requestedMangoAccountRaw.length) {
-      const mangoAccount = await onchain.mangoClient.getMangoAccount(
-        new PublicKey(requestedMangoAccountRaw),
+    if (!mangoAccount.group.equals(group.publicKey)) {
+      throw new Error('mango_account group mismatch');
+    }
+    mangoAccountPk = mangoAccount.publicKey;
+    mangoAccountExists = true;
+    healthRemainingAccounts =
+      await onchain.mangoClient.buildHealthRemainingAccounts(
+        group,
+        [mangoAccount],
+        [quoteBank],
+        [],
       );
-      if (!mangoAccount.owner.equals(owner)) {
-        throw new Error('mango_account owner mismatch');
-      }
-      if (!mangoAccount.group.equals(group.publicKey)) {
-        throw new Error('mango_account group mismatch');
-      }
+  } else {
+    const ownerAccounts = await onchain.mangoClient.getMangoAccountsForOwner(
+      group,
+      owner,
+    );
+    const requestedAccount = ownerAccounts.find(
+      (account) => account.accountNum === requestedAccountNum,
+    );
+    const mangoAccount = requestedAccount ?? ownerAccounts[0] ?? null;
+    if (mangoAccount) {
       mangoAccountPk = mangoAccount.publicKey;
       mangoAccountExists = true;
       healthRemainingAccounts =
@@ -7026,68 +6168,48 @@ async function processDepositContextRequest(
           [],
         );
     } else {
-      const ownerAccounts = await onchain.mangoClient.getMangoAccountsForOwner(
-        group,
-        owner,
+      [mangoAccountPk] = PublicKey.findProgramAddressSync(
+        [
+          Buffer.from('MangoAccount'),
+          group.publicKey.toBuffer(),
+          owner.toBuffer(),
+          u32ToLe(requestedAccountNum),
+        ],
+        onchain.programId,
       );
-      const requestedAccount = ownerAccounts.find(
-        (account) => account.accountNum === requestedAccountNum,
-      );
-      const mangoAccount = requestedAccount ?? ownerAccounts[0] ?? null;
-      if (mangoAccount) {
-        mangoAccountPk = mangoAccount.publicKey;
-        mangoAccountExists = true;
-        healthRemainingAccounts =
-          await onchain.mangoClient.buildHealthRemainingAccounts(
-            group,
-            [mangoAccount],
-            [quoteBank],
-            [],
-          );
-      } else {
-        [mangoAccountPk] = PublicKey.findProgramAddressSync(
-          [
-            Buffer.from('MangoAccount'),
-            group.publicKey.toBuffer(),
-            owner.toBuffer(),
-            u32ToLe(requestedAccountNum),
-          ],
-          onchain.programId,
-        );
-        const fallbackMap =
-          await onchain.mangoClient.deriveFallbackOracleContexts(group);
-        const fallbackAccounts =
-          fallbackMap.get(quoteBank.oracle.toBase58()) || [];
-        healthRemainingAccounts = [quoteBank.publicKey, quoteBank.oracle];
-        for (const fallback of fallbackAccounts) {
-          if (
-            !fallback.equals(PublicKey.default) &&
-            !healthRemainingAccounts.find((existing) => existing.equals(fallback))
-          ) {
-            healthRemainingAccounts.push(fallback);
-          }
+      const fallbackMap =
+        await onchain.mangoClient.deriveFallbackOracleContexts(group);
+      const fallbackAccounts =
+        fallbackMap.get(quoteBank.oracle.toBase58()) || [];
+      healthRemainingAccounts = [quoteBank.publicKey, quoteBank.oracle];
+      for (const fallback of fallbackAccounts) {
+        if (
+          !fallback.equals(PublicKey.default) &&
+          !healthRemainingAccounts.find((existing) => existing.equals(fallback))
+        ) {
+          healthRemainingAccounts.push(fallback);
         }
       }
     }
+  }
 
-    return {
-      owner: owner.toBase58(),
-      group: group.publicKey.toBase58(),
-      program_id: onchain.programId.toBase58(),
-      quote_mint: quoteMint.toBase58(),
-      quote_decimals: quoteBank.mintDecimals,
-      quote_bank: quoteBank.publicKey.toBase58(),
-      quote_vault: quoteBank.vault.toBase58(),
-      quote_oracle: quoteBank.oracle.toBase58(),
-      mango_account: mangoAccountPk.toBase58(),
-      mango_account_exists: mangoAccountExists,
-      account_num: requestedAccountNum,
-      health_remaining_accounts: healthRemainingAccounts.map((pk) =>
-        pk.toBase58(),
-      ),
-      default_ui_amount: HARNESS_AIRDROP_DEPOSIT_UI_AMOUNT,
-    };
-  });
+  return {
+    owner: owner.toBase58(),
+    group: group.publicKey.toBase58(),
+    program_id: onchain.programId.toBase58(),
+    quote_mint: quoteMint.toBase58(),
+    quote_decimals: quoteBank.mintDecimals,
+    quote_bank: quoteBank.publicKey.toBase58(),
+    quote_vault: quoteBank.vault.toBase58(),
+    quote_oracle: quoteBank.oracle.toBase58(),
+    mango_account: mangoAccountPk.toBase58(),
+    mango_account_exists: mangoAccountExists,
+    account_num: requestedAccountNum,
+    health_remaining_accounts: healthRemainingAccounts.map((pk) =>
+      pk.toBase58(),
+    ),
+    default_ui_amount: HARNESS_AIRDROP_DEPOSIT_UI_AMOUNT,
+  };
 }
 
 async function buildLaneForOwner(
@@ -7107,150 +6229,148 @@ async function buildLaneForOwner(
   };
   accounts_hash: string;
 }> {
-  if (!onchain?.groupPk) {
+  if (!onchain?.mangoClient || !onchain.groupPk) {
     throw new Error(
       'lane registration unavailable: group/client not configured',
     );
   }
-  return await withOnchainRead(onchain, 'build_lane_for_owner', async () => {
-    const owner = new PublicKey(ownerRaw);
-    const group = await getFreshGroup(onchain);
-    if (!group || !onchain.mangoClient) {
-      throw new Error('lane registration unavailable: group could not be loaded');
-    }
+  const owner = new PublicKey(ownerRaw);
+  const group = await getFreshGroup(onchain);
+  if (!group) {
+    throw new Error('lane registration unavailable: group could not be loaded');
+  }
 
-    // Resolve Mango account
-    const ownerAccounts = await onchain.mangoClient.getMangoAccountsForOwner(
+  // Resolve Mango account
+  const ownerAccounts = await onchain.mangoClient.getMangoAccountsForOwner(
+    group,
+    owner,
+  );
+  const mangoAccount = ownerAccounts[0];
+  if (!mangoAccount) {
+    throw new Error(`no Mango account found for owner ${ownerRaw}`);
+  }
+
+  // Get first perp market
+  const perpMarkets = Array.from(group.perpMarketsMapByMarketIndex.values());
+  if (!perpMarkets.length) {
+    throw new Error('no perp markets configured');
+  }
+  const perpMarket = perpMarkets[0];
+
+  const executionQueuePk = new PublicKey(
+    process.env.EXECUTION_QUEUE_PK ||
+      process.env.CONTINUUM_HARNESS_EXECUTION_QUEUE_PK ||
+      '',
+  );
+  const remainingAccounts =
+    await onchain.mangoClient.buildExecutionQueueCanonicalPerpRemainingAccounts(
       group,
+      mangoAccount,
+      perpMarket.perpMarketIndex,
       owner,
     );
-    const mangoAccount = ownerAccounts[0];
-    if (!mangoAccount) {
-      throw new Error(`no Mango account found for owner ${ownerRaw}`);
+
+  // Compute accounts hash the same way the relayer does
+  const accountsForHash = remainingAccounts.map((a) => ({
+    pubkey: a.pubkey instanceof PublicKey ? a.pubkey : new PublicKey(a.pubkey),
+    isSigner: a.isSigner,
+    isWritable: a.isWritable,
+  }));
+
+  // Merge runtime flags with fixed accounts (group=writable, queue=writable, sysvar=readonly)
+  const fixedAccounts = [
+    { pubkey: group.publicKey, isSigner: false, isWritable: true },
+    { pubkey: executionQueuePk, isSigner: false, isWritable: true },
+    {
+      pubkey: new PublicKey('Sysvar1nstructions1111111111111111111111111'),
+      isSigner: false,
+      isWritable: false,
+    },
+  ];
+  const merged = new Map<string, { isSigner: boolean; isWritable: boolean }>();
+  for (const a of [...fixedAccounts, ...accountsForHash]) {
+    const key = a.pubkey.toBase58();
+    const existing = merged.get(key);
+    if (existing) {
+      existing.isSigner = existing.isSigner || a.isSigner;
+      existing.isWritable = existing.isWritable || a.isWritable;
+    } else {
+      merged.set(key, { isSigner: a.isSigner, isWritable: a.isWritable });
     }
-
-    // Get first perp market
-    const perpMarkets = Array.from(group.perpMarketsMapByMarketIndex.values());
-    if (!perpMarkets.length) {
-      throw new Error('no perp markets configured');
-    }
-    const perpMarket = perpMarkets[0];
-
-    const executionQueuePk = new PublicKey(
-      process.env.EXECUTION_QUEUE_PK ||
-        process.env.CONTINUUM_HARNESS_EXECUTION_QUEUE_PK ||
-        '',
-    );
-    const remainingAccounts =
-      await onchain.mangoClient.buildExecutionQueueCanonicalPerpRemainingAccounts(
-        group,
-        mangoAccount,
-        perpMarket.perpMarketIndex,
-        owner,
-      );
-
-    // Compute accounts hash the same way the relayer does
-    const accountsForHash = remainingAccounts.map((a) => ({
-      pubkey: a.pubkey instanceof PublicKey ? a.pubkey : new PublicKey(a.pubkey),
-      isSigner: a.isSigner,
-      isWritable: a.isWritable,
-    }));
-
-    // Merge runtime flags with fixed accounts (group=writable, queue=writable, sysvar=readonly)
-    const fixedAccounts = [
-      { pubkey: group.publicKey, isSigner: false, isWritable: true },
-      { pubkey: executionQueuePk, isSigner: false, isWritable: true },
-      {
-        pubkey: new PublicKey('Sysvar1nstructions1111111111111111111111111'),
-        isSigner: false,
-        isWritable: false,
-      },
-    ];
-    const merged = new Map<string, { isSigner: boolean; isWritable: boolean }>();
-    for (const a of [...fixedAccounts, ...accountsForHash]) {
-      const key = a.pubkey.toBase58();
-      const existing = merged.get(key);
-      if (existing) {
-        existing.isSigner = existing.isSigner || a.isSigner;
-        existing.isWritable = existing.isWritable || a.isWritable;
-      } else {
-        merged.set(key, { isSigner: a.isSigner, isWritable: a.isWritable });
-      }
-    }
-    const effectiveAccounts = accountsForHash.map((a) => {
-      const key = a.pubkey.toBase58();
-      const flags = merged.get(key)!;
-      return {
-        pubkey: a.pubkey,
-        isSigner: flags.isSigner,
-        isWritable: flags.isWritable,
-      };
-    });
-
-    const hashData = Buffer.concat(
-      effectiveAccounts.map((a) =>
-        Buffer.concat([
-          a.pubkey.toBuffer(),
-          Buffer.from([a.isSigner ? 1 : 0, a.isWritable ? 1 : 0]),
-        ]),
-      ),
-    );
-    const accountsHash = createHash('sha256').update(hashData).digest('hex');
-
-    // Write to lane cache if path is configured
-    const laneCachePath = process.env.EXECUTION_QUEUE_LANE_CACHE_PATH || '';
-    const laneName = `registered-${owner.toBase58().slice(0, 12)}`;
-    if (laneCachePath) {
-      let cache: Array<{
-        name: string;
-        user_owner: string;
-        remainingAccounts: Array<{
-          pubkey: string;
-          isWritable: boolean;
-          isSigner: boolean;
-        }>;
-      }> = [];
-      try {
-        if (fs.existsSync(laneCachePath)) {
-          cache = JSON.parse(fs.readFileSync(laneCachePath, 'utf-8'));
-        }
-      } catch {
-        cache = [];
-      }
-      cache = cache.filter((l) => l.user_owner !== ownerRaw);
-      cache.push({
-        name: laneName,
-        user_owner: ownerRaw,
-        remainingAccounts: remainingAccounts.map((a) => ({
-          pubkey: (a.pubkey instanceof PublicKey
-            ? a.pubkey
-            : new PublicKey(a.pubkey)
-          ).toBase58(),
-          isWritable: a.isWritable,
-          isSigner: a.isSigner,
-        })),
-      });
-      fs.writeFileSync(laneCachePath, JSON.stringify(cache, null, 2));
-    }
-
+  }
+  const effectiveAccounts = accountsForHash.map((a) => {
+    const key = a.pubkey.toBase58();
+    const flags = merged.get(key)!;
     return {
-      ok: true,
-      owner: owner.toBase58(),
-      mango_account: mangoAccount.publicKey.toBase58(),
-      lane: {
-        name: laneName,
-        remainingAccounts: remainingAccounts.map((a) => ({
-          pubkey: (a.pubkey instanceof PublicKey
-            ? a.pubkey
-            : new PublicKey(a.pubkey)
-          ).toBase58(),
-          isWritable: a.isWritable,
-          isSigner: a.isSigner,
-        })),
-      },
-      accounts_hash: accountsHash,
+      pubkey: a.pubkey,
+      isSigner: flags.isSigner,
+      isWritable: flags.isWritable,
     };
   });
+
+  const hashData = Buffer.concat(
+    effectiveAccounts.map((a) =>
+      Buffer.concat([
+        a.pubkey.toBuffer(),
+        Buffer.from([a.isSigner ? 1 : 0, a.isWritable ? 1 : 0]),
+      ]),
+    ),
+  );
+  const accountsHash = createHash('sha256').update(hashData).digest('hex');
+
+  // Write to lane cache if path is configured
+  const laneCachePath = process.env.EXECUTION_QUEUE_LANE_CACHE_PATH || '';
+  const laneName = `registered-${owner.toBase58().slice(0, 12)}`;
+  if (laneCachePath) {
+    let cache: Array<{
+      name: string;
+      user_owner: string;
+      remainingAccounts: Array<{
+        pubkey: string;
+        isWritable: boolean;
+        isSigner: boolean;
+      }>;
+    }> = [];
+    try {
+      if (fs.existsSync(laneCachePath)) {
+        cache = JSON.parse(fs.readFileSync(laneCachePath, 'utf-8'));
+      }
+    } catch {
+      cache = [];
+    }
+    cache = cache.filter((l) => l.user_owner !== ownerRaw);
+    cache.push({
+      name: laneName,
+      user_owner: ownerRaw,
+      remainingAccounts: remainingAccounts.map((a) => ({
+        pubkey: (a.pubkey instanceof PublicKey
+          ? a.pubkey
+          : new PublicKey(a.pubkey)
+        ).toBase58(),
+        isWritable: a.isWritable,
+        isSigner: a.isSigner,
+      })),
+    });
+    fs.writeFileSync(laneCachePath, JSON.stringify(cache, null, 2));
+  }
+
+  return {
+    ok: true,
+    owner: owner.toBase58(),
+    mango_account: mangoAccount.publicKey.toBase58(),
+    lane: {
+      name: laneName,
+      remainingAccounts: remainingAccounts.map((a) => ({
+        pubkey: (a.pubkey instanceof PublicKey
+          ? a.pubkey
+          : new PublicKey(a.pubkey)
+        ).toBase58(),
+        isWritable: a.isWritable,
+        isSigner: a.isSigner,
+      })),
+    },
+    accounts_hash: accountsHash,
+  };
 }
 
 function initializeSse(res: ServerResponse): void {
@@ -8220,10 +7340,6 @@ function startPeriodicTask(
   task: () => void | Promise<void>,
   opts: { runImmediately?: boolean } = {},
 ): void {
-  if (intervalMs <= 0) {
-    console.info(`periodic:${name} disabled (interval_ms=${intervalMs})`);
-    return;
-  }
   const safeIntervalMs = Math.max(1000, intervalMs);
   const runImmediately = opts.runImmediately !== false;
   let running = false;
@@ -8487,7 +7603,6 @@ function buildHttpServer(
           ok: true,
           ...stats,
           onchain_read_enabled: !!onchain?.groupPk && !!onchain?.mangoClient,
-          read_provider: getReadProviderDiagnostics(onchain),
           market_metadata_total: cachedMetadataCount,
           airdrop_enabled: !!airdrop,
           airdrop_deposit_enabled: !!airdrop?.groupPk && !!airdrop?.mangoClient,
@@ -8564,13 +7679,6 @@ function buildHttpServer(
         writeJson(res, 200, {
           stats: laneGuard.getStats(),
           markets: Array.from(laneGuard.getSuppressedMarkets().values()),
-        });
-        return;
-      }
-
-      if (method === 'GET' && url.pathname === '/diagnostics/read-provider') {
-        writeJson(res, 200, {
-          data: getReadProviderDiagnostics(onchain),
         });
         return;
       }
@@ -9237,13 +8345,110 @@ function buildHttpServer(
       }
 
       if (method === 'GET' && url.pathname === '/monitoring') {
-        const fullHistory = url.searchParams.get('full_history') === 'true';
-        writeJson(res, 200, await buildMonitoringResponse(onchain, fullHistory));
-        return;
-      }
+        const monitoringMetadata = await getMarketMetadataMapSafe(onchain);
+        const monitoringSnapshot = engine.getSnapshot('confirmed');
 
-      if (method === 'GET' && url.pathname === '/monitoring-prometheus') {
-        writeText(res, 200, await monitoringPrometheusText(onchain));
+        // All markets we know about (union of engine + on-chain).
+        const monitoringMarketKeys = new Set([
+          ...Object.keys(monitoringSnapshot.markets),
+          ...Object.keys(monitoringMetadata),
+          ...Object.keys(marketStatsStore.markets),
+        ]);
+
+        const monitoringItems = Array.from(monitoringMarketKeys).map(
+          (marketKey) => {
+            const stats = marketStatsStore.markets[marketKey] ?? null;
+            const meta = monitoringMetadata[marketKey] ?? null;
+            const marketName = meta?.name ?? stats?.market_name ?? marketKey;
+
+            // 24 h trade summary from in-memory engine trade cache.
+            const tradesFor24h = engine.getTrades(marketKey, 'confirmed', 50_000);
+            const tradeSummary24h = buildTradeSummary(
+              marketKey,
+              'confirmed',
+              tradesFor24h,
+              meta,
+              TRADE_SUMMARY_WINDOW_MS,
+            );
+
+            // Currently-active unique users (non-zero position on this market).
+            let activeUniqueUsers = 0;
+            for (const user of Object.values(monitoringSnapshot.users)) {
+              if (user.per_market.some((p) => p.market === marketKey)) {
+                activeUniqueUsers += 1;
+              }
+            }
+
+            // Latest funding-rate entry (most recent poll snapshot).
+            const latestFunding =
+              stats?.funding_rate_history?.length
+                ? stats.funding_rate_history[
+                    stats.funding_rate_history.length - 1
+                  ]
+                : null;
+
+            // Funding history for the response: last 48 entries (~96 min at
+            // 120 s interval).  Callers can request the full history via
+            // ?full_history=true.
+            const fullHistory =
+              url.searchParams.get('full_history') === 'true';
+            const fundingHistory = fullHistory
+              ? (stats?.funding_rate_history ?? [])
+              : (stats?.funding_rate_history ?? []).slice(-48);
+
+            return {
+              market: marketKey,
+              market_name: marketName,
+              last_collected_ms: stats?.last_collected_ms ?? null,
+              // ── 24 h window ──────────────────────────────────────────
+              volume_24h_base_lots: tradeSummary24h.volume_base_lots,
+              volume_24h_quote_lots: tradeSummary24h.volume_quote_lots,
+              volume_24h_base_ui: tradeSummary24h.volume_base_ui,
+              volume_24h_quote_ui: tradeSummary24h.volume_quote_ui,
+              trade_count_24h: tradeSummary24h.trade_count,
+              change_24h_pct: tradeSummary24h.change_24h_pct,
+              last_price_ui: tradeSummary24h.last_price_ui,
+              // ── Cumulative (since stats tracking started) ────────────
+              cumulative_volume_base_lots:
+                stats?.cumulative_volume_base_lots ?? '0',
+              cumulative_volume_quote_lots:
+                stats?.cumulative_volume_quote_lots ?? '0',
+              cumulative_volume_base_ui: baseLotsToUi(
+                stats?.cumulative_volume_base_lots ?? '0',
+                meta,
+              ),
+              cumulative_volume_quote_ui: quoteLotsToUi(
+                stats?.cumulative_volume_quote_lots ?? '0',
+                meta,
+              ),
+              // ── Open interest ─────────────────────────────────────────
+              open_interest_base_lots: stats?.open_interest_base_lots ?? null,
+              open_interest_base_ui: stats?.open_interest_base_ui ?? null,
+              // ── Accrued fees (on-chain) ───────────────────────────────
+              fees_accrued_native: stats?.fees_accrued_native ?? null,
+              fees_settled_native: stats?.fees_settled_native ?? null,
+              // ── Users ─────────────────────────────────────────────────
+              active_unique_users: activeUniqueUsers,
+              all_time_unique_users: stats?.all_time_unique_users?.length ?? 0,
+              // ── Funding rate ──────────────────────────────────────────
+              current_funding_hourly_pct:
+                latestFunding?.hourly_pct ?? null,
+              current_funding_daily_pct:
+                latestFunding?.daily_pct ?? null,
+              current_oracle_price_ui:
+                latestFunding?.oracle_price_ui ?? null,
+              funding_rate_history: fundingHistory,
+            };
+          },
+        );
+
+        writeJson(res, 200, {
+          generated_ts_ms: Date.now(),
+          collection_interval_ms: HARNESS_MARKET_STATS_INTERVAL_MS,
+          stats_file: HARNESS_MARKET_STATS_PATH,
+          last_collection_ms: marketStatsStore.written_ts_ms,
+          markets: monitoringItems,
+        });
         return;
       }
 
@@ -9393,9 +8598,9 @@ async function main(): Promise<void> {
     `Continuum harness instance: id=${HARNESS_INSTANCE_ID}, pid=${process.pid}, cwd=${process.cwd()}, bind=${HARNESS_BIND_ADDR}`,
   );
 
-  const connection = createReadConnection(
+  const connection = new Connection(
     CLUSTER_URL,
-    CLUSTER_WS_URL || null,
+    HARNESS_COMMITMENT === 'processed' ? 'confirmed' : HARNESS_COMMITMENT,
   );
   const programId = PROGRAM_ID_OVERRIDE
     ? new PublicKey(PROGRAM_ID_OVERRIDE)
@@ -9410,27 +8615,6 @@ async function main(): Promise<void> {
     'startup.build_onchain_context',
     async () => await buildOnchainContext(connection, programId),
   );
-  attachRpcWebSocketDiagnostics(
-    onchain.primaryConnection,
-    inferRpcProviderLabel(CLUSTER_URL, 'primary'),
-    CLUSTER_URL,
-    CLUSTER_WS_URL || null,
-    (details) => {
-      notePrimaryWsUnexpectedResponse(
-        onchain,
-        details.statusCode,
-        details.statusMessage,
-      );
-    },
-  );
-  if (onchain.fallbackConnection) {
-    attachRpcWebSocketDiagnostics(
-      onchain.fallbackConnection,
-      inferRpcProviderLabel(onchain.fallbackRpcUrl || '', 'fallback'),
-      onchain.fallbackRpcUrl || '',
-      onchain.fallbackWsUrl,
-    );
-  }
   let bootstrappedOnchainState:
     | {
         snapshot: EngineSnapshot;
@@ -9496,6 +8680,9 @@ async function main(): Promise<void> {
       appendTxnLog(event);
       broadcastEvent(event);
       const context = deriveEventContext(event);
+      if (context.market) {
+        marketRuntimeMetricsCache.delete(context.market);
+      }
       if (event.event_type !== 'relay_intent_accepted') {
         scheduleTradeStreamNotification(event);
       }
@@ -9594,23 +8781,9 @@ async function main(): Promise<void> {
     },
   );
 
-  // Lightweight queue-state refresh — keeps last_processed_sequence current
-  // even when the WebSocket log subscription misses QueueItemEnqueued events.
-  // Reads one account only; no getAllMangoAccounts().
-  if (HARNESS_QUEUE_REFRESH_INTERVAL_MS > 0 && onchain) {
-    startPeriodicTask(
-      'onchain_queue_refresh',
-      HARNESS_QUEUE_REFRESH_INTERVAL_MS,
-      async () => {
-        await refreshOnchainQueueState(onchain, onchainSync);
-      },
-      { runImmediately: false },
-    );
-  }
-
   startPeriodicTask(
     'frontend_market_refresh',
-    HARNESS_FRONTEND_REFRESH_INTERVAL_MS,
+    HARNESS_ONCHAIN_CACHE_TTL_MS,
     async () => {
       marketRuntimeMetricsCache.clear();
       scheduleFrontendStreamNotification(onchain, onchainSync, {

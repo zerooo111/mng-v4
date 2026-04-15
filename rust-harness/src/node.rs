@@ -72,9 +72,13 @@ impl NativeContinuumStateEngine {
         group: String,
         sequence: String,
         kind: u32,
+        // Optional v2 sub-queue market index. Pass undefined/null to do a
+        // best-effort scan across all markets (legacy single-stream lookup).
+        market_index: Option<u32>,
     ) -> Result<Option<String>> {
+        let market_index_u16 = market_index.map(|m| m as u16);
         self.with_engine("find_intent_json", |engine| {
-            engine.find_intent_json(&group, &sequence, kind as u8)
+            engine.find_intent_json(&group, market_index_u16, &sequence, kind as u8)
         })
     }
 
@@ -87,10 +91,14 @@ impl NativeContinuumStateEngine {
         include_owner_state: bool,
         include_market_state: bool,
         include_market_open_orders: bool,
+        // Optional v2 sub-queue market index.
+        market_index: Option<u32>,
     ) -> Result<Option<String>> {
+        let market_index_u16 = market_index.map(|m| m as u16);
         self.with_engine("get_validated_local_payload_json", |engine| {
             engine.get_validated_local_payload_json(
                 &group,
+                market_index_u16,
                 &sequence,
                 kind as u8,
                 include_owner_state,

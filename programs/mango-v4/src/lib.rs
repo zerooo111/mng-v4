@@ -42,7 +42,7 @@ use state::{
     TokenIndex, TCS_START_INCENTIVE,
 };
 
-declare_id!("Bgjnb7rn2T157TSradRsENVcW86Ss58oMvGGvBgQxTEt");
+declare_id!("Hjz5uX54acR4mhiNAih5Qd8yvxZTL5Zt4caFswrqP2Zu");
 
 #[program]
 pub mod mango_v4 {
@@ -596,20 +596,22 @@ pub mod mango_v4 {
 
     pub fn execution_queue_drop_ctm(
         ctx: Context<ExecutionQueueAdmin>,
+        market_index: u16,
         sequence: u64,
     ) -> Result<()> {
         #[cfg(feature = "enable-gpl")]
-        instructions::execution_queue_drop_ctm(ctx, sequence)?;
+        instructions::execution_queue_drop_ctm(ctx, market_index, sequence)?;
         Ok(())
     }
 
     pub fn execution_queue_enqueue_ctm(
         ctx: Context<ExecutionQueueEnqueueCtm>,
+        market_index: u16,
         envelope: CtmEnvelope,
         payload: Vec<u8>,
     ) -> Result<()> {
         #[cfg(feature = "enable-gpl")]
-        instructions::execution_queue_enqueue_ctm(ctx, envelope, payload)?;
+        instructions::execution_queue_enqueue_ctm(ctx, market_index, envelope, payload)?;
         Ok(())
     }
 
@@ -617,11 +619,12 @@ pub mod mango_v4 {
     /// Enforces a 10-slot delayed execution to prevent race conditions with relayer sequences.
     pub fn execution_queue_enqueue_direct(
         ctx: Context<ExecutionQueueEnqueueCtm>,
+        market_index: u16,
         envelope: CtmEnvelope,
         payload: Vec<u8>,
     ) -> Result<()> {
         #[cfg(feature = "enable-gpl")]
-        instructions::execution_queue_enqueue_direct(ctx, envelope, payload)?;
+        instructions::execution_queue_enqueue_direct(ctx, market_index, envelope, payload)?;
         Ok(())
     }
 
@@ -637,15 +640,17 @@ pub mod mango_v4 {
 
     pub fn execution_queue_execute(
         ctx: Context<ExecutionQueueExecute>,
+        market_index: u16,
         max_items: u16,
     ) -> Result<()> {
         #[cfg(feature = "enable-gpl")]
-        instructions::execution_queue_execute(ctx, max_items)?;
+        instructions::execution_queue_execute(ctx, market_index, max_items)?;
         Ok(())
     }
 
     pub fn execution_queue_execute_multi(
         ctx: Context<ExecutionQueueExecute>,
+        market_index: u16,
         max_items: u16,
         lane_count: u8,
         accounts_per_lane: u16,
@@ -654,11 +659,24 @@ pub mod mango_v4 {
         #[cfg(feature = "enable-gpl")]
         instructions::execution_queue_execute_multi(
             ctx,
+            market_index,
             max_items,
             lane_count,
             accounts_per_lane,
             lane_hashes,
         )?;
+        Ok(())
+    }
+
+    /// Migrate a v1 single-queue ExecutionQueue to the v2 sub-queue layout.
+    /// Requires admin auth, paused ingress + execute, and total_count == 0
+    /// (queue must be drained). Reinitializes the header in v2 form,
+    /// initializes all 16 sub-queue header slots as inactive, and sets
+    /// layout_version = 2. The first market to enqueue post-migration will
+    /// claim sub-queue slot 0.
+    pub fn execution_queue_migrate_v1_to_v2(ctx: Context<ExecutionQueueAdmin>) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_migrate_v1_to_v2(ctx)?;
         Ok(())
     }
 

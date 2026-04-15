@@ -440,6 +440,44 @@ fn account_metas_from_infos(account_infos: &[AccountInfo]) -> Vec<AccountMeta> {
         .collect()
 }
 
+fn canonical_direct_dispatch_account_metas(
+    group: Pubkey,
+    execution_queue: Pubkey,
+    dispatch_accounts: &[AccountMeta],
+    user_owner: Option<Pubkey>,
+) -> Vec<AccountMeta> {
+    let mut effective_remaining = merge_effective_runtime_flags_for_hash(
+        dispatch_accounts,
+        &[
+            AccountMeta {
+                pubkey: group,
+                is_signer: false,
+                is_writable: true,
+            },
+            AccountMeta {
+                pubkey: execution_queue,
+                is_signer: false,
+                is_writable: true,
+            },
+            AccountMeta {
+                pubkey: tx_instructions::id(),
+                is_signer: false,
+                is_writable: false,
+            },
+        ],
+    );
+    if let Some(user_owner) = user_owner {
+        if let Some(owner_meta) = effective_remaining
+            .iter_mut()
+            .find(|meta| meta.pubkey == user_owner)
+        {
+            owner_meta.is_signer = false;
+            owner_meta.is_writable = false;
+        }
+    }
+    effective_remaining
+}
+
 fn build_dispatch_ix_data(payload: &DecodedQueuePayload) -> Vec<u8> {
     match &payload.body {
         QueuePayloadBody::PerpPlaceOrderV2(p) => crate::instruction::PerpPlaceOrderV2 {
@@ -1501,17 +1539,21 @@ pub fn execution_queue_enqueue_direct(
         &decoded_payload,
         dispatch_accounts,
     )?;
-
-    let account_hash = hash_accounts(
-        &dispatch_accounts
-            .iter()
-            .map(|ai| AccountMeta {
-                pubkey: *ai.key,
-                is_signer: ai.is_signer,
-                is_writable: ai.is_writable,
-            })
-            .collect::<Vec<_>>(),
-    );
+    let user_signature_keys = if variant_uses_user_signature(decoded_payload.variant) {
+        Some(extract_user_owner_for_ctm_payload(
+            ctx.accounts.group.key(),
+            dispatch_accounts,
+        )?)
+    } else {
+        None
+    };
+    let dispatch_account_metas = account_metas_from_infos(dispatch_accounts);
+    let account_hash = hash_accounts(&canonical_direct_dispatch_account_metas(
+        ctx.accounts.group.key(),
+        ctx.accounts.execution_queue.key(),
+        &dispatch_account_metas,
+        user_signature_keys.map(|(_, user_owner)| user_owner),
+    ));
     require!(
         account_hash == envelope.accounts_hash,
         MangoError::ExecutionQueueAccountsHashMismatch
@@ -1524,9 +1566,7 @@ pub fn execution_queue_enqueue_direct(
 
     // Direct-submit: NO CTM signer verification required.
     // Instead, verify only the user's Ed25519 intent signature.
-    if variant_uses_user_signature(decoded_payload.variant) {
-        let (mango_account_key, user_owner) =
-            extract_user_owner_for_ctm_payload(ctx.accounts.group.key(), dispatch_accounts)?;
+    if let Some((mango_account_key, user_owner)) = user_signature_keys {
         let user_intent_hash_v2 = canonical_user_intent_message_v2(
             ctx.accounts.group.key(),
             mango_account_key,
@@ -2470,6 +2510,35 @@ mod tests {
         ]);
 
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn canonical_direct_dispatch_account_metas_scrubs_user_owner_runtime_uplift() {
+        let group = Pubkey::new_unique();
+        let execution_queue = Pubkey::new_unique();
+        let mango_account = Pubkey::new_unique();
+        let user_owner = Pubkey::new_unique();
+        let perp_market = Pubkey::new_unique();
+        let dispatch_accounts = vec![
+            AccountMeta::new_readonly(group, false),
+            AccountMeta::new(mango_account, false),
+            AccountMeta::new(user_owner, true),
+            AccountMeta::new(perp_market, false),
+        ];
+
+        let canonical = canonical_direct_dispatch_account_metas(
+            group,
+            execution_queue,
+            &dispatch_accounts,
+            Some(user_owner),
+        );
+
+        assert_eq!(canonical[0].pubkey, group);
+        assert!(!canonical[0].is_signer);
+        assert!(canonical[0].is_writable);
+        assert_eq!(canonical[2].pubkey, user_owner);
+        assert!(!canonical[2].is_signer);
+        assert!(!canonical[2].is_writable);
     }
 
     fn write_u16_le(data: &mut [u8], offset: usize, value: u16) {

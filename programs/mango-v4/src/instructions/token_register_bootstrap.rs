@@ -72,7 +72,11 @@ pub fn token_register_bootstrap(
     bank.last_net_borrows_window_start_ts = now_ts / 86_400 * 86_400;
     bank.net_borrow_limit_per_window_quote = 5_000_000_000;
     bank.borrow_weight_scale_start_quote = 5_000_000_000.0;
-    bank.deposit_weight_scale_start_quote = 5_000_000_000.0;
+    bank.deposit_weight_scale_start_quote = if token_index == 0 {
+        f64::MAX
+    } else {
+        5_000_000_000.0
+    };
     bank.reduce_only = 2;
     bank.disable_asset_liquidation = 0;
     bank.interest_target_utilization = 0.5;

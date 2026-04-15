@@ -504,6 +504,7 @@ async function main(): Promise<void> {
             group,
             executionQueue,
             executionQueueBuffer,
+            0, // Phase 3: marketIndex = 0 for legacy single-market cranker
             toAccountMetas(lane),
             CRANK_MAX_ITEMS,
             {

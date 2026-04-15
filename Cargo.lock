@@ -3555,7 +3555,6 @@ dependencies = [
  "num 0.4.3",
  "num_enum 0.5.11",
  "openbook-v2",
- "pyth-sdk-solana",
  "rand 0.8.5",
  "regex",
  "serde",

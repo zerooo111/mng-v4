@@ -30,6 +30,26 @@ const PROGRAM_ID_OVERRIDE = process.env.CTM_RELAYER_PROGRAM_ID;
 const GROUP_NUM = Number(
   process.env.EXECUTION_QUEUE_GROUP_NUM || process.env.GROUP_NUM || '9101',
 );
+const DEFAULT_PERP_BASE_DECIMALS = 6;
+const DEFAULT_PERP_BASE_LOT_SIZE = 100;
+const DEFAULT_PERP_QUOTE_LOT_SIZE = 1;
+type OracleMode = 'stub' | 'pyth';
+type PerpMarketPrecision = {
+  baseDecimals: number;
+  baseLotSize: number;
+  quoteLotSize: number;
+};
+
+const PYTH_SPONSORED_FEED: Record<string, PublicKey> = {
+  SOL: new PublicKey('7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE'),
+  BTC: new PublicKey('4cSM2e6rvbGQUFiJbqytoVMi5GgghSMr8LwVrT9VPSPo'),
+  ETH: new PublicKey('42amVS4KgzR9rA28tkVYqVXjq9Qa8dcZQMbH5EYFX6XC'),
+};
+
+const PYTH_ORACLE_CONFIG = {
+  confFilter: 0.1,
+  maxStalenessSlots: 600,
+} as const;
 
 type Cli = {
   symbol: string;
@@ -39,7 +59,32 @@ type Cli = {
   baseLotSize: number;
   quoteLotSize: number;
   mintDecimals: number;
+  oracleMode: OracleMode | null;
+  pythFeed: string | null;
 };
+
+function defaultPrecisionForSymbol(symbol: string): PerpMarketPrecision {
+  switch (symbol) {
+    case 'SOL':
+      return {
+        baseDecimals: 5,
+        baseLotSize: 100,
+        quoteLotSize: 1,
+      };
+    case 'BTC':
+      return {
+        baseDecimals: 6,
+        baseLotSize: 100,
+        quoteLotSize: 1,
+      };
+    default:
+      return {
+        baseDecimals: DEFAULT_PERP_BASE_DECIMALS,
+        baseLotSize: DEFAULT_PERP_BASE_LOT_SIZE,
+        quoteLotSize: DEFAULT_PERP_QUOTE_LOT_SIZE,
+      };
+  }
+}
 
 function parseCli(): Cli {
   const args = process.argv.slice(2);
@@ -47,11 +92,16 @@ function parseCli(): Cli {
     symbol: '',
     price: Number.NaN,
     index: null,
-    baseDecimals: 6,
-    baseLotSize: 100,
-    quoteLotSize: 10,
+    baseDecimals: DEFAULT_PERP_BASE_DECIMALS,
+    baseLotSize: DEFAULT_PERP_BASE_LOT_SIZE,
+    quoteLotSize: DEFAULT_PERP_QUOTE_LOT_SIZE,
     mintDecimals: 9,
+    oracleMode: null,
+    pythFeed: null,
   };
+  let baseDecimalsOverridden = false;
+  let baseLotSizeOverridden = false;
+  let quoteLotSizeOverridden = false;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     const take = (): string => {
@@ -74,15 +124,29 @@ function parseCli(): Cli {
         break;
       case '--base-decimals':
         out.baseDecimals = Number(take());
+        baseDecimalsOverridden = true;
         break;
       case '--base-lot-size':
         out.baseLotSize = Number(take());
+        baseLotSizeOverridden = true;
         break;
       case '--quote-lot-size':
         out.quoteLotSize = Number(take());
+        quoteLotSizeOverridden = true;
         break;
       case '--mint-decimals':
         out.mintDecimals = Number(take());
+        break;
+      case '--oracle-mode': {
+        const mode = take().trim().toLowerCase();
+        if (mode !== 'stub' && mode !== 'pyth') {
+          throw new Error(`invalid --oracle-mode ${mode}`);
+        }
+        out.oracleMode = mode as OracleMode;
+        break;
+      }
+      case '--pyth-feed':
+        out.pythFeed = take().trim();
         break;
       default:
         throw new Error(`unknown arg ${a}`);
@@ -91,6 +155,28 @@ function parseCli(): Cli {
   if (!out.symbol) throw new Error('--symbol is required');
   if (!Number.isFinite(out.price) || out.price <= 0) {
     throw new Error('--price must be a positive number');
+  }
+  const precision = defaultPrecisionForSymbol(out.symbol);
+  if (!baseDecimalsOverridden) {
+    out.baseDecimals = precision.baseDecimals;
+  }
+  if (!baseLotSizeOverridden) {
+    out.baseLotSize = precision.baseLotSize;
+  }
+  if (!quoteLotSizeOverridden) {
+    out.quoteLotSize = precision.quoteLotSize;
+  }
+  if (out.oracleMode === null) {
+    out.oracleMode = PYTH_SPONSORED_FEED[out.symbol] ? 'pyth' : 'stub';
+  }
+  if (out.oracleMode === 'pyth' && !out.pythFeed) {
+    const sponsored = PYTH_SPONSORED_FEED[out.symbol];
+    if (!sponsored) {
+      throw new Error(
+        `no default Pyth sponsored feed for ${out.symbol}; pass --pyth-feed or --oracle-mode stub`,
+      );
+    }
+    out.pythFeed = sponsored.toBase58();
   }
   return out;
 }
@@ -189,22 +275,34 @@ async function main(): Promise<void> {
   );
   console.error(`[add-perp-market] created base mint ${baseMint.toBase58()}`);
 
-  // 2) Create stub oracle for the base mint.
-  const existingOracles = await adminClient.getStubOracle(group, baseMint);
+  // 2) Select the market oracle.
   let oraclePk: PublicKey;
-  if (existingOracles.length > 0) {
-    oraclePk = existingOracles[0].publicKey;
+  let oracleConfig: { confFilter: number; maxStalenessSlots: number | null };
+  if (cli.oracleMode === 'pyth') {
+    oraclePk = new PublicKey(cli.pythFeed!);
+    oracleConfig = { ...PYTH_ORACLE_CONFIG };
     console.error(
-      `[add-perp-market] reusing existing stub oracle ${oraclePk.toBase58()}`,
+      `[add-perp-market] using sponsored pyth oracle ${oraclePk.toBase58()}`,
     );
   } else {
-    await adminClient.stubOracleCreate(group, baseMint, cli.price);
-    const oracles = await adminClient.getStubOracle(group, baseMint);
-    if (oracles.length === 0) {
-      throw new Error('stub oracle creation did not yield an account');
+    const existingOracles = await adminClient.getStubOracle(group, baseMint);
+    if (existingOracles.length > 0) {
+      oraclePk = existingOracles[0].publicKey;
+      console.error(
+        `[add-perp-market] reusing existing stub oracle ${oraclePk.toBase58()}`,
+      );
+    } else {
+      await adminClient.stubOracleCreate(group, baseMint, cli.price);
+      const oracles = await adminClient.getStubOracle(group, baseMint);
+      if (oracles.length === 0) {
+        throw new Error('stub oracle creation did not yield an account');
+      }
+      oraclePk = oracles[0].publicKey;
+      console.error(
+        `[add-perp-market] created stub oracle ${oraclePk.toBase58()}`,
+      );
     }
-    oraclePk = oracles[0].publicKey;
-    console.error(`[add-perp-market] created stub oracle ${oraclePk.toBase58()}`);
+    oracleConfig = { confFilter: 0.1, maxStalenessSlots: null };
   }
 
   // 3) Create the perp market. Risk params mirror SOL-PERP bootstrap.
@@ -213,7 +311,7 @@ async function main(): Promise<void> {
     oraclePk,
     marketIndex,
     marketName,
-    { confFilter: 0.1, maxStalenessSlots: null },
+    oracleConfig,
     cli.baseDecimals,
     cli.quoteLotSize,
     cli.baseLotSize,
@@ -259,6 +357,8 @@ async function main(): Promise<void> {
     name: marketName,
     baseMint: baseMint.toBase58(),
     oracle: oraclePk.toBase58(),
+    oracleMode: cli.oracleMode,
+    pythFeed: cli.oracleMode === 'pyth' ? cli.pythFeed : null,
     perpMarket: perpMarket.publicKey.toBase58(),
     bids: perpMarket.bids.toBase58(),
     asks: perpMarket.asks.toBase58(),
@@ -266,6 +366,9 @@ async function main(): Promise<void> {
     baseDecimals: cli.baseDecimals,
     baseLotSize: cli.baseLotSize,
     quoteLotSize: cli.quoteLotSize,
+    priceTickUi:
+      (cli.quoteLotSize * Math.pow(10, cli.baseDecimals - 6)) /
+      cli.baseLotSize,
     initialPrice: cli.price,
     signature: sig?.signature ?? null,
     createdAtMs: Date.now(),

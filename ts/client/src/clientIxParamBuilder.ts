@@ -62,7 +62,8 @@ export const DefaultTokenRegisterParams: TokenRegisterParams = {
   netBorrowLimitPerWindowQuote: 5_000_000_000,
   netBorrowLimitWindowSizeTs: 86_400,
   borrowWeightScaleStartQuote: 5_000_000_000,
-  depositWeightScaleStartQuote: 5_000_000_000,
+  // Default to no collateral scaling; explicit risk configs can opt back in.
+  depositWeightScaleStartQuote: Number.MAX_VALUE,
   reduceOnly: 0,
   tokenConditionalSwapTakerFeeRate: 0.0005,
   tokenConditionalSwapMakerFeeRate: 0.0005,

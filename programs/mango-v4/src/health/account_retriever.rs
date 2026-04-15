@@ -407,6 +407,13 @@ impl<'a, 'info> ScannedBanksAndOracles<'a, 'info> {
         Ok((bank, price))
     }
 
+    pub fn has_scanned_bank_and_oracle_key(&self, token_index: TokenIndex) -> Result<()> {
+        let index = self.bank_index(token_index)?;
+        let bank = self.banks[index].load_fully_unchecked::<Bank>()?;
+        require_keys_eq!(bank.oracle, *self.oracles[index].key);
+        Ok(())
+    }
+
     #[inline(always)]
     fn create_oracle_infos(
         &self,
@@ -584,6 +591,11 @@ impl<'a, 'info> ScanningAccountRetriever<'a, 'info> {
         self.banks_and_oracles.scanned_bank_and_oracle(token_index)
     }
 
+    pub fn has_scanned_bank_and_oracle_key(&self, token_index: TokenIndex) -> Result<()> {
+        self.banks_and_oracles
+            .has_scanned_bank_and_oracle_key(token_index)
+    }
+
     pub fn scanned_perp_market_and_oracle(
         &self,
         perp_market_index: PerpMarketIndex,
@@ -596,6 +608,16 @@ impl<'a, 'info> ScanningAccountRetriever<'a, 'info> {
         let price =
             perp_market.oracle_price(&oracle_acc_infos, self.banks_and_oracles.staleness_slot)?;
         Ok((perp_market, price))
+    }
+
+    pub fn has_scanned_perp_market_and_oracle_key(
+        &self,
+        perp_market_index: PerpMarketIndex,
+    ) -> Result<()> {
+        let index = self.perp_market_index(perp_market_index)?;
+        let perp_market = self.perp_markets[index].load_fully_unchecked::<PerpMarket>()?;
+        require_keys_eq!(perp_market.oracle, *self.perp_oracles[index].key);
+        Ok(())
     }
 
     pub fn scanned_serum_oo(&self, key: &Pubkey) -> Result<&OpenOrders> {

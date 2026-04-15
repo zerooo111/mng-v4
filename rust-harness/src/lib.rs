@@ -8,8 +8,8 @@ mod replay;
 mod types;
 
 pub use engine::{
-    AccountSnapshot, BookLevel, ExecutionFill, ExecutionOut, ExecutionResult, HarnessEngine,
-    MarketConfig, OpenOrderSnapshot, OrderbookSnapshot, PerpPositionSnapshot,
+    AccountSnapshot, BookLevel, ExecutionFill, ExecutionOut, ExecutionResult, FastPerpPosition,
+    HarnessEngine, MarketConfig, OpenOrderSnapshot, OrderbookSnapshot, PerpPositionSnapshot,
 };
 pub use error::{HarnessError, Result};
 pub use payload::{

@@ -24,6 +24,7 @@ import {
   encodePerpBatchIntentQueuePayload,
   encodePerpCancelOrderQueuePayload,
   encodePerpPlaceOrderV2QueuePayload,
+  hashExecutionQueueAccounts,
   hashExecutionQueuePayload,
   signExecutionQueueIntentMessage,
 } from './executionQueue';
@@ -435,6 +436,18 @@ describe('Execution Queue Helpers', () => {
     expect(built.instructions[0]).eq(built.userIntentPreInstruction);
     expect(built.instructions[1]).eq(built.enqueueInstruction);
     expect(built.envelope.sequence).eq(0n);
+    const expectedDirectAccounts = [
+      { pubkey: group, isWritable: true, isSigner: false },
+      { pubkey: mangoAccount, isWritable: true, isSigner: false },
+      { pubkey: user.publicKey, isWritable: false, isSigner: false },
+      { pubkey: remainingAccounts[3].pubkey, isWritable: true, isSigner: false },
+    ];
+    expect(
+      Buffer.compare(
+        built.envelope.accountsHash,
+        hashExecutionQueueAccounts(expectedDirectAccounts),
+      ),
+    ).eq(0);
   });
 
   it('message_changes_with_sequence', () => {

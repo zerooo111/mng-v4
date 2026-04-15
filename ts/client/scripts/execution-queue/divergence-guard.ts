@@ -386,6 +386,7 @@ async function enqueueGapFillers(params: {
       group: groupPk,
       executionQueue: executionQueuePk,
       executionQueueBuffer: executionQueuePk,
+      marketIndex: 0, // divergence-guard targets the single-market default
       remainingAccounts,
       payload,
       sequence,

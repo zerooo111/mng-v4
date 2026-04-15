@@ -455,9 +455,25 @@ export class PerpMarket {
   }
 
   public uiPriceToLots(price: number): BN {
-    return toNative(price, QUOTE_DECIMALS)
-      .mul(this.baseLotSize)
-      .div(this.quoteLotSize.mul(new BN(Math.pow(10, this.baseDecimals))));
+    return this.uiPriceToLotsRoundDown(price);
+  }
+
+  public uiPriceToLotsRoundDown(price: number): BN {
+    return this.uiPriceToLotsWithRounding(price, 'down');
+  }
+
+  public uiPriceToLotsRoundUp(price: number): BN {
+    return this.uiPriceToLotsWithRounding(price, 'up');
+  }
+
+  public uiPriceToLotsForSide(price: number, side: PerpOrderSide): BN {
+    return 'ask' in side
+      ? this.uiPriceToLotsRoundUp(price)
+      : this.uiPriceToLotsRoundDown(price);
+  }
+
+  public roundUiPriceToTick(price: number, side: PerpOrderSide): number {
+    return this.priceLotsToUi(this.uiPriceToLotsForSide(price, side));
   }
 
   public uiBaseToLots(quantity: number): BN {
@@ -486,6 +502,26 @@ export class PerpMarket {
 
   public quoteLotsToUi(quantity: BN): number {
     return parseFloat(quantity.toString()) * this.quoteLotsToUiConverter;
+  }
+
+  private uiPriceToLotsWithRounding(
+    price: number,
+    rounding: 'down' | 'up',
+  ): BN {
+    const nativePrice = toNative(price, QUOTE_DECIMALS);
+    if (nativePrice.lten(0)) {
+      return new BN(0);
+    }
+
+    const numerator = nativePrice.mul(this.baseLotSize);
+    const denominator = this.quoteLotSize.mul(
+      new BN(Math.pow(10, this.baseDecimals)),
+    );
+    const roundedDown = numerator.div(denominator);
+    if (rounding === 'down' || numerator.mod(denominator).isZero()) {
+      return roundedDown;
+    }
+    return roundedDown.addn(1);
   }
 
   /**

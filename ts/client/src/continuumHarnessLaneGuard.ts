@@ -373,6 +373,68 @@ export class ContinuumHarnessLaneGuard {
     return this.trackedIntents.get(`${group}:${sequence}:${kind}`) || null;
   }
 
+  /**
+   * Sweep pending intents whose sequence is below the on-chain queue's
+   * next-to-execute watermark and that are no longer in the on-chain
+   * pending set. Called after each periodic queue-state refresh so the
+   * lane guard releases pending intents that have been crankered on-chain
+   * without waiting for the 8 s stale timeout or a code-3 event.
+   *
+   * Returns the swept intents so the caller can emit synthetic
+   * QueueItemProcessed events to the engine (advancing confirmed_seq).
+   */
+  sweepProcessedBelow(
+    nextOnchainSequence: bigint,
+    pendingOnchainSequenceKinds: Set<string>,
+    nowMs = Date.now(),
+  ): Array<
+    Pick<
+      LaneGuardTrackedIntent,
+      'group' | 'sequence' | 'kind' | 'market' | 'owner' | 'mangoAccount'
+    >
+  > {
+    if (nextOnchainSequence === 0n) {
+      return [];
+    }
+    const swept: Array<
+      Pick<
+        LaneGuardTrackedIntent,
+        'group' | 'sequence' | 'kind' | 'market' | 'owner' | 'mangoAccount'
+      >
+    > = [];
+    for (const tracked of this.trackedIntents.values()) {
+      if (tracked.terminalTsMs !== null) {
+        continue; // already resolved
+      }
+      if (BigInt(tracked.sequence) >= nextOnchainSequence) {
+        continue; // still possibly pending on-chain
+      }
+      if (pendingOnchainSequenceKinds.has(`${tracked.sequence}:${tracked.kind}`)) {
+        continue; // still in on-chain pending queue
+      }
+      // Intent is below the on-chain watermark and not pending — processed.
+      const lane = this.lanes.get(tracked.laneHash);
+      if (lane) {
+        this.removePendingTracking(lane, tracked, tracked.sequence);
+        lane.consecutiveFailures = 0;
+        if (lane.pendingTrackingKeys.size === 0 && lane.suppressUntilTsMs <= nowMs) {
+          lane.lastFailureReason = null;
+          lane.lastFailureTsMs = null;
+        }
+      }
+      tracked.terminalTsMs = nowMs;
+      swept.push({
+        group: tracked.group,
+        sequence: tracked.sequence,
+        kind: tracked.kind,
+        market: tracked.market,
+        owner: tracked.owner,
+        mangoAccount: tracked.mangoAccount,
+      });
+    }
+    return swept;
+  }
+
   getSuppressedMarkets(nowMs = Date.now()): Map<string, LaneGuardMarketSuppression> {
     this.cleanup(nowMs);
     const byMarket = new Map<string, LaneGuardMarketSuppression>();

@@ -26,6 +26,7 @@ use mango_v4::{
         OutEvent, PerpMarket, PerpMarketIndex, QueueItemKind, Side, TokenIndex,
         EXECUTION_QUEUE_CTM_CAPACITY, EXECUTION_QUEUE_CTM_ITEMS_OFFSET,
         EXECUTION_QUEUE_ITEM_ACCOUNTS_HASH_OFFSET, EXECUTION_QUEUE_ITEM_KIND_OFFSET,
+        EXECUTION_QUEUE_ITEM_MIN_EXECUTE_SLOT_OFFSET,
         EXECUTION_QUEUE_ITEM_PAYLOAD_LEN_OFFSET, EXECUTION_QUEUE_ITEM_PAYLOAD_OFFSET,
         EXECUTION_QUEUE_ITEM_SEQUENCE_OFFSET, EXECUTION_QUEUE_ITEM_SIZE,
         EXECUTION_QUEUE_ITEM_STATUS_OFFSET, EXECUTION_QUEUE_LIQUIDITY_CAPACITY,
@@ -3021,6 +3022,8 @@ struct PendingHeadDispatch {
     accounts_hash: Option<[u8; 32]>,
     lane_hash: [u8; 32],
     dispatch_kind: PendingDispatchKind,
+    min_execute_slot: Option<u64>,
+    sent_slot: Option<u64>,
     sent_at_ms: u64,
     last_status_check_ms: u64,
     no_advance_recorded: bool,
@@ -3032,6 +3035,33 @@ struct PendingHeadDispatch {
 enum PendingDispatchKind {
     Execute,
     GapSkip,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingExecuteEligibilityState {
+    Normal,
+    WaitingForMinSlot,
+    ReadyForRetry,
+}
+
+fn pending_execute_eligibility_state(
+    pending: &PendingHeadDispatch,
+    chain_slot: u64,
+) -> PendingExecuteEligibilityState {
+    if pending.dispatch_kind != PendingDispatchKind::Execute || !pending.targeted {
+        return PendingExecuteEligibilityState::Normal;
+    }
+
+    match (pending.sent_slot, pending.min_execute_slot) {
+        (Some(sent_slot), Some(min_execute_slot)) if sent_slot < min_execute_slot => {
+            if chain_slot < min_execute_slot {
+                PendingExecuteEligibilityState::WaitingForMinSlot
+            } else {
+                PendingExecuteEligibilityState::ReadyForRetry
+            }
+        }
+        _ => PendingExecuteEligibilityState::Normal,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5149,6 +5179,39 @@ impl Engine {
                 }
             }
         }
+        if let Some(cache_path) = self.config.executor_lane_cache_path.as_ref() {
+            if cache_path.exists() {
+                let content = tokio::fs::read_to_string(cache_path).await?;
+                if let Ok(cached_lanes) = serde_json::from_str::<Vec<LaneConfigFile>>(&content) {
+                    for lane in cached_lanes {
+                        let mut remaining_accounts =
+                            Vec::with_capacity(lane.remaining_accounts.len());
+                        let mut parse_failed = false;
+                        for account in &lane.remaining_accounts {
+                            let Ok(pubkey) = Pubkey::from_str(&account.pubkey) else {
+                                parse_failed = true;
+                                break;
+                            };
+                            remaining_accounts.push(AccountMeta {
+                                pubkey,
+                                is_signer: account.is_signer,
+                                is_writable: account.is_writable,
+                            });
+                        }
+                        if parse_failed || remaining_accounts.is_empty() {
+                            continue;
+                        }
+                        executor
+                            .register_dynamic_lane(
+                                lane.name.unwrap_or_else(|| "cached".to_string()),
+                                &remaining_accounts,
+                                self.config.executor_include_legacy_fixed_hash,
+                            )
+                            .await;
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -6460,6 +6523,7 @@ impl Engine {
         executor: &Arc<ExecutorState>,
         head: &QueueHead,
         now_ms: u64,
+        chain_slot: u64,
     ) -> Vec<PendingHeadDispatch> {
         let pending_snapshot = {
             let mut pending_dispatches = executor.pending_dispatches.lock().await;
@@ -6503,6 +6567,30 @@ impl Engine {
                 {
                     match status {
                         Some(status) if status.err.is_none() => {
+                            match pending_execute_eligibility_state(&retained[index], chain_slot) {
+                                PendingExecuteEligibilityState::WaitingForMinSlot => {
+                                    debug!(
+                                        "executor targeted execute confirmed before min_execute_slot sequence={} sig={} current_slot={} min_execute_slot={}",
+                                        retained[index].sequence,
+                                        signature,
+                                        chain_slot,
+                                        retained[index].min_execute_slot.unwrap_or_default(),
+                                    );
+                                    continue;
+                                }
+                                PendingExecuteEligibilityState::ReadyForRetry => {
+                                    debug!(
+                                        "executor clearing pre-eligibility execute so head can be retried sequence={} sig={} current_slot={} min_execute_slot={}",
+                                        retained[index].sequence,
+                                        signature,
+                                        chain_slot,
+                                        retained[index].min_execute_slot.unwrap_or_default(),
+                                    );
+                                    failed_indices.insert(index);
+                                    continue;
+                                }
+                                PendingExecuteEligibilityState::Normal => {}
+                            }
                             if !retained[index].no_advance_recorded {
                                 retained[index].no_advance_recorded = true;
                                 self.metrics
@@ -6723,10 +6811,21 @@ impl Engine {
                 _ => return Ok(ExecuteLoopOutcome::Idle),
             }
         };
+        let chain = self.blockhashes.snapshot().await;
 
         let pending_snapshot = self
-            .reconcile_pending_dispatches(executor, &head, now_ms)
+            .reconcile_pending_dispatches(executor, &head, now_ms, chain.slot)
             .await;
+        if head_waiting_for_min_execute_slot(&head, chain.slot) {
+            debug!(
+                "executor skipped: queue_count={} next_sequence={} reason=head_not_yet_eligible current_slot={} min_execute_slot={}",
+                head.count,
+                head.next_sequence,
+                chain.slot,
+                head.ctm_min_execute_slot.unwrap_or_default(),
+            );
+            return Ok(ExecuteLoopOutcome::Busy);
+        }
         let same_head_pending_count = pending_snapshot
             .iter()
             .filter(|pending| {
@@ -7034,6 +7133,8 @@ impl Engine {
                             accounts_hash: None,
                             lane_hash: [0u8; 32],
                             dispatch_kind: PendingDispatchKind::GapSkip,
+                            min_execute_slot: None,
+                            sent_slot: None,
                             sent_at_ms: now_ms,
                             last_status_check_ms: now_ms,
                             no_advance_recorded: false,
@@ -7339,6 +7440,12 @@ impl Engine {
             let self_ref = self.clone();
             let lane_hash_for_failure = eligible_lanes[0].hash;
             let lanes_for_send = eligible_lanes.clone();
+            let sent_slot = chain.slot;
+            let min_execute_slot = if is_speculative {
+                None
+            } else {
+                head.ctm_min_execute_slot
+            };
 
             tokio::spawn(async move {
                 match self_ref
@@ -7362,6 +7469,8 @@ impl Engine {
                             accounts_hash,
                             lane_hash,
                             dispatch_kind: PendingDispatchKind::Execute,
+                            min_execute_slot,
+                            sent_slot: Some(sent_slot),
                             sent_at_ms: unix_timestamp_ms(),
                             last_status_check_ms: unix_timestamp_ms(),
                             no_advance_recorded: false,
@@ -7436,6 +7545,12 @@ impl Engine {
                     },
                     lane_hash: eligible_lanes[0].hash,
                     dispatch_kind: PendingDispatchKind::Execute,
+                    min_execute_slot: if speculative_mode {
+                        None
+                    } else {
+                        head.ctm_min_execute_slot
+                    },
+                    sent_slot: Some(chain.slot),
                     sent_at_ms: now_ms,
                     last_status_check_ms: now_ms,
                     no_advance_recorded: false,
@@ -8417,6 +8532,27 @@ fn expand_lane_variants(
         hash: enqueue_hash,
         remaining_accounts: raw_accounts,
     }];
+    let direct_hash =
+        hash_execution_queue_accounts_for_direct_enqueue(group, execution_queue, remaining_accounts);
+    if direct_hash != enqueue_hash {
+        lanes.push(Lane {
+            name: format!("{lane_name}-direct"),
+            hash: direct_hash,
+            remaining_accounts: remaining_accounts.to_vec(),
+        });
+    }
+    let legacy_direct_hash = hash_execution_queue_accounts_for_legacy_direct_enqueue(
+        group,
+        execution_queue,
+        remaining_accounts,
+    );
+    if legacy_direct_hash != enqueue_hash && legacy_direct_hash != direct_hash {
+        lanes.push(Lane {
+            name: format!("{lane_name}-legacy-direct"),
+            hash: legacy_direct_hash,
+            remaining_accounts: remaining_accounts.to_vec(),
+        });
+    }
     if include_legacy {
         let legacy_accounts = merge_effective_runtime_flags(
             remaining_accounts,
@@ -8651,6 +8787,61 @@ fn hash_execution_queue_accounts_for_ctm_enqueue(
     hashv(&[&bytes]).to_bytes()
 }
 
+fn hash_execution_queue_accounts_for_direct_enqueue(
+    group: Pubkey,
+    execution_queue: Pubkey,
+    remaining_accounts: &[AccountMeta],
+) -> [u8; 32] {
+    let mut effective_remaining = merge_effective_runtime_flags(
+        remaining_accounts,
+        &[
+            AccountMeta::new(group, false),
+            AccountMeta::new(execution_queue, false),
+            AccountMeta::new_readonly(sysvar::instructions::id(), false),
+        ],
+    );
+    if let Some(user_owner) = remaining_accounts.get(2).map(|account| account.pubkey) {
+        if let Some(owner_meta) = effective_remaining
+            .iter_mut()
+            .find(|account| account.pubkey == user_owner)
+        {
+            owner_meta.is_signer = false;
+            owner_meta.is_writable = false;
+        }
+    }
+    let mut bytes = Vec::with_capacity(effective_remaining.len() * 34);
+    for account in effective_remaining {
+        bytes.extend_from_slice(account.pubkey.as_ref());
+        bytes.push(u8::from(account.is_signer));
+        bytes.push(u8::from(account.is_writable));
+    }
+    hashv(&[&bytes]).to_bytes()
+}
+
+fn hash_execution_queue_accounts_for_legacy_direct_enqueue(
+    group: Pubkey,
+    execution_queue: Pubkey,
+    remaining_accounts: &[AccountMeta],
+) -> [u8; 32] {
+    let mut fixed_accounts = vec![
+        AccountMeta::new(group, false),
+        AccountMeta::new(execution_queue, false),
+        AccountMeta::new_readonly(sysvar::instructions::id(), false),
+    ];
+    if let Some(user_owner) = remaining_accounts.get(2).map(|account| account.pubkey) {
+        fixed_accounts.push(AccountMeta::new(user_owner, true));
+    }
+    let effective_remaining =
+        merge_effective_runtime_flags(remaining_accounts, &fixed_accounts);
+    let mut bytes = Vec::with_capacity(effective_remaining.len() * 34);
+    for account in effective_remaining {
+        bytes.extend_from_slice(account.pubkey.as_ref());
+        bytes.push(u8::from(account.is_signer));
+        bytes.push(u8::from(account.is_writable));
+    }
+    hashv(&[&bytes]).to_bytes()
+}
+
 fn canonical_envelope_message(group: Pubkey, envelope: &CtmEnvelope) -> [u8; 32] {
     hashv(&[
         b"mango-v4-ctm-envelope-v1",
@@ -8737,9 +8928,17 @@ fn verify_user_signature(
             });
         }
     }
-    Err(Status::invalid_argument(
-        "user_signature verification failed",
-    ))
+    let candidate_hashes = message_hashes
+        .iter()
+        .map(|hash| bytes_to_hex(hash))
+        .collect::<Vec<_>>()
+        .join(",");
+    Err(Status::invalid_argument(format!(
+        "user_signature verification failed owner={} sig={} candidate_hashes=[{}]",
+        owner,
+        bytes_to_hex(signature_bytes),
+        candidate_hashes
+    )))
 }
 
 fn build_presigned_ed25519_instruction(
@@ -9041,6 +9240,7 @@ struct QueueHead {
     ctm_sequence: Option<u64>,
     ctm_kind: Option<u8>,
     ctm_status: Option<u8>,
+    ctm_min_execute_slot: Option<u64>,
 }
 
 impl QueueHead {
@@ -9053,7 +9253,7 @@ impl QueueHead {
 
     fn blocked_reason(&self) -> String {
         format!(
-            "reason={} ctm_count={} liquidity_count={} ctm_sequence={} ctm_kind={} ctm_status={}",
+            "reason={} ctm_count={} liquidity_count={} ctm_sequence={} ctm_kind={} ctm_status={} ctm_min_execute_slot={}",
             self.reason,
             self.ctm_count,
             self.liquidity_count,
@@ -9066,8 +9266,20 @@ impl QueueHead {
             self.ctm_status
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "none".to_string()),
+            self.ctm_min_execute_slot
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
         )
     }
+}
+
+fn head_waiting_for_min_execute_slot(head: &QueueHead, chain_slot: u64) -> bool {
+    matches!(head.source, Some(QueueHeadSource::Ctm))
+        && head.reason == "ctm_pending"
+        && head
+            .ctm_min_execute_slot
+            .map(|min_execute_slot| chain_slot < min_execute_slot)
+            .unwrap_or(false)
 }
 
 fn inspect_queue_head(queue_data: &[u8]) -> QueueHead {
@@ -9113,6 +9325,7 @@ fn inspect_queue_head_for_market(queue_data: &[u8], market_index: u16) -> QueueH
             ctm_sequence: None,
             ctm_kind: None,
             ctm_status: None,
+            ctm_min_execute_slot: None,
         };
     }
 
@@ -9129,6 +9342,7 @@ fn inspect_queue_head_for_market(queue_data: &[u8], market_index: u16) -> QueueH
     let mut ctm_sequence = None;
     let mut ctm_kind = None;
     let mut ctm_status = None;
+    let mut ctm_min_execute_slot = None;
     if ctm_count > 0 {
         let slot_idx = sub_slot.unwrap_or(0);
         let ctm_offset = ctm_item_offset(slot_idx, next_sequence);
@@ -9141,9 +9355,16 @@ fn inspect_queue_head_for_market(queue_data: &[u8], market_index: u16) -> QueueH
             );
             let kind = queue_data[ctm_offset + EXECUTION_QUEUE_ITEM_KIND_OFFSET];
             let status = queue_data[ctm_offset + EXECUTION_QUEUE_ITEM_STATUS_OFFSET];
+            let min_execute_slot = u64::from_le_bytes(
+                queue_data[ctm_offset + EXECUTION_QUEUE_ITEM_MIN_EXECUTE_SLOT_OFFSET
+                    ..ctm_offset + EXECUTION_QUEUE_ITEM_MIN_EXECUTE_SLOT_OFFSET + 8]
+                    .try_into()
+                    .unwrap_or([0; 8]),
+            );
             ctm_sequence = Some(sequence);
             ctm_kind = Some(kind);
             ctm_status = Some(status);
+            ctm_min_execute_slot = Some(min_execute_slot);
             if status == 1 && kind == 0 && sequence == next_sequence {
                 let mut hash = [0u8; 32];
                 hash.copy_from_slice(
@@ -9162,6 +9383,7 @@ fn inspect_queue_head_for_market(queue_data: &[u8], market_index: u16) -> QueueH
                     ctm_sequence,
                     ctm_kind,
                     ctm_status,
+                    ctm_min_execute_slot,
                 };
             }
         } else {
@@ -9177,6 +9399,7 @@ fn inspect_queue_head_for_market(queue_data: &[u8], market_index: u16) -> QueueH
                 ctm_sequence,
                 ctm_kind,
                 ctm_status,
+                ctm_min_execute_slot,
             };
         }
     }
@@ -9204,6 +9427,7 @@ fn inspect_queue_head_for_market(queue_data: &[u8], market_index: u16) -> QueueH
                     ctm_sequence,
                     ctm_kind,
                     ctm_status,
+                    ctm_min_execute_slot,
                 };
             }
             return QueueHead {
@@ -9218,6 +9442,7 @@ fn inspect_queue_head_for_market(queue_data: &[u8], market_index: u16) -> QueueH
                 ctm_sequence,
                 ctm_kind,
                 ctm_status,
+                ctm_min_execute_slot,
             };
         }
     }
@@ -9247,6 +9472,7 @@ fn inspect_queue_head_for_market(queue_data: &[u8], market_index: u16) -> QueueH
         ctm_sequence,
         ctm_kind,
         ctm_status,
+        ctm_min_execute_slot,
     }
 }
 
@@ -11246,6 +11472,60 @@ mod tests {
     }
 
     #[test]
+    fn inspect_queue_head_reads_ctm_min_execute_slot() {
+        let mut data = vec![0u8; EXECUTION_QUEUE_LIQUIDITY_ITEMS_OFFSET];
+        write_u32(&mut data, EXECUTION_QUEUE_COUNT_OFFSET, 1);
+        write_u64(&mut data, EXECUTION_QUEUE_NEXT_SEQUENCE_OFFSET, 12);
+        write_u64(&mut data, EXECUTION_QUEUE_MAX_SEEN_SEQUENCE_OFFSET, 12);
+        write_u32(&mut data, EXECUTION_QUEUE_CTM_COUNT_OFFSET, 1);
+
+        let item_offset = queue_item_offset(12);
+        write_u64(
+            &mut data,
+            item_offset + EXECUTION_QUEUE_ITEM_SEQUENCE_OFFSET,
+            12,
+        );
+        write_u64(
+            &mut data,
+            item_offset + EXECUTION_QUEUE_ITEM_MIN_EXECUTE_SLOT_OFFSET,
+            543,
+        );
+        data[item_offset + EXECUTION_QUEUE_ITEM_KIND_OFFSET] = 0;
+        data[item_offset + EXECUTION_QUEUE_ITEM_STATUS_OFFSET] = 1;
+
+        let head = inspect_queue_head(&data);
+        assert_eq!(head.ctm_min_execute_slot, Some(543));
+        assert!(head_waiting_for_min_execute_slot(&head, 542));
+        assert!(!head_waiting_for_min_execute_slot(&head, 543));
+    }
+
+    #[test]
+    fn pending_execute_eligibility_state_waits_then_retries_after_speed_bump() {
+        let pending = PendingHeadDispatch {
+            sequence: 12,
+            accounts_hash: Some([7u8; 32]),
+            lane_hash: [8u8; 32],
+            dispatch_kind: PendingDispatchKind::Execute,
+            min_execute_slot: Some(543),
+            sent_slot: Some(536),
+            sent_at_ms: 0,
+            last_status_check_ms: 0,
+            no_advance_recorded: false,
+            targeted: true,
+            signature: Signature::default(),
+        };
+
+        assert_eq!(
+            pending_execute_eligibility_state(&pending, 542),
+            PendingExecuteEligibilityState::WaitingForMinSlot
+        );
+        assert_eq!(
+            pending_execute_eligibility_state(&pending, 543),
+            PendingExecuteEligibilityState::ReadyForRetry
+        );
+    }
+
+    #[test]
     fn inspect_gap_recovery_batch_returns_first_contiguous_pending_span_after_gap() {
         let mut data = vec![0u8; EXECUTION_QUEUE_LIQUIDITY_ITEMS_OFFSET];
         write_u32(&mut data, EXECUTION_QUEUE_COUNT_OFFSET, 3);
@@ -11380,6 +11660,8 @@ mod tests {
             accounts_hash: Some([0x20; 32]),
             lane_hash: [0x20; 32],
             dispatch_kind: PendingDispatchKind::Execute,
+            min_execute_slot: None,
+            sent_slot: None,
             sent_at_ms: 0,
             last_status_check_ms: 0,
             no_advance_recorded: false,
@@ -11854,5 +12136,69 @@ mod tests {
             vec![10, 11, 12]
         );
         assert_eq!(inspect_no_lane_match_batch(&data, &head, 2), vec![10, 11]);
+    }
+
+    #[test]
+    fn expand_lane_variants_includes_direct_hash_variant() {
+        let group = Pubkey::new_unique();
+        let execution_queue = Pubkey::new_unique();
+        let mango_account = Pubkey::new_unique();
+        let user_owner = Pubkey::new_unique();
+        let perp_market = Pubkey::new_unique();
+        let remaining_accounts = vec![
+            AccountMeta::new_readonly(group, false),
+            AccountMeta::new(mango_account, false),
+            AccountMeta::new_readonly(user_owner, false),
+            AccountMeta::new(perp_market, false),
+        ];
+
+        let lanes = expand_lane_variants(
+            "test".to_string(),
+            &remaining_accounts,
+            group,
+            execution_queue,
+            false,
+        );
+        let hashes: HashSet<[u8; 32]> = lanes.iter().map(|lane| lane.hash).collect();
+
+        assert_eq!(lanes.len(), 2);
+        assert!(hashes.contains(&hash_execution_queue_accounts_for_ctm_enqueue(
+            group,
+            execution_queue,
+            &remaining_accounts,
+        )));
+        assert!(hashes.contains(&hash_execution_queue_accounts_for_legacy_direct_enqueue(
+            group,
+            execution_queue,
+            &remaining_accounts,
+        )));
+    }
+
+    #[test]
+    fn canonical_direct_hash_scrubs_user_owner_runtime_uplift() {
+        let group = Pubkey::new_unique();
+        let execution_queue = Pubkey::new_unique();
+        let mango_account = Pubkey::new_unique();
+        let user_owner = Pubkey::new_unique();
+        let perp_market = Pubkey::new_unique();
+        let remaining_accounts = vec![
+            AccountMeta::new_readonly(group, false),
+            AccountMeta::new(mango_account, false),
+            AccountMeta::new(user_owner, true),
+            AccountMeta::new(perp_market, false),
+        ];
+
+        let canonical = hash_execution_queue_accounts_for_direct_enqueue(
+            group,
+            execution_queue,
+            &remaining_accounts,
+        );
+        let legacy = hash_execution_queue_accounts_for_legacy_direct_enqueue(
+            group,
+            execution_queue,
+            &remaining_accounts,
+        );
+
+        assert_ne!(canonical, legacy);
     }
 }

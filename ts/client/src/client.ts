@@ -38,6 +38,7 @@ import groupBy from 'lodash/groupBy';
 import mapValues from 'lodash/mapValues';
 import maxBy from 'lodash/maxBy';
 import uniq from 'lodash/uniq';
+import uniqBy from 'lodash/uniqBy';
 import { Bank, MintInfo, TokenIndex } from './accounts/bank';
 import { Group } from './accounts/group';
 import {
@@ -109,6 +110,7 @@ import {
   encodePerpPlaceOrderV2QueuePayload,
   QueueItemKind,
 } from './executionQueue';
+import { buildCanonicalHealthRemainingAccountKeys } from './healthAccounts';
 import { FlashLoanType, HealthCheckKind, OracleConfigParams } from './types';
 import {
   EmptyWallet,
@@ -156,6 +158,7 @@ export type MangoClientOptions = {
 export type ExecutionQueueEnqueueCtmWithIntentParams = {
   executionQueue: PublicKey;
   executionQueueBuffer?: PublicKey;
+  marketIndex: number;
   remainingAccounts: AccountMeta[];
   payload: Uint8Array;
   sequence: bigint | BN | number;
@@ -170,6 +173,7 @@ export type ExecutionQueueEnqueueCtmWithIntentParams = {
 export type ExecutionQueueBaseCtmParams = {
   executionQueue: PublicKey;
   executionQueueBuffer?: PublicKey;
+  marketIndex: number;
   sequence: bigint | BN | number;
   minExecuteSlot: bigint | BN | number;
   expiresAtSlot?: bigint | BN | number;
@@ -4013,7 +4017,7 @@ export class MangoClient {
     return await this.program.methods
       .perpPlaceOrder(
         side,
-        perpMarket.uiPriceToLots(price),
+        perpMarket.uiPriceToLotsForSide(price, side),
         perpMarket.uiBaseToLots(quantity),
         maxQuoteQuantity
           ? perpMarket.uiQuoteToLots(maxQuoteQuantity)
@@ -4082,7 +4086,7 @@ export class MangoClient {
     return await this.program.methods
       .perpPlaceOrderV2(
         side,
-        perpMarket.uiPriceToLots(price),
+        perpMarket.uiPriceToLotsForSide(price, side),
         perpMarket.uiBaseToLots(quantity),
         maxQuoteQuantity
           ? perpMarket.uiQuoteToLots(maxQuoteQuantity)
@@ -6226,8 +6230,6 @@ export class MangoClient {
     serumOpenOrdersForMarket: [Serum3Market, PublicKey][] = [],
     openbookOpenOrdersForMarket: [OpenbookV2Market, PublicKey][] = [],
   ): Promise<PublicKey[]> {
-    const healthRemainingAccounts: PublicKey[] = [];
-
     const tokenPositionIndices = mangoAccounts
       .map((mangoAccount) => mangoAccount.tokens.map((t) => t.tokenIndex))
       .flat();
@@ -6247,19 +6249,11 @@ export class MangoClient {
         }
       }
     }
-    const mintInfos = uniq(
+    const mintInfos = uniqBy(
       tokenPositionIndices
         .filter((tokenIndex) => tokenIndex !== TokenPosition.TokenIndexUnset)
         .map((tokenIndex) => group.mintInfosMapByTokenIndex.get(tokenIndex)!),
-      (mintInfo) => {
-        mintInfo.tokenIndex;
-      },
-    );
-    healthRemainingAccounts.push(
-      ...mintInfos.map((mintInfo) => mintInfo.firstBank()),
-    );
-    healthRemainingAccounts.push(
-      ...mintInfos.map((mintInfo) => mintInfo.oracle),
+      (mintInfo) => mintInfo.tokenIndex,
     );
 
     // Insert any extra perp markets in the free perp position slots
@@ -6279,7 +6273,7 @@ export class MangoClient {
         }
       }
     }
-    const allPerpMarkets = uniq(
+    const allPerpMarkets = uniqBy(
       perpPositionsMarketIndices
         .filter(
           (perpMarktIndex) =>
@@ -6288,10 +6282,6 @@ export class MangoClient {
         .map((perpIdx) => group.getPerpMarketByMarketIndex(perpIdx)!),
       (pm) => pm.perpMarketIndex,
     );
-    healthRemainingAccounts.push(
-      ...allPerpMarkets.map((perp) => perp.publicKey),
-    );
-    healthRemainingAccounts.push(...allPerpMarkets.map((perp) => perp.oracle));
 
     // Insert any extra serum open orders accounts in the cooresponding free serum market slot
     const serumPositionMarketIndices = mangoAccounts
@@ -6351,24 +6341,20 @@ export class MangoClient {
       }
     }
 
-    healthRemainingAccounts.push(
-      ...serumPositionMarketIndices
-        .filter(
-          (serumPosition) =>
-            serumPosition.marketIndex !== Serum3Orders.Serum3MarketIndexUnset,
-        )
-        .map((serumPosition) => serumPosition.openOrders),
-    );
+    const serumOpenOrders = serumPositionMarketIndices
+      .filter(
+        (serumPosition) =>
+          serumPosition.marketIndex !== Serum3Orders.Serum3MarketIndexUnset,
+      )
+      .map((serumPosition) => serumPosition.openOrders);
 
-    healthRemainingAccounts.push(
-      ...openbookPositionMarketIndices
-        .filter(
-          (openbookPosition) =>
-            openbookPosition.marketIndex !==
-            OpenbookV2Orders.OpenbookV2MarketIndexUnset,
-        )
-        .map((openbookPosition) => openbookPosition.openOrders),
-    );
+    const openbookOpenOrders = openbookPositionMarketIndices
+      .filter(
+        (openbookPosition) =>
+          openbookPosition.marketIndex !==
+          OpenbookV2Orders.OpenbookV2MarketIndexUnset,
+      )
+      .map((openbookPosition) => openbookPosition.openOrders);
 
     const fallbackMap = await this.deriveFallbackOracleContexts(group);
     const fallbacks: PublicKey[] = [];
@@ -6379,16 +6365,17 @@ export class MangoClient {
       }
     }
 
-    for (const fallback of uniq(fallbacks)) {
-      if (
-        !healthRemainingAccounts.find((h) => h.equals(fallback)) &&
-        !fallback.equals(PublicKey.default)
-      ) {
-        healthRemainingAccounts.push(fallback);
-      }
-    }
-
-    return healthRemainingAccounts;
+    return buildCanonicalHealthRemainingAccountKeys({
+      bankAccounts: mintInfos.map((mintInfo) => mintInfo.firstBank()),
+      tokenOracles: mintInfos.map((mintInfo) => mintInfo.oracle),
+      perpMarkets: allPerpMarkets.map((perp) => perp.publicKey),
+      perpOracles: allPerpMarkets.map((perp) => perp.oracle),
+      serumOpenOrders,
+      openbookOpenOrders,
+      fallbackOracles: uniq(fallbacks).filter(
+        (fallback) => !fallback.equals(PublicKey.default),
+      ),
+    });
   }
 
   /**This function assumes that the provided group has loaded banks*/
@@ -6546,10 +6533,11 @@ export class MangoClient {
     return remainingAccounts;
   }
 
-  private async executionQueueCanonicalPerpRemainingAccounts(
+  public async buildExecutionQueueCanonicalPerpRemainingAccounts(
     group: Group,
     mangoAccount: MangoAccount,
     perpMarketIndex: PerpMarketIndex,
+    userOwner?: PublicKey,
   ): Promise<AccountMeta[]> {
     const perpMarket = group.getPerpMarketByMarketIndex(perpMarketIndex);
     const healthRemainingAccounts: PublicKey[] =
@@ -6559,17 +6547,13 @@ export class MangoClient {
         [group.getFirstBankForPerpSettlement()],
         [perpMarket],
       );
-    const riskSidecarAccounts = await this.existingRiskSidecarAccountMetas(
-      group.publicKey,
-      mangoAccount.publicKey,
-      true,
-    );
 
-    return [
+    const remainingAccounts: AccountMeta[] = [
       { pubkey: group.publicKey, isSigner: false, isWritable: false },
       { pubkey: mangoAccount.publicKey, isSigner: false, isWritable: true },
       {
-        pubkey: (this.program.provider as AnchorProvider).wallet.publicKey,
+        pubkey:
+          userOwner ?? (this.program.provider as AnchorProvider).wallet.publicKey,
         isSigner: false,
         isWritable: false,
       },
@@ -6578,7 +6562,6 @@ export class MangoClient {
       { pubkey: perpMarket.asks, isSigner: false, isWritable: true },
       { pubkey: perpMarket.eventQueue, isSigner: false, isWritable: true },
       { pubkey: perpMarket.oracle, isSigner: false, isWritable: false },
-      ...riskSidecarAccounts,
       ...healthRemainingAccounts.map(
         (pubkey) =>
           ({
@@ -6588,6 +6571,46 @@ export class MangoClient {
           } as AccountMeta),
       ),
     ];
+
+    // Stabilize queue lane widths across users on the same target market by
+    // appending a deterministic readonly tail for every other perp market.
+    // These extra metas come after the ordered health accounts, so they do not
+    // disturb the fixed-order health retriever but still normalize lane widths
+    // for execute_multi batching.
+    const seen = new Set(remainingAccounts.map((account) => account.pubkey.toBase58()));
+    for (const market of Array.from(group.perpMarketsMapByMarketIndex.values()).sort(
+      (left, right) => left.perpMarketIndex - right.perpMarketIndex,
+    )) {
+      if (market.perpMarketIndex === perpMarketIndex) {
+        continue;
+      }
+      for (const pubkey of [market.publicKey, market.oracle]) {
+        const key = pubkey.toBase58();
+        if (seen.has(key)) {
+          continue;
+        }
+        seen.add(key);
+        remainingAccounts.push({
+          pubkey,
+          isSigner: false,
+          isWritable: false,
+        });
+      }
+    }
+
+    return remainingAccounts;
+  }
+
+  private async executionQueueCanonicalPerpRemainingAccounts(
+    group: Group,
+    mangoAccount: MangoAccount,
+    perpMarketIndex: PerpMarketIndex,
+  ): Promise<AccountMeta[]> {
+    return this.buildExecutionQueueCanonicalPerpRemainingAccounts(
+      group,
+      mangoAccount,
+      perpMarketIndex,
+    );
   }
 
   private riskSidecarCacheKey(group: PublicKey, mangoAccount: PublicKey): string {
@@ -6626,6 +6649,7 @@ export class MangoClient {
       group: group.publicKey,
       executionQueue: params.executionQueue,
       executionQueueBuffer: params.executionQueueBuffer,
+      marketIndex: params.marketIndex,
       remainingAccounts: params.remainingAccounts,
       payload: params.payload,
       sequence: params.sequence,
@@ -6673,6 +6697,7 @@ export class MangoClient {
     group: Group,
     executionQueue: PublicKey,
     executionQueueBuffer: PublicKey,
+    marketIndex: number,
     remainingAccounts: AccountMeta[],
     maxItems: number,
     opts: SendTransactionOpts = {},
@@ -6682,6 +6707,7 @@ export class MangoClient {
       group: group.publicKey,
       executionQueue,
       executionQueueBuffer,
+      marketIndex,
       remainingAccounts,
       maxItems,
     });
@@ -6706,7 +6732,9 @@ export class MangoClient {
     const perpMarket = group.getPerpMarketByMarketIndex(perpMarketIndex);
     const payload = encodePerpPlaceOrderV2QueuePayload({
       side: params.side,
-      priceLots: BigInt(perpMarket.uiPriceToLots(params.price).toString()),
+      priceLots: BigInt(
+        perpMarket.uiPriceToLotsForSide(params.price, params.side).toString(),
+      ),
       maxBaseLots: BigInt(perpMarket.uiBaseToLots(params.quantity).toString()),
       maxQuoteLots: params.maxQuoteQuantity
         ? BigInt(perpMarket.uiQuoteToLots(params.maxQuoteQuantity).toString())
@@ -6724,6 +6752,7 @@ export class MangoClient {
       {
         executionQueue: params.executionQueue,
         executionQueueBuffer: params.executionQueueBuffer,
+        marketIndex: perpMarketIndex,
         remainingAccounts: await this.executionQueueCanonicalPerpRemainingAccounts(
           group,
           mangoAccount,
@@ -6768,6 +6797,7 @@ export class MangoClient {
       {
         executionQueue: params.executionQueue,
         executionQueueBuffer: params.executionQueueBuffer,
+        marketIndex: perpMarketIndex,
         remainingAccounts: await this.executionQueueCanonicalPerpRemainingAccounts(
           group,
           mangoAccount,
@@ -6812,6 +6842,7 @@ export class MangoClient {
       {
         executionQueue: params.executionQueue,
         executionQueueBuffer: params.executionQueueBuffer,
+        marketIndex: perpMarketIndex,
         remainingAccounts: await this.executionQueueCanonicalPerpRemainingAccounts(
           group,
           mangoAccount,
@@ -6856,7 +6887,11 @@ export class MangoClient {
         return {
           kind: 'place' as const,
           side: operation.side,
-          priceLots: BigInt(perpMarket.uiPriceToLots(operation.price).toString()),
+          priceLots: BigInt(
+            perpMarket
+              .uiPriceToLotsForSide(operation.price, operation.side)
+              .toString(),
+          ),
           maxBaseLots: BigInt(
             perpMarket.uiBaseToLots(operation.quantity).toString(),
           ),
@@ -6878,6 +6913,7 @@ export class MangoClient {
       {
         executionQueue: params.executionQueue,
         executionQueueBuffer: params.executionQueueBuffer,
+        marketIndex: perpMarketIndex,
         remainingAccounts: await this.executionQueueCanonicalPerpRemainingAccounts(
           group,
           mangoAccount,
@@ -6912,6 +6948,7 @@ export class MangoClient {
       {
         executionQueue: params.executionQueue,
         executionQueueBuffer: params.executionQueueBuffer,
+        marketIndex: perpMarketIndex,
         remainingAccounts: await this.executionQueueCanonicalPerpRemainingAccounts(
           group,
           mangoAccount,
@@ -6947,6 +6984,7 @@ export class MangoClient {
       {
         executionQueue: params.executionQueue,
         executionQueueBuffer: params.executionQueueBuffer,
+        marketIndex: perpMarketIndex,
         remainingAccounts: await this.executionQueueCanonicalPerpRemainingAccounts(
           group,
           mangoAccount,

@@ -317,6 +317,20 @@ Rust backend notes:
 - set `CONTINUUM_HARNESS_SEQUENCER_PREFER_INTERNAL_HTTP=false` to force the older gRPC tick stream path instead
 - explicit `CONTINUUM_HARNESS_SEQUENCER_ACCEPTED_STREAM_URL` and `CONTINUUM_HARNESS_SEQUENCER_TICK_STREAM_URL` still override the default selection
 
+Required persistent devnet deploy profile:
+- `CONTINUUM_HARNESS_BACKEND=rust-backend`
+- `CONTINUUM_HARNESS_SANITY_INTERVAL_MS=0`
+- `CONTINUUM_HARNESS_MARKET_STATS_INTERVAL_MS=0`
+- `CONTINUUM_HARNESS_RECONCILE_INTERVAL_MS=30000`
+- `CONTINUUM_HARNESS_ONCHAIN_CACHE_TTL_MS=5000`
+- `CONTINUUM_HARNESS_FRONTEND_REFRESH_INTERVAL_MS=10000`
+
+Why these must stay pinned:
+- `rust-backend` still uses the TypeScript `:9091` HTTP/SSE wrapper around the Rust native engine
+- if `onchain_sanity` or `market_stats` are re-enabled in the live devnet harness, they contend with the request loop and can stall SSE even when the Rust executor is healthy
+- if `CONTINUUM_HARNESS_ONCHAIN_CACHE_TTL_MS` is made too small or `CONTINUUM_HARNESS_FRONTEND_REFRESH_INTERVAL_MS` is tied to it, frontend market streams start forcing repeated on-chain reads and `/state/markets/:market` latency regresses
+- `onchain_reconciliation` remains the correctness backstop, but it should run on the slower `30000 ms` cadence above for the persistent devnet deploy
+
 ### Harness Logging
 
 The harness keeps two JSONL files:

@@ -28,7 +28,7 @@ export const OPENBOOK_V2_PROGRAM_ID = {
 
 export const MANGO_V4_ID = {
   testnet: new PublicKey('4MangoMjqJ2firMokCjjGgoK8d4MXcrgL7XJaL3w6fVg'),
-  devnet: new PublicKey('4MangoMjqJ2firMokCjjGgoK8d4MXcrgL7XJaL3w6fVg'),
+  devnet: new PublicKey('Hjz5uX54acR4mhiNAih5Qd8yvxZTL5Zt4caFswrqP2Zu'),
   'mainnet-beta': new PublicKey('4MangoMjqJ2firMokCjjGgoK8d4MXcrgL7XJaL3w6fVg'),
 };
 

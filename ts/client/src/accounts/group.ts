@@ -5,7 +5,6 @@ import {
   BookSideAccount,
   OpenBookV2Client,
 } from '@openbook-dex/openbook-v2';
-import { parsePriceData } from '@pythnetwork/client';
 import { TOKEN_PROGRAM_ID, unpackAccount } from '@solana/spl-token';
 import {
   AccountInfo,
@@ -33,6 +32,7 @@ import {
   OracleProvider,
   isPythOracle,
   isSwitchboardOracle,
+  parsePythOracle,
   parseSwitchboardOracle,
 } from './oracle';
 import { BookSide, PerpMarket, PerpMarketIndex } from './perp';
@@ -619,14 +619,11 @@ export class Group {
       provider = OracleProvider.Stub;
       deviation = stubOracle.deviation;
     } else if (isPythOracle(ai)) {
-      const priceData = parsePriceData(ai.data);
-      uiPrice = priceData.previousPrice;
+      const priceData = parsePythOracle(ai);
+      uiPrice = priceData.price;
       price = this.toNativePrice(uiPrice, baseDecimals);
-      lastUpdatedSlot = parseInt(priceData.lastSlot.toString());
-      deviation =
-        priceData.previousConfidence !== undefined
-          ? this.toNativePrice(priceData.previousConfidence, baseDecimals)
-          : undefined;
+      lastUpdatedSlot = priceData.lastUpdatedSlot;
+      deviation = this.toNativePrice(priceData.uiDeviation, baseDecimals);
 
       provider = OracleProvider.Pyth;
     } else if (isSwitchboardOracle(ai)) {

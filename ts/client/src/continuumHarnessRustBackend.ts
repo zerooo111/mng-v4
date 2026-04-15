@@ -30,7 +30,12 @@ type NativeContinuumStateEngine = {
   ingestQueueProcessedJson(eventJson: string): void;
   listDivergencesJson(limit: number): string;
   listIntentsJson(): string;
-  findIntentJson(group: string, sequence: string, kind: number): string | null;
+  findIntentJson(
+    group: string,
+    sequence: string,
+    kind: number,
+    marketIndex?: number | null,
+  ): string | null;
   getValidatedLocalPayloadJson(
     group: string,
     sequence: string,
@@ -38,6 +43,7 @@ type NativeContinuumStateEngine = {
     includeOwnerState: boolean,
     includeMarketState: boolean,
     includeMarketOpenOrders: boolean,
+    marketIndex?: number | null,
   ): string | null;
   getSnapshotJson(view: QueueView): string;
   getMarketStateJson(market: string, view: QueueView): string;
@@ -86,8 +92,14 @@ class RustContinuumStateEngine implements ContinuumHarnessBackend {
     group: string,
     sequence: string | bigint,
     kind: string | number,
+    marketIndex?: number | null,
   ): CanonicalIntent | null {
-    const raw = this.native.findIntentJson(group, String(sequence), Number(kind));
+    const raw = this.native.findIntentJson(
+      group,
+      String(sequence),
+      Number(kind),
+      marketIndex ?? undefined,
+    );
     return raw ? (JSON.parse(raw) as unknown as CanonicalIntent) : null;
   }
 
@@ -99,6 +111,7 @@ class RustContinuumStateEngine implements ContinuumHarnessBackend {
       includeOwnerState?: boolean;
       includeMarketState?: boolean;
       includeMarketOpenOrders?: boolean;
+      marketIndex?: number | null;
     },
   ): ValidatedLocalPayload | null {
     const includeOwnerState = opts?.includeOwnerState !== false;
@@ -111,6 +124,7 @@ class RustContinuumStateEngine implements ContinuumHarnessBackend {
       includeOwnerState,
       includeMarketState,
       includeMarketOpenOrders,
+      opts?.marketIndex ?? undefined,
     );
     return raw ? (JSON.parse(raw) as ValidatedLocalPayload) : null;
   }

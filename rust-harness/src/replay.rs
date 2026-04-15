@@ -17,11 +17,12 @@ use crate::types::{
     PerpMarketSyncState, TokenBankSyncState, UserBalanceTotals, UserPerMarketState,
 };
 use crate::{
-    logging, CanonicalIntentState, DivergenceEvent, EngineSnapshot, ExecutionResult, HarnessEngine,
-    HarnessError, MarginSummary, MarginSummaryAccount, MarginSummaryEmpty, MarginSummaryOk,
-    MarginSummaryPlaceholder, MarketCandle, MarketConfig, MarketState, MarketTrade,
-    OpenOrderSummary, QueueItemEnqueuedEvent, QueueItemProcessedEvent, QueuePayload, QueueView,
-    RelayIntentAcceptedEvent, Result, UserBalances, UserState, ValidatedLocalPayload,
+    logging, CanonicalIntentState, DivergenceEvent, EngineSnapshot, ExecutionResult,
+    FastPerpPosition, HarnessEngine, HarnessError, MarginSummary, MarginSummaryAccount,
+    MarginSummaryEmpty, MarginSummaryOk, MarginSummaryPlaceholder, MarketCandle, MarketConfig,
+    MarketState, MarketTrade, OpenOrderSummary, QueueItemEnqueuedEvent, QueueItemProcessedEvent,
+    QueuePayload, QueueView, RelayIntentAcceptedEvent, Result, UserBalances, UserState,
+    ValidatedLocalPayload,
 };
 
 const QUEUE_ITEM_KIND_CTM_WRAPPED: u8 = 0;
@@ -540,7 +541,7 @@ impl ContinuumStateEngine {
         let market_index = parse_market_index(&event.market)?;
         let user_owner_pubkey = parse_pubkey("user_owner", &event.user_owner)?;
         let mango_account_pubkey = parse_pubkey("mango_account", &event.mango_account)?;
-        let key = queue_item_key(&event.group, sequence, event.kind);
+        let key = queue_item_key(&event.group, Some(market_index), sequence, event.kind);
         let existing = self.intents_by_key.get(&key).cloned();
 
         let canonical = CanonicalIntent {
@@ -633,7 +634,7 @@ impl ContinuumStateEngine {
         let market_index = parse_market_index(&event.market)?;
         let user_owner_pubkey = parse_pubkey("user_owner", &event.user_owner)?;
         let mango_account_pubkey = parse_pubkey("mango_account", &event.mango_account)?;
-        let key = queue_item_key(&event.group, sequence, event.kind);
+        let key = queue_item_key(&event.group, Some(market_index), sequence, event.kind);
         let existing = self.intents_by_key.get(&key).cloned();
 
         let canonical = CanonicalIntent {
@@ -787,7 +788,7 @@ impl ContinuumStateEngine {
             self.last_seen_slot = slot;
         }
 
-        let key = queue_item_key(&event.group, sequence, event.kind);
+        let key = queue_item_key(&event.group, Some(event.market_index), sequence, event.kind);
         if let Some(intent) = self.intents_by_key.get_mut(&key) {
             intent.enqueued_slot = Some(slot);
             intent.min_execute_slot = parse_u64_field("min_execute_slot", &event.min_execute_slot)?;
@@ -810,7 +811,7 @@ impl ContinuumStateEngine {
             self.last_seen_slot = slot;
         }
 
-        let key = queue_item_key(&event.group, sequence, event.kind);
+        let key = queue_item_key(&event.group, Some(event.market_index), sequence, event.kind);
         let refined_existing_processed = if let Some(intent) = self.intents_by_key.get_mut(&key) {
             if intent.processed_status == Some(event.status) {
                 let mut touched = false;
@@ -920,8 +921,12 @@ impl ContinuumStateEngine {
                     key,
                     group: event.group,
                     execution_queue: "unknown".to_string(),
-                    market: "unknown".to_string(),
-                    market_index: None,
+                    // v2 sub-queue: stamp the placeholder with the event's
+                    // market index so subsequent lookups by (group, market,
+                    // sequence, kind) hit this entry directly instead of
+                    // falling through to the slow scan.
+                    market: event.market_index.to_string(),
+                    market_index: Some(event.market_index),
                     sequence,
                     kind: event.kind,
                     payload_b64: String::new(),
@@ -1015,30 +1020,50 @@ impl ContinuumStateEngine {
         Ok(serde_json::to_string(&self.list_intents())?)
     }
 
+    /// Look up an intent by (group, market_index, sequence, kind).
+    /// `market_index` is required for v2 sub-queue lookups; v1-only callers
+    /// can pass `None` to fall back to the legacy single-stream key shape.
+    /// When `market_index` is `None` on a v2 queue, scans the intent map and
+    /// returns the first matching (group, sequence, kind) — useful for
+    /// best-effort diagnostic queries.
     pub fn find_intent(
         &self,
         group: &str,
+        market_index: Option<u16>,
         sequence: impl ToString,
         kind: u8,
     ) -> Result<Option<CanonicalIntentState>> {
-        let key = queue_item_key(
-            group,
-            parse_u64_field("sequence", &sequence.to_string())?,
-            kind,
-        );
-        Ok(self
+        let parsed_sequence = parse_u64_field("sequence", &sequence.to_string())?;
+        let key = queue_item_key(group, market_index, parsed_sequence, kind);
+        if let Some(found) = self
             .list_intents()
             .into_iter()
-            .find(|intent| intent.key == key))
+            .find(|intent| intent.key == key)
+        {
+            return Ok(Some(found));
+        }
+        // v2 fallback: callers that don't know the market_index get a
+        // best-effort scan. Pick the first record that matches
+        // (group, sequence, kind) regardless of which sub-queue it lives in.
+        if market_index.is_none() {
+            let parsed_sequence_str = parsed_sequence.to_string();
+            return Ok(self.list_intents().into_iter().find(|intent| {
+                intent.group == group
+                    && intent.sequence == parsed_sequence_str
+                    && intent.kind == kind
+            }));
+        }
+        Ok(None)
     }
 
     pub fn find_intent_json(
         &self,
         group: &str,
+        market_index: Option<u16>,
         sequence: impl ToString,
         kind: u8,
     ) -> Result<Option<String>> {
-        self.find_intent(group, sequence, kind)?
+        self.find_intent(group, market_index, sequence, kind)?
             .map(|intent| serde_json::to_string(&intent))
             .transpose()
             .map_err(Into::into)
@@ -1047,6 +1072,7 @@ impl ContinuumStateEngine {
     pub fn get_validated_local_payload(
         &mut self,
         group: &str,
+        market_index: Option<u16>,
         sequence: impl ToString,
         kind: u8,
         include_owner_state: bool,
@@ -1054,8 +1080,18 @@ impl ContinuumStateEngine {
         include_market_open_orders: bool,
     ) -> Result<Option<ValidatedLocalPayload>> {
         let sequence = parse_u64_field("sequence", &sequence.to_string())?;
-        let key = queue_item_key(group, sequence, kind);
-        let Some(intent) = self.intents_by_key.get(&key).cloned() else {
+        let key = queue_item_key(group, market_index, sequence, kind);
+        let intent_opt = self.intents_by_key.get(&key).cloned().or_else(|| {
+            if market_index.is_none() {
+                self.intents_by_key
+                    .values()
+                    .find(|it| it.group == group && it.sequence == sequence && it.kind == kind)
+                    .cloned()
+            } else {
+                None
+            }
+        });
+        let Some(intent) = intent_opt else {
             return Ok(None);
         };
         if intent.payload_b64.is_empty()
@@ -1067,19 +1103,18 @@ impl ContinuumStateEngine {
             return Ok(None);
         }
 
-        Ok(Some(
-            self.build_validated_local_payload_incremental(
-                &intent,
-                include_owner_state,
-                include_market_state,
-                include_market_open_orders,
-            )?,
-        ))
+        Ok(Some(self.build_validated_local_payload_incremental(
+            &intent,
+            include_owner_state,
+            include_market_state,
+            include_market_open_orders,
+        )?))
     }
 
     pub fn get_validated_local_payload_json(
         &mut self,
         group: &str,
+        market_index: Option<u16>,
         sequence: impl ToString,
         kind: u8,
         include_owner_state: bool,
@@ -1088,15 +1123,16 @@ impl ContinuumStateEngine {
     ) -> Result<Option<String>> {
         self.get_validated_local_payload(
             group,
+            market_index,
             sequence,
             kind,
             include_owner_state,
             include_market_state,
             include_market_open_orders,
         )?
-            .map(|payload| serde_json::to_string(&payload))
-            .transpose()
-            .map_err(Into::into)
+        .map(|payload| serde_json::to_string(&payload))
+        .transpose()
+        .map_err(Into::into)
     }
 
     fn build_validated_local_payload_incremental(
@@ -1249,6 +1285,41 @@ impl ContinuumStateEngine {
 
     pub fn get_user_state_json(&mut self, owner: &str, view: QueueView) -> Result<String> {
         Ok(serde_json::to_string(&self.get_user_state(owner, view)?)?)
+    }
+
+    /// Phase 4-lite **fastest** path: return just the per-market perp
+    /// position aggregates (base_position_lots, quote_position_native,
+    /// open_bid_base_lots, open_ask_base_lots) for a single mango account,
+    /// read directly from the `MangoAccount.perp_open_orders` +
+    /// `PerpPosition` fields in memory.
+    ///
+    /// Skips the orderbook walk entirely — unlike
+    /// `HarnessEngine::account_snapshot` which walks every market's book
+    /// to filter orders for the user, this method only touches the user's
+    /// own account struct (~O(user's active positions)).
+    ///
+    /// Returns `Ok(None)` when the mango account isn't known to the live
+    /// projection (caller falls back to the legacy HTTP path).
+    ///
+    /// This is the hot-path entry point for the margin-check use case,
+    /// which only needs per-market aggregates for single-mango-account
+    /// users. The legacy `AccountSnapshot` path remains for any caller
+    /// that actually needs open_orders.
+    pub fn account_positions_fast(
+        &mut self,
+        mango_account: anchor_lang::prelude::Pubkey,
+    ) -> Result<Option<Vec<FastPerpPosition>>> {
+        self.ensure_live_optimistic_projection()?;
+        let projection = self
+            .live_optimistic_projection
+            .as_ref()
+            .expect("ensure_live_optimistic_projection guarantees Some");
+        let positions = projection.engine.fast_perp_positions(mango_account);
+        match positions {
+            Ok(v) => Ok(Some(v)),
+            Err(HarnessError::UnknownAccount(_)) => Ok(None),
+            Err(err) => Err(err),
+        }
     }
 
     pub fn get_orders(
@@ -1751,7 +1822,11 @@ impl ContinuumStateEngine {
                 .queue
                 .entry(intent.market.clone())
                 .or_insert_with(QueueAggregate::default);
-            if intent.market == "unknown" && intent.processed_status.is_some() {
+            // v2 sub-queue: queue events now carry the market index, so the
+            // "processed without relay intent" placeholder has a real market
+            // label rather than "unknown". Use the absent canonical user_owner
+            // as the unmatched-placeholder signal instead.
+            if intent.user_owner == "unknown" && intent.processed_status.is_some() {
                 queue.unmatched_processed_count += 1;
             }
             match intent.processed_status {
@@ -1800,8 +1875,7 @@ impl ContinuumStateEngine {
         }
 
         for (_group, intents_by_sequence) in pending_by_group {
-            let Some(mut next_sequence) =
-                self.optimistic_ctm_start_sequence(&intents_by_sequence)
+            let Some(mut next_sequence) = self.optimistic_ctm_start_sequence(&intents_by_sequence)
             else {
                 continue;
             };
@@ -1835,14 +1909,11 @@ impl ContinuumStateEngine {
             .processed_unix_ts
             .unwrap_or_else(|| intent.processed_ts_ms.unwrap_or(intent.accepted_ts_ms) / 1_000);
         let mut next_projection = state.projection.clone();
-        let validation_error =
-            match self.apply_intent(intent, &mut next_projection, execution_ts) {
-                Ok(_) => None,
-                Err(err) if is_recoverable_local_validation_error(&err) => {
-                    Some(err.to_string())
-                }
-                Err(err) => return Err(err),
-            };
+        let validation_error = match self.apply_intent(intent, &mut next_projection, execution_ts) {
+            Ok(_) => None,
+            Err(err) if is_recoverable_local_validation_error(&err) => Some(err.to_string()),
+            Err(err) => return Err(err),
+        };
         if validation_error.is_none() {
             state.projection = next_projection;
             state.failed_executed_keys.remove(&intent.key);
@@ -3345,8 +3416,16 @@ fn restored_sequence(side: Side, order_id: u128) -> u64 {
     }
 }
 
-fn queue_item_key(group: &str, sequence: u64, kind: u8) -> String {
-    format!("{group}:{sequence}:{kind}")
+/// v2 sub-queue: per-market sequence allocators mean `(group, sequence)` is no
+/// longer unique. When `market_index` is known, embed it in the key so events
+/// on different markets that happen to share a sequence number do not collide
+/// in the intent map. v1 callers (legacy single-stream queues) pass `None` and
+/// get the original v1 key shape.
+fn queue_item_key(group: &str, market_index: Option<u16>, sequence: u64, kind: u8) -> String {
+    match market_index {
+        Some(m) => format!("{group}:m{m}:{sequence}:{kind}"),
+        None => format!("{group}:{sequence}:{kind}"),
+    }
 }
 
 fn parse_market_index(value: &str) -> Result<u16> {
@@ -3727,6 +3806,7 @@ mod tests {
                 event_type: "queue_item_processed".to_string(),
                 ts_ms: sequence * 1_000 + 1,
                 group: group.to_string(),
+                market_index: 0,
                 sequence: sequence.to_string(),
                 kind: 0,
                 status: QUEUE_PROCESS_EXECUTED,
@@ -3745,7 +3825,7 @@ mod tests {
         market: &str,
     ) -> ValidatedLocalPayload {
         let intent = engine
-            .find_intent(group, sequence.to_string(), 0)
+            .find_intent(group, None, sequence.to_string(), 0)
             .unwrap()
             .unwrap();
         let owner_state = engine.get_user_state(owner, QueueView::Confirmed).unwrap();
@@ -3778,7 +3858,7 @@ mod tests {
     ) {
         black_box(
             engine
-                .find_intent_json(group, sequence.to_string(), 0)
+                .find_intent_json(group, None, sequence.to_string(), 0)
                 .unwrap()
                 .unwrap(),
         );
@@ -3873,6 +3953,7 @@ mod tests {
                     event_type: "queue_item_processed".to_string(),
                     ts_ms: 2_000,
                     group: group.clone(),
+                    market_index: 0,
                     sequence: "1".to_string(),
                     kind: 0,
                     status: QUEUE_PROCESS_EXECUTED,
@@ -3913,6 +3994,7 @@ mod tests {
                     event_type: "queue_item_processed".to_string(),
                     ts_ms: 4_000,
                     group,
+                    market_index: 0,
                     sequence: "2".to_string(),
                     kind: 0,
                     status: QUEUE_PROCESS_EXECUTED,
@@ -3997,6 +4079,7 @@ mod tests {
                     event_type: "queue_item_processed".to_string(),
                     ts_ms: 3,
                     group: group.clone(),
+                    market_index: 7,
                     sequence: "1".to_string(),
                     kind: 0,
                     status: QUEUE_PROCESS_EXECUTED,
@@ -4008,6 +4091,7 @@ mod tests {
                     event_type: "queue_item_processed".to_string(),
                     ts_ms: 4,
                     group: group.clone(),
+                    market_index: 7,
                     sequence: "2".to_string(),
                     kind: 0,
                     status: QUEUE_PROCESS_EXECUTED,
@@ -4043,6 +4127,7 @@ mod tests {
                     event_type: "queue_item_processed".to_string(),
                     ts_ms: 4,
                     group: group.clone(),
+                    market_index: 7,
                     sequence: "2".to_string(),
                     kind: 0,
                     status: QUEUE_PROCESS_EXECUTED,
@@ -4074,6 +4159,7 @@ mod tests {
                     event_type: "queue_item_processed".to_string(),
                     ts_ms: 3,
                     group,
+                    market_index: 7,
                     sequence: "1".to_string(),
                     kind: 0,
                     status: QUEUE_PROCESS_EXECUTED,
@@ -4103,6 +4189,7 @@ mod tests {
                     event_type: "queue_item_processed".to_string(),
                     ts_ms: 1,
                     group: group.clone(),
+                    market_index: 0,
                     sequence: "99".to_string(),
                     kind: 0,
                     status: QUEUE_PROCESS_FAILED,
@@ -4115,9 +4202,11 @@ mod tests {
             let divergences = engine.list_divergences(10);
             assert_eq!(divergences.len(), 1);
             assert_eq!(divergences[0].reason, "processed_without_relay_intent");
+            // v2 sub-queue: placeholder is now labeled with the market index
+            // from the event (market_index: 0 above) instead of "unknown".
             assert_eq!(
                 engine
-                    .get_queue_state("unknown")
+                    .get_queue_state("0")
                     .unwrap()
                     .unmatched_processed_count,
                 1
@@ -4200,6 +4289,7 @@ mod tests {
                     event_type: "queue_item_processed".to_string(),
                     ts_ms: 3_000,
                     group: group.clone(),
+                    market_index: 0,
                     sequence: "1".to_string(),
                     kind: 0,
                     status: QUEUE_PROCESS_EXECUTED,
@@ -4213,6 +4303,7 @@ mod tests {
                     event_type: "queue_item_processed".to_string(),
                     ts_ms: 4_000,
                     group,
+                    market_index: 0,
                     sequence: "2".to_string(),
                     kind: 0,
                     status: QUEUE_PROCESS_EXECUTED,
@@ -4289,6 +4380,7 @@ mod tests {
                 event_type: "queue_item_processed".to_string(),
                 ts_ms: 2,
                 group,
+                market_index: 12,
                 sequence: "5".to_string(),
                 kind: 0,
                 status: QUEUE_PROCESS_SKIPPED,
@@ -4366,6 +4458,7 @@ mod tests {
                     event_type: "queue_item_processed".to_string(),
                     ts_ms: 2,
                     group,
+                    market_index: 14,
                     sequence: "9".to_string(),
                     kind: 0,
                     status: QUEUE_PROCESS_FAILED,
@@ -4425,6 +4518,7 @@ mod tests {
                     event_type: "queue_item_processed".to_string(),
                     ts_ms: 2,
                     group: group.clone(),
+                    market_index: 13,
                     sequence: "8".to_string(),
                     kind: 0,
                     status: QUEUE_PROCESS_FAILED,
@@ -4438,6 +4532,7 @@ mod tests {
                     event_type: "queue_item_processed".to_string(),
                     ts_ms: 3,
                     group: group.clone(),
+                    market_index: 13,
                     sequence: "8".to_string(),
                     kind: 0,
                     status: QUEUE_PROCESS_EXECUTED,
@@ -4453,8 +4548,12 @@ mod tests {
                 .filter(|event| event.reason == "processed_status_changed")
                 .collect();
             assert_eq!(divergences.len(), 1);
-            assert_eq!(divergences[0].key, format!("{}:8:0", group));
-            let intent = engine.find_intent(&group, "8", 0).unwrap().unwrap();
+            // v2 sub-queue: keys now embed the market index
+            assert_eq!(divergences[0].key, format!("{}:m13:8:0", group));
+            let intent = engine
+                .find_intent(&group, Some(13), "8", 0)
+                .unwrap()
+                .unwrap();
             assert_eq!(intent.processed_status, Some(QUEUE_PROCESS_FAILED));
             assert_eq!(intent.processed_tx_signature.as_deref(), Some("failed-8"));
         });
@@ -4471,6 +4570,7 @@ mod tests {
                     event_type: "queue_item_processed".to_string(),
                     ts_ms: 1,
                     group,
+                    market_index: 0,
                     sequence: "5".to_string(),
                     kind: 0,
                     status: QUEUE_PROCESS_FAILED,
@@ -4552,6 +4652,7 @@ mod tests {
                     event_type: "queue_item_processed".to_string(),
                     ts_ms: 102_500,
                     group: group.clone(),
+                    market_index: 31,
                     sequence: "1".to_string(),
                     kind: 0,
                     status: QUEUE_PROCESS_EXECUTED,
@@ -4568,7 +4669,7 @@ mod tests {
             assert_eq!(confirmed.open_orders[0].price_lots, "785");
             assert_eq!(confirmed.bids[0].price_lots, "785");
 
-            let intent = engine.find_intent(&group, "1", 0).unwrap().unwrap();
+            let intent = engine.find_intent(&group, None, "1", 0).unwrap().unwrap();
             assert_eq!(intent.processed_unix_ts, Some(100));
         });
     }
@@ -4725,6 +4826,7 @@ mod tests {
                     event_type: "queue_item_processed".to_string(),
                     ts_ms: 3,
                     group,
+                    market_index: 23,
                     sequence: "1".to_string(),
                     kind: 0,
                     status: QUEUE_PROCESS_FAILED,
@@ -4795,6 +4897,7 @@ mod tests {
                     event_type: "queue_item_enqueued".to_string(),
                     ts_ms: 2,
                     group,
+                    market_index: 24,
                     sequence: "1".to_string(),
                     kind: 0,
                     min_execute_slot: "50".to_string(),
@@ -5135,6 +5238,7 @@ mod tests {
                         event_type: "queue_item_processed".to_string(),
                         ts_ms: sequence * 1_000 + 1,
                         group: group.clone(),
+                        market_index: 13,
                         sequence: sequence.to_string(),
                         kind: 0,
                         status: QUEUE_PROCESS_EXECUTED,
@@ -5147,6 +5251,7 @@ mod tests {
                 let payload = engine
                     .get_validated_local_payload(
                         &group,
+                        None,
                         sequence.to_string(),
                         0,
                         true,
@@ -5237,6 +5342,7 @@ mod tests {
                     let incremental_payload = incremental_typed
                         .get_validated_local_payload(
                             &group,
+                            None,
                             sequence.to_string(),
                             0,
                             true,
@@ -5260,6 +5366,7 @@ mod tests {
                         incremental_json
                             .get_validated_local_payload_json(
                                 &group,
+                                None,
                                 sequence.to_string(),
                                 0,
                                 true,
@@ -5286,6 +5393,7 @@ mod tests {
                 let incremental_payload = incremental_typed
                     .get_validated_local_payload(
                         &group,
+                        None,
                         sequence.to_string(),
                         0,
                         true,
@@ -5316,6 +5424,7 @@ mod tests {
                     incremental_json
                         .get_validated_local_payload_json(
                             &group,
+                            None,
                             sequence.to_string(),
                             0,
                             true,
@@ -5490,6 +5599,7 @@ mod tests {
                         event_type: "queue_item_processed".to_string(),
                         ts_ms: sequence as u64,
                         group: group.clone(),
+                        market_index: 0,
                         sequence: sequence.to_string(),
                         kind: 0,
                         status: QUEUE_PROCESS_FAILED,

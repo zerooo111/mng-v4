@@ -199,6 +199,16 @@ pub enum MangoError {
     ExecutionQueueAdminActionRequiresPause,
     #[msg("execution queue sequence is not currently pending")]
     ExecutionQueueSequenceNotPending,
+    #[msg("execution queue sub-queue slots exhausted (no slot available for new market)")]
+    ExecutionQueueSubQueueSlotsExhausted,
+    #[msg("execution queue sub-queue market_index does not match dispatched perp market")]
+    ExecutionQueueSubQueueMarketIndexMismatch,
+    #[msg("execution queue layout version mismatch (expected v2; account is v1 — run migration)")]
+    ExecutionQueueSubQueueLayoutVersionMismatch,
+    #[msg("execution queue sub-queue invalid market_index (not registered)")]
+    ExecutionQueueSubQueueInvalidMarketIndex,
+    #[msg("execution queue perp health accounts invalid")]
+    ExecutionQueuePerpHealthAccountsInvalid,
 }
 
 impl MangoError {

@@ -147,7 +147,11 @@ pub fn token_register_trustless(
         now_ts / net_borrow_limit_window_size_ts * net_borrow_limit_window_size_ts;
     bank.net_borrow_limit_per_window_quote = 5_000_000_000;
     bank.borrow_weight_scale_start_quote = 5_000_000_000.0;
-    bank.deposit_weight_scale_start_quote = 5_000_000_000.0;
+    bank.deposit_weight_scale_start_quote = if token_index == 0 {
+        f64::MAX
+    } else {
+        5_000_000_000.0
+    };
     bank.reduce_only = 2;
     bank.disable_asset_liquidation = 1;
     bank.interest_target_utilization = 0.5;

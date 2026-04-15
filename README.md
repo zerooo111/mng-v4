@@ -114,6 +114,23 @@ STACK_CLUSTER=devnet PROGRAM_ID=<program-id> ./startup_local.sh restart
 
 Devnet runtime state is written under `.devnet/`.
 
+Persistent devnet harness deploys must keep the low-latency wrapper profile in
+`.devnet/systemd/devnet-stack.env`:
+
+```bash
+CONTINUUM_HARNESS_BACKEND=rust-backend
+CONTINUUM_HARNESS_SANITY_INTERVAL_MS=0
+CONTINUUM_HARNESS_MARKET_STATS_INTERVAL_MS=0
+CONTINUUM_HARNESS_RECONCILE_INTERVAL_MS=30000
+CONTINUUM_HARNESS_ONCHAIN_CACHE_TTL_MS=5000
+CONTINUUM_HARNESS_FRONTEND_REFRESH_INTERVAL_MS=10000
+```
+
+Important: `rust-backend` still means the `:9091` HTTP/SSE server is the
+TypeScript harness wrapper around the Rust native engine. If these wrapper
+intervals drift back to aggressive settings, SSE and `/state/*` latency can
+regress even while the Rust executor stays fast.
+
 ## Common Commands
 
 Rust:
