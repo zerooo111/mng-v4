@@ -366,6 +366,13 @@ pub struct ContinuumStateEngine {
     baseline_perp_markets: BTreeMap<String, PerpMarketSyncState>,
     baseline_token_banks: BTreeMap<String, TokenBankSyncState>,
     baseline_bootstrapped: bool,
+    /// Trades accumulated before the current baseline watermark. When
+    /// `bootstrap_from_onchain_snapshot` advances the baseline, all intents
+    /// below the new watermark are pruned from `sorted_replay_intents`. Their
+    /// fills would normally be lost on the next projection rebuild. Instead,
+    /// we snapshot the current confirmed trade buffer here so the next
+    /// `build_baseline_projection` starts with the full historical trade log.
+    baseline_trades: BTreeMap<String, Vec<InternalTrade>>,
     /// Phase 3: live in-place optimistic projection. Updated incrementally
     /// by `apply_relay_intent_local` so reads don't need to walk all
     /// stored intents and replay them through HarnessEngine. Cleared on
@@ -424,12 +431,26 @@ impl ContinuumStateEngine {
             baseline_perp_markets: BTreeMap::new(),
             baseline_token_banks: BTreeMap::new(),
             baseline_bootstrapped: false,
+            baseline_trades: BTreeMap::new(),
             live_optimistic_projection: None,
             live_optimistic_built_at_ms: 0,
         }
     }
 
     pub fn bootstrap_from_onchain_snapshot(&mut self, snapshot: EngineSnapshot) -> Result<()> {
+        // Snapshot the confirmed trade buffer before advancing the baseline.
+        // `sorted_replay_intents` will filter out intents at or below the new
+        // `baseline_confirmed_seq`, so fills from those intents would otherwise
+        // vanish on the next projection rebuild (causing the monitoring 24h
+        // volume to oscillate to 0 every ~30 s). Replacing `baseline_trades`
+        // with the full current confirmed projection trades is idempotent: the
+        // confirmed projection already starts from the previous `baseline_trades`
+        // and adds any new fills, so this snapshot is always the complete
+        // historical fill log up to this moment.
+        if let Some(cache) = &self.cached_confirmed {
+            self.baseline_trades = cache.state.trades.clone();
+        }
+
         self.baseline_positions.clear();
         self.baseline_orders.clear();
         self.baseline_margin_accounts.clear();
@@ -1666,7 +1687,10 @@ impl ContinuumStateEngine {
             owner_accounts: self.baseline_user_accounts.clone(),
             account_identities: HashMap::new(),
             queue: BTreeMap::new(),
-            trades: BTreeMap::new(),
+            // Seed with trades accumulated before the current baseline
+            // watermark. These were captured in `bootstrap_from_onchain_snapshot`
+            // so fills from pruned intents are not lost on rebuild.
+            trades: self.baseline_trades.clone(),
             last_slot: self.last_seen_slot,
         };
 

@@ -324,12 +324,24 @@ Required persistent devnet deploy profile:
 - `CONTINUUM_HARNESS_RECONCILE_INTERVAL_MS=30000`
 - `CONTINUUM_HARNESS_ONCHAIN_CACHE_TTL_MS=5000`
 - `CONTINUUM_HARNESS_FRONTEND_REFRESH_INTERVAL_MS=10000`
+- `CONTINUUM_HARNESS_READ_FAILURE_WINDOW_MS=30000`
+- `CONTINUUM_HARNESS_READ_FAILURE_MIN_SAMPLES=2`
+- `CONTINUUM_HARNESS_READ_FAILURE_RATE_THRESHOLD=0.15`
+- `CONTINUUM_HARNESS_READ_SLOW_THRESHOLD_MS=200`
+- `CONTINUUM_HARNESS_READ_SLOW_MIN_SAMPLES=3`
+- `CONTINUUM_HARNESS_READ_SLOW_RATE_THRESHOLD=0.20`
+- `CONTINUUM_HARNESS_READ_IMMEDIATE_FAILOVER_ON_ERROR=true`
+- `CONTINUUM_HARNESS_READ_IMMEDIATE_SLOW_THRESHOLD_MS=750`
+- `CTM_RELAYER_LOCAL_STATE=true`
+- `CTM_RELAYER_HARNESS_REJECT_MARKET_DRIFT=false`
 
 Why these must stay pinned:
 - `rust-backend` still uses the TypeScript `:9091` HTTP/SSE wrapper around the Rust native engine
 - if `onchain_sanity` or `market_stats` are re-enabled in the live devnet harness, they contend with the request loop and can stall SSE even when the Rust executor is healthy
 - if `CONTINUUM_HARNESS_ONCHAIN_CACHE_TTL_MS` is made too small or `CONTINUUM_HARNESS_FRONTEND_REFRESH_INTERVAL_MS` is tied to it, frontend market streams start forcing repeated on-chain reads and `/state/markets/:market` latency regresses
+- if Helius starts returning even short bursts of errors or >750 ms reads, the harness should fail over to Triton immediately instead of waiting for a longer failure window
 - `onchain_reconciliation` remains the correctness backstop, but it should run on the slower `30000 ms` cadence above for the persistent devnet deploy
+- the relayer's optimized path is the embedded Rust local state; when drift rejection is off, submit-path readiness checks should not poll the TS harness over `:9091`, and margin precheck should not call `/state/users`
 
 ### Harness Logging
 

@@ -51,7 +51,7 @@ type RustBackendModule = {
 export function parseHarnessBackendKind(
   value: string | undefined | null,
 ): HarnessBackendKind {
-  const normalized = (value || 'ts-backend').trim().toLowerCase();
+  const normalized = (value || 'rust-backend').trim().toLowerCase();
   if (normalized === 'ts-backend' || normalized === 'rust-backend') {
     return normalized;
   }

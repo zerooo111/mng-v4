@@ -6230,6 +6230,50 @@ export class MangoClient {
     serumOpenOrdersForMarket: [Serum3Market, PublicKey][] = [],
     openbookOpenOrdersForMarket: [OpenbookV2Market, PublicKey][] = [],
   ): Promise<PublicKey[]> {
+    const requiredTokenIndices = uniq(
+      [
+        ...mangoAccounts
+          .map((mangoAccount) => mangoAccount.tokens.map((t) => t.tokenIndex))
+          .flat()
+          .filter((tokenIndex) => tokenIndex !== TokenPosition.TokenIndexUnset),
+        ...banks.map((bank) => bank.tokenIndex),
+      ] as TokenIndex[],
+    );
+    if (
+      requiredTokenIndices.some(
+        (tokenIndex) => !group.banksMapByTokenIndex.has(tokenIndex),
+      )
+    ) {
+      await group.reloadBanks(this);
+    }
+    if (
+      requiredTokenIndices.some(
+        (tokenIndex) => !group.mintInfosMapByTokenIndex.has(tokenIndex),
+      )
+    ) {
+      await group.reloadMintInfos(this);
+    }
+
+    const requiredPerpMarketIndices = uniq(
+      [
+        ...mangoAccounts
+          .map((mangoAccount) => mangoAccount.perps.map((p) => p.marketIndex))
+          .flat()
+          .filter(
+            (marketIndex) =>
+              marketIndex !== PerpPosition.PerpMarketIndexUnset,
+          ),
+        ...perpMarkets.map((perpMarket) => perpMarket.perpMarketIndex),
+      ] as PerpMarketIndex[],
+    );
+    if (
+      requiredPerpMarketIndices.some(
+        (marketIndex) => !group.perpMarketsMapByMarketIndex.has(marketIndex),
+      )
+    ) {
+      await group.reloadPerpMarkets(this);
+    }
+
     const tokenPositionIndices = mangoAccounts
       .map((mangoAccount) => mangoAccount.tokens.map((t) => t.tokenIndex))
       .flat();
@@ -6539,12 +6583,24 @@ export class MangoClient {
     perpMarketIndex: PerpMarketIndex,
     userOwner?: PublicKey,
   ): Promise<AccountMeta[]> {
+    if (!group.perpMarketsMapByMarketIndex.has(perpMarketIndex)) {
+      await group.reloadPerpMarkets(this);
+    }
     const perpMarket = group.getPerpMarketByMarketIndex(perpMarketIndex);
+    if (!group.banksMapByTokenIndex.has(perpMarket.settleTokenIndex)) {
+      await group.reloadBanks(this);
+    }
+    if (!group.mintInfosMapByTokenIndex.has(perpMarket.settleTokenIndex)) {
+      await group.reloadMintInfos(this);
+    }
+    const settlementBank = group.getFirstBankByTokenIndex(
+      perpMarket.settleTokenIndex,
+    );
     const healthRemainingAccounts: PublicKey[] =
       await this.buildHealthRemainingAccounts(
         group,
         [mangoAccount],
-        [group.getFirstBankForPerpSettlement()],
+        [settlementBank],
         [perpMarket],
       );
 

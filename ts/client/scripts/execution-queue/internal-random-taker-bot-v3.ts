@@ -47,6 +47,8 @@ type MarketRuntimeState = {
   marketIndex: number;
   name: string;
   baseLotSizeUi: number;
+  perpMarketPk?: PublicKey;
+  oraclePriceUi?: number;
 };
 
 type TakerBotRuntime = {
@@ -99,9 +101,10 @@ const HARNESS_URL = process.env.TAKER_HARNESS_URL || 'http://127.0.0.1:9091';
 const HARNESS_POLL_MS = Number(process.env.TAKER_HARNESS_POLL_MS || '20000');
 const SKEW_SOFT_LIMIT_UI = Number(process.env.TAKER_SKEW_SOFT_LIMIT_UI || '5');
 const SKEW_HARD_LIMIT_UI = Number(process.env.TAKER_SKEW_HARD_LIMIT_UI || '50');
-// v2 sub-queue deploy bootstraps SOL-PERP (idx 0) and BTC-PERP (idx 1).
+// v2 sub-queue deploy bootstraps SOL-PERP (idx 0), BTC-PERP (idx 1),
+// and ETH-PERP (idx 2).
 // Override via TAKER_MARKET_INDEXES for other deploys.
-const DEFAULT_MARKET_INDEXES = '0,1';
+const DEFAULT_MARKET_INDEXES = '0,1,2';
 const MARKET_INDEXES = parseMarketIndexes(
   process.env.TAKER_MARKET_INDEXES || DEFAULT_MARKET_INDEXES,
 );
@@ -161,6 +164,8 @@ function ensureMarketRuntime(marketIndex: number): MarketRuntimeState {
     marketIndex,
     name: `market-${marketIndex}`,
     baseLotSizeUi: 0.01,
+    perpMarketPk: undefined,
+    oraclePriceUi: undefined,
   };
   marketRuntimeByIndex.set(marketIndex, created);
   return created;
@@ -319,21 +324,6 @@ function selectDispatchTarget(bots: TakerBotRuntime[]): DispatchTarget {
   return next;
 }
 
-async function executionQueueCanonicalPerpRemainingAccounts(params: {
-  client: MangoClient;
-  group: Awaited<ReturnType<MangoClient['getGroup']>>;
-  mangoAccount: Awaited<ReturnType<MangoClient['getMangoAccount']>>;
-  marketIndex: number;
-  userOwner: PublicKey;
-}): Promise<AccountMeta[]> {
-  return params.client.buildExecutionQueueCanonicalPerpRemainingAccounts(
-    params.group,
-    params.mangoAccount,
-    params.marketIndex as PerpMarketIndex,
-    params.userOwner,
-  );
-}
-
 async function submitIntentViaRelayer(params: {
   group: PublicKey;
   executionQueue: PublicKey;
@@ -432,6 +422,7 @@ async function refreshMarketMetadata(marketIndex: number): Promise<void> {
       `${HARNESS_URL}/state/markets/${marketIndex}?view=confirmed`,
     );
     const metadata = data?.metadata ?? data?.data?.metadata ?? {};
+    const metrics = data?.metrics ?? data?.data?.metrics ?? {};
     const rawLotSize = metadata?.base_lot_size;
     const baseDecimals = Number(metadata?.base_decimals ?? 4);
     if (rawLotSize) {
@@ -439,6 +430,12 @@ async function refreshMarketMetadata(marketIndex: number): Promise<void> {
     }
     if (metadata?.name) {
       marketRuntime.name = metadata.name;
+    }
+    if (metadata?.perp_market) {
+      marketRuntime.perpMarketPk = new PublicKey(metadata.perp_market);
+    }
+    if (metrics?.oracle_price_ui !== undefined && metrics?.oracle_price_ui !== null) {
+      marketRuntime.oraclePriceUi = Number(metrics.oracle_price_ui);
     }
   } catch (err) {
     console.log(
@@ -448,6 +445,61 @@ async function refreshMarketMetadata(marketIndex: number): Promise<void> {
         error: err instanceof Error ? err.message : String(err),
       }),
     );
+  }
+}
+
+function attachPerpMarketToGroup(
+  group: Awaited<ReturnType<MangoClient['getGroup']>>,
+  perpMarket: PerpMarket,
+): void {
+  group.perpMarketsMapByMarketIndex.set(
+    perpMarket.perpMarketIndex,
+    perpMarket,
+  );
+  group.perpMarketsMapByName.set(perpMarket.name, perpMarket);
+  group.perpMarketsMapByOracle.set(perpMarket.oracle.toBase58(), perpMarket);
+}
+
+async function loadPerpMarketForIndex(
+  client: MangoClient,
+  group: Awaited<ReturnType<MangoClient['getGroup']>>,
+  marketIndex: number,
+): Promise<PerpMarket> {
+  const existing = group.perpMarketsMapByMarketIndex.get(
+    marketIndex as PerpMarketIndex,
+  );
+  if (existing) {
+    return existing;
+  }
+
+  await refreshMarketMetadata(marketIndex);
+  const marketRuntime = ensureMarketRuntime(marketIndex);
+  if (!marketRuntime.perpMarketPk) {
+    throw new Error(`missing perp market pubkey for marketIndex ${marketIndex}`);
+  }
+
+  const perpMarketAccount = await client.program.account.perpMarket.fetch(
+    marketRuntime.perpMarketPk,
+  );
+  const perpMarket = PerpMarket.from(
+    marketRuntime.perpMarketPk,
+    perpMarketAccount as any,
+  );
+  if (marketRuntime.oraclePriceUi !== undefined) {
+    perpMarket._uiPrice = marketRuntime.oraclePriceUi;
+  }
+  attachPerpMarketToGroup(group, perpMarket);
+  return perpMarket;
+}
+
+async function ensureGroupPerpMarketsLoaded(
+  client: MangoClient,
+  group: Awaited<ReturnType<MangoClient['getGroup']>>,
+): Promise<void> {
+  for (const marketIndex of MARKET_INDEXES) {
+    if (!group.perpMarketsMapByMarketIndex.has(marketIndex as PerpMarketIndex)) {
+      await loadPerpMarketForIndex(client, group, marketIndex);
+    }
   }
 }
 
@@ -561,6 +613,7 @@ async function main(): Promise<void> {
   const cluster = CLUSTER_OVERRIDE || config.cluster;
   const clusterUrl = CLUSTER_URL_OVERRIDE || config.clusterUrl;
   const programId = new PublicKey(PROGRAM_ID_OVERRIDE || config.programId);
+  const configuredGroup = new PublicKey(config.group);
   const executionQueue = new PublicKey(
     EXECUTION_QUEUE_OVERRIDE || config.executionQueue,
   );
@@ -587,7 +640,13 @@ async function main(): Promise<void> {
   // Prime startup metadata from the on-chain group/perp definitions so the
   // first startup banner does not depend on the harness refresh path.
   const startupMangoAccount = await bots[0].client.getMangoAccount(bots[0].mangoAccountPk);
+  if (!startupMangoAccount.group.equals(configuredGroup)) {
+    throw new Error(
+      `stale taker bot config: ${bots[0].name} account ${startupMangoAccount.publicKey.toBase58()} belongs to group ${startupMangoAccount.group.toBase58()}, expected ${configuredGroup.toBase58()}`,
+    );
+  }
   const startupGroup = await bots[0].client.getGroup(startupMangoAccount.group);
+  await ensureGroupPerpMarketsLoaded(bots[0].client, startupGroup);
   hydrateMarketMetadataFromGroup(startupGroup);
 
   console.log(
@@ -598,6 +657,7 @@ async function main(): Promise<void> {
       cluster,
       cluster_url: clusterUrl,
       program_id: programId.toBase58(),
+      configured_group: configuredGroup.toBase58(),
       execution_queue: executionQueue.toBase58(),
       bot_count: bots.length,
       owners: bots.map((bot) => bot.ownerPk.toBase58()),
@@ -632,9 +692,17 @@ async function main(): Promise<void> {
     const bot = target.bot;
     const marketIndex = target.marketIndex;
     const mangoAccount = await bot.client.getMangoAccount(bot.mangoAccountPk);
+    if (!mangoAccount.group.equals(configuredGroup)) {
+      throw new Error(
+        `stale taker bot config: ${bot.name} account ${mangoAccount.publicKey.toBase58()} belongs to group ${mangoAccount.group.toBase58()}, expected ${configuredGroup.toBase58()}`,
+      );
+    }
     const group = await bot.client.getGroup(mangoAccount.group);
-    const perpMarket = group.getPerpMarketByMarketIndex(
-      marketIndex as PerpMarketIndex,
+    await ensureGroupPerpMarketsLoaded(bot.client, group);
+    const perpMarket = await loadPerpMarketForIndex(
+      bot.client,
+      group,
+      marketIndex,
     );
     // Refresh runtime metadata from the live market definition before any
     // position math or logging so stale harness/default metadata cannot skew
@@ -668,13 +736,10 @@ async function main(): Promise<void> {
     });
     const clientOrderId = Date.now() * 100 + (tick % 100);
 
-    const remainingAccounts = await executionQueueCanonicalPerpRemainingAccounts({
-      client: bot.client,
-      group,
-      mangoAccount,
-      marketIndex,
-      userOwner: bot.user.publicKey,
-    });
+    // For target-bound user intents, the relayer owns canonical remaining-account
+    // derivation. Passing an empty list avoids fragile client-side cache
+    // dependencies and lets the relayer derive the authoritative account set.
+    const remainingAccounts: AccountMeta[] = [];
 
     const priceLots = perpMarket.uiPriceToLotsForSide(capPriceUi, side);
     const priceLotsNum = Number(priceLots.toString());

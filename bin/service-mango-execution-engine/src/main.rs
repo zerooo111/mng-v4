@@ -26,11 +26,10 @@ use mango_v4::{
         OutEvent, PerpMarket, PerpMarketIndex, QueueItemKind, Side, TokenIndex,
         EXECUTION_QUEUE_CTM_CAPACITY, EXECUTION_QUEUE_CTM_ITEMS_OFFSET,
         EXECUTION_QUEUE_ITEM_ACCOUNTS_HASH_OFFSET, EXECUTION_QUEUE_ITEM_KIND_OFFSET,
-        EXECUTION_QUEUE_ITEM_MIN_EXECUTE_SLOT_OFFSET,
-        EXECUTION_QUEUE_ITEM_PAYLOAD_LEN_OFFSET, EXECUTION_QUEUE_ITEM_PAYLOAD_OFFSET,
-        EXECUTION_QUEUE_ITEM_SEQUENCE_OFFSET, EXECUTION_QUEUE_ITEM_SIZE,
-        EXECUTION_QUEUE_ITEM_STATUS_OFFSET, EXECUTION_QUEUE_LIQUIDITY_CAPACITY,
-        EXECUTION_QUEUE_LIQUIDITY_ITEMS_OFFSET,
+        EXECUTION_QUEUE_ITEM_MIN_EXECUTE_SLOT_OFFSET, EXECUTION_QUEUE_ITEM_PAYLOAD_LEN_OFFSET,
+        EXECUTION_QUEUE_ITEM_PAYLOAD_OFFSET, EXECUTION_QUEUE_ITEM_SEQUENCE_OFFSET,
+        EXECUTION_QUEUE_ITEM_SIZE, EXECUTION_QUEUE_ITEM_STATUS_OFFSET,
+        EXECUTION_QUEUE_LIQUIDITY_CAPACITY, EXECUTION_QUEUE_LIQUIDITY_ITEMS_OFFSET,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -248,6 +247,10 @@ struct Config {
     /// Base backoff in milliseconds for the exponential retry on transient
     /// RPC failures. Doubled per attempt, capped at 6 doublings.
     bg_submit_retry_base_ms: u64,
+    /// Fixed pause in milliseconds before retrying a submit that failed with
+    /// ExecutionQueueFull.  Should be roughly one executor drain cycle so the
+    /// ring-buffer has time to free a slot before we try again.  Default 200ms.
+    bg_submit_queue_full_retry_ms: u64,
     /// Phase 3.5: TTL (in milliseconds) for the margin-check account
     /// cache. Set to 0 to disable caching entirely (every margin check
     /// hits RPC). 500 ms is the recommended starting point — short
@@ -258,8 +261,9 @@ struct Config {
     /// oldest entries are evicted when the cache exceeds this size.
     margin_cache_max_entries: usize,
     /// Phase 2: enable in-process optimistic state via the embedded
-    /// rust-harness crate. Defaults to false so the legacy HTTP path is
-    /// preserved until soaked.
+    /// rust-harness crate. Defaults to true when a harness is configured
+    /// so relayer hot paths stay inside Rust instead of depending on the
+    /// legacy HTTP wrapper.
     local_state_enabled: bool,
     /// URL the relayer hits at startup to bootstrap its in-process state
     /// from the legacy harness. Only consulted when local_state_enabled is
@@ -378,7 +382,7 @@ impl Config {
         let harness_health_cache_ms = parse_u64_env("CTM_RELAYER_HARNESS_HEALTH_CACHE_MS", 250)?;
         let harness_health_max_age_ms = parse_u64_env("CTM_RELAYER_HARNESS_MAX_STALE_MS", 30_000)?;
         let harness_reject_market_drift =
-            parse_bool_env("CTM_RELAYER_HARNESS_REJECT_MARKET_DRIFT", true);
+            parse_bool_env("CTM_RELAYER_HARNESS_REJECT_MARKET_DRIFT", false);
         let executor_enabled = parse_bool_env("EXECUTION_QUEUE_ENGINE_ENABLED", true)
             && executor_group.is_some()
             && executor_queue.is_some();
@@ -508,10 +512,15 @@ impl Config {
         let bg_submit_workers = parse_u64_env("CTM_RELAYER_BG_SUBMIT_WORKERS", 16)? as usize;
         let bg_submit_max_retries = parse_u64_env("CTM_RELAYER_BG_SUBMIT_MAX_RETRIES", 5)? as u32;
         let bg_submit_retry_base_ms = parse_u64_env("CTM_RELAYER_BG_SUBMIT_RETRY_BASE_MS", 50)?;
+        let bg_submit_queue_full_retry_ms =
+            parse_u64_env("CTM_RELAYER_BG_SUBMIT_QUEUE_FULL_RETRY_MS", 200)?;
         let margin_cache_ttl_ms = parse_u64_env("CTM_RELAYER_MARGIN_CACHE_TTL_MS", 500)?;
         let margin_cache_max_entries =
             parse_u64_env("CTM_RELAYER_MARGIN_CACHE_MAX_ENTRIES", 4096)? as usize;
-        let local_state_enabled = parse_bool_env("CTM_RELAYER_LOCAL_STATE", false);
+        let local_state_enabled = std::env::var("CTM_RELAYER_LOCAL_STATE")
+            .ok()
+            .map(|value| value.eq_ignore_ascii_case("true"))
+            .unwrap_or(harness_base_url.is_some());
         let local_state_bootstrap_url = std::env::var("CTM_RELAYER_LOCAL_STATE_BOOTSTRAP_URL")
             .ok()
             .map(|v| v.trim().to_string())
@@ -619,6 +628,7 @@ impl Config {
             bg_submit_workers,
             bg_submit_max_retries,
             bg_submit_retry_base_ms,
+            bg_submit_queue_full_retry_ms,
             margin_cache_ttl_ms,
             margin_cache_max_entries,
             local_state_enabled,
@@ -3260,12 +3270,10 @@ impl Engine {
             .ingress_failure_memo
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let entry = guard
-            .entry(user_key)
-            .or_insert_with(|| IngressFailureMemo {
-                count: 0,
-                last_seen_ms: now_ms,
-            });
+        let entry = guard.entry(user_key).or_insert_with(|| IngressFailureMemo {
+            count: 0,
+            last_seen_ms: now_ms,
+        });
         entry.count = entry.count.saturating_add(1);
         entry.last_seen_ms = now_ms;
     }
@@ -3397,11 +3405,73 @@ impl Engine {
         }
     }
 
-    async fn ensure_group_static_account_mirror(
+    fn configured_group_static_account_mirror_ready(&self, group: Pubkey) -> bool {
+        if self.config.executor_group != Some(group) {
+            return true;
+        }
+
+        self.group_account_mirrors
+            .lock()
+            .ok()
+            .map(|cache| cache.contains_key(&group))
+            .unwrap_or(false)
+    }
+
+    fn ensure_configured_group_static_account_mirror_ready(
         &self,
         request: &SubmitIntentRequest,
         group: Pubkey,
-    ) -> Result<GroupStaticAccountMirror, Status> {
+    ) -> Result<(), Status> {
+        if self.configured_group_static_account_mirror_ready(group) {
+            return Ok(());
+        }
+
+        Err(self.reject_submit_request(
+            request,
+            Code::Unavailable,
+            format!(
+                "group account mirror bootstrap still in progress for group={group}; refusing enqueue until relayer mirror is ready"
+            ),
+        ))
+    }
+
+    fn ensure_request_targets_configured_stack(
+        &self,
+        request: &SubmitIntentRequest,
+        group: Pubkey,
+        execution_queue: Pubkey,
+    ) -> Result<(), Status> {
+        if let Some(configured_group) = self.config.executor_group {
+            if group != configured_group {
+                return Err(self.reject_submit_request(
+                    request,
+                    Code::InvalidArgument,
+                    format!(
+                        "request group {group} does not match configured relayer group {configured_group}"
+                    ),
+                ));
+            }
+        }
+
+        if let Some(configured_queue) = self.config.executor_queue {
+            if execution_queue != configured_queue {
+                return Err(self.reject_submit_request(
+                    request,
+                    Code::InvalidArgument,
+                    format!(
+                        "request execution_queue {execution_queue} does not match configured relayer queue {configured_queue}"
+                    ),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn bootstrap_group_static_account_mirror(
+        &self,
+        group: Pubkey,
+    ) -> Result<GroupStaticAccountMirror> {
         if let Ok(cache) = self.group_account_mirrors.lock() {
             if let Some(mirror) = cache.get(&group) {
                 return Ok(mirror.clone());
@@ -3412,13 +3482,7 @@ impl Engine {
             .rpc
             .get_program_accounts(&self.config.program_id)
             .await
-            .map_err(|err| {
-                self.reject_submit_request(
-                    request,
-                    Code::Unavailable,
-                    format!("group account mirror bootstrap failed for group={group}: {err}"),
-                )
-            })?;
+            .with_context(|| format!("group account mirror bootstrap failed for group={group}"))?;
 
         let mut mirror = GroupStaticAccountMirror::default();
         let mut static_accounts = Vec::new();
@@ -3476,10 +3540,8 @@ impl Engine {
         }
 
         if mirror.banks_by_token_index.is_empty() && mirror.perps_by_market_index.is_empty() {
-            return Err(self.reject_submit_request(
-                request,
-                Code::Unavailable,
-                format!("group account mirror bootstrap found no bank/perp accounts for group={group}"),
+            return Err(anyhow!(
+                "group account mirror bootstrap found no bank/perp accounts for group={group}"
             ));
         }
 
@@ -3495,15 +3557,11 @@ impl Engine {
                 .rpc
                 .get_multiple_accounts(&unique_fallback_pubkeys)
                 .await
-                .map_err(|err| {
-                    self.reject_submit_request(
-                        request,
-                        Code::Unavailable,
-                        format!("fallback oracle bootstrap failed for group={group}: {err}"),
-                    )
-                })?;
-            for (fallback_pubkey, maybe_account) in
-                unique_fallback_pubkeys.iter().copied().zip(fetched.into_iter())
+                .with_context(|| format!("fallback oracle bootstrap failed for group={group}"))?;
+            for (fallback_pubkey, maybe_account) in unique_fallback_pubkeys
+                .iter()
+                .copied()
+                .zip(fetched.into_iter())
             {
                 let mut accounts = vec![fallback_pubkey];
                 if let Some(account) = maybe_account {
@@ -3534,13 +3592,7 @@ impl Engine {
                 .rpc
                 .get_multiple_accounts(&unique_quote_oracle_pubkeys)
                 .await
-                .map_err(|err| {
-                    self.reject_submit_request(
-                        request,
-                        Code::Unavailable,
-                        format!("quote oracle bootstrap failed for group={group}: {err}"),
-                    )
-                })?;
+                .with_context(|| format!("quote oracle bootstrap failed for group={group}"))?;
             for (quote_oracle_pubkey, maybe_account) in unique_quote_oracle_pubkeys
                 .iter()
                 .copied()
@@ -3577,6 +3629,22 @@ impl Engine {
         Ok(mirror)
     }
 
+    async fn ensure_group_static_account_mirror(
+        &self,
+        request: &SubmitIntentRequest,
+        group: Pubkey,
+    ) -> Result<GroupStaticAccountMirror, Status> {
+        self.bootstrap_group_static_account_mirror(group)
+            .await
+            .map_err(|err| {
+                self.reject_submit_request(
+                    request,
+                    Code::Unavailable,
+                    format!("group account mirror bootstrap failed for group={group}: {err:#}"),
+                )
+            })
+    }
+
     async fn ensure_mango_account_mirror(
         &self,
         request: &SubmitIntentRequest,
@@ -3603,18 +3671,14 @@ impl Engine {
             keyed
         };
 
-        let mirror =
-            build_mango_account_mirror_from_keyed_account(mango_account, &keyed_account).map_err(
-                |err| {
-                    self.reject_submit_request(
-                        request,
-                        Code::FailedPrecondition,
-                        format!(
-                            "failed to build mango account mirror for {mango_account}: {err}"
-                        ),
-                    )
-                },
-            )?;
+        let mirror = build_mango_account_mirror_from_keyed_account(mango_account, &keyed_account)
+            .map_err(|err| {
+            self.reject_submit_request(
+                request,
+                Code::FailedPrecondition,
+                format!("failed to build mango account mirror for {mango_account}: {err}"),
+            )
+        })?;
         if let Ok(mut cache) = self.mango_account_mirrors.lock() {
             let entry = cache.entry(mango_account).or_insert_with(|| mirror.clone());
             return Ok(entry.clone());
@@ -3658,7 +3722,8 @@ impl Engine {
         })?;
 
         if !request.remaining_accounts.is_empty() {
-            let matches = supplied_account_metas_match(&request.remaining_accounts, &remaining_accounts);
+            let matches =
+                supplied_account_metas_match(&request.remaining_accounts, &remaining_accounts);
             if target.intent_version == INTENT_VERSION_V1 && !matches {
                 return Err(self.reject_submit_request(
                     request,
@@ -3701,6 +3766,10 @@ impl Engine {
     }
 
     async fn ensure_harness_ready(&self, market: &str) -> Result<(), Status> {
+        if !self.config.harness_reject_market_drift {
+            return Ok(());
+        }
+
         let Some(harness_base_url) = self.config.harness_base_url.as_deref() else {
             return Ok(());
         };
@@ -3859,17 +3928,16 @@ impl Engine {
             ));
         }
 
-        let harness_state = self.fetch_harness_user_state(request, keys).await?;
+        let margin_user_state = self.fetch_margin_user_state(request, keys).await?;
         let margin_snapshot =
-            build_harness_margin_snapshot(harness_state.as_ref(), &request.mango_account).map_err(
-                |err| {
+            build_harness_margin_snapshot(Some(&margin_user_state), &request.mango_account)
+                .map_err(|err| {
                     self.reject_submit_request(
                         request,
                         Code::Unavailable,
-                        format!("invalid harness user state for margin precheck: {err}"),
+                        format!("invalid local margin state for margin precheck: {err}"),
                     )
-                },
-            )?;
+                })?;
         let extra_market_metadata = self
             .fetch_harness_market_metadata(request, &margin_snapshot)
             .await?;
@@ -3891,22 +3959,13 @@ impl Engine {
         )
     }
 
-    async fn fetch_harness_user_state(
+    async fn fetch_margin_user_state(
         &self,
         request: &SubmitIntentRequest,
         keys: ParsedSubmitIntentKeys,
-    ) -> Result<Option<HarnessUserState>, Status> {
-        // Phase 4-lite fast path: read a SINGLE mango account's perp
-        // positions directly from the live rust-harness projection's
-        // in-memory MangoAccount struct. No orderbook walks, no full
-        // EngineSnapshot rebuild, no string serialization beyond the
-        // one quote_position_native field that margin check needs.
-        //
-        // `account_positions_fast` returns in ~5-20 µs; conversion to
-        // HarnessUserState is another ~10 µs of field re-packing. Lock
-        // is held briefly, never across an `.await`.
+    ) -> Result<HarnessUserState, Status> {
+        let mango_account = keys.mango_account;
         if let Some(state) = &self.state {
-            let mango_account = keys.mango_account;
             let positions_opt =
                 state
                     .lock()
@@ -3922,59 +3981,55 @@ impl Engine {
                         )
                     })?;
             if let Some(positions) = positions_opt {
-                return Ok(Some(harness_user_state_from_fast_positions(
+                return Ok(harness_user_state_from_fast_positions(
                     mango_account,
                     positions,
-                )));
+                ));
             }
-            // Account not known to local state — fall through to the
-            // (slower) HTTP path below. This handles the warmup case
-            // where a new mango account hasn't been seen by any prior
-            // intent.
         }
 
-        let Some(harness_base_url) = self.config.harness_base_url.as_deref() else {
-            return Ok(None);
-        };
-        let timeout = Duration::from_millis(self.config.harness_health_timeout_ms);
-        let owner = keys.user_owner.to_string();
-        let url = format!(
-            "{}/state/users/{}?view=optimistic&onchain=false",
-            harness_base_url.trim_end_matches('/'),
-            owner
-        );
-        let response = self
-            .http_client
-            .get(&url)
-            .timeout(timeout)
-            .send()
-            .await
-            .map_err(|err| {
-                self.reject_submit_request(
-                    request,
-                    Code::Unavailable,
-                    format!("harness user-state request failed owner={owner}: {err}"),
-                )
-            })?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(self.reject_submit_request(
-                request,
-                Code::Unavailable,
-                format!(
-                    "harness user-state request returned status {} owner={} url={}",
-                    status, owner, url
-                ),
-            ));
-        }
-        let payload: HarnessUserStateResponse = response.json().await.map_err(|err| {
+        // First-touch fallback: read the single MangoAccount directly from RPC
+        // and derive the compact perp-position view locally. This keeps the
+        // margin path out of `/state/users` while avoiding a reject cliff for
+        // accounts the relayer's in-process mirror has not seen yet.
+        let account = self.rpc.get_account(&mango_account).await.map_err(|err| {
             self.reject_submit_request(
                 request,
                 Code::Unavailable,
-                format!("failed to decode harness user-state payload owner={owner}: {err}"),
+                format!(
+                    "margin state mango account fetch failed mango_account={}: {err}",
+                    mango_account
+                ),
             )
         })?;
-        Ok(Some(payload.data))
+        let keyed = KeyedAccountSharedData::new(mango_account, account.into());
+        self.seed_static_account_cache(std::iter::once(keyed.clone()));
+        let data = keyed.data.data();
+        if data.len() < 8 {
+            return Err(self.reject_submit_request(
+                request,
+                Code::FailedPrecondition,
+                format!(
+                    "mango account data too short for margin bootstrap mango_account={} data_len={}",
+                    mango_account,
+                    data.len()
+                ),
+            ));
+        }
+        let account_value = MangoAccountValue::from_bytes(&data[8..]).map_err(|err| {
+            self.reject_submit_request(
+                request,
+                Code::FailedPrecondition,
+                format!(
+                    "failed to deserialize mango account for margin bootstrap {}: {err}",
+                    mango_account
+                ),
+            )
+        })?;
+        Ok(harness_user_state_from_mango_account_value(
+            mango_account,
+            &account_value,
+        ))
     }
 
     async fn fetch_harness_market_metadata(
@@ -5456,6 +5511,12 @@ impl Engine {
                 };
             // ---- End ingress protection ----
 
+            self.ensure_request_targets_configured_stack(
+                &request,
+                keys.group,
+                keys.execution_queue,
+            )?;
+            self.ensure_configured_group_static_account_mirror_ready(&request, keys.group)?;
             self.ensure_harness_ready(&request.market).await?;
             let remaining_accounts = self
                 .derive_submit_remaining_accounts(&request, keys, target)
@@ -5903,6 +5964,49 @@ impl Engine {
                     .bg_submit_inflight
                     .fetch_sub(1, Ordering::Relaxed);
             }
+            // ExecutionQueueFull is a transient capacity error — the sequence
+            // is valid, the on-chain ring-buffer just needs time to drain.
+            // Treating it as a window error (rewind_to_queue_floor) causes the
+            // cursor to reset to the on-chain floor position and then retry
+            // immediately, which creates a tight retry storm that saturates the
+            // HTTP/2 connection to the RPC provider and kills the service.
+            // Instead, retry with the same sequence after a fixed drain pause.
+            Err(err)
+                if is_execution_queue_full_error(&err)
+                    && pending.attempts < self.config.bg_submit_max_retries =>
+            {
+                self.metrics
+                    .bg_submit_transient_total
+                    .fetch_add(1, Ordering::Relaxed);
+                pending.attempts = pending.attempts.saturating_add(1);
+                // Use a fixed drain-pause rather than an exponential backoff so
+                // the first retry fires after roughly one executor cycle (~100ms)
+                // regardless of how many times we've already tried.
+                let backoff = Duration::from_millis(
+                    self.config.bg_submit_queue_full_retry_ms,
+                );
+                warn!(
+                    "bg submitter queue full — retrying sequence={} attempt={} backoff_ms={} err={err:?}",
+                    pending.sequence,
+                    pending.attempts,
+                    backoff.as_millis()
+                );
+                let retry_tx = self.bg_submit_tx.clone();
+                let metrics = self.metrics.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(backoff).await;
+                    if let Err(send_err) = retry_tx.send(pending).await {
+                        warn!("bg submitter queue-full retry channel closed: {send_err:?}");
+                        metrics
+                            .bg_submit_retry_dropped_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        metrics
+                            .bg_submit_failed_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        metrics.bg_submit_inflight.fetch_sub(1, Ordering::Relaxed);
+                    }
+                });
+            }
             Err(err)
                 if is_transient_rpc_error(&err)
                     && pending.attempts < self.config.bg_submit_max_retries =>
@@ -5957,8 +6061,9 @@ impl Engine {
                 if !is_execution_queue_duplicate_sequence_error(&err) {
                     let pending_market_index =
                         parse_market_from_sequence_key(&pending.sequence_key);
-                    let rewind_to_queue_floor = is_execution_queue_full_error(&err)
-                        || is_invalid_sequence_number_error(&err);
+                    // ExecutionQueueFull handled above as transient; only
+                    // InvalidSequenceNumber warrants a cursor rewind.
+                    let rewind_to_queue_floor = is_invalid_sequence_number_error(&err);
                     self.recover_sequence_after_submit_error(
                         &pending.sequence_key,
                         pending_market_index,
@@ -6081,13 +6186,11 @@ impl Engine {
             target_kind: Some(request.target_kind),
             target_index: Some(request.target_index),
             accounts_hash: Some(bytes_to_hex(&envelope.accounts_hash)),
-            remaining_accounts_source: Some(
-                if request.intent_version == INTENT_VERSION_V2 {
-                    "relayer_derived".to_string()
-                } else {
-                    "legacy_caller_supplied".to_string()
-                },
-            ),
+            remaining_accounts_source: Some(if request.intent_version == INTENT_VERSION_V2 {
+                "relayer_derived".to_string()
+            } else {
+                "legacy_caller_supplied".to_string()
+            }),
             sequence: envelope.sequence.to_string(),
             kind: envelope.kind,
             payload_b64: base64::engine::general_purpose::STANDARD.encode(&request.payload),
@@ -8321,10 +8424,7 @@ fn account_metas_to_proto(accounts: &[AccountMeta]) -> Vec<AccountMetaProto> {
         .collect()
 }
 
-fn supplied_account_metas_match(
-    supplied: &[AccountMetaProto],
-    derived: &[AccountMeta],
-) -> bool {
+fn supplied_account_metas_match(supplied: &[AccountMetaProto], derived: &[AccountMeta]) -> bool {
     supplied.len() == derived.len()
         && supplied.iter().zip(derived.iter()).all(|(left, right)| {
             left.pubkey == right.pubkey.to_string()
@@ -8345,9 +8445,8 @@ fn build_mango_account_mirror_from_keyed_account(
             data.len()
         ));
     }
-    let account = MangoAccountValue::from_bytes(&data[8..]).with_context(|| {
-        format!("failed to deserialize mango account {}", mango_account)
-    })?;
+    let account = MangoAccountValue::from_bytes(&data[8..])
+        .with_context(|| format!("failed to deserialize mango account {}", mango_account))?;
 
     Ok(MangoAccountMirror {
         token_indices: account
@@ -8380,7 +8479,9 @@ fn build_derived_perp_remaining_accounts(
     let target_market = group_mirror
         .perps_by_market_index
         .get(&target_market_index)
-        .with_context(|| format!("perp market index {target_market_index} not found in group mirror"))?;
+        .with_context(|| {
+            format!("perp market index {target_market_index} not found in group mirror")
+        })?;
 
     let mut token_indices = mango_account_mirror.token_indices.clone();
     let mut perp_market_indices = mango_account_mirror.perp_market_indices.clone();
@@ -8423,7 +8524,12 @@ fn build_canonical_health_account_metas(
         let bank = group_mirror
             .banks_by_token_index
             .get(token_index)
-            .with_context(|| format!("bank for token index {} not found in group mirror", token_index))?;
+            .with_context(|| {
+                format!(
+                    "bank for token index {} not found in group mirror",
+                    token_index
+                )
+            })?;
         sections[0].push(bank.bank);
         sections[1].push(bank.oracle);
         sections[6].extend(bank.fallback_oracles.iter().copied());
@@ -8532,8 +8638,11 @@ fn expand_lane_variants(
         hash: enqueue_hash,
         remaining_accounts: raw_accounts,
     }];
-    let direct_hash =
-        hash_execution_queue_accounts_for_direct_enqueue(group, execution_queue, remaining_accounts);
+    let direct_hash = hash_execution_queue_accounts_for_direct_enqueue(
+        group,
+        execution_queue,
+        remaining_accounts,
+    );
     if direct_hash != enqueue_hash {
         lanes.push(Lane {
             name: format!("{lane_name}-direct"),
@@ -8831,8 +8940,7 @@ fn hash_execution_queue_accounts_for_legacy_direct_enqueue(
     if let Some(user_owner) = remaining_accounts.get(2).map(|account| account.pubkey) {
         fixed_accounts.push(AccountMeta::new(user_owner, true));
     }
-    let effective_remaining =
-        merge_effective_runtime_flags(remaining_accounts, &fixed_accounts);
+    let effective_remaining = merge_effective_runtime_flags(remaining_accounts, &fixed_accounts);
     let mut bytes = Vec::with_capacity(effective_remaining.len() * 34);
     for account in effective_remaining {
         bytes.extend_from_slice(account.pubkey.as_ref());
@@ -10297,6 +10405,24 @@ fn harness_user_state_from_fast_positions(
     }
 }
 
+fn harness_user_state_from_mango_account_value(
+    mango_account: Pubkey,
+    account: &MangoAccountValue,
+) -> HarnessUserState {
+    let positions = account
+        .all_perp_positions()
+        .filter(|position| position.is_active())
+        .map(|position| rust_harness::FastPerpPosition {
+            market_index: position.market_index,
+            base_position_lots: position.base_position_lots(),
+            quote_position_native: position.quote_position_native().to_string(),
+            open_bid_base_lots: position.bids_base_lots,
+            open_ask_base_lots: position.asks_base_lots,
+        })
+        .collect();
+    harness_user_state_from_fast_positions(mango_account, positions)
+}
+
 /// Phase 4-lite fast-path converter: build a `HarnessUserState` from a
 /// single-account `AccountSnapshot` returned by
 /// `ContinuumStateEngine::account_snapshot_fast`. Only used by the margin
@@ -10681,8 +10807,9 @@ async fn async_main() -> Result<()> {
     // Phase 2: optional in-process optimistic state. If
     // CTM_RELAYER_LOCAL_STATE=true, fetch a one-time snapshot from the
     // legacy harness and seed an in-process ContinuumStateEngine. The
-    // relayer then owns its own copy and never hits the harness HTTP
-    // endpoint on the hot path again.
+    // relayer then owns its own copy and keeps margin precheck on the
+    // Rust hot path instead of falling back to /state/users. Misses can
+    // still bootstrap a single MangoAccount directly from RPC.
     let local_state = if config.local_state_enabled {
         match bootstrap_local_state(
             &config.local_state_bootstrap_url,
@@ -10698,7 +10825,9 @@ async fn async_main() -> Result<()> {
                 Some(Arc::new(PlMutex::new(engine)))
             }
             Err(err) => {
-                warn!("local-state bootstrap failed; falling back to legacy HTTP path: {err:#}");
+                warn!(
+                    "local-state bootstrap failed; continuing without local margin state and using direct MangoAccount RPC reads on margin misses instead of /state/users: {err:#}"
+                );
                 None
             }
         }
@@ -10732,6 +10861,36 @@ async fn async_main() -> Result<()> {
         ingress_failure_memo: Arc::new(StdMutex::new(HashMap::new())),
         ingress_rate_slots: Arc::new(StdMutex::new(HashMap::new())),
     });
+
+    if let Some(group) = config.executor_group {
+        let engine_for_bootstrap = engine.clone();
+        tokio::spawn(async move {
+            loop {
+                match engine_for_bootstrap
+                    .bootstrap_group_static_account_mirror(group)
+                    .await
+                {
+                    Ok(mirror) => {
+                        info!(
+                            group = %group,
+                            banks = mirror.banks_by_token_index.len(),
+                            perps = mirror.perps_by_market_index.len(),
+                            "configured group static account mirror bootstrapped"
+                        );
+                        break;
+                    }
+                    Err(err) => {
+                        warn!(
+                            group = %group,
+                            error = %err,
+                            "configured group static account mirror not ready yet; retrying"
+                        );
+                        sleep(Duration::from_millis(1_000)).await;
+                    }
+                }
+            }
+        });
+    }
 
     // Spawn the bg submitter worker pool. Each worker shares the receiver
     // via a tokio Mutex (work-stealing). Workers exit when the channel
@@ -11017,8 +11176,12 @@ mod tests {
                 fallback_oracles: vec![usdc_fallback],
             },
         );
-        group_mirror.perps_by_market_index.insert(0, sol_market.clone());
-        group_mirror.perps_by_market_index.insert(1, btc_market.clone());
+        group_mirror
+            .perps_by_market_index
+            .insert(0, sol_market.clone());
+        group_mirror
+            .perps_by_market_index
+            .insert(1, btc_market.clone());
 
         let mango_mirror = MangoAccountMirror {
             token_indices: vec![0],
@@ -11055,7 +11218,10 @@ mod tests {
             usdc_fallback,
         ];
         assert_eq!(
-            derived.iter().map(|account| account.pubkey).collect::<Vec<_>>(),
+            derived
+                .iter()
+                .map(|account| account.pubkey)
+                .collect::<Vec<_>>(),
             expected_pubkeys
         );
         assert!(!derived[0].is_writable);
@@ -11083,10 +11249,8 @@ mod tests {
             ..envelope_a.clone()
         };
 
-        let v1_a =
-            canonical_user_intent_message_v1(group, mango_account, user_owner, &envelope_a);
-        let v1_b =
-            canonical_user_intent_message_v1(group, mango_account, user_owner, &envelope_b);
+        let v1_a = canonical_user_intent_message_v1(group, mango_account, user_owner, &envelope_a);
+        let v1_b = canonical_user_intent_message_v1(group, mango_account, user_owner, &envelope_b);
         let v2_a = canonical_user_intent_message_v2(
             group,
             mango_account,
@@ -12162,16 +12326,20 @@ mod tests {
         let hashes: HashSet<[u8; 32]> = lanes.iter().map(|lane| lane.hash).collect();
 
         assert_eq!(lanes.len(), 2);
-        assert!(hashes.contains(&hash_execution_queue_accounts_for_ctm_enqueue(
-            group,
-            execution_queue,
-            &remaining_accounts,
-        )));
-        assert!(hashes.contains(&hash_execution_queue_accounts_for_legacy_direct_enqueue(
-            group,
-            execution_queue,
-            &remaining_accounts,
-        )));
+        assert!(
+            hashes.contains(&hash_execution_queue_accounts_for_ctm_enqueue(
+                group,
+                execution_queue,
+                &remaining_accounts,
+            ))
+        );
+        assert!(
+            hashes.contains(&hash_execution_queue_accounts_for_legacy_direct_enqueue(
+                group,
+                execution_queue,
+                &remaining_accounts,
+            ))
+        );
     }
 
     #[test]

@@ -80,6 +80,8 @@ const HARNESS_MODE = process.env.CONTINUUM_HARNESS_MODE || 'local';
 const HARNESS_BACKEND: HarnessBackendKind = parseHarnessBackendKind(
   process.env.CONTINUUM_HARNESS_BACKEND,
 );
+const HARNESS_USE_LIGHTWEIGHT_WRAPPER_DEFAULTS =
+  HARNESS_BACKEND === 'rust-backend';
 const HARNESS_PROCESS_STARTED_TS_MS = Date.now();
 const HARNESS_INSTANCE_ID = `${process.pid}-${HARNESS_PROCESS_STARTED_TS_MS}`;
 const HARNESS_EVENT_LOG_PATH =
@@ -142,7 +144,8 @@ const HARNESS_AIRDROP_AUTO_CREATE_PERP_OO_COUNT = Number(
 const HARNESS_AIRDROP_AUTO_CREATE_NAME =
   process.env.CONTINUUM_HARNESS_AIRDROP_AUTO_CREATE_NAME || 'harness-auto';
 const HARNESS_SANITY_INTERVAL_MS = Number(
-  process.env.CONTINUUM_HARNESS_SANITY_INTERVAL_MS || '5000',
+  process.env.CONTINUUM_HARNESS_SANITY_INTERVAL_MS ||
+    (HARNESS_USE_LIGHTWEIGHT_WRAPPER_DEFAULTS ? '0' : '5000'),
 );
 const HARNESS_ONCHAIN_CACHE_TTL_MS = Number(
   process.env.CONTINUUM_HARNESS_ONCHAIN_CACHE_TTL_MS || '5000',
@@ -151,7 +154,8 @@ const HARNESS_MARKET_METADATA_CACHE_TTL_MS = Number(
   process.env.CONTINUUM_HARNESS_MARKET_METADATA_CACHE_TTL_MS || '60000',
 );
 const HARNESS_RECONCILE_INTERVAL_MS = Number(
-  process.env.CONTINUUM_HARNESS_RECONCILE_INTERVAL_MS || '10000',
+  process.env.CONTINUUM_HARNESS_RECONCILE_INTERVAL_MS ||
+    (HARNESS_USE_LIGHTWEIGHT_WRAPPER_DEFAULTS ? '30000' : '10000'),
 );
 const HARNESS_DIRECT_ONCHAIN_REBASE_DEBOUNCE_MS = Number(
   process.env.CONTINUUM_HARNESS_DIRECT_ONCHAIN_REBASE_DEBOUNCE_MS || '750',
@@ -172,33 +176,40 @@ const HARNESS_FRONTEND_REFRESH_INTERVAL_MS = Number(
 );
 const HARNESS_READ_FAILURE_WINDOW_MS = Math.max(
   1000,
-  Number(process.env.CONTINUUM_HARNESS_READ_FAILURE_WINDOW_MS || '60000'),
+  Number(process.env.CONTINUUM_HARNESS_READ_FAILURE_WINDOW_MS || '30000'),
 );
 const HARNESS_READ_FAILURE_MIN_SAMPLES = Math.max(
   1,
-  Number(process.env.CONTINUUM_HARNESS_READ_FAILURE_MIN_SAMPLES || '8'),
+  Number(process.env.CONTINUUM_HARNESS_READ_FAILURE_MIN_SAMPLES || '2'),
 );
 const HARNESS_READ_FAILURE_RATE_THRESHOLD = Math.min(
   1,
   Math.max(
     0,
-    Number(process.env.CONTINUUM_HARNESS_READ_FAILURE_RATE_THRESHOLD || '0.35'),
+    Number(process.env.CONTINUUM_HARNESS_READ_FAILURE_RATE_THRESHOLD || '0.15'),
   ),
 );
 const HARNESS_READ_SLOW_THRESHOLD_MS = Math.max(
   1,
-  Number(process.env.CONTINUUM_HARNESS_READ_SLOW_THRESHOLD_MS || '350'),
+  Number(process.env.CONTINUUM_HARNESS_READ_SLOW_THRESHOLD_MS || '200'),
 );
 const HARNESS_READ_SLOW_MIN_SAMPLES = Math.max(
   1,
-  Number(process.env.CONTINUUM_HARNESS_READ_SLOW_MIN_SAMPLES || '8'),
+  Number(process.env.CONTINUUM_HARNESS_READ_SLOW_MIN_SAMPLES || '3'),
 );
 const HARNESS_READ_SLOW_RATE_THRESHOLD = Math.min(
   1,
   Math.max(
     0,
-    Number(process.env.CONTINUUM_HARNESS_READ_SLOW_RATE_THRESHOLD || '0.35'),
+    Number(process.env.CONTINUUM_HARNESS_READ_SLOW_RATE_THRESHOLD || '0.2'),
   ),
+);
+const HARNESS_READ_IMMEDIATE_FAILOVER_ON_ERROR =
+  (process.env.CONTINUUM_HARNESS_READ_IMMEDIATE_FAILOVER_ON_ERROR || 'true') ===
+  'true';
+const HARNESS_READ_IMMEDIATE_SLOW_THRESHOLD_MS = Math.max(
+  HARNESS_READ_SLOW_THRESHOLD_MS,
+  Number(process.env.CONTINUUM_HARNESS_READ_IMMEDIATE_SLOW_THRESHOLD_MS || '750'),
 );
 const HARNESS_PRIMARY_WS_ERROR_WINDOW_MS = Math.max(
   1000,
@@ -318,7 +329,7 @@ const HARNESS_LANE_SUPPRESSION_MS = Math.max(
   Number(process.env.CONTINUUM_HARNESS_LANE_SUPPRESSION_MS || '5000'),
 );
 const HARNESS_LANE_PENDING_STALE_MS = Math.max(
-  1000,
+  100,
   Number(process.env.CONTINUUM_HARNESS_LANE_PENDING_STALE_MS || '15000'),
 );
 const SEQUENCER_TICK_PROCESSED_SIGNATURE_PREFIX = 'sequencer-tick:';
@@ -326,7 +337,8 @@ const LOCAL_QUEUE_PROCESS_EXECUTED = 2;
 
 // ── Market stats collection ──────────────────────────────────────────────────
 const HARNESS_MARKET_STATS_INTERVAL_MS = Number(
-  process.env.CONTINUUM_HARNESS_MARKET_STATS_INTERVAL_MS || '120000',
+  process.env.CONTINUUM_HARNESS_MARKET_STATS_INTERVAL_MS ||
+    (HARNESS_USE_LIGHTWEIGHT_WRAPPER_DEFAULTS ? '0' : '120000'),
 );
 const HARNESS_MARKET_STATS_PATH =
   process.env.CONTINUUM_HARNESS_MARKET_STATS_PATH ||
@@ -681,6 +693,13 @@ type PerMarketStats = {
   /** Running total accumulated since tracking began (survives restarts). */
   cumulative_volume_base_lots: string;
   cumulative_volume_quote_lots: string;
+  /**
+   * Highest taker_sequence counted into the cumulative volume totals.
+   * Persisted so restarts don't re-count already-counted fills.
+   * Using sequence as the high-water mark avoids stalls when the
+   * 5000-trade in-memory ring buffer rotates old fills out.
+   */
+  cumulative_volume_seq_hwm: string;
   /** Latest on-chain values; null when on-chain read is unavailable. */
   fees_accrued_native: string | null;
   fees_settled_native: string | null;
@@ -921,12 +940,8 @@ let marketStatsStore: MarketStatsStore = {
   written_ts_ms: 0,
   markets: {},
 };
-// Tracks the total in-memory trade volume seen at the last poll per market,
-// so we can compute deltas for the cumulative volume counter.
-const marketStatsVolumeCheckpoints = new Map<
-  string,
-  { base_lots: bigint; quote_lots: bigint }
->();
+// (Volume checkpointing migrated to per-market cumulative_volume_seq_hwm in
+// PerMarketStats — persisted in the stats file for restart safety.)
 const bufferedLogWriters = new Map<
   string,
   {
@@ -1275,7 +1290,18 @@ async function withOnchainRead<T>(
         slow: latencyMs >= HARNESS_READ_SLOW_THRESHOLD_MS,
       });
       prunePrimaryReadOutcomes(onchain);
-      maybeActivateFallbackProvider(onchain, operation);
+      if (
+        latencyMs >= HARNESS_READ_IMMEDIATE_SLOW_THRESHOLD_MS &&
+        switchReadProviderToFallback(
+          onchain,
+          `primary read latency ${latencyMs.toFixed(2)}ms exceeded ` +
+            `${HARNESS_READ_IMMEDIATE_SLOW_THRESHOLD_MS}ms during ${operation}`,
+        )
+      ) {
+        // Keep the successful result and route subsequent reads to fallback.
+      } else {
+        maybeActivateFallbackProvider(onchain, operation);
+      }
     }
     return result;
   } catch (err) {
@@ -1302,6 +1328,16 @@ async function withOnchainRead<T>(
       active_provider: getReadProviderLabel(onchain),
       latency_ms: latencyMs.toFixed(3),
     });
+    if (
+      provider === 'primary' &&
+      HARNESS_READ_IMMEDIATE_FAILOVER_ON_ERROR &&
+      switchReadProviderToFallback(
+        onchain,
+        `primary read error during ${operation}: ${normalized.message}`,
+      )
+    ) {
+      return await withOnchainRead(onchain, `${operation}:fallback_retry`, read);
+    }
     if (provider === 'primary' && maybeActivateFallbackProvider(onchain, operation)) {
       return await withOnchainRead(onchain, `${operation}:fallback_retry`, read);
     }
@@ -1338,6 +1374,8 @@ function getReadProviderDiagnostics(
     primary_slow_min_samples: HARNESS_READ_SLOW_MIN_SAMPLES,
     primary_slow_rate_threshold: HARNESS_READ_SLOW_RATE_THRESHOLD,
     primary_slow_stats: primarySlowStats,
+    primary_immediate_failover_on_error: HARNESS_READ_IMMEDIATE_FAILOVER_ON_ERROR,
+    primary_immediate_slow_threshold_ms: HARNESS_READ_IMMEDIATE_SLOW_THRESHOLD_MS,
     primary_ws_error_window_ms: HARNESS_PRIMARY_WS_ERROR_WINDOW_MS,
     primary_ws_error_threshold: HARNESS_PRIMARY_WS_ERROR_THRESHOLD,
     primary_ws_error_stats: primaryWsStats,
@@ -8346,6 +8384,7 @@ async function pollMarketStats(onchain: OnchainContext | null): Promise<void> {
       last_collected_ms: 0,
       cumulative_volume_base_lots: '0',
       cumulative_volume_quote_lots: '0',
+      cumulative_volume_seq_hwm: '0',
       fees_accrued_native: null,
       fees_settled_native: null,
       open_interest_base_lots: null,
@@ -8353,6 +8392,10 @@ async function pollMarketStats(onchain: OnchainContext | null): Promise<void> {
       funding_rate_history: [],
       all_time_unique_users: [],
     };
+    // Back-fill the new field for entries loaded from an older stats file.
+    if (!entry.cumulative_volume_seq_hwm) {
+      entry.cumulative_volume_seq_hwm = '0';
+    }
 
     if (meta?.name) {
       entry.market_name = meta.name;
@@ -8407,22 +8450,27 @@ async function pollMarketStats(onchain: OnchainContext | null): Promise<void> {
     }
 
     // ── Cumulative volume accumulation ────────────────────────────────────
-    // Pull all in-memory confirmed trades for this market and compute a delta
-    // against the last checkpoint so we count each fill exactly once.
+    // Use a taker_sequence high-water mark (persisted in the stats file) so
+    // each fill is counted exactly once regardless of:
+    //  - harness restarts (checkpoint loaded from file, no re-counting)
+    //  - the 5000-trade ring buffer rotating old fills out (we track by
+    //    sequence, not by summing the buffer, so buffer roll-over no longer
+    //    stalls the accumulator)
     const trades = engine.getTrades(marketKey, 'confirmed', 100_000);
-    let curBase = 0n;
-    let curQuote = 0n;
+    const seqHwm = BigInt(entry.cumulative_volume_seq_hwm ?? '0');
+    let newSeqHwm = seqHwm;
+    let deltaBase = 0n;
+    let deltaQuote = 0n;
     for (const t of trades) {
-      curBase += BigInt(t.base_lots);
-      curQuote += BigInt(t.quote_lots);
+      const seq = BigInt(t.taker_sequence);
+      if (seq > seqHwm) {
+        deltaBase += BigInt(t.base_lots);
+        deltaQuote += BigInt(t.quote_lots);
+        if (seq > newSeqHwm) {
+          newSeqHwm = seq;
+        }
+      }
     }
-    const prev = marketStatsVolumeCheckpoints.get(marketKey) ?? {
-      base_lots: 0n,
-      quote_lots: 0n,
-    };
-    // Guard against checkpoint being ahead of curBase (e.g. harness restart).
-    const deltaBase = curBase > prev.base_lots ? curBase - prev.base_lots : 0n;
-    const deltaQuote = curQuote > prev.quote_lots ? curQuote - prev.quote_lots : 0n;
     if (deltaBase > 0n) {
       entry.cumulative_volume_base_lots = (
         BigInt(entry.cumulative_volume_base_lots) + deltaBase
@@ -8433,10 +8481,7 @@ async function pollMarketStats(onchain: OnchainContext | null): Promise<void> {
         BigInt(entry.cumulative_volume_quote_lots) + deltaQuote
       ).toString();
     }
-    marketStatsVolumeCheckpoints.set(marketKey, {
-      base_lots: curBase,
-      quote_lots: curQuote,
-    });
+    entry.cumulative_volume_seq_hwm = newSeqHwm.toString();
 
     // ── Cumulative unique users ───────────────────────────────────────────
     const userSet = new Set(entry.all_time_unique_users);

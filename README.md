@@ -93,6 +93,7 @@ RESET_VALIDATOR=1 ./startup_local.sh restart
 BUILD_SBF=1 ./startup_local.sh restart
 CTM_RELAYER_IMPL=ts ./startup_local.sh restart
 EXECUTION_QUEUE_ENGINE_ENABLED=false ./startup_local.sh restart
+# Fallback/debug only: forces the legacy TS replay backend.
 HARNESS_BACKEND=ts-backend ./startup_local.sh restart
 ```
 
@@ -124,12 +125,27 @@ CONTINUUM_HARNESS_MARKET_STATS_INTERVAL_MS=0
 CONTINUUM_HARNESS_RECONCILE_INTERVAL_MS=30000
 CONTINUUM_HARNESS_ONCHAIN_CACHE_TTL_MS=5000
 CONTINUUM_HARNESS_FRONTEND_REFRESH_INTERVAL_MS=10000
+CONTINUUM_HARNESS_READ_FAILURE_WINDOW_MS=30000
+CONTINUUM_HARNESS_READ_FAILURE_MIN_SAMPLES=2
+CONTINUUM_HARNESS_READ_FAILURE_RATE_THRESHOLD=0.15
+CONTINUUM_HARNESS_READ_SLOW_THRESHOLD_MS=200
+CONTINUUM_HARNESS_READ_SLOW_MIN_SAMPLES=3
+CONTINUUM_HARNESS_READ_SLOW_RATE_THRESHOLD=0.20
+CONTINUUM_HARNESS_READ_IMMEDIATE_FAILOVER_ON_ERROR=true
+CONTINUUM_HARNESS_READ_IMMEDIATE_SLOW_THRESHOLD_MS=750
+CTM_RELAYER_LOCAL_STATE=true
+CTM_RELAYER_HARNESS_REJECT_MARKET_DRIFT=false
 ```
 
 Important: `rust-backend` still means the `:9091` HTTP/SSE server is the
 TypeScript harness wrapper around the Rust native engine. If these wrapper
 intervals drift back to aggressive settings, SSE and `/state/*` latency can
 regress even while the Rust executor stays fast.
+
+The relayer should also default to the embedded Rust local-state path. With
+`CTM_RELAYER_HARNESS_REJECT_MARKET_DRIFT=false`, submit-path margin checks stay
+in Rust, do not fall back to `GET /state/users/:owner`, and the relayer should
+not poll `:9091 /healthz` on every ingress.
 
 ## Common Commands
 

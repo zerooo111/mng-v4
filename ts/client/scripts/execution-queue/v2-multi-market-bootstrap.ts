@@ -2,7 +2,7 @@
  * v2-multi-market-bootstrap.ts
  *
  * Minimal bootstrap for testing the v2 sub-queue with multiple markets.
- * Creates: group + USDC bank + 2 perp markets (SOL-PERP, BTC-PERP) +
+ * Creates: group + USDC bank + 3 perp markets (SOL-PERP, BTC-PERP, ETH-PERP) +
  * execution queue + maker/taker mango accounts + lanes config + run config.
  *
  * Skips editMangoAccount (broken in test-validator due to ws confirmation
@@ -74,6 +74,12 @@ const DEFAULT_PERP_MARKET_PRECISION: Record<number, PerpMarketPrecision> = {
   },
   // BTC-PERP: 0.01 USDC ticks.
   1: {
+    baseDecimals: 6,
+    baseLotSize: 100,
+    quoteLotSize: 1,
+  },
+  // ETH-PERP: 0.01 USDC ticks.
+  2: {
     baseDecimals: 6,
     baseLotSize: 100,
     quoteLotSize: 1,
@@ -507,9 +513,10 @@ async function main(): Promise<void> {
     await group.reloadAll(adminClient);
   }
 
-  // Create 2 mints + 2 perp markets
+  // Create 3 synthetic base mints + 3 perp markets
   const solMint = await createMint(provider.connection, admin, admin.publicKey, null, ASSET_MINT_DECIMALS);
   const btcMint = await createMint(provider.connection, admin, admin.publicKey, null, ASSET_MINT_DECIMALS);
+  const ethMint = await createMint(provider.connection, admin, admin.publicKey, null, ASSET_MINT_DECIMALS);
 
   let pm0 = group.perpMarketsMapByMarketIndex.get(0 as PerpMarketIndex);
   if (!pm0) {
@@ -538,6 +545,21 @@ async function main(): Promise<void> {
       PYTH_SPONSORED_FEED.BTC,
     );
     console.log(JSON.stringify({ msg: 'perp_market_created', market_index: 1, name: 'BTC-PERP' }));
+    await group.reloadAll(adminClient);
+  }
+
+  let pm2 = group.perpMarketsMapByMarketIndex.get(2 as PerpMarketIndex);
+  if (!pm2) {
+    await createPerpMarket(
+      adminClient,
+      group,
+      ethMint,
+      2 as PerpMarketIndex,
+      'ETH-PERP',
+      2000,
+      PYTH_SPONSORED_FEED.ETH,
+    );
+    console.log(JSON.stringify({ msg: 'perp_market_created', market_index: 2, name: 'ETH-PERP' }));
     await group.reloadAll(adminClient);
   }
 
@@ -605,7 +627,7 @@ async function main(): Promise<void> {
     ['maker', makerClient, reloadedMakerGroup, reloadedMaker, maker.publicKey],
     ['taker', takerClient, reloadedTakerGroup, reloadedTaker, taker.publicKey],
   ] as const) {
-    for (const marketIndex of [0, 1] as const) {
+    for (const marketIndex of [0, 1, 2] as const) {
       const ra = await canonicalRemainingAccounts(
         client,
         grp,
@@ -639,7 +661,8 @@ async function main(): Promise<void> {
     usdcMint: usdcMint.toBase58(),
     solMint: solMint.toBase58(),
     btcMint: btcMint.toBase58(),
-    perpMarkets: [0, 1],
+    ethMint: ethMint.toBase58(),
+    perpMarkets: [0, 1, 2],
     oracleMode: ORACLE_MODE,
     oracles:
       ORACLE_MODE === 'pyth'
@@ -647,6 +670,7 @@ async function main(): Promise<void> {
             usdc: PYTH_SPONSORED_FEED.USDC.toBase58(),
             sol: PYTH_SPONSORED_FEED.SOL.toBase58(),
             btc: PYTH_SPONSORED_FEED.BTC.toBase58(),
+            eth: PYTH_SPONSORED_FEED.ETH.toBase58(),
           }
         : { note: 'stub oracles created per-mint; query via getStubOracle' },
     // Default sub-queue / relayer config consumed by the taker bot v3 and

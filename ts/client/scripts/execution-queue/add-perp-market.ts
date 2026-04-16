@@ -72,6 +72,7 @@ function defaultPrecisionForSymbol(symbol: string): PerpMarketPrecision {
         quoteLotSize: 1,
       };
     case 'BTC':
+    case 'ETH':
       return {
         baseDecimals: 6,
         baseLotSize: 100,

@@ -214,8 +214,15 @@ export class ContinuumHarnessLaneGuard {
       suppressionReason = 'lane_pending_limit';
     }
 
-    lane.pendingTrackingKeys.add(trackingKey);
-    lane.pendingSequences.add(event.sequence);
+    // Only track forwarded (non-suppressed) intents in the pending set.
+    // Suppressed intents are never sent to the executor so they never generate
+    // a terminal event, meaning they can only age out via the stale timeout.
+    // Counting them against the limit causes the pending set to grow without
+    // bound and makes maxOptimisticPendingPerLane ineffective.
+    if (!suppressionReason) {
+      lane.pendingTrackingKeys.add(trackingKey);
+      lane.pendingSequences.add(event.sequence);
+    }
     lane.pendingPayloadCounts.set(
       payloadHash,
       (lane.pendingPayloadCounts.get(payloadHash) || 0) + 1,

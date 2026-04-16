@@ -5,6 +5,9 @@ members = [
     "lib/*",
     "rust-harness",
 ]
+exclude = [
+    "bin/service-fanout",
+]
 
 [workspace.dependencies]
 anchor-client = "0.28.0"

@@ -1,0 +1,62 @@
+[package]
+name = "service-fanout"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+
+# Excluded from the workspace (see root Cargo.toml `exclude`).
+# No dependency on rust-harness, the execution engine, or any Solana/Anchor
+# crates — intentional isolation so this binary can be built independently.
+#
+# Because this crate is outside the workspace it resolves deps independently.
+# We pin every dep whose MSRV was bumped past 1.70 in recent releases.
+# All pinned versions are verified present in the local crate registry.
+
+[[bin]]
+name = "service-fanout"
+path = "src/main.rs"
+
+[dependencies]
+anyhow             = "1.0"
+async-trait        = "0.1"
+axum               = { version = "0.6", features = ["headers"] }   # resolves to 0.6.20
+base64             = "=0.21.7"
+dashmap            = "=4.0.2"
+hmac               = "=0.12.1"
+serde              = { version = "1.0", features = ["derive"] }
+serde_json         = "1.0"
+sha2               = "=0.10.8"
+tracing            = "0.1"
+tracing-subscriber = { version = "=0.3.19", features = ["env-filter", "fmt"] }
+
+# ── Pinned transitive deps to keep MSRV at 1.70 ──────────────────────────
+# tokio 1.44+ requires rustc 1.75; 1.43.4 requires 1.70.
+tokio              = { version = "=1.43.4", features = ["full"] }
+# tokio-stream 0.1.17 is the latest locally available version.
+tokio-stream       = { version = "=0.1.17", features = ["sync"] }
+# tokio-util 0.7.18 requires 1.71; 0.7.15 requires 1.70.
+tokio-util         = "=0.7.15"
+# futures-* 0.3.32 requires rustc 1.71; 0.3.31 requires 1.56 (safe for 1.70).
+# 0.3.28 is NOT available in the current crates-io index (only in source cache).
+# axum 0.6 uses futures-util with `features = ["alloc"], default-features = false`,
+# so futures-macro (which is in the default feature set) is never pulled in.
+futures-channel    = "=0.3.31"
+futures-core       = "=0.3.31"
+futures-io         = "=0.3.32"  # 0.3.31 not available; 0.3.32 MSRV is 1.36 ✓
+futures-sink       = "=0.3.31"
+futures-task       = "=0.3.31"
+futures-util       = "=0.3.31"
+# mio 1.0.3 = first stable 1.x; pin below 1.2 (unknown MSRV).
+mio                = "=1.0.3"
+# socket2 0.5.x has MSRV 1.63; 0.6.x may require newer Rust.
+socket2            = ">=0.5.0, <0.6"
+# parking_lot 0.12.5 requires 1.71; 0.12.3 requires 1.56.
+parking_lot        = "=0.12.3"
+
+# Rust 1.70 compatibility patches — mirrors the workspace [patch.crates-io]
+# section (not inherited here because this crate is excluded from the workspace).
+[patch.crates-io]
+quote            = { path = "../../third-party/quote-1.0.45-local" }
+syn              = { path = "../../third-party/syn-2.0.117-local" }
+unicode-ident    = { path = "../../third-party/unicode-ident-1.0.24-local" }
+proc-macro-crate = { path = "../../third-party/proc-macro-crate-1.3.1-local" }
