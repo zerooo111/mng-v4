@@ -114,7 +114,7 @@ impl MarketSnapshot {
 /// Runtime configuration loaded from environment variables at startup.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// `FANOUT_BIND_ADDR` — default `0.0.0.0:8080`
+    /// `FANOUT_BIND_ADDR` — default `0.0.0.0:9094`
     pub bind_addr: SocketAddr,
 
     /// `FANOUT_CHANNEL_CAPACITY` — broadcast ring size per market, default 4096
@@ -151,7 +151,7 @@ pub struct Config {
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
         let bind_addr: SocketAddr = std::env::var("FANOUT_BIND_ADDR")
-            .unwrap_or_else(|_| "0.0.0.0:8080".into())
+            .unwrap_or_else(|_| "0.0.0.0:9094".into())
             .parse()?;
 
         let channel_capacity = parse_env_usize("FANOUT_CHANNEL_CAPACITY", 4096)?;

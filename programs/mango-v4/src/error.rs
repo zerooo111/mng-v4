@@ -209,6 +209,24 @@ pub enum MangoError {
     ExecutionQueueSubQueueInvalidMarketIndex,
     #[msg("execution queue perp health accounts invalid")]
     ExecutionQueuePerpHealthAccountsInvalid,
+    #[msg("execution queue v3 invalid page_size")]
+    ExecutionQueueV3InvalidPageSize,
+    #[msg("execution queue v3 invalid num_pages")]
+    ExecutionQueueV3InvalidNumPages,
+    #[msg("execution queue v3 invalid soft_limit")]
+    ExecutionQueueV3InvalidSoftLimit,
+    #[msg("execution queue v3 page_slot out of range for queue root")]
+    ExecutionQueueV3PageSlotOutOfRange,
+    #[msg("execution queue v3 assigned_abs_page_no does not match page_slot ring position")]
+    ExecutionQueueV3AssignedPageMismatch,
+    #[msg("execution queue v3 only supports shard_id = 0 in phase 1")]
+    ExecutionQueueV3UnsupportedShardId,
+    #[msg("execution queue v3 page belongs to a different queue root")]
+    ExecutionQueueV3PageQueueRootMismatch,
+    #[msg("execution queue v3 page is not active")]
+    ExecutionQueueV3PageInactive,
+    #[msg("execution queue v3 page offset out of range")]
+    ExecutionQueueV3PageOffsetOutOfRange,
 }
 
 impl MangoError {

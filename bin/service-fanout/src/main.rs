@@ -10,7 +10,7 @@
 ///
 /// | Variable                          | Default        | Description                        |
 /// |-----------------------------------|----------------|------------------------------------|
-/// | `FANOUT_BIND_ADDR`                | `0.0.0.0:8080` | TCP listen address                 |
+/// | `FANOUT_BIND_ADDR`                | `0.0.0.0:9094` | TCP listen address                 |
 /// | `FANOUT_CHANNEL_CAPACITY`         | `4096`         | Broadcast ring size per market     |
 /// | `FANOUT_SNAPSHOT_MAX_EVENTS`      | `256`          | Recent-event ring per snapshot     |
 /// | `FANOUT_MAX_CONNECTIONS`          | `2000`         | Global SSE connection cap          |

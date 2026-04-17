@@ -247,26 +247,34 @@ The engine's hot path must never block on external consumers. The fanout service
 
 ## Implementation Plan
 
-### Phase 1 — Core Fanout (single instance, SSE only)
+### Phase 1 — Core Fanout (single instance, SSE only) ✅
 
-- [ ] Create `bin/service-fanout/` crate, add to workspace `Cargo.toml`
-- [ ] Add dependencies: `axum`, `tokio`, `serde_json`, `dashmap`, `async-stream`, `axum-extra` (SSE)
-- [ ] Implement `EventEnvelope` type mirroring execution engine's `RelayIntentStatusEvent` / `RelayIntentAcceptedEvent` JSON shapes
-- [ ] Implement `MarketChannels` registry with `DashMap<u16, broadcast::Sender<Arc<EventEnvelope>>>`
-- [ ] Implement `POST /ingest` handler — deserialize, broadcast, update snapshot cache
-- [ ] Implement `GET /stream/{market_index}` SSE handler with lag detection + resync event
-- [ ] Implement `GET /snapshot/{market_index}` REST handler
-- [ ] Implement `/healthz` and `/metrics` (Prometheus counters: events_ingested, active_subscribers, lagged_events)
-- [ ] Wire up Axum router + Tokio multi-thread runtime
-- [ ] Dockerfile + systemd unit
+- [x] Create `bin/service-fanout/` crate, excluded from workspace for isolation
+- [x] Dependencies: `axum 0.6`, `tokio 1.43`, `serde_json`, `dashmap 4`, `hmac`/`sha2`/`base64`
+- [x] `EventEnvelope` — transparent `serde_json::Value` wrapper, zero coupling with engine types
+- [x] `ChannelRegistry` — `DashMap<String, broadcast::Sender<Arc<EventEnvelope>>>` keyed by market index string (`"0"`, `"1"`, …)
+- [x] `POST /ingest` — deserialize, broadcast O(1), update snapshot, metrics
+- [x] `POST /ingest/batch` — amortised multi-event ingest
+- [x] `GET /stream/{market}` SSE handler — lag detection + `event: resync` signal
+- [x] `GuardedStream` RAII wrapper — connection cleanup on disconnect
+- [x] `GET /snapshot/{market}` — `RwLock<MarketSnapshot>` with 256-event ring buffer
+- [x] `GET /markets` — enumerate known markets
+- [x] `/healthz` and `/metrics` — plain atomic counters, OpenMetrics text format
+- [x] Axum router + Tokio multi-thread runtime (8 MB stack, mirrors engine config)
+- [x] **Event pipeline relay** — `continuum-proxy-rust/src/fanout_relay.rs`: subscribes to `{harness}/state/stream` SSE, forwards events fire-and-forget to `{fanout}/ingest` (lives in the proxy, not fanout itself)
+- [ ] Dockerfile + systemd unit (Phase 5 / deployment)
 
-### Phase 2 — Auth + Connection Controls
+> **Market key note:** The `market` field in ingest payloads is an integer index string (`"0"`, `"1"`, `"2"`, …), not a pubkey. The `group` field carries the pubkey. Channel registry keys and URL path segments use these integer strings.
 
-- [ ] JWT middleware (Axum extractor, async JWKS fetch + cache)
-- [ ] API key middleware (alternative to JWT, same extractor trait)
-- [ ] Per-user connection counter (`DashMap<UserId, AtomicU32>`)
-- [ ] Global connection semaphore
-- [ ] Per-tier rate limiting (token bucket)
+### Phase 2 — Auth + Connection Controls ✅ (superseded by proxy — better)
+
+- [x] JWT (HS256) verification — code in `auth.rs` (available as fallback)
+- [x] API key verification — O(1) `HashMap` lookup, `key[:user_id[:tier]]` format (available as fallback)
+- [x] `FANOUT_AUTH_DISABLED=true` fast-path — **used in production** (fanout is an internal service; proxy handles all auth)
+- [x] Per-user connection counter — `DashMap<user_id, AtomicU32>` in fanout (backstop); **primary** tracking via proxy `ConnectionTracker` (shared with WebSocket)
+- [x] Global connection semaphore — `tokio::sync::Semaphore` (backstop)
+- [x] `GuardedStream` RAII in proxy `src/services/fanout.rs` — releases slot + fires metrics on disconnect
+- [x] Per-key rate limiting — `rps/rpm/burst_size` per UUID key in proxy PostgreSQL DB (supersedes the deferred token bucket plan)
 
 ### Phase 3 — User Snapshots + Harness Proxy
 

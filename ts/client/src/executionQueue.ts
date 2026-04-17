@@ -5,6 +5,7 @@ import {
   AccountMeta,
   Ed25519Program,
   PublicKey,
+  SystemProgram,
   SYSVAR_INSTRUCTIONS_PUBKEY,
   TransactionInstruction,
 } from '@solana/web3.js';
@@ -263,6 +264,131 @@ export type BuildExecutionQueueEnqueueDirectWithIntentParams = {
   userSigner: IntentSigner;
 };
 
+export type DecodedExecutionQueueV3MarketRoot = {
+  group: PublicKey;
+  authorityState: PublicKey;
+  marketIndex: number;
+  shardId: number;
+  pausedIngress: boolean;
+  pausedExecute: boolean;
+  bump: number;
+  maxCompactionDistance: number;
+  minExpiryBufferSlots: number;
+  nextSequenceToExecute: bigint;
+  maxSeenSequence: bigint;
+  gapObservedSlot: bigint;
+  firstFailureSlot: bigint;
+  liveCount: number;
+  gapWaitSlots: number;
+  pageSize: number;
+  numPages: number;
+  softLimit: number;
+  recipeVersion: number;
+};
+
+export type BuildExecutionQueueV3InitMarketPageParams = {
+  programId: PublicKey;
+  group: PublicKey;
+  authorityState: PublicKey;
+  queueRoot: PublicKey;
+  payer: PublicKey;
+  pageSlot: number;
+  assignedAbsPageNo: BigNumberish;
+};
+
+export type BuildExecutionQueueV3EnqueueCtmParams = {
+  programId: PublicKey;
+  group: PublicKey;
+  authorityState: PublicKey;
+  queueRoot: PublicKey;
+  queuePage: PublicKey;
+  marketIndex: number;
+  remainingAccounts: AccountMeta[];
+  envelope: CtmEnvelopeWire;
+  payload: Uint8Array;
+};
+
+export type BuildExecutionQueueV3EnqueueDirectParams = {
+  programId: PublicKey;
+  group: PublicKey;
+  authorityState: PublicKey;
+  queueRoot: PublicKey;
+  queuePage: PublicKey;
+  remainingAccounts: AccountMeta[];
+  envelope: CtmEnvelopeWire;
+  payload: Uint8Array;
+};
+
+export type BuildExecutionQueueV3ExecuteParams = {
+  programId: PublicKey;
+  group: PublicKey;
+  authorityState: PublicKey;
+  queueRoot: PublicKey;
+  queuePage: PublicKey;
+  remainingAccounts: AccountMeta[];
+  maxItems: number;
+};
+
+export type BuildExecutionQueueV3ExecuteMultiParams = {
+  programId: PublicKey;
+  group: PublicKey;
+  authorityState: PublicKey;
+  queueRoot: PublicKey;
+  queuePage: PublicKey;
+  laneAccounts: AccountMeta[][];
+  accountsPerLane: number;
+  laneHashes: Buffer[];
+  maxItems: number;
+};
+
+export type BuildExecutionQueueV3CloseMarketPageParams = {
+  programId: PublicKey;
+  group: PublicKey;
+  authorityState: PublicKey;
+  queueRoot: PublicKey;
+  queuePage: PublicKey;
+  receiver: PublicKey;
+  admin: PublicKey;
+};
+
+export type BuildExecutionQueueV3EnqueueCtmWithIntentParams = {
+  programId: PublicKey;
+  group: PublicKey;
+  authorityState: PublicKey;
+  queueRoot: PublicKey;
+  queuePage: PublicKey;
+  marketIndex: number;
+  remainingAccounts: AccountMeta[];
+  payload: Uint8Array;
+  sequence: BigNumberish;
+  minExecuteSlot: BigNumberish;
+  expiresAtSlot?: BigNumberish;
+  kind?: QueueItemKind;
+  userOwner: PublicKey;
+  mangoAccount: PublicKey;
+  intentVersion?: UserIntentVersion;
+  userSigner: IntentSigner;
+  ctmSigner: IntentSigner;
+};
+
+export type BuildExecutionQueueV3EnqueueDirectWithIntentParams = {
+  programId: PublicKey;
+  group: PublicKey;
+  authorityState: PublicKey;
+  queueRoot: PublicKey;
+  queuePage: PublicKey;
+  marketIndex: number;
+  remainingAccounts: AccountMeta[];
+  payload: Uint8Array;
+  minExecuteSlot?: BigNumberish;
+  expiresAtSlot?: BigNumberish;
+  kind?: QueueItemKind;
+  intentVersion?: UserIntentVersion;
+  userOwner: PublicKey;
+  mangoAccount: PublicKey;
+  userSigner: IntentSigner;
+};
+
 const U16_MAX = 0xffff;
 const U32_MAX = 0xffffffff;
 const U64_MAX = (1n << 64n) - 1n;
@@ -340,6 +466,10 @@ function u16ToLe(value: number): Buffer {
   const out = Buffer.alloc(2);
   out.writeUInt16LE(value, 0);
   return out;
+}
+
+function pubkeyFromBuffer(data: Buffer, offset: number): PublicKey {
+  return new PublicKey(data.subarray(offset, offset + 32));
 }
 
 function sha256(data: Uint8Array): Buffer {
@@ -631,6 +761,113 @@ export function hashExecutionQueuePayload(payload: Uint8Array): Buffer {
   return sha256(Buffer.from(payload));
 }
 
+export function findExecutionQueueAuthorityStatePda(
+  programId: PublicKey,
+  group: PublicKey,
+): PublicKey {
+  return PublicKey.findProgramAddressSync(
+    [Buffer.from('queue-authority', 'utf-8'), group.toBuffer()],
+    programId,
+  )[0];
+}
+
+export function findPerpMarketQueueRootV3Pda(
+  programId: PublicKey,
+  group: PublicKey,
+  marketIndex: number,
+  shardId = 0,
+): PublicKey {
+  return PublicKey.findProgramAddressSync(
+    [
+      Buffer.from('perp-queue-root', 'utf-8'),
+      group.toBuffer(),
+      u16ToLe(marketIndex),
+      Buffer.from([shardId]),
+    ],
+    programId,
+  )[0];
+}
+
+export function findLiquidityQueueRootV3Pda(
+  programId: PublicKey,
+  group: PublicKey,
+): PublicKey {
+  return PublicKey.findProgramAddressSync(
+    [Buffer.from('liq-queue-root', 'utf-8'), group.toBuffer()],
+    programId,
+  )[0];
+}
+
+export function findExecutionQueuePageV3Pda(
+  programId: PublicKey,
+  queueRoot: PublicKey,
+  pageSlot: number,
+): PublicKey {
+  return PublicKey.findProgramAddressSync(
+    [
+      Buffer.from('queue-page', 'utf-8'),
+      queueRoot.toBuffer(),
+      u16ToLe(pageSlot),
+    ],
+    programId,
+  )[0];
+}
+
+export function decodeExecutionQueueV3MarketRoot(
+  data: Buffer,
+): DecodedExecutionQueueV3MarketRoot {
+  if (data.length < 136) {
+    throw new Error('execution queue v3 market root account too small');
+  }
+  const offset = 8;
+  return {
+    group: pubkeyFromBuffer(data, offset + 0),
+    authorityState: pubkeyFromBuffer(data, offset + 32),
+    marketIndex: data.readUInt16LE(offset + 64),
+    shardId: data[offset + 66],
+    pausedIngress: data[offset + 67] !== 0,
+    pausedExecute: data[offset + 68] !== 0,
+    bump: data[offset + 69],
+    maxCompactionDistance: data[offset + 70],
+    minExpiryBufferSlots: data[offset + 71],
+    nextSequenceToExecute: data.readBigUInt64LE(offset + 76),
+    maxSeenSequence: data.readBigUInt64LE(offset + 84),
+    gapObservedSlot: data.readBigUInt64LE(offset + 92),
+    firstFailureSlot: data.readBigUInt64LE(offset + 100),
+    liveCount: data.readUInt32LE(offset + 108),
+    gapWaitSlots: data.readUInt16LE(offset + 112),
+    pageSize: data.readUInt16LE(offset + 114),
+    numPages: data.readUInt16LE(offset + 116),
+    softLimit: data.readUInt16LE(offset + 118),
+    recipeVersion: data.readUInt16LE(offset + 120),
+  };
+}
+
+export function executionQueueV3AbsPageNoForSequence(
+  sequence: BigNumberish,
+  pageSize: number,
+): bigint {
+  return toBigInt(sequence) / BigInt(pageSize);
+}
+
+export function executionQueueV3PageSlotForSequence(
+  sequence: BigNumberish,
+  pageSize: number,
+  numPages: number,
+): number {
+  return Number(
+    executionQueueV3AbsPageNoForSequence(sequence, pageSize) % BigInt(numPages),
+  );
+}
+
+export function executionQueueV3NextEnqueueSequence(
+  root: DecodedExecutionQueueV3MarketRoot,
+): bigint {
+  return root.liveCount === 0
+    ? root.nextSequenceToExecute
+    : root.maxSeenSequence + 1n;
+}
+
 export function buildCtmEnvelopeMessage(
   group: PublicKey,
   envelope: CtmEnvelopeWire,
@@ -808,6 +1045,36 @@ export function buildExecutionQueueEnqueueCtmIx(
   });
 }
 
+export function buildExecutionQueueV3InitMarketPageIx(
+  params: BuildExecutionQueueV3InitMarketPageParams,
+): TransactionInstruction {
+  const queuePage = findExecutionQueuePageV3Pda(
+    params.programId,
+    params.queueRoot,
+    params.pageSlot,
+  );
+  return new TransactionInstruction({
+    programId: params.programId,
+    keys: [
+      { pubkey: params.group, isSigner: false, isWritable: false },
+      { pubkey: params.authorityState, isSigner: false, isWritable: false },
+      { pubkey: params.queueRoot, isSigner: false, isWritable: true },
+      { pubkey: queuePage, isSigner: false, isWritable: true },
+      { pubkey: params.payer, isSigner: true, isWritable: true },
+      {
+        pubkey: SystemProgram.programId,
+        isSigner: false,
+        isWritable: false,
+      },
+    ],
+    data: Buffer.concat([
+      anchorInstructionDiscriminator('execution_queue_v3_init_market_page'),
+      u16ToLe(params.pageSlot),
+      u64ToLe(params.assignedAbsPageNo),
+    ]),
+  });
+}
+
 export function buildExecutionQueueEnqueueLiquidityIx(
   params: BuildExecutionQueueEnqueueLiquidityParams,
 ): TransactionInstruction {
@@ -900,6 +1167,132 @@ export function buildExecutionQueueExecuteIx(
       ...params.remainingAccounts,
     ],
     data,
+  });
+}
+
+export function buildExecutionQueueV3EnqueueCtmIx(
+  params: BuildExecutionQueueV3EnqueueCtmParams,
+): TransactionInstruction {
+  return new TransactionInstruction({
+    programId: params.programId,
+    keys: [
+      { pubkey: params.group, isSigner: false, isWritable: true },
+      { pubkey: params.authorityState, isSigner: false, isWritable: true },
+      { pubkey: params.queueRoot, isSigner: false, isWritable: true },
+      { pubkey: params.queuePage, isSigner: false, isWritable: true },
+      {
+        pubkey: SYSVAR_INSTRUCTIONS_PUBKEY,
+        isSigner: false,
+        isWritable: false,
+      },
+      ...params.remainingAccounts,
+      { pubkey: params.programId, isSigner: false, isWritable: false },
+    ],
+    data: Buffer.concat([
+      anchorInstructionDiscriminator('execution_queue_v3_enqueue_market'),
+      u16ToLe(params.marketIndex),
+      encodeEnvelope(params.envelope),
+      u32ToLe(params.payload.length),
+      Buffer.from(params.payload),
+    ]),
+  });
+}
+
+export function buildExecutionQueueV3EnqueueDirectIx(
+  params: BuildExecutionQueueV3EnqueueDirectParams,
+): TransactionInstruction {
+  return new TransactionInstruction({
+    programId: params.programId,
+    keys: [
+      { pubkey: params.group, isSigner: false, isWritable: true },
+      { pubkey: params.authorityState, isSigner: false, isWritable: true },
+      { pubkey: params.queueRoot, isSigner: false, isWritable: true },
+      { pubkey: params.queuePage, isSigner: false, isWritable: true },
+      {
+        pubkey: SYSVAR_INSTRUCTIONS_PUBKEY,
+        isSigner: false,
+        isWritable: false,
+      },
+      ...params.remainingAccounts,
+      { pubkey: params.programId, isSigner: false, isWritable: false },
+    ],
+    data: Buffer.concat([
+      anchorInstructionDiscriminator('execution_queue_v3_enqueue_market_direct'),
+      encodeEnvelope(params.envelope),
+      u32ToLe(params.payload.length),
+      Buffer.from(params.payload),
+    ]),
+  });
+}
+
+export function buildExecutionQueueV3ExecuteIx(
+  params: BuildExecutionQueueV3ExecuteParams,
+): TransactionInstruction {
+  return new TransactionInstruction({
+    programId: params.programId,
+    keys: [
+      { pubkey: params.group, isSigner: false, isWritable: true },
+      { pubkey: params.authorityState, isSigner: false, isWritable: false },
+      { pubkey: params.queueRoot, isSigner: false, isWritable: true },
+      { pubkey: params.queuePage, isSigner: false, isWritable: true },
+      ...params.remainingAccounts,
+    ],
+    data: Buffer.concat([
+      anchorInstructionDiscriminator('execution_queue_v3_execute_market'),
+      u16ToLe(params.maxItems),
+    ]),
+  });
+}
+
+export function buildExecutionQueueV3ExecuteMultiIx(
+  params: BuildExecutionQueueV3ExecuteMultiParams,
+): TransactionInstruction {
+  const laneCount = params.laneAccounts.length;
+  if (laneCount === 0 || laneCount > 20) {
+    throw new Error('v3 execute_multi requires 1-20 lanes');
+  }
+  if (params.laneHashes.length !== laneCount) {
+    throw new Error('laneHashes length must equal laneAccounts length');
+  }
+  return new TransactionInstruction({
+    programId: params.programId,
+    keys: [
+      { pubkey: params.group, isSigner: false, isWritable: true },
+      { pubkey: params.authorityState, isSigner: false, isWritable: false },
+      { pubkey: params.queueRoot, isSigner: false, isWritable: true },
+      { pubkey: params.queuePage, isSigner: false, isWritable: true },
+      ...params.laneAccounts.flat(),
+    ],
+    data: Buffer.concat([
+      anchorInstructionDiscriminator('execution_queue_v3_execute_market_multi'),
+      u16ToLe(params.maxItems),
+      u8(laneCount),
+      u16ToLe(params.accountsPerLane),
+      u32ToLe(params.laneHashes.length),
+      ...params.laneHashes.map((hash) => {
+        if (hash.length !== 32) {
+          throw new Error('lane hash must be 32 bytes');
+        }
+        return Buffer.from(hash);
+      }),
+    ]),
+  });
+}
+
+export function buildExecutionQueueV3CloseMarketPageIx(
+  params: BuildExecutionQueueV3CloseMarketPageParams,
+): TransactionInstruction {
+  return new TransactionInstruction({
+    programId: params.programId,
+    keys: [
+      { pubkey: params.group, isSigner: false, isWritable: false },
+      { pubkey: params.authorityState, isSigner: false, isWritable: false },
+      { pubkey: params.queueRoot, isSigner: false, isWritable: false },
+      { pubkey: params.queuePage, isSigner: false, isWritable: true },
+      { pubkey: params.receiver, isSigner: true, isWritable: true },
+      { pubkey: params.admin, isSigner: true, isWritable: false },
+    ],
+    data: anchorInstructionDiscriminator('execution_queue_v3_close_market_page'),
   });
 }
 
@@ -1046,6 +1439,164 @@ export function buildExecutionQueueEnqueueDirectWithIntentIxs(
     executionQueue: params.executionQueue,
     executionQueueBuffer: params.executionQueueBuffer,
     marketIndex: params.marketIndex,
+    remainingAccounts: params.remainingAccounts,
+    envelope,
+    payload: params.payload,
+  });
+
+  return {
+    envelope,
+    userIntentMessage,
+    userIntentPreInstruction,
+    enqueueInstruction,
+    instructions: [userIntentPreInstruction, enqueueInstruction],
+  };
+}
+
+export function buildExecutionQueueV3EnqueueCtmWithIntentIxs(
+  params: BuildExecutionQueueV3EnqueueCtmWithIntentParams,
+): {
+  envelope: CtmEnvelopeWire;
+  userIntentMessage: Buffer;
+  ctmEnvelopeMessage: Buffer;
+  userIntentPreInstruction: TransactionInstruction;
+  ctmEnvelopePreInstruction: TransactionInstruction;
+  enqueueInstruction: TransactionInstruction;
+  instructions: TransactionInstruction[];
+} {
+  const kind = params.kind ?? QueueItemKind.CtmWrapped;
+  if (kind !== QueueItemKind.CtmWrapped) {
+    throw new Error('v3 enqueue_ctm requires QueueItemKind.CtmWrapped');
+  }
+
+  const payloadHash = hashExecutionQueuePayload(params.payload);
+  const accountsHash = hashExecutionQueueAccountsForCtmEnqueue(
+    params.group,
+    params.queueRoot,
+    params.remainingAccounts,
+  );
+  const envelope: CtmEnvelopeWire = {
+    sequence: toBigInt(params.sequence),
+    minExecuteSlot: toBigInt(params.minExecuteSlot),
+    kind,
+    payloadHash,
+    accountsHash,
+    expiresAtSlot: toBigInt(params.expiresAtSlot ?? 0),
+  };
+
+  const userIntentMessage =
+    (params.intentVersion ?? UserIntentVersion.V2) === UserIntentVersion.V1
+      ? buildLegacyUserIntentMessage(
+          params.group,
+          params.mangoAccount,
+          params.userOwner,
+          envelope,
+        )
+      : buildUserIntentMessage(
+          params.group,
+          params.mangoAccount,
+          params.userOwner,
+          envelope,
+          {
+            kind: UserIntentTargetKind.PerpMarket,
+            index: params.marketIndex,
+          },
+        );
+  const ctmEnvelopeMessage = buildCtmEnvelopeMessage(params.group, envelope);
+
+  const userIntentPreInstruction = buildIntentEd25519Instruction(
+    userIntentMessage,
+    params.userSigner,
+  );
+  const ctmEnvelopePreInstruction = buildIntentEd25519Instruction(
+    ctmEnvelopeMessage,
+    params.ctmSigner,
+  );
+  const enqueueInstruction = buildExecutionQueueV3EnqueueCtmIx({
+    programId: params.programId,
+    group: params.group,
+    authorityState: params.authorityState,
+    queueRoot: params.queueRoot,
+    queuePage: params.queuePage,
+    marketIndex: params.marketIndex,
+    remainingAccounts: params.remainingAccounts,
+    envelope,
+    payload: params.payload,
+  });
+
+  return {
+    envelope,
+    userIntentMessage,
+    ctmEnvelopeMessage,
+    userIntentPreInstruction,
+    ctmEnvelopePreInstruction,
+    enqueueInstruction,
+    instructions: [
+      userIntentPreInstruction,
+      ctmEnvelopePreInstruction,
+      enqueueInstruction,
+    ],
+  };
+}
+
+export function buildExecutionQueueV3EnqueueDirectWithIntentIxs(
+  params: BuildExecutionQueueV3EnqueueDirectWithIntentParams,
+): {
+  envelope: CtmEnvelopeWire;
+  userIntentMessage: Buffer;
+  userIntentPreInstruction: TransactionInstruction;
+  enqueueInstruction: TransactionInstruction;
+  instructions: TransactionInstruction[];
+} {
+  const kind = params.kind ?? QueueItemKind.CtmWrapped;
+  if (kind !== QueueItemKind.CtmWrapped) {
+    throw new Error('v3 enqueue_direct requires QueueItemKind.CtmWrapped');
+  }
+
+  const payloadHash = hashExecutionQueuePayload(params.payload);
+  const accountsHash = hashExecutionQueueAccountsForCtmEnqueue(
+    params.group,
+    params.queueRoot,
+    params.remainingAccounts,
+  );
+  const envelope: CtmEnvelopeWire = {
+    sequence: 0n,
+    minExecuteSlot: toBigInt(params.minExecuteSlot ?? 0),
+    kind,
+    payloadHash,
+    accountsHash,
+    expiresAtSlot: toBigInt(params.expiresAtSlot ?? 0),
+  };
+
+  const userIntentMessage =
+    (params.intentVersion ?? UserIntentVersion.V2) === UserIntentVersion.V1
+      ? buildLegacyUserIntentMessage(
+          params.group,
+          params.mangoAccount,
+          params.userOwner,
+          envelope,
+        )
+      : buildUserIntentMessage(
+          params.group,
+          params.mangoAccount,
+          params.userOwner,
+          envelope,
+          {
+            kind: UserIntentTargetKind.PerpMarket,
+            index: params.marketIndex,
+          },
+        );
+
+  const userIntentPreInstruction = buildIntentEd25519Instruction(
+    userIntentMessage,
+    params.userSigner,
+  );
+  const enqueueInstruction = buildExecutionQueueV3EnqueueDirectIx({
+    programId: params.programId,
+    group: params.group,
+    authorityState: params.authorityState,
+    queueRoot: params.queueRoot,
+    queuePage: params.queuePage,
     remainingAccounts: params.remainingAccounts,
     envelope,
     payload: params.payload,

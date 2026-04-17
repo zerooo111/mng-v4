@@ -29,7 +29,11 @@ pub mod types;
 pub mod instructions;
 
 #[cfg(feature = "enable-gpl")]
-use instructions::{CtmEnvelope, ExecutionQueueConfigParams};
+use instructions::{
+    CtmEnvelope, ExecutionQueueConfigParams, ExecutionQueueV3LiquidityRootConfigParams,
+    ExecutionQueueV3LiquidityRootCreateParams, ExecutionQueueV3MarketRootConfigParams,
+    ExecutionQueueV3MarketRootCreateParams,
+};
 
 #[cfg(all(not(feature = "no-entrypoint"), not(feature = "enable-gpl")))]
 
@@ -677,6 +681,183 @@ pub mod mango_v4 {
     pub fn execution_queue_migrate_v1_to_v2(ctx: Context<ExecutionQueueAdmin>) -> Result<()> {
         #[cfg(feature = "enable-gpl")]
         instructions::execution_queue_migrate_v1_to_v2(ctx)?;
+        Ok(())
+    }
+
+    pub fn execution_queue_v3_init_authority_state(
+        ctx: Context<ExecutionQueueV3InitAuthorityState>,
+        ctm_signer: Pubkey,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_v3_init_authority_state(ctx, ctm_signer)?;
+        Ok(())
+    }
+
+    pub fn execution_queue_v3_set_ctm_pending(
+        ctx: Context<ExecutionQueueV3AuthorityAdmin>,
+        pending_ctm_signer: Pubkey,
+        activate_at_slot: u64,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_v3_set_ctm_pending(
+            ctx,
+            pending_ctm_signer,
+            activate_at_slot,
+        )?;
+        Ok(())
+    }
+
+    pub fn execution_queue_v3_init_market_root(
+        ctx: Context<ExecutionQueueV3InitMarketRoot>,
+        market_index: u16,
+        shard_id: u8,
+        params: ExecutionQueueV3MarketRootCreateParams,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_v3_init_market_root(ctx, market_index, shard_id, params)?;
+        Ok(())
+    }
+
+    pub fn execution_queue_v3_configure_market_root(
+        ctx: Context<ExecutionQueueV3MarketRootAdmin>,
+        params: ExecutionQueueV3MarketRootConfigParams,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_v3_configure_market_root(ctx, params)?;
+        Ok(())
+    }
+
+    pub fn execution_queue_v3_init_liquidity_root(
+        ctx: Context<ExecutionQueueV3InitLiquidityRoot>,
+        params: ExecutionQueueV3LiquidityRootCreateParams,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_v3_init_liquidity_root(ctx, params)?;
+        Ok(())
+    }
+
+    pub fn execution_queue_v3_configure_liquidity_root(
+        ctx: Context<ExecutionQueueV3LiquidityRootAdmin>,
+        params: ExecutionQueueV3LiquidityRootConfigParams,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_v3_configure_liquidity_root(ctx, params)?;
+        Ok(())
+    }
+
+    pub fn execution_queue_v3_init_market_page(
+        ctx: Context<ExecutionQueueV3InitMarketPage>,
+        page_slot: u16,
+        assigned_abs_page_no: u64,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_v3_init_market_page(ctx, page_slot, assigned_abs_page_no)?;
+        Ok(())
+    }
+
+    pub fn execution_queue_v3_init_liquidity_page(
+        ctx: Context<ExecutionQueueV3InitLiquidityPage>,
+        page_slot: u16,
+        assigned_abs_page_no: u64,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_v3_init_liquidity_page(
+            ctx,
+            page_slot,
+            assigned_abs_page_no,
+        )?;
+        Ok(())
+    }
+
+    pub fn execution_queue_v3_close_market_page(
+        ctx: Context<ExecutionQueueV3CloseMarketPage>,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_v3_close_market_page(ctx)?;
+        Ok(())
+    }
+
+    pub fn execution_queue_v3_close_liquidity_page(
+        ctx: Context<ExecutionQueueV3CloseLiquidityPage>,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_v3_close_liquidity_page(ctx)?;
+        Ok(())
+    }
+
+    pub fn execution_queue_v3_enqueue_market(
+        ctx: Context<ExecutionQueueV3EnqueueMarket>,
+        market_index: u16,
+        envelope: CtmEnvelope,
+        payload: Vec<u8>,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_v3_enqueue_market(ctx, market_index, envelope, payload)?;
+        Ok(())
+    }
+
+    pub fn execution_queue_v3_enqueue_market_direct(
+        ctx: Context<ExecutionQueueV3EnqueueMarket>,
+        envelope: CtmEnvelope,
+        payload: Vec<u8>,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_v3_enqueue_market_direct(ctx, envelope, payload)?;
+        Ok(())
+    }
+
+    pub fn execution_queue_v3_enqueue_liquidity(
+        ctx: Context<ExecutionQueueV3EnqueueLiquidity>,
+        kind: u8,
+        payload: Vec<u8>,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_v3_enqueue_liquidity(ctx, kind, payload)?;
+        Ok(())
+    }
+
+    pub fn execution_queue_v3_execute_market(
+        ctx: Context<ExecutionQueueV3ExecuteMarket>,
+        max_items: u16,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_v3_execute_market(ctx, max_items)?;
+        Ok(())
+    }
+
+    pub fn execution_queue_v3_execute_market_multi(
+        ctx: Context<ExecutionQueueV3ExecuteMarket>,
+        max_items: u16,
+        lane_count: u8,
+        accounts_per_lane: u16,
+        lane_hashes: Vec<[u8; 32]>,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_v3_execute_market_multi(
+            ctx,
+            max_items,
+            lane_count,
+            accounts_per_lane,
+            lane_hashes,
+        )?;
+        Ok(())
+    }
+
+    pub fn execution_queue_v3_drop_market(
+        ctx: Context<ExecutionQueueV3MarketPageAdmin>,
+        sequence: u64,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_v3_drop_market(ctx, sequence)?;
+        Ok(())
+    }
+
+    pub fn execution_queue_v3_execute_liquidity(
+        ctx: Context<ExecutionQueueV3ExecuteLiquidity>,
+        max_items: u16,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_v3_execute_liquidity(ctx, max_items)?;
         Ok(())
     }
 

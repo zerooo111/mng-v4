@@ -59,9 +59,9 @@ const QUEUE_PAYLOAD_HEADER_LEN: usize = 4;
 // One retry is sufficient: with the C-1 hash integrity fix, the cranker cannot
 // provide wrong accounts to artificially fail dispatch. Non-transient failures
 // (expired order, frozen account, paused market) won't resolve on retry.
-const EXECUTION_QUEUE_MAX_RETRIES: u8 = 1;
-const EXECUTION_QUEUE_GAP_SKIP_LIMIT_PER_EXECUTE: u16 = 32;
-const DIRECT_SUBMIT_DELAY_SLOTS: u64 = 10;
+pub(crate) const EXECUTION_QUEUE_MAX_RETRIES: u8 = 1;
+pub(crate) const EXECUTION_QUEUE_GAP_SKIP_LIMIT_PER_EXECUTE: u16 = 32;
+pub(crate) const DIRECT_SUBMIT_DELAY_SLOTS: u64 = 10;
 
 #[repr(u8)]
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,7 +77,7 @@ pub enum QueuePayloadVariant {
 
 #[repr(u8)]
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq)]
-enum UserIntentTargetKind {
+pub(crate) enum UserIntentTargetKind {
     PerpMarket = 0,
     Token = 1,
 }
@@ -130,7 +130,7 @@ pub struct LiquidityWithdrawPayload {
 }
 
 #[derive(Clone, Debug)]
-enum QueuePayloadBody {
+pub(crate) enum QueuePayloadBody {
     PerpPlaceOrderV2(PerpPlaceOrderV2Payload),
     PerpCancelOrder(PerpCancelOrderPayload),
     PerpCancelOrderByClientOrderId(PerpCancelOrderByClientOrderIdPayload),
@@ -141,16 +141,16 @@ enum QueuePayloadBody {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct QueueHealthRegionSpec {
+pub(crate) struct QueueHealthRegionSpec {
     account_index: usize,
     health_accounts_start: usize,
 }
 
 #[derive(Clone, Debug)]
-struct DecodedQueuePayload {
-    variant: QueuePayloadVariant,
-    flags: u16,
-    body: QueuePayloadBody,
+pub(crate) struct DecodedQueuePayload {
+    pub(crate) variant: QueuePayloadVariant,
+    pub(crate) flags: u16,
+    pub(crate) body: QueuePayloadBody,
 }
 
 #[derive(Clone, Debug)]
@@ -164,7 +164,7 @@ struct ExecutableCandidate {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TerminalCtmFailureReason {
+pub(crate) enum TerminalCtmFailureReason {
     Expired,
     InvalidNumericInput,
 }
@@ -180,7 +180,7 @@ struct Ed25519SignatureOffsets {
     message_instruction_index: u16,
 }
 
-fn split_dispatch_accounts<'a, 'info>(
+pub(crate) fn split_dispatch_accounts<'a, 'info>(
     remaining_accounts: &'a [AccountInfo<'info>],
     execution_queue_key: Pubkey,
 ) -> Result<(&'a [AccountInfo<'info>], &'a [AccountInfo<'info>])> {
@@ -239,7 +239,7 @@ fn merge_effective_runtime_flags_for_hash(
         .collect()
 }
 
-fn hash_accounts(accounts: &[AccountMeta]) -> [u8; 32] {
+pub(crate) fn hash_accounts(accounts: &[AccountMeta]) -> [u8; 32] {
     let mut bytes = Vec::with_capacity(accounts.len() * 34);
     for a in accounts {
         bytes.extend_from_slice(a.pubkey.as_ref());
@@ -249,7 +249,7 @@ fn hash_accounts(accounts: &[AccountMeta]) -> [u8; 32] {
     hashv(&[&bytes]).to_bytes()
 }
 
-fn canonical_envelope_message(group: Pubkey, envelope: &CtmEnvelope) -> [u8; 32] {
+pub(crate) fn canonical_envelope_message(group: Pubkey, envelope: &CtmEnvelope) -> [u8; 32] {
     hashv(&[
         b"mango-v4-ctm-envelope-v1",
         group.as_ref(),
@@ -263,7 +263,7 @@ fn canonical_envelope_message(group: Pubkey, envelope: &CtmEnvelope) -> [u8; 32]
     .to_bytes()
 }
 
-fn canonical_user_intent_message_v1(
+pub(crate) fn canonical_user_intent_message_v1(
     group: Pubkey,
     mango_account: Pubkey,
     user_owner: Pubkey,
@@ -281,7 +281,7 @@ fn canonical_user_intent_message_v1(
     .to_bytes()
 }
 
-fn canonical_user_intent_message_v2(
+pub(crate) fn canonical_user_intent_message_v2(
     group: Pubkey,
     mango_account: Pubkey,
     user_owner: Pubkey,
@@ -329,7 +329,7 @@ fn queue_payload_variant_from_u8(value: u8) -> Result<QueuePayloadVariant> {
     }
 }
 
-fn queue_item_kind_for_payload_variant(variant: QueuePayloadVariant) -> u8 {
+pub(crate) fn queue_item_kind_for_payload_variant(variant: QueuePayloadVariant) -> u8 {
     match variant {
         QueuePayloadVariant::PerpPlaceOrderV2
         | QueuePayloadVariant::PerpCancelOrder
@@ -341,7 +341,9 @@ fn queue_item_kind_for_payload_variant(variant: QueuePayloadVariant) -> u8 {
     }
 }
 
-fn queue_health_region_spec(variant: QueuePayloadVariant) -> Option<QueueHealthRegionSpec> {
+pub(crate) fn queue_health_region_spec(
+    variant: QueuePayloadVariant,
+) -> Option<QueueHealthRegionSpec> {
     match variant {
         // Only place orders can worsen health; cancels release margin and are always safe.
         QueuePayloadVariant::PerpPlaceOrderV2 => Some(QueueHealthRegionSpec {
@@ -352,7 +354,7 @@ fn queue_health_region_spec(variant: QueuePayloadVariant) -> Option<QueueHealthR
     }
 }
 
-fn variant_uses_user_signature(variant: QueuePayloadVariant) -> bool {
+pub(crate) fn variant_uses_user_signature(variant: QueuePayloadVariant) -> bool {
     matches!(
         variant,
         QueuePayloadVariant::PerpPlaceOrderV2
@@ -363,7 +365,7 @@ fn variant_uses_user_signature(variant: QueuePayloadVariant) -> bool {
     )
 }
 
-fn variant_uses_queue_owner_signer(_variant: QueuePayloadVariant) -> bool {
+pub(crate) fn variant_uses_queue_owner_signer(_variant: QueuePayloadVariant) -> bool {
     false
 }
 
@@ -405,7 +407,7 @@ fn decode_payload_body(variant: QueuePayloadVariant, body: &[u8]) -> Result<Queu
     Ok(decoded)
 }
 
-fn decode_queue_payload(payload: &[u8]) -> Result<DecodedQueuePayload> {
+pub(crate) fn decode_queue_payload(payload: &[u8]) -> Result<DecodedQueuePayload> {
     require!(
         payload.len() >= QUEUE_PAYLOAD_HEADER_LEN,
         MangoError::ExecutionQueuePayloadDecodeFailed
@@ -429,7 +431,7 @@ fn decode_queue_payload(payload: &[u8]) -> Result<DecodedQueuePayload> {
     })
 }
 
-fn account_metas_from_infos(account_infos: &[AccountInfo]) -> Vec<AccountMeta> {
+pub(crate) fn account_metas_from_infos(account_infos: &[AccountInfo]) -> Vec<AccountMeta> {
     account_infos
         .iter()
         .map(|ai| AccountMeta {
@@ -440,7 +442,7 @@ fn account_metas_from_infos(account_infos: &[AccountInfo]) -> Vec<AccountMeta> {
         .collect()
 }
 
-fn canonical_direct_dispatch_account_metas(
+pub(crate) fn canonical_direct_dispatch_account_metas(
     group: Pubkey,
     execution_queue: Pubkey,
     dispatch_accounts: &[AccountMeta],
@@ -571,7 +573,7 @@ fn dispatch_perp_place_order_v2<'info>(
     Ok(())
 }
 
-fn prevalidate_terminal_ctm_payload(
+pub(crate) fn prevalidate_terminal_ctm_payload(
     payload: &DecodedQueuePayload,
     now_ts: u64,
 ) -> Option<TerminalCtmFailureReason> {
@@ -589,7 +591,7 @@ fn prevalidate_terminal_ctm_payload(
     }
 }
 
-fn terminal_ctm_failure_msg(reason: TerminalCtmFailureReason) -> &'static str {
+pub(crate) fn terminal_ctm_failure_msg(reason: TerminalCtmFailureReason) -> &'static str {
     match reason {
         TerminalCtmFailureReason::Expired => "execution_queue: cleared terminal expired CTM",
         TerminalCtmFailureReason::InvalidNumericInput => {
@@ -643,7 +645,7 @@ fn dispatch_perp_cancel_order_by_client_order_id<'info>(
     Ok(())
 }
 
-fn dispatch_queue_payload(
+pub(crate) fn dispatch_queue_payload(
     payload: &DecodedQueuePayload,
     dispatch_accounts: &[AccountInfo],
     invoke_accounts: &[AccountInfo],
@@ -815,7 +817,7 @@ fn validate_perp_place_order_health_accounts(
     Ok(())
 }
 
-fn validate_queue_payload_dispatch_accounts(
+pub(crate) fn validate_queue_payload_dispatch_accounts(
     group_key: Pubkey,
     payload: &DecodedQueuePayload,
     dispatch_accounts: &[AccountInfo],
@@ -835,7 +837,7 @@ fn validate_queue_payload_dispatch_accounts(
 /// for market A into market B's sub-queue. Liquidity payloads have no perp
 /// market in the dispatch accounts and bypass this check (they go to the
 /// global liquidity ring).
-fn require_dispatch_market_index(
+pub(crate) fn require_dispatch_market_index(
     dispatch_accounts: &[AccountInfo],
     expected_market_index: u16,
 ) -> Result<()> {
@@ -855,7 +857,7 @@ fn require_dispatch_market_index(
     Ok(())
 }
 
-fn extract_user_owner_for_ctm_payload(
+pub(crate) fn extract_user_owner_for_ctm_payload(
     group_key: Pubkey,
     remaining_accounts: &[AccountInfo],
 ) -> Result<(Pubkey, Pubkey)> {
@@ -1010,13 +1012,17 @@ fn has_ed25519_preinstruction(
     Ok(false)
 }
 
-fn verify_ed25519_preinstruction(ixs: &AccountInfo, signer: Pubkey, message: &[u8]) -> Result<()> {
+pub(crate) fn verify_ed25519_preinstruction(
+    ixs: &AccountInfo,
+    signer: Pubkey,
+    message: &[u8],
+) -> Result<()> {
     let found = has_ed25519_preinstruction(ixs, signer, message)?;
     require!(found, MangoError::CtmSignatureMissing);
     Ok(())
 }
 
-fn verify_user_ed25519_preinstruction(
+pub(crate) fn verify_user_ed25519_preinstruction(
     ixs: &AccountInfo,
     signer: Pubkey,
     msg_hashes: &[[u8; 32]],
@@ -1036,7 +1042,7 @@ fn verify_user_ed25519_preinstruction(
     err!(MangoError::ExecutionQueueUserSignatureMissing)
 }
 
-fn queue_health_region_begin(
+pub(crate) fn queue_health_region_begin(
     dispatch_accounts: &[AccountInfo],
     spec: QueueHealthRegionSpec,
 ) -> Result<()> {
@@ -1066,7 +1072,7 @@ fn queue_health_region_begin(
     Ok(())
 }
 
-fn queue_health_region_end(
+pub(crate) fn queue_health_region_end(
     dispatch_accounts: &[AccountInfo],
     spec: QueueHealthRegionSpec,
 ) -> Result<()> {

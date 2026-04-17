@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use anchor_lang::{AnchorDeserialize, InstructionData};
+use anchor_lang::{AccountDeserialize, AnchorDeserialize, InstructionData};
 use anyhow::{anyhow, Context, Result};
 use fixed::types::I80F48;
 use mango_v4::{
@@ -18,18 +18,21 @@ use mango_v4::{
     error::MangoError,
     health::{new_health_cache, FixedOrderAccountRetriever},
     instructions::{
-        CtmEnvelope, ExecutionQueueConfigParams, PerpPlaceOrderV2Payload, QueuePayloadVariant,
+        CtmEnvelope, ExecutionQueueConfigParams, ExecutionQueueV3MarketRootConfigParams,
+        PerpPlaceOrderV2Payload, QueuePayloadVariant,
     },
     state::{
         load_orca_pool_state, load_raydium_pool_state, pyth_mainnet_sol_oracle,
         pyth_mainnet_usdc_oracle, Bank, EventQueue, EventType, FillEvent, MangoAccountValue,
-        OutEvent, PerpMarket, PerpMarketIndex, QueueItemKind, Side, TokenIndex,
+        ExecutionQueuePageV3, OutEvent, PerpMarket, PerpMarketIndex, PerpMarketQueueRootV3,
+        QueueItemKind, QueueItemStatusV3, QueuePageStateV3, Side, TokenIndex,
         EXECUTION_QUEUE_CTM_CAPACITY, EXECUTION_QUEUE_CTM_ITEMS_OFFSET,
         EXECUTION_QUEUE_ITEM_ACCOUNTS_HASH_OFFSET, EXECUTION_QUEUE_ITEM_KIND_OFFSET,
-        EXECUTION_QUEUE_ITEM_MIN_EXECUTE_SLOT_OFFSET, EXECUTION_QUEUE_ITEM_PAYLOAD_LEN_OFFSET,
-        EXECUTION_QUEUE_ITEM_PAYLOAD_OFFSET, EXECUTION_QUEUE_ITEM_SEQUENCE_OFFSET,
-        EXECUTION_QUEUE_ITEM_SIZE, EXECUTION_QUEUE_ITEM_STATUS_OFFSET,
-        EXECUTION_QUEUE_LIQUIDITY_CAPACITY, EXECUTION_QUEUE_LIQUIDITY_ITEMS_OFFSET,
+        EXECUTION_QUEUE_ITEM_MIN_EXECUTE_SLOT_OFFSET,
+        EXECUTION_QUEUE_ITEM_PAYLOAD_LEN_OFFSET, EXECUTION_QUEUE_ITEM_PAYLOAD_OFFSET,
+        EXECUTION_QUEUE_ITEM_SEQUENCE_OFFSET, EXECUTION_QUEUE_ITEM_SIZE,
+        EXECUTION_QUEUE_ITEM_STATUS_OFFSET, EXECUTION_QUEUE_LIQUIDITY_CAPACITY,
+        EXECUTION_QUEUE_LIQUIDITY_ITEMS_OFFSET,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -99,6 +102,36 @@ enum UserIntentTargetKind {
     Token = 1,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QueueTopology {
+    V2,
+    V3PerpMarket,
+}
+
+impl QueueTopology {
+    fn is_v3(self) -> bool {
+        matches!(self, Self::V3PerpMarket)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct QueueV3RuntimeConfig {
+    authority_state: Pubkey,
+    market_index: u16,
+    page_size: u16,
+    num_pages: u16,
+}
+
+impl QueueV3RuntimeConfig {
+    fn abs_page_no_for_sequence(&self, sequence: u64) -> u64 {
+        sequence / self.page_size as u64
+    }
+
+    fn page_slot_for_sequence(&self, sequence: u64) -> u16 {
+        (self.abs_page_no_for_sequence(sequence) % self.num_pages as u64) as u16
+    }
+}
+
 #[derive(Clone)]
 struct Config {
     cluster_url: String,
@@ -111,6 +144,7 @@ struct Config {
     program_id: Pubkey,
     executor_group: Option<Pubkey>,
     executor_queue: Option<Pubkey>,
+    queue_topology: QueueTopology,
     executor_lane_config_path: Option<PathBuf>,
     executor_lane_cache_path: Option<PathBuf>,
     executor_relay_event_log_path: Option<PathBuf>,
@@ -247,10 +281,6 @@ struct Config {
     /// Base backoff in milliseconds for the exponential retry on transient
     /// RPC failures. Doubled per attempt, capped at 6 doublings.
     bg_submit_retry_base_ms: u64,
-    /// Fixed pause in milliseconds before retrying a submit that failed with
-    /// ExecutionQueueFull.  Should be roughly one executor drain cycle so the
-    /// ring-buffer has time to free a slot before we try again.  Default 200ms.
-    bg_submit_queue_full_retry_ms: u64,
     /// Phase 3.5: TTL (in milliseconds) for the margin-check account
     /// cache. Set to 0 to disable caching entirely (every margin check
     /// hits RPC). 500 ms is the recommended starting point — short
@@ -261,9 +291,8 @@ struct Config {
     /// oldest entries are evicted when the cache exceeds this size.
     margin_cache_max_entries: usize,
     /// Phase 2: enable in-process optimistic state via the embedded
-    /// rust-harness crate. Defaults to true when a harness is configured
-    /// so relayer hot paths stay inside Rust instead of depending on the
-    /// legacy HTTP wrapper.
+    /// rust-harness crate. Defaults to false so the legacy HTTP path is
+    /// preserved until soaked.
     local_state_enabled: bool,
     /// URL the relayer hits at startup to bootstrap its in-process state
     /// from the legacy harness. Only consulted when local_state_enabled is
@@ -326,6 +355,20 @@ impl Config {
             .unwrap_or(mango_v4::id());
         let executor_group = parse_optional_pubkey_env("EXECUTION_QUEUE_GROUP_PK")?;
         let executor_queue = parse_optional_pubkey_env("EXECUTION_QUEUE_PK")?;
+        let queue_topology = match std::env::var("EXECUTION_QUEUE_TOPOLOGY")
+            .unwrap_or_else(|_| "v2".to_string())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "v2" => QueueTopology::V2,
+            "v3" | "v3-market" | "v3_perp_market" => QueueTopology::V3PerpMarket,
+            other => {
+                return Err(anyhow!(
+                    "unsupported EXECUTION_QUEUE_TOPOLOGY value: {other}"
+                ))
+            }
+        };
         let _execution_queue_buffer = parse_optional_pubkey_env("EXECUTION_QUEUE_BUFFER_PK")?
             .or(executor_queue)
             .unwrap_or_default();
@@ -382,7 +425,7 @@ impl Config {
         let harness_health_cache_ms = parse_u64_env("CTM_RELAYER_HARNESS_HEALTH_CACHE_MS", 250)?;
         let harness_health_max_age_ms = parse_u64_env("CTM_RELAYER_HARNESS_MAX_STALE_MS", 30_000)?;
         let harness_reject_market_drift =
-            parse_bool_env("CTM_RELAYER_HARNESS_REJECT_MARKET_DRIFT", false);
+            parse_bool_env("CTM_RELAYER_HARNESS_REJECT_MARKET_DRIFT", true);
         let executor_enabled = parse_bool_env("EXECUTION_QUEUE_ENGINE_ENABLED", true)
             && executor_group.is_some()
             && executor_queue.is_some();
@@ -512,15 +555,10 @@ impl Config {
         let bg_submit_workers = parse_u64_env("CTM_RELAYER_BG_SUBMIT_WORKERS", 16)? as usize;
         let bg_submit_max_retries = parse_u64_env("CTM_RELAYER_BG_SUBMIT_MAX_RETRIES", 5)? as u32;
         let bg_submit_retry_base_ms = parse_u64_env("CTM_RELAYER_BG_SUBMIT_RETRY_BASE_MS", 50)?;
-        let bg_submit_queue_full_retry_ms =
-            parse_u64_env("CTM_RELAYER_BG_SUBMIT_QUEUE_FULL_RETRY_MS", 200)?;
         let margin_cache_ttl_ms = parse_u64_env("CTM_RELAYER_MARGIN_CACHE_TTL_MS", 500)?;
         let margin_cache_max_entries =
             parse_u64_env("CTM_RELAYER_MARGIN_CACHE_MAX_ENTRIES", 4096)? as usize;
-        let local_state_enabled = std::env::var("CTM_RELAYER_LOCAL_STATE")
-            .ok()
-            .map(|value| value.eq_ignore_ascii_case("true"))
-            .unwrap_or(harness_base_url.is_some());
+        let local_state_enabled = parse_bool_env("CTM_RELAYER_LOCAL_STATE", false);
         let local_state_bootstrap_url = std::env::var("CTM_RELAYER_LOCAL_STATE_BOOTSTRAP_URL")
             .ok()
             .map(|v| v.trim().to_string())
@@ -552,6 +590,7 @@ impl Config {
             program_id,
             executor_group,
             executor_queue,
+            queue_topology,
             executor_lane_config_path,
             executor_lane_cache_path,
             executor_relay_event_log_path,
@@ -628,7 +667,6 @@ impl Config {
             bg_submit_workers,
             bg_submit_max_retries,
             bg_submit_retry_base_ms,
-            bg_submit_queue_full_retry_ms,
             margin_cache_ttl_ms,
             margin_cache_max_entries,
             local_state_enabled,
@@ -2888,6 +2926,8 @@ struct Engine {
     http_client: reqwest::Client,
     harness_readiness: Arc<Mutex<Option<CachedHarnessReadiness>>>,
     executor: Option<Arc<ExecutorState>>,
+    configured_queue_v3: Option<QueueV3RuntimeConfig>,
+    known_v3_pages: Arc<StdMutex<HashSet<Pubkey>>>,
     execute_nonce: Arc<AtomicU64>,
     /// Mango accounts whose perp order slots are full. Keyed by account
     /// pubkey, value is the wall-clock ms when the block expires.  New
@@ -3270,10 +3310,12 @@ impl Engine {
             .ingress_failure_memo
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let entry = guard.entry(user_key).or_insert_with(|| IngressFailureMemo {
-            count: 0,
-            last_seen_ms: now_ms,
-        });
+        let entry = guard
+            .entry(user_key)
+            .or_insert_with(|| IngressFailureMemo {
+                count: 0,
+                last_seen_ms: now_ms,
+            });
         entry.count = entry.count.saturating_add(1);
         entry.last_seen_ms = now_ms;
     }
@@ -3405,73 +3447,11 @@ impl Engine {
         }
     }
 
-    fn configured_group_static_account_mirror_ready(&self, group: Pubkey) -> bool {
-        if self.config.executor_group != Some(group) {
-            return true;
-        }
-
-        self.group_account_mirrors
-            .lock()
-            .ok()
-            .map(|cache| cache.contains_key(&group))
-            .unwrap_or(false)
-    }
-
-    fn ensure_configured_group_static_account_mirror_ready(
+    async fn ensure_group_static_account_mirror(
         &self,
         request: &SubmitIntentRequest,
         group: Pubkey,
-    ) -> Result<(), Status> {
-        if self.configured_group_static_account_mirror_ready(group) {
-            return Ok(());
-        }
-
-        Err(self.reject_submit_request(
-            request,
-            Code::Unavailable,
-            format!(
-                "group account mirror bootstrap still in progress for group={group}; refusing enqueue until relayer mirror is ready"
-            ),
-        ))
-    }
-
-    fn ensure_request_targets_configured_stack(
-        &self,
-        request: &SubmitIntentRequest,
-        group: Pubkey,
-        execution_queue: Pubkey,
-    ) -> Result<(), Status> {
-        if let Some(configured_group) = self.config.executor_group {
-            if group != configured_group {
-                return Err(self.reject_submit_request(
-                    request,
-                    Code::InvalidArgument,
-                    format!(
-                        "request group {group} does not match configured relayer group {configured_group}"
-                    ),
-                ));
-            }
-        }
-
-        if let Some(configured_queue) = self.config.executor_queue {
-            if execution_queue != configured_queue {
-                return Err(self.reject_submit_request(
-                    request,
-                    Code::InvalidArgument,
-                    format!(
-                        "request execution_queue {execution_queue} does not match configured relayer queue {configured_queue}"
-                    ),
-                ));
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn bootstrap_group_static_account_mirror(
-        &self,
-        group: Pubkey,
-    ) -> Result<GroupStaticAccountMirror> {
+    ) -> Result<GroupStaticAccountMirror, Status> {
         if let Ok(cache) = self.group_account_mirrors.lock() {
             if let Some(mirror) = cache.get(&group) {
                 return Ok(mirror.clone());
@@ -3482,7 +3462,13 @@ impl Engine {
             .rpc
             .get_program_accounts(&self.config.program_id)
             .await
-            .with_context(|| format!("group account mirror bootstrap failed for group={group}"))?;
+            .map_err(|err| {
+                self.reject_submit_request(
+                    request,
+                    Code::Unavailable,
+                    format!("group account mirror bootstrap failed for group={group}: {err}"),
+                )
+            })?;
 
         let mut mirror = GroupStaticAccountMirror::default();
         let mut static_accounts = Vec::new();
@@ -3540,8 +3526,10 @@ impl Engine {
         }
 
         if mirror.banks_by_token_index.is_empty() && mirror.perps_by_market_index.is_empty() {
-            return Err(anyhow!(
-                "group account mirror bootstrap found no bank/perp accounts for group={group}"
+            return Err(self.reject_submit_request(
+                request,
+                Code::Unavailable,
+                format!("group account mirror bootstrap found no bank/perp accounts for group={group}"),
             ));
         }
 
@@ -3557,11 +3545,15 @@ impl Engine {
                 .rpc
                 .get_multiple_accounts(&unique_fallback_pubkeys)
                 .await
-                .with_context(|| format!("fallback oracle bootstrap failed for group={group}"))?;
-            for (fallback_pubkey, maybe_account) in unique_fallback_pubkeys
-                .iter()
-                .copied()
-                .zip(fetched.into_iter())
+                .map_err(|err| {
+                    self.reject_submit_request(
+                        request,
+                        Code::Unavailable,
+                        format!("fallback oracle bootstrap failed for group={group}: {err}"),
+                    )
+                })?;
+            for (fallback_pubkey, maybe_account) in
+                unique_fallback_pubkeys.iter().copied().zip(fetched.into_iter())
             {
                 let mut accounts = vec![fallback_pubkey];
                 if let Some(account) = maybe_account {
@@ -3592,7 +3584,13 @@ impl Engine {
                 .rpc
                 .get_multiple_accounts(&unique_quote_oracle_pubkeys)
                 .await
-                .with_context(|| format!("quote oracle bootstrap failed for group={group}"))?;
+                .map_err(|err| {
+                    self.reject_submit_request(
+                        request,
+                        Code::Unavailable,
+                        format!("quote oracle bootstrap failed for group={group}: {err}"),
+                    )
+                })?;
             for (quote_oracle_pubkey, maybe_account) in unique_quote_oracle_pubkeys
                 .iter()
                 .copied()
@@ -3629,22 +3627,6 @@ impl Engine {
         Ok(mirror)
     }
 
-    async fn ensure_group_static_account_mirror(
-        &self,
-        request: &SubmitIntentRequest,
-        group: Pubkey,
-    ) -> Result<GroupStaticAccountMirror, Status> {
-        self.bootstrap_group_static_account_mirror(group)
-            .await
-            .map_err(|err| {
-                self.reject_submit_request(
-                    request,
-                    Code::Unavailable,
-                    format!("group account mirror bootstrap failed for group={group}: {err:#}"),
-                )
-            })
-    }
-
     async fn ensure_mango_account_mirror(
         &self,
         request: &SubmitIntentRequest,
@@ -3671,14 +3653,18 @@ impl Engine {
             keyed
         };
 
-        let mirror = build_mango_account_mirror_from_keyed_account(mango_account, &keyed_account)
-            .map_err(|err| {
-            self.reject_submit_request(
-                request,
-                Code::FailedPrecondition,
-                format!("failed to build mango account mirror for {mango_account}: {err}"),
-            )
-        })?;
+        let mirror =
+            build_mango_account_mirror_from_keyed_account(mango_account, &keyed_account).map_err(
+                |err| {
+                    self.reject_submit_request(
+                        request,
+                        Code::FailedPrecondition,
+                        format!(
+                            "failed to build mango account mirror for {mango_account}: {err}"
+                        ),
+                    )
+                },
+            )?;
         if let Ok(mut cache) = self.mango_account_mirrors.lock() {
             let entry = cache.entry(mango_account).or_insert_with(|| mirror.clone());
             return Ok(entry.clone());
@@ -3722,8 +3708,7 @@ impl Engine {
         })?;
 
         if !request.remaining_accounts.is_empty() {
-            let matches =
-                supplied_account_metas_match(&request.remaining_accounts, &remaining_accounts);
+            let matches = supplied_account_metas_match(&request.remaining_accounts, &remaining_accounts);
             if target.intent_version == INTENT_VERSION_V1 && !matches {
                 return Err(self.reject_submit_request(
                     request,
@@ -3766,10 +3751,6 @@ impl Engine {
     }
 
     async fn ensure_harness_ready(&self, market: &str) -> Result<(), Status> {
-        if !self.config.harness_reject_market_drift {
-            return Ok(());
-        }
-
         let Some(harness_base_url) = self.config.harness_base_url.as_deref() else {
             return Ok(());
         };
@@ -3928,16 +3909,17 @@ impl Engine {
             ));
         }
 
-        let margin_user_state = self.fetch_margin_user_state(request, keys).await?;
+        let harness_state = self.fetch_harness_user_state(request, keys).await?;
         let margin_snapshot =
-            build_harness_margin_snapshot(Some(&margin_user_state), &request.mango_account)
-                .map_err(|err| {
+            build_harness_margin_snapshot(harness_state.as_ref(), &request.mango_account).map_err(
+                |err| {
                     self.reject_submit_request(
                         request,
                         Code::Unavailable,
-                        format!("invalid local margin state for margin precheck: {err}"),
+                        format!("invalid harness user state for margin precheck: {err}"),
                     )
-                })?;
+                },
+            )?;
         let extra_market_metadata = self
             .fetch_harness_market_metadata(request, &margin_snapshot)
             .await?;
@@ -3959,13 +3941,22 @@ impl Engine {
         )
     }
 
-    async fn fetch_margin_user_state(
+    async fn fetch_harness_user_state(
         &self,
         request: &SubmitIntentRequest,
         keys: ParsedSubmitIntentKeys,
-    ) -> Result<HarnessUserState, Status> {
-        let mango_account = keys.mango_account;
+    ) -> Result<Option<HarnessUserState>, Status> {
+        // Phase 4-lite fast path: read a SINGLE mango account's perp
+        // positions directly from the live rust-harness projection's
+        // in-memory MangoAccount struct. No orderbook walks, no full
+        // EngineSnapshot rebuild, no string serialization beyond the
+        // one quote_position_native field that margin check needs.
+        //
+        // `account_positions_fast` returns in ~5-20 µs; conversion to
+        // HarnessUserState is another ~10 µs of field re-packing. Lock
+        // is held briefly, never across an `.await`.
         if let Some(state) = &self.state {
+            let mango_account = keys.mango_account;
             let positions_opt =
                 state
                     .lock()
@@ -3981,55 +3972,59 @@ impl Engine {
                         )
                     })?;
             if let Some(positions) = positions_opt {
-                return Ok(harness_user_state_from_fast_positions(
+                return Ok(Some(harness_user_state_from_fast_positions(
                     mango_account,
                     positions,
-                ));
+                )));
             }
+            // Account not known to local state — fall through to the
+            // (slower) HTTP path below. This handles the warmup case
+            // where a new mango account hasn't been seen by any prior
+            // intent.
         }
 
-        // First-touch fallback: read the single MangoAccount directly from RPC
-        // and derive the compact perp-position view locally. This keeps the
-        // margin path out of `/state/users` while avoiding a reject cliff for
-        // accounts the relayer's in-process mirror has not seen yet.
-        let account = self.rpc.get_account(&mango_account).await.map_err(|err| {
-            self.reject_submit_request(
+        let Some(harness_base_url) = self.config.harness_base_url.as_deref() else {
+            return Ok(None);
+        };
+        let timeout = Duration::from_millis(self.config.harness_health_timeout_ms);
+        let owner = keys.user_owner.to_string();
+        let url = format!(
+            "{}/state/users/{}?view=optimistic&onchain=false",
+            harness_base_url.trim_end_matches('/'),
+            owner
+        );
+        let response = self
+            .http_client
+            .get(&url)
+            .timeout(timeout)
+            .send()
+            .await
+            .map_err(|err| {
+                self.reject_submit_request(
+                    request,
+                    Code::Unavailable,
+                    format!("harness user-state request failed owner={owner}: {err}"),
+                )
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(self.reject_submit_request(
                 request,
                 Code::Unavailable,
                 format!(
-                    "margin state mango account fetch failed mango_account={}: {err}",
-                    mango_account
-                ),
-            )
-        })?;
-        let keyed = KeyedAccountSharedData::new(mango_account, account.into());
-        self.seed_static_account_cache(std::iter::once(keyed.clone()));
-        let data = keyed.data.data();
-        if data.len() < 8 {
-            return Err(self.reject_submit_request(
-                request,
-                Code::FailedPrecondition,
-                format!(
-                    "mango account data too short for margin bootstrap mango_account={} data_len={}",
-                    mango_account,
-                    data.len()
+                    "harness user-state request returned status {} owner={} url={}",
+                    status, owner, url
                 ),
             ));
         }
-        let account_value = MangoAccountValue::from_bytes(&data[8..]).map_err(|err| {
+        let payload: HarnessUserStateResponse = response.json().await.map_err(|err| {
             self.reject_submit_request(
                 request,
-                Code::FailedPrecondition,
-                format!(
-                    "failed to deserialize mango account for margin bootstrap {}: {err}",
-                    mango_account
-                ),
+                Code::Unavailable,
+                format!("failed to decode harness user-state payload owner={owner}: {err}"),
             )
         })?;
-        Ok(harness_user_state_from_mango_account_value(
-            mango_account,
-            &account_value,
-        ))
+        Ok(Some(payload.data))
     }
 
     async fn fetch_harness_market_metadata(
@@ -4997,6 +4992,160 @@ impl Engine {
         sequence: u64,
         reason: &str,
     ) -> Result<Signature> {
+        if self.config.queue_topology.is_v3() {
+            let root = self
+                .load_v3_market_root_account(executor.execution_queue)
+                .await?;
+            let head_page = self
+                .load_v3_market_page_account(executor.execution_queue, root.head_page_slot())
+                .await?
+                .map(|(_, page)| page);
+            let head = inspect_v3_queue_head(&root, head_page.as_ref());
+            let head_matches = head.next_sequence == sequence;
+            let head_is_pending = head_matches && head.reason == "ctm_pending";
+            let head_is_gap = head_matches && head.is_ctm_gap_state();
+            if !head_is_pending && !head_is_gap {
+                return Err(anyhow!(
+                    "v3 queue head moved before admin drop: expected_sequence={} current_sequence={} reason={}",
+                    sequence,
+                    head.next_sequence,
+                    head.reason
+                ));
+            }
+            let recovery_mode = if head_is_pending {
+                "head_drop"
+            } else {
+                "gap_span_drop"
+            };
+            let sequences_to_drop = if head_is_pending {
+                if matches!(reason, "no_lane_match_stale" | "sequence_failure_threshold") {
+                    let batch = self
+                        .inspect_v3_no_lane_match_batch(
+                            executor.execution_queue,
+                            &head,
+                            self.config.executor_no_lane_match_drop_batch_max,
+                        )
+                        .await?;
+                    if batch.is_empty() {
+                        vec![sequence]
+                    } else {
+                        batch
+                    }
+                } else {
+                    vec![sequence]
+                }
+            } else {
+                let gap_batch = self
+                    .inspect_v3_gap_recovery_batch(
+                        executor.execution_queue,
+                        &head,
+                        self.config.executor_gap_recovery_drop_batch_max,
+                    )
+                    .await?;
+                if gap_batch.is_empty() {
+                    return Err(anyhow!(
+                        "v3 queue gap recovery found no pending CTM span: expected_sequence={} current_sequence={} max_seen_sequence={}",
+                        sequence,
+                        head.next_sequence,
+                        head.max_seen_sequence
+                    ));
+                }
+                gap_batch
+            };
+
+            let mut instructions = vec![ComputeBudgetInstruction::set_compute_unit_limit(1_400_000)];
+            if self.config.executor_prioritization_fee > 0 {
+                instructions.push(ComputeBudgetInstruction::set_compute_unit_price(
+                    self.config.executor_prioritization_fee,
+                ));
+            }
+            instructions.push(build_execution_queue_v3_configure_market_root_instruction(
+                self.config.program_id,
+                executor.group,
+                root.authority_state,
+                executor.execution_queue,
+                self.config.executor_admin.pubkey(),
+                &root,
+                true,
+            ));
+            for dropped_sequence in &sequences_to_drop {
+                let queue_page = find_execution_queue_v3_page_pda(
+                    self.config.program_id,
+                    executor.execution_queue,
+                    root.page_slot_for_sequence(*dropped_sequence),
+                );
+                instructions.push(build_execution_queue_v3_drop_market_instruction(
+                    self.config.program_id,
+                    executor.group,
+                    root.authority_state,
+                    executor.execution_queue,
+                    queue_page,
+                    self.config.executor_admin.pubkey(),
+                    *dropped_sequence,
+                ));
+            }
+            instructions.push(build_execution_queue_v3_configure_market_root_instruction(
+                self.config.program_id,
+                executor.group,
+                root.authority_state,
+                executor.execution_queue,
+                self.config.executor_admin.pubkey(),
+                &root,
+                root.paused_execute != 0,
+            ));
+
+            let chain = self.blockhashes.snapshot().await;
+            let message = MessageV0::try_compile(
+                &self.config.payer.pubkey(),
+                &instructions,
+                &[],
+                chain.blockhash,
+            )?;
+            let tx = if self.config.executor_admin.pubkey() == self.config.payer.pubkey() {
+                VersionedTransaction::try_new(
+                    solana_sdk::message::VersionedMessage::V0(message),
+                    &[self.config.payer.as_ref()],
+                )?
+            } else {
+                VersionedTransaction::try_new(
+                    solana_sdk::message::VersionedMessage::V0(message),
+                    &[
+                        self.config.payer.as_ref(),
+                        self.config.executor_admin.as_ref(),
+                    ],
+                )?
+            };
+            let send_cfg = RpcSendTransactionConfig {
+                skip_preflight: self.config.executor_skip_preflight,
+                preflight_commitment: Some(CommitmentConfig::processed().commitment),
+                max_retries: Some(0),
+                ..RpcSendTransactionConfig::default()
+            };
+            let signature = self.rpc.send_transaction_with_config(&tx, send_cfg).await?;
+            self.await_signature_result(signature, self.config.executor_admin_tx_timeout_ms)
+                .await?;
+            executor.pending_dispatches.lock().await.clear();
+            {
+                let mut sequence_failures = executor.sequence_failure_counts.lock().await;
+                for dropped_sequence in &sequences_to_drop {
+                    sequence_failures.remove(dropped_sequence);
+                }
+            }
+            executor.last_inspect_ms.store(0, Ordering::Relaxed);
+            *executor.cached_head.lock().await = None;
+            info!(
+                "executor v3 admin recovery completed start_sequence={} first_dropped_sequence={} last_dropped_sequence={} dropped={} mode={} reason={} tx={}",
+                sequence,
+                sequences_to_drop.first().copied().unwrap_or(sequence),
+                sequences_to_drop.last().copied().unwrap_or(sequence),
+                sequences_to_drop.len(),
+                recovery_mode,
+                reason,
+                signature
+            );
+            return Ok(signature);
+        }
+
         let queue_account = self.rpc.get_account(&executor.execution_queue).await?;
         let queue_state =
             inspect_queue_admin_state_for_market(&queue_account.data, executor.market_index);
@@ -5165,6 +5314,359 @@ impl Engine {
                 None
             }
         })
+    }
+
+    fn configured_queue_v3(&self) -> Option<&QueueV3RuntimeConfig> {
+        self.configured_queue_v3.as_ref()
+    }
+
+    async fn ensure_v3_market_page_known(
+        &self,
+        queue_root: Pubkey,
+        sequence: u64,
+    ) -> Result<(Pubkey, u16, u64, bool), Status> {
+        let runtime = self
+            .configured_queue_v3()
+            .ok_or_else(|| Status::internal("configured v3 queue metadata unavailable"))?;
+        let page_slot = runtime.page_slot_for_sequence(sequence);
+        let abs_page_no = runtime.abs_page_no_for_sequence(sequence);
+        let queue_page =
+            find_execution_queue_v3_page_pda(self.config.program_id, queue_root, page_slot);
+
+        match self.rpc.get_account(&queue_page).await {
+            Ok(_) => {
+                self.known_v3_pages
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(queue_page);
+                Ok((queue_page, page_slot, abs_page_no, true))
+            }
+            Err(err) => {
+                let msg = err.to_string().to_ascii_lowercase();
+                if msg.contains("accountnotfound")
+                    || msg.contains("could not find account")
+                    || msg.contains("not found")
+                {
+                    Ok((queue_page, page_slot, abs_page_no, false))
+                } else {
+                    Err(Status::unavailable(format!(
+                        "failed to probe v3 queue page {queue_page}: {err}"
+                    )))
+                }
+            }
+        }
+    }
+
+    async fn load_v3_market_root_account(
+        &self,
+        queue_root: Pubkey,
+    ) -> Result<PerpMarketQueueRootV3> {
+        let account = self.rpc.get_account(&queue_root).await?;
+        let mut data: &[u8] = &account.data;
+        PerpMarketQueueRootV3::try_deserialize(&mut data)
+            .map_err(|err| anyhow!("failed to deserialize v3 queue root {queue_root}: {err}"))
+    }
+
+    async fn load_v3_market_page_account(
+        &self,
+        queue_root: Pubkey,
+        page_slot: u16,
+    ) -> Result<Option<(Pubkey, ExecutionQueuePageV3)>> {
+        let queue_page =
+            find_execution_queue_v3_page_pda(self.config.program_id, queue_root, page_slot);
+        match self.rpc.get_account(&queue_page).await {
+            Ok(account) => {
+                let mut data: &[u8] = &account.data;
+                let page = ExecutionQueuePageV3::try_deserialize(&mut data).map_err(|err| {
+                    anyhow!("failed to deserialize v3 queue page {queue_page}: {err}")
+                })?;
+                self.known_v3_pages
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(queue_page);
+                Ok(Some((queue_page, page)))
+            }
+            Err(err) => {
+                let msg = err.to_string().to_ascii_lowercase();
+                if msg.contains("accountnotfound")
+                    || msg.contains("could not find account")
+                    || msg.contains("not found")
+                {
+                    self.known_v3_pages
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&queue_page);
+                    Ok(None)
+                } else {
+                    Err(anyhow!("failed to fetch v3 queue page {queue_page}: {err}"))
+                }
+            }
+        }
+    }
+
+    async fn inspect_v3_near_head_lane_entries(
+        &self,
+        queue_root: Pubkey,
+        root: &PerpMarketQueueRootV3,
+        head: &QueueHead,
+        max_scan_items: usize,
+        max_unique_hashes: usize,
+    ) -> Result<Vec<(u64, [u8; 32])>> {
+        if max_scan_items == 0 || max_unique_hashes == 0 || head.reason != "ctm_pending" {
+            return Ok(Vec::new());
+        }
+
+        let end_sequence = head
+            .next_sequence
+            .saturating_add(max_scan_items.saturating_sub(1) as u64)
+            .min(head.max_seen_sequence);
+        let mut entries = Vec::new();
+        let mut seen = HashSet::new();
+        let mut loaded_abs_page_no = None;
+        let mut loaded_page = None;
+        let mut sequence = head.next_sequence;
+
+        while sequence <= end_sequence {
+            let abs_page_no = root.abs_page_no_for_sequence(sequence);
+            if loaded_abs_page_no != Some(abs_page_no) {
+                loaded_page = self
+                    .load_v3_market_page_account(queue_root, root.page_slot_for_sequence(sequence))
+                    .await?
+                    .map(|(_, page)| page);
+                loaded_abs_page_no = Some(abs_page_no);
+            }
+
+            let Some(page) = loaded_page.as_ref() else {
+                break;
+            };
+            if page.page_state != QueuePageStateV3::Active as u8
+                || page.page_slot != root.page_slot_for_sequence(sequence)
+                || page.assigned_abs_page_no != abs_page_no
+            {
+                break;
+            }
+
+            let offset = root.page_offset_for_sequence(sequence) as usize;
+            let item = &page.items[offset];
+            if item.status != QueueItemStatusV3::Pending as u8
+                || item.kind != QueueItemKind::CtmWrapped as u8
+                || item.sequence != sequence
+            {
+                break;
+            }
+
+            if seen.insert(item.accounts_hash) {
+                entries.push((sequence, item.accounts_hash));
+                if entries.len() >= max_unique_hashes.min(20) {
+                    break;
+                }
+            }
+
+            sequence = sequence.saturating_add(1);
+        }
+
+        Ok(entries)
+    }
+
+    async fn inspect_v3_market_queue(
+        &self,
+        executor: &Arc<ExecutorState>,
+    ) -> Result<(QueueHead, Vec<(u64, [u8; 32])>)> {
+        let root = self
+            .load_v3_market_root_account(executor.execution_queue)
+            .await?;
+        let head_page = if root.live_count > 0 {
+            self.load_v3_market_page_account(executor.execution_queue, root.head_page_slot())
+                .await?
+                .map(|(_, page)| page)
+        } else {
+            None
+        };
+        let head = inspect_v3_queue_head(&root, head_page.as_ref());
+        let near_head_lane_entries = self
+            .inspect_v3_near_head_lane_entries(
+                executor.execution_queue,
+                &root,
+                &head,
+                self.config.executor_head_scan_items,
+                self.config.executor_target_lane_fanout.max(1).min(20),
+            )
+            .await?;
+        Ok((head, near_head_lane_entries))
+    }
+
+    async fn inspect_v3_next_enqueue_sequence(&self, queue_root: Pubkey) -> Result<u64> {
+        let root = self.load_v3_market_root_account(queue_root).await?;
+        Ok(root.next_enqueue_sequence())
+    }
+
+    async fn inspect_v3_sequence_presence(
+        &self,
+        queue_root: Pubkey,
+        sequence: u64,
+    ) -> Result<QueueSequencePresence> {
+        let root = self.load_v3_market_root_account(queue_root).await?;
+        if sequence < root.next_sequence_to_execute {
+            return Ok(QueueSequencePresence::PastFloor);
+        }
+        if sequence
+            >= root
+                .next_sequence_to_execute
+                .saturating_add(root.admission_limit())
+        {
+            return Ok(QueueSequencePresence::Absent);
+        }
+
+        let abs_page_no = root.abs_page_no_for_sequence(sequence);
+        let Some((_, page)) = self
+            .load_v3_market_page_account(queue_root, root.page_slot_for_sequence(sequence))
+            .await?
+        else {
+            return Ok(QueueSequencePresence::Absent);
+        };
+        if page.page_state != QueuePageStateV3::Active as u8
+            || page.page_slot != root.page_slot_for_sequence(sequence)
+            || page.assigned_abs_page_no != abs_page_no
+        {
+            return Ok(QueueSequencePresence::Absent);
+        }
+
+        let item = &page.items[root.page_offset_for_sequence(sequence) as usize];
+        if item.status == QueueItemStatusV3::Pending as u8 && item.sequence == sequence {
+            Ok(QueueSequencePresence::Pending)
+        } else {
+            Ok(QueueSequencePresence::Absent)
+        }
+    }
+
+    async fn inspect_v3_no_lane_match_batch(
+        &self,
+        queue_root: Pubkey,
+        head: &QueueHead,
+        max_batch: usize,
+    ) -> Result<Vec<u64>> {
+        if max_batch == 0 || head.reason != "ctm_pending" {
+            return Ok(Vec::new());
+        }
+        let Some(target_hash) = head.head_accounts_hash else {
+            return Ok(Vec::new());
+        };
+
+        let root = self.load_v3_market_root_account(queue_root).await?;
+        let end_sequence = head
+            .next_sequence
+            .saturating_add(max_batch.saturating_sub(1) as u64)
+            .min(head.max_seen_sequence);
+        let mut sequences = Vec::new();
+        let mut loaded_abs_page_no = None;
+        let mut loaded_page = None;
+        let mut sequence = head.next_sequence;
+
+        while sequence <= end_sequence {
+            let abs_page_no = root.abs_page_no_for_sequence(sequence);
+            if loaded_abs_page_no != Some(abs_page_no) {
+                loaded_page = self
+                    .load_v3_market_page_account(queue_root, root.page_slot_for_sequence(sequence))
+                    .await?
+                    .map(|(_, page)| page);
+                loaded_abs_page_no = Some(abs_page_no);
+            }
+
+            let Some(page) = loaded_page.as_ref() else {
+                break;
+            };
+            if page.page_state != QueuePageStateV3::Active as u8
+                || page.page_slot != root.page_slot_for_sequence(sequence)
+                || page.assigned_abs_page_no != abs_page_no
+            {
+                break;
+            }
+
+            let item = &page.items[root.page_offset_for_sequence(sequence) as usize];
+            if item.status != QueueItemStatusV3::Pending as u8
+                || item.kind != QueueItemKind::CtmWrapped as u8
+                || item.sequence != sequence
+                || item.accounts_hash != target_hash
+            {
+                break;
+            }
+            sequences.push(sequence);
+            sequence = sequence.saturating_add(1);
+        }
+
+        Ok(sequences)
+    }
+
+    async fn inspect_v3_gap_recovery_batch(
+        &self,
+        queue_root: Pubkey,
+        head: &QueueHead,
+        max_batch: usize,
+    ) -> Result<Vec<u64>> {
+        if max_batch == 0 || !head.is_ctm_gap_state() {
+            return Ok(Vec::new());
+        }
+
+        let root = self.load_v3_market_root_account(queue_root).await?;
+        if root.max_seen_sequence < head.next_sequence {
+            return Ok(Vec::new());
+        }
+
+        let mut sequences = Vec::new();
+        let mut first_pending_found = false;
+        let mut loaded_abs_page_no = None;
+        let mut loaded_page = None;
+        let mut sequence = head.next_sequence;
+
+        while sequence <= root.max_seen_sequence {
+            let abs_page_no = root.abs_page_no_for_sequence(sequence);
+            if loaded_abs_page_no != Some(abs_page_no) {
+                loaded_page = self
+                    .load_v3_market_page_account(queue_root, root.page_slot_for_sequence(sequence))
+                    .await?
+                    .map(|(_, page)| page);
+                loaded_abs_page_no = Some(abs_page_no);
+            }
+
+            let Some(page) = loaded_page.as_ref() else {
+                sequence = ((abs_page_no + 1) * root.page_size as u64).max(sequence + 1);
+                continue;
+            };
+            if page.page_state != QueuePageStateV3::Active as u8
+                || page.page_slot != root.page_slot_for_sequence(sequence)
+                || page.assigned_abs_page_no != abs_page_no
+            {
+                sequence = ((abs_page_no + 1) * root.page_size as u64).max(sequence + 1);
+                continue;
+            }
+
+            let item = &page.items[root.page_offset_for_sequence(sequence) as usize];
+            let is_pending = item.status == QueueItemStatusV3::Pending as u8
+                && item.kind == QueueItemKind::CtmWrapped as u8
+                && item.sequence == sequence;
+            if !first_pending_found {
+                if is_pending {
+                    first_pending_found = true;
+                    sequences.push(sequence);
+                    if sequences.len() >= max_batch {
+                        break;
+                    }
+                }
+                sequence = sequence.saturating_add(1);
+                continue;
+            }
+
+            if !is_pending {
+                break;
+            }
+            sequences.push(sequence);
+            if sequences.len() >= max_batch {
+                break;
+            }
+            sequence = sequence.saturating_add(1);
+        }
+
+        Ok(sequences)
     }
 
     async fn refresh_dynamic_lanes_from_event_log(
@@ -5433,6 +5935,46 @@ impl Engine {
                 .record(after_parse_elapsed.as_millis() as u64);
             let group = keys.group;
             let execution_queue = keys.execution_queue;
+            if let Some(v3) = self.configured_queue_v3() {
+                let configured_group = self
+                    .config
+                    .executor_group
+                    .ok_or_else(|| Status::internal("configured v3 group missing"))?;
+                let configured_queue = self
+                    .config
+                    .executor_queue
+                    .ok_or_else(|| Status::internal("configured v3 queue root missing"))?;
+                if group != configured_group {
+                    return Err(self.reject_submit_request(
+                        &request,
+                        Code::InvalidArgument,
+                        format!(
+                            "group mismatch for v3 queue topology: request.group={} configured.group={configured_group}",
+                            group
+                        ),
+                    ));
+                }
+                if execution_queue != configured_queue {
+                    return Err(self.reject_submit_request(
+                        &request,
+                        Code::InvalidArgument,
+                        format!(
+                            "execution_queue mismatch for v3 queue topology: request.execution_queue={} configured.queue_root={configured_queue}",
+                            execution_queue
+                        ),
+                    ));
+                }
+                if market_index != v3.market_index {
+                    return Err(self.reject_submit_request(
+                        &request,
+                        Code::InvalidArgument,
+                        format!(
+                            "market mismatch for configured v3 queue root: request.market={} configured.market={}",
+                            market_index, v3.market_index
+                        ),
+                    ));
+                }
+            }
             if self.config.queue_soft_limit > 0 {
                 if let Some((queue_count, gap_span, head_available)) =
                     self.current_queue_state_for(group, execution_queue)
@@ -5511,12 +6053,6 @@ impl Engine {
                 };
             // ---- End ingress protection ----
 
-            self.ensure_request_targets_configured_stack(
-                &request,
-                keys.group,
-                keys.execution_queue,
-            )?;
-            self.ensure_configured_group_static_account_mirror_ready(&request, keys.group)?;
             self.ensure_harness_ready(&request.market).await?;
             let remaining_accounts = self
                 .derive_submit_remaining_accounts(&request, keys, target)
@@ -5657,23 +6193,50 @@ impl Engine {
                     .try_into()
                     .map_err(|_| Status::internal("ctm signature length was not 64 bytes"))?,
             );
-            let enqueue_instruction = build_enqueue_instruction(
-                self.config.program_id,
-                group,
-                execution_queue,
-                &remaining_accounts,
-                market_index,
-                envelope.clone(),
-                request.payload.clone(),
-            );
             let prepare_elapsed = parse_started.elapsed().saturating_sub(parse_elapsed);
 
-            let mut instructions = vec![
-                ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
-                user_preinstruction,
-                ctm_preinstruction,
-                enqueue_instruction,
-            ];
+            let mut instructions = vec![ComputeBudgetInstruction::set_compute_unit_limit(1_400_000)];
+            if let Some(v3) = self.configured_queue_v3() {
+                let (queue_page, page_slot, abs_page_no, page_exists) = self
+                    .ensure_v3_market_page_known(execution_queue, sequence)
+                    .await?;
+                if !page_exists {
+                    instructions.push(build_execution_queue_v3_init_market_page_instruction(
+                        self.config.program_id,
+                        group,
+                        v3.authority_state,
+                        execution_queue,
+                        self.config.payer.pubkey(),
+                        page_slot,
+                        abs_page_no,
+                    ));
+                }
+                instructions.push(user_preinstruction);
+                instructions.push(ctm_preinstruction);
+                instructions.push(build_enqueue_instruction_v3(
+                    self.config.program_id,
+                    group,
+                    v3.authority_state,
+                    execution_queue,
+                    queue_page,
+                    &remaining_accounts,
+                    market_index,
+                    envelope.clone(),
+                    request.payload.clone(),
+                ));
+            } else {
+                instructions.push(user_preinstruction);
+                instructions.push(ctm_preinstruction);
+                instructions.push(build_enqueue_instruction(
+                    self.config.program_id,
+                    group,
+                    execution_queue,
+                    &remaining_accounts,
+                    market_index,
+                    envelope.clone(),
+                    request.payload.clone(),
+                ));
+            }
             if self.config.prioritization_fee > 0 {
                 instructions.insert(
                     0,
@@ -5887,17 +6450,51 @@ impl Engine {
         execution_queue: Pubkey,
         rewind_to_queue_floor: bool,
     ) {
-        let account = match self.rpc.get_account(&execution_queue).await {
-            Ok(account) => account,
-            Err(err) => {
-                warn!(
-                    "failed to recover sequence state for key={} queue={}: {err:?}",
-                    sequence_key, execution_queue
-                );
-                return;
-            }
+        let (fallback_next, presence) = if self.config.queue_topology.is_v3() {
+            let fallback_next = match self.inspect_v3_next_enqueue_sequence(execution_queue).await {
+                Ok(value) => value,
+                Err(err) => {
+                    warn!(
+                        "failed to recover v3 sequence state for key={} queue={}: {err:?}",
+                        sequence_key, execution_queue
+                    );
+                    return;
+                }
+            };
+            let presence = match self
+                .inspect_v3_sequence_presence(execution_queue, failed_sequence)
+                .await
+            {
+                Ok(value) => value,
+                Err(err) => {
+                    warn!(
+                        "failed to inspect v3 sequence presence for key={} queue={} sequence={}: {err:?}",
+                        sequence_key, execution_queue, failed_sequence
+                    );
+                    return;
+                }
+            };
+            (fallback_next, presence)
+        } else {
+            let account = match self.rpc.get_account(&execution_queue).await {
+                Ok(account) => account,
+                Err(err) => {
+                    warn!(
+                        "failed to recover sequence state for key={} queue={}: {err:?}",
+                        sequence_key, execution_queue
+                    );
+                    return;
+                }
+            };
+            (
+                inspect_next_enqueue_sequence_for_market(&account.data, market_index),
+                inspect_queue_sequence_presence_for_market(
+                    &account.data,
+                    market_index,
+                    failed_sequence,
+                ),
+            )
         };
-        let fallback_next = inspect_next_enqueue_sequence_for_market(&account.data, market_index);
         if rewind_to_queue_floor {
             self.sequences
                 .rewind_to_queue_floor(sequence_key, fallback_next)
@@ -5906,11 +6503,7 @@ impl Engine {
         self.sequences
             .observe_queue_floor(sequence_key, fallback_next)
             .await;
-        match inspect_queue_sequence_presence_for_market(
-            &account.data,
-            market_index,
-            failed_sequence,
-        ) {
+        match presence {
             QueueSequencePresence::PastFloor => {}
             QueueSequencePresence::Pending => {
                 self.sequences
@@ -5963,49 +6556,6 @@ impl Engine {
                 self.metrics
                     .bg_submit_inflight
                     .fetch_sub(1, Ordering::Relaxed);
-            }
-            // ExecutionQueueFull is a transient capacity error — the sequence
-            // is valid, the on-chain ring-buffer just needs time to drain.
-            // Treating it as a window error (rewind_to_queue_floor) causes the
-            // cursor to reset to the on-chain floor position and then retry
-            // immediately, which creates a tight retry storm that saturates the
-            // HTTP/2 connection to the RPC provider and kills the service.
-            // Instead, retry with the same sequence after a fixed drain pause.
-            Err(err)
-                if is_execution_queue_full_error(&err)
-                    && pending.attempts < self.config.bg_submit_max_retries =>
-            {
-                self.metrics
-                    .bg_submit_transient_total
-                    .fetch_add(1, Ordering::Relaxed);
-                pending.attempts = pending.attempts.saturating_add(1);
-                // Use a fixed drain-pause rather than an exponential backoff so
-                // the first retry fires after roughly one executor cycle (~100ms)
-                // regardless of how many times we've already tried.
-                let backoff = Duration::from_millis(
-                    self.config.bg_submit_queue_full_retry_ms,
-                );
-                warn!(
-                    "bg submitter queue full — retrying sequence={} attempt={} backoff_ms={} err={err:?}",
-                    pending.sequence,
-                    pending.attempts,
-                    backoff.as_millis()
-                );
-                let retry_tx = self.bg_submit_tx.clone();
-                let metrics = self.metrics.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(backoff).await;
-                    if let Err(send_err) = retry_tx.send(pending).await {
-                        warn!("bg submitter queue-full retry channel closed: {send_err:?}");
-                        metrics
-                            .bg_submit_retry_dropped_total
-                            .fetch_add(1, Ordering::Relaxed);
-                        metrics
-                            .bg_submit_failed_total
-                            .fetch_add(1, Ordering::Relaxed);
-                        metrics.bg_submit_inflight.fetch_sub(1, Ordering::Relaxed);
-                    }
-                });
             }
             Err(err)
                 if is_transient_rpc_error(&err)
@@ -6061,9 +6611,8 @@ impl Engine {
                 if !is_execution_queue_duplicate_sequence_error(&err) {
                     let pending_market_index =
                         parse_market_from_sequence_key(&pending.sequence_key);
-                    // ExecutionQueueFull handled above as transient; only
-                    // InvalidSequenceNumber warrants a cursor rewind.
-                    let rewind_to_queue_floor = is_invalid_sequence_number_error(&err);
+                    let rewind_to_queue_floor = is_execution_queue_full_error(&err)
+                        || is_invalid_sequence_number_error(&err);
                     self.recover_sequence_after_submit_error(
                         &pending.sequence_key,
                         pending_market_index,
@@ -6186,11 +6735,13 @@ impl Engine {
             target_kind: Some(request.target_kind),
             target_index: Some(request.target_index),
             accounts_hash: Some(bytes_to_hex(&envelope.accounts_hash)),
-            remaining_accounts_source: Some(if request.intent_version == INTENT_VERSION_V2 {
-                "relayer_derived".to_string()
-            } else {
-                "legacy_caller_supplied".to_string()
-            }),
+            remaining_accounts_source: Some(
+                if request.intent_version == INTENT_VERSION_V2 {
+                    "relayer_derived".to_string()
+                } else {
+                    "legacy_caller_supplied".to_string()
+                },
+            ),
             sequence: envelope.sequence.to_string(),
             kind: envelope.kind,
             payload_b64: base64::engine::general_purpose::STANDARD.encode(&request.payload),
@@ -6831,15 +7382,22 @@ impl Engine {
         let mut near_head_lane_entries = Vec::new();
         let mut near_head_exact_hashes = Vec::new();
         let head = if now_ms.saturating_sub(last_inspect) >= effective_inspect_ms {
-            let accounts = self.rpc.get_account(&executor.execution_queue).await?;
-            let head = inspect_queue_head_for_market(&accounts.data, executor.market_index);
-            near_head_lane_entries = inspect_near_head_lane_entries(
-                &accounts.data,
-                executor.market_index,
-                &head,
-                self.config.executor_head_scan_items,
-                planner_lane_fanout,
-            );
+            let head = if self.config.queue_topology.is_v3() {
+                let (head, entries) = self.inspect_v3_market_queue(executor).await?;
+                near_head_lane_entries = entries;
+                head
+            } else {
+                let accounts = self.rpc.get_account(&executor.execution_queue).await?;
+                let head = inspect_queue_head_for_market(&accounts.data, executor.market_index);
+                near_head_lane_entries = inspect_near_head_lane_entries(
+                    &accounts.data,
+                    executor.market_index,
+                    &head,
+                    self.config.executor_head_scan_items,
+                    planner_lane_fanout,
+                );
+                head
+            };
             near_head_exact_hashes = near_head_lane_entries
                 .iter()
                 .map(|(_, hash)| *hash)
@@ -7372,6 +7930,28 @@ impl Engine {
                         let mango_acct = lane.remaining_accounts[1].pubkey;
                         if blocked.contains_key(&mango_acct) {
                             drop(blocked);
+                            if self.config.queue_topology.is_v3() {
+                                match self
+                                    .drop_ctm_head_with_admin_tx(
+                                        executor,
+                                        head.next_sequence,
+                                        "blocked_mango_account",
+                                    )
+                                    .await
+                                {
+                                    Ok(signature) => {
+                                        info!(
+                                            "executor fast-drop blocked_account={} sequence={} tx={}",
+                                            mango_acct, head.next_sequence, signature,
+                                        );
+                                    }
+                                    Err(err) => {
+                                        debug!("executor v3 fast-drop failed: {err:?}");
+                                    }
+                                }
+                                executor.last_inspect_ms.store(0, Ordering::Relaxed);
+                                return Ok(ExecuteLoopOutcome::Sent);
+                            }
                             // Read queue state and build batch of consecutive pending items
                             let batch_max = self.config.executor_expired_head_drop_batch_max.max(8);
                             match self.rpc.get_account(&executor.execution_queue).await {
@@ -7795,12 +8375,22 @@ impl Engine {
         head_sequence: u64,
     ) -> Result<(VersionedTransaction, RpcSendTransactionConfig)> {
         let chain = self.blockhashes.snapshot().await;
-        let mut instructions = vec![
-            ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
-            build_execute_head_memo_instruction(
-                head_sequence,
-                self.execute_nonce.fetch_add(1, Ordering::Relaxed),
-            ),
+        let execute_instruction = if let Some(v3) = self.configured_queue_v3() {
+            let queue_page = find_execution_queue_v3_page_pda(
+                self.config.program_id,
+                executor.execution_queue,
+                v3.page_slot_for_sequence(head_sequence),
+            );
+            build_execute_instruction_v3(
+                self.config.program_id,
+                executor.group,
+                v3.authority_state,
+                executor.execution_queue,
+                queue_page,
+                &lane.remaining_accounts,
+                executor.effective_max_items(self.config.executor_max_items),
+            )
+        } else {
             build_execute_instruction(
                 self.config.program_id,
                 executor.group,
@@ -7808,7 +8398,15 @@ impl Engine {
                 &lane.remaining_accounts,
                 executor.market_index,
                 executor.effective_max_items(self.config.executor_max_items),
+            )
+        };
+        let mut instructions = vec![
+            ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+            build_execute_head_memo_instruction(
+                head_sequence,
+                self.execute_nonce.fetch_add(1, Ordering::Relaxed),
             ),
+            execute_instruction,
         ];
         if self.config.executor_prioritization_fee > 0 {
             instructions.insert(
@@ -7849,12 +8447,24 @@ impl Engine {
             lanes.iter().map(|l| l.remaining_accounts.clone()).collect();
         // Pass the pre-computed lane hashes (with original flags, not runtime-OR'd)
         let lane_hashes: Vec<[u8; 32]> = lanes.iter().map(|l| l.hash).collect();
-        let mut instructions = vec![
-            ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
-            build_execute_head_memo_instruction(
-                head_sequence,
-                self.execute_nonce.fetch_add(1, Ordering::Relaxed),
-            ),
+        let execute_instruction = if let Some(v3) = self.configured_queue_v3() {
+            let queue_page = find_execution_queue_v3_page_pda(
+                self.config.program_id,
+                executor.execution_queue,
+                v3.page_slot_for_sequence(head_sequence),
+            );
+            build_execute_multi_instruction_v3(
+                self.config.program_id,
+                executor.group,
+                v3.authority_state,
+                executor.execution_queue,
+                queue_page,
+                &lane_accounts,
+                accounts_per_lane,
+                lane_hashes,
+                executor.effective_max_items(self.config.executor_max_items),
+            )
+        } else {
             build_execute_multi_instruction(
                 self.config.program_id,
                 executor.group,
@@ -7864,7 +8474,15 @@ impl Engine {
                 lane_hashes,
                 executor.market_index,
                 executor.effective_max_items(self.config.executor_max_items),
+            )
+        };
+        let mut instructions = vec![
+            ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+            build_execute_head_memo_instruction(
+                head_sequence,
+                self.execute_nonce.fetch_add(1, Ordering::Relaxed),
             ),
+            execute_instruction,
         ];
         if self.config.executor_prioritization_fee > 0 {
             instructions.insert(
@@ -7900,12 +8518,24 @@ impl Engine {
         head_sequence: u64,
     ) -> Result<(VersionedTransaction, RpcSendTransactionConfig)> {
         let chain = self.blockhashes.snapshot().await;
-        let mut instructions = vec![
-            ComputeBudgetInstruction::set_compute_unit_limit(400_000),
-            build_execute_head_memo_instruction(
-                head_sequence,
-                self.execute_nonce.fetch_add(1, Ordering::Relaxed),
-            ),
+        let execute_instruction = if let Some(v3) = self.configured_queue_v3() {
+            let queue_page = find_execution_queue_v3_page_pda(
+                self.config.program_id,
+                executor.execution_queue,
+                v3.page_slot_for_sequence(head_sequence),
+            );
+            build_execute_instruction_v3(
+                self.config.program_id,
+                executor.group,
+                v3.authority_state,
+                executor.execution_queue,
+                queue_page,
+                &lane.remaining_accounts,
+                executor
+                    .effective_max_items(self.config.executor_max_items)
+                    .max(1),
+            )
+        } else {
             build_execute_instruction(
                 self.config.program_id,
                 executor.group,
@@ -7915,7 +8545,15 @@ impl Engine {
                 executor
                     .effective_max_items(self.config.executor_max_items)
                     .max(1),
+            )
+        };
+        let mut instructions = vec![
+            ComputeBudgetInstruction::set_compute_unit_limit(400_000),
+            build_execute_head_memo_instruction(
+                head_sequence,
+                self.execute_nonce.fetch_add(1, Ordering::Relaxed),
             ),
+            execute_instruction,
         ];
         if self.config.executor_prioritization_fee > 0 {
             instructions.insert(
@@ -8424,7 +9062,10 @@ fn account_metas_to_proto(accounts: &[AccountMeta]) -> Vec<AccountMetaProto> {
         .collect()
 }
 
-fn supplied_account_metas_match(supplied: &[AccountMetaProto], derived: &[AccountMeta]) -> bool {
+fn supplied_account_metas_match(
+    supplied: &[AccountMetaProto],
+    derived: &[AccountMeta],
+) -> bool {
     supplied.len() == derived.len()
         && supplied.iter().zip(derived.iter()).all(|(left, right)| {
             left.pubkey == right.pubkey.to_string()
@@ -8445,8 +9086,9 @@ fn build_mango_account_mirror_from_keyed_account(
             data.len()
         ));
     }
-    let account = MangoAccountValue::from_bytes(&data[8..])
-        .with_context(|| format!("failed to deserialize mango account {}", mango_account))?;
+    let account = MangoAccountValue::from_bytes(&data[8..]).with_context(|| {
+        format!("failed to deserialize mango account {}", mango_account)
+    })?;
 
     Ok(MangoAccountMirror {
         token_indices: account
@@ -8479,9 +9121,7 @@ fn build_derived_perp_remaining_accounts(
     let target_market = group_mirror
         .perps_by_market_index
         .get(&target_market_index)
-        .with_context(|| {
-            format!("perp market index {target_market_index} not found in group mirror")
-        })?;
+        .with_context(|| format!("perp market index {target_market_index} not found in group mirror"))?;
 
     let mut token_indices = mango_account_mirror.token_indices.clone();
     let mut perp_market_indices = mango_account_mirror.perp_market_indices.clone();
@@ -8524,12 +9164,7 @@ fn build_canonical_health_account_metas(
         let bank = group_mirror
             .banks_by_token_index
             .get(token_index)
-            .with_context(|| {
-                format!(
-                    "bank for token index {} not found in group mirror",
-                    token_index
-                )
-            })?;
+            .with_context(|| format!("bank for token index {} not found in group mirror", token_index))?;
         sections[0].push(bank.bank);
         sections[1].push(bank.oracle);
         sections[6].extend(bank.fallback_oracles.iter().copied());
@@ -8638,11 +9273,8 @@ fn expand_lane_variants(
         hash: enqueue_hash,
         remaining_accounts: raw_accounts,
     }];
-    let direct_hash = hash_execution_queue_accounts_for_direct_enqueue(
-        group,
-        execution_queue,
-        remaining_accounts,
-    );
+    let direct_hash =
+        hash_execution_queue_accounts_for_direct_enqueue(group, execution_queue, remaining_accounts);
     if direct_hash != enqueue_hash {
         lanes.push(Lane {
             name: format!("{lane_name}-direct"),
@@ -8940,7 +9572,8 @@ fn hash_execution_queue_accounts_for_legacy_direct_enqueue(
     if let Some(user_owner) = remaining_accounts.get(2).map(|account| account.pubkey) {
         fixed_accounts.push(AccountMeta::new(user_owner, true));
     }
-    let effective_remaining = merge_effective_runtime_flags(remaining_accounts, &fixed_accounts);
+    let effective_remaining =
+        merge_effective_runtime_flags(remaining_accounts, &fixed_accounts);
     let mut bytes = Vec::with_capacity(effective_remaining.len() * 34);
     for account in effective_remaining {
         bytes.extend_from_slice(account.pubkey.as_ref());
@@ -9077,6 +9710,139 @@ fn build_presigned_ed25519_instruction(
     }
 }
 
+fn find_execution_queue_v3_page_pda(
+    program_id: Pubkey,
+    queue_root: Pubkey,
+    page_slot: u16,
+) -> Pubkey {
+    Pubkey::find_program_address(
+        &[
+            b"queue-page".as_ref(),
+            queue_root.as_ref(),
+            &page_slot.to_le_bytes(),
+        ],
+        &program_id,
+    )
+    .0
+}
+
+fn build_execution_queue_v3_init_market_page_instruction(
+    program_id: Pubkey,
+    group: Pubkey,
+    authority_state: Pubkey,
+    queue_root: Pubkey,
+    payer: Pubkey,
+    page_slot: u16,
+    assigned_abs_page_no: u64,
+) -> Instruction {
+    let queue_page = find_execution_queue_v3_page_pda(program_id, queue_root, page_slot);
+    Instruction {
+        program_id,
+        accounts: vec![
+            AccountMeta::new_readonly(group, false),
+            AccountMeta::new_readonly(authority_state, false),
+            AccountMeta::new(queue_root, false),
+            AccountMeta::new(queue_page, false),
+            AccountMeta::new(payer, true),
+            AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+        ],
+        data: mango_v4::instruction::ExecutionQueueV3InitMarketPage {
+            page_slot,
+            assigned_abs_page_no,
+        }
+        .data(),
+    }
+}
+
+fn build_enqueue_instruction_v3(
+    program_id: Pubkey,
+    group: Pubkey,
+    authority_state: Pubkey,
+    queue_root: Pubkey,
+    queue_page: Pubkey,
+    remaining_accounts: &[AccountMeta],
+    market_index: u16,
+    envelope: CtmEnvelope,
+    payload: Vec<u8>,
+) -> Instruction {
+    let mut accounts = vec![
+        AccountMeta::new(group, false),
+        AccountMeta::new(authority_state, false),
+        AccountMeta::new(queue_root, false),
+        AccountMeta::new(queue_page, false),
+        AccountMeta::new_readonly(sysvar::instructions::id(), false),
+    ];
+    accounts.extend_from_slice(remaining_accounts);
+    accounts.push(AccountMeta::new_readonly(program_id, false));
+    Instruction {
+        program_id,
+        accounts,
+        data: mango_v4::instruction::ExecutionQueueV3EnqueueMarket {
+            market_index,
+            envelope,
+            payload,
+        }
+        .data(),
+    }
+}
+
+fn build_execute_instruction_v3(
+    program_id: Pubkey,
+    group: Pubkey,
+    authority_state: Pubkey,
+    queue_root: Pubkey,
+    queue_page: Pubkey,
+    remaining_accounts: &[AccountMeta],
+    max_items: u16,
+) -> Instruction {
+    let mut accounts = vec![
+        AccountMeta::new(group, false),
+        AccountMeta::new_readonly(authority_state, false),
+        AccountMeta::new(queue_root, false),
+        AccountMeta::new(queue_page, false),
+    ];
+    accounts.extend_from_slice(remaining_accounts);
+    Instruction {
+        program_id,
+        accounts,
+        data: mango_v4::instruction::ExecutionQueueV3ExecuteMarket { max_items }.data(),
+    }
+}
+
+fn build_execute_multi_instruction_v3(
+    program_id: Pubkey,
+    group: Pubkey,
+    authority_state: Pubkey,
+    queue_root: Pubkey,
+    queue_page: Pubkey,
+    lane_accounts: &[Vec<AccountMeta>],
+    accounts_per_lane: u16,
+    lane_hashes: Vec<[u8; 32]>,
+    max_items: u16,
+) -> Instruction {
+    let lane_count = lane_accounts.len() as u8;
+    let mut accounts = vec![
+        AccountMeta::new(group, false),
+        AccountMeta::new_readonly(authority_state, false),
+        AccountMeta::new(queue_root, false),
+        AccountMeta::new(queue_page, false),
+    ];
+    for lane in lane_accounts {
+        accounts.extend_from_slice(lane);
+    }
+    Instruction {
+        program_id,
+        accounts,
+        data: mango_v4::instruction::ExecutionQueueV3ExecuteMarketMulti {
+            max_items,
+            lane_count,
+            accounts_per_lane,
+            lane_hashes,
+        }
+        .data(),
+    }
+}
+
 fn build_enqueue_instruction(
     program_id: Pubkey,
     group: Pubkey,
@@ -9196,6 +9962,38 @@ fn build_execution_queue_configure_instruction(
     }
 }
 
+fn build_execution_queue_v3_configure_market_root_instruction(
+    program_id: Pubkey,
+    group: Pubkey,
+    authority_state: Pubkey,
+    queue_root: Pubkey,
+    admin: Pubkey,
+    queue_root_state: &PerpMarketQueueRootV3,
+    pause_execute: bool,
+) -> Instruction {
+    Instruction {
+        program_id,
+        accounts: vec![
+            AccountMeta::new_readonly(group, false),
+            AccountMeta::new_readonly(authority_state, false),
+            AccountMeta::new(queue_root, false),
+            AccountMeta::new_readonly(admin, true),
+        ],
+        data: mango_v4::instruction::ExecutionQueueV3ConfigureMarketRoot {
+            params: ExecutionQueueV3MarketRootConfigParams {
+                soft_limit: queue_root_state.soft_limit,
+                recipe_version: queue_root_state.recipe_version,
+                gap_wait_slots: queue_root_state.gap_wait_slots,
+                max_compaction_distance: queue_root_state.max_compaction_distance,
+                min_expiry_buffer_slots: queue_root_state.min_expiry_buffer_slots,
+                pause_ingress: queue_root_state.paused_ingress != 0,
+                pause_execute,
+            },
+        }
+        .data(),
+    }
+}
+
 fn build_execution_queue_drop_ctm_instruction(
     program_id: Pubkey,
     group: Pubkey,
@@ -9216,6 +10014,28 @@ fn build_execution_queue_drop_ctm_instruction(
             sequence,
         }
         .data(),
+    }
+}
+
+fn build_execution_queue_v3_drop_market_instruction(
+    program_id: Pubkey,
+    group: Pubkey,
+    authority_state: Pubkey,
+    queue_root: Pubkey,
+    queue_page: Pubkey,
+    admin: Pubkey,
+    sequence: u64,
+) -> Instruction {
+    Instruction {
+        program_id,
+        accounts: vec![
+            AccountMeta::new_readonly(group, false),
+            AccountMeta::new_readonly(authority_state, false),
+            AccountMeta::new(queue_root, false),
+            AccountMeta::new(queue_page, false),
+            AccountMeta::new_readonly(admin, true),
+        ],
+        data: mango_v4::instruction::ExecutionQueueV3DropMarket { sequence }.data(),
     }
 }
 
@@ -9388,6 +10208,121 @@ fn head_waiting_for_min_execute_slot(head: &QueueHead, chain_slot: u64) -> bool 
             .ctm_min_execute_slot
             .map(|min_execute_slot| chain_slot < min_execute_slot)
             .unwrap_or(false)
+}
+
+fn inspect_v3_queue_head(
+    root: &PerpMarketQueueRootV3,
+    head_page: Option<&ExecutionQueuePageV3>,
+) -> QueueHead {
+    let count = root.live_count;
+    let next_sequence = root.next_sequence_to_execute;
+    let max_seen_sequence = root.max_seen_sequence;
+    if count == 0 {
+        return QueueHead {
+            count,
+            ctm_count: count,
+            liquidity_count: 0,
+            next_sequence,
+            max_seen_sequence,
+            head_accounts_hash: None,
+            source: None,
+            reason: "empty",
+            ctm_sequence: None,
+            ctm_kind: None,
+            ctm_status: None,
+            ctm_min_execute_slot: None,
+        };
+    }
+
+    let Some(page) = head_page else {
+        return QueueHead {
+            count,
+            ctm_count: count,
+            liquidity_count: 0,
+            next_sequence,
+            max_seen_sequence,
+            head_accounts_hash: None,
+            source: None,
+            reason: "ctm_page_missing",
+            ctm_sequence: None,
+            ctm_kind: None,
+            ctm_status: None,
+            ctm_min_execute_slot: None,
+        };
+    };
+
+    let head_abs_page_no = root.head_abs_page_no();
+    let head_page_slot = root.head_page_slot();
+    if page.page_state != QueuePageStateV3::Active as u8
+        || page.page_slot != head_page_slot
+        || page.assigned_abs_page_no != head_abs_page_no
+    {
+        return QueueHead {
+            count,
+            ctm_count: count,
+            liquidity_count: 0,
+            next_sequence,
+            max_seen_sequence,
+            head_accounts_hash: None,
+            source: None,
+            reason: "ctm_page_mismatch",
+            ctm_sequence: None,
+            ctm_kind: None,
+            ctm_status: None,
+            ctm_min_execute_slot: None,
+        };
+    }
+
+    let item = &page.items[root.head_page_offset() as usize];
+    let ctm_sequence = Some(item.sequence);
+    let ctm_kind = Some(item.kind);
+    let ctm_status = Some(item.status);
+    let ctm_min_execute_slot = Some(item.min_execute_slot);
+    if item.status == QueueItemStatusV3::Pending as u8
+        && item.kind == QueueItemKind::CtmWrapped as u8
+        && item.sequence == next_sequence
+    {
+        return QueueHead {
+            count,
+            ctm_count: count,
+            liquidity_count: 0,
+            next_sequence,
+            max_seen_sequence,
+            head_accounts_hash: Some(item.accounts_hash),
+            source: Some(QueueHeadSource::Ctm),
+            reason: "ctm_pending",
+            ctm_sequence,
+            ctm_kind,
+            ctm_status,
+            ctm_min_execute_slot,
+        };
+    }
+
+    let reason = if item.status == QueueItemStatusV3::Empty as u8 {
+        "ctm_gap_or_empty_slot"
+    } else if item.sequence != next_sequence {
+        "ctm_sequence_mismatch"
+    } else if item.kind != QueueItemKind::CtmWrapped as u8 {
+        "ctm_kind_mismatch"
+    } else if item.status != QueueItemStatusV3::Pending as u8 {
+        "ctm_status_mismatch"
+    } else {
+        "head_unavailable"
+    };
+    QueueHead {
+        count,
+        ctm_count: count,
+        liquidity_count: 0,
+        next_sequence,
+        max_seen_sequence,
+        head_accounts_hash: None,
+        source: None,
+        reason,
+        ctm_sequence,
+        ctm_kind,
+        ctm_status,
+        ctm_min_execute_slot,
+    }
 }
 
 fn inspect_queue_head(queue_data: &[u8]) -> QueueHead {
@@ -10405,24 +11340,6 @@ fn harness_user_state_from_fast_positions(
     }
 }
 
-fn harness_user_state_from_mango_account_value(
-    mango_account: Pubkey,
-    account: &MangoAccountValue,
-) -> HarnessUserState {
-    let positions = account
-        .all_perp_positions()
-        .filter(|position| position.is_active())
-        .map(|position| rust_harness::FastPerpPosition {
-            market_index: position.market_index,
-            base_position_lots: position.base_position_lots(),
-            quote_position_native: position.quote_position_native().to_string(),
-            open_bid_base_lots: position.bids_base_lots,
-            open_ask_base_lots: position.asks_base_lots,
-        })
-        .collect();
-    harness_user_state_from_fast_positions(mango_account, positions)
-}
-
 /// Phase 4-lite fast-path converter: build a `HarnessUserState` from a
 /// single-account `AccountSnapshot` returned by
 /// `ContinuumStateEngine::account_snapshot_fast`. Only used by the margin
@@ -10718,6 +11635,35 @@ async fn async_main() -> Result<()> {
         Arc::new(SequenceStore::new(config.sequence_state_path.clone(), metrics.clone()).await?);
     let blockhashes =
         Arc::new(BlockhashManager::new(rpc.clone(), config.blockhash_refresh_ms).await?);
+    let configured_queue_v3 = if config.queue_topology.is_v3() {
+        let group_pk = config
+            .executor_group
+            .context("EXECUTION_QUEUE_GROUP_PK is required when EXECUTION_QUEUE_TOPOLOGY=v3")?;
+        let queue_pk = config
+            .executor_queue
+            .context("EXECUTION_QUEUE_PK is required when EXECUTION_QUEUE_TOPOLOGY=v3")?;
+        let account = rpc
+            .get_account(&queue_pk)
+            .await
+            .with_context(|| format!("failed to fetch configured v3 queue root {queue_pk}"))?;
+        let mut data: &[u8] = &account.data;
+        let root = PerpMarketQueueRootV3::try_deserialize(&mut data)
+            .with_context(|| format!("failed to deserialize configured v3 queue root {queue_pk}"))?;
+        if root.group != group_pk {
+            return Err(anyhow!(
+                "configured v3 queue root group mismatch: root.group={} configured.group={group_pk}",
+                root.group
+            ));
+        }
+        Some(QueueV3RuntimeConfig {
+            authority_state: root.authority_state,
+            market_index: root.market_index,
+            page_size: root.page_size,
+            num_pages: root.num_pages,
+        })
+    } else {
+        None
+    };
     // Phase 2B: build one ExecutorState per active market_index. The lanes
     // map is shared across all per-market executors (each filters lanes by
     // perp_market pubkey internally). The first executor (lowest
@@ -10727,16 +11673,34 @@ async fn async_main() -> Result<()> {
         let static_lanes = load_executor_lanes(config.as_ref())?;
         let group_pk = config.executor_group.expect("executor group");
         let queue_pk = config.executor_queue.expect("executor queue");
-        let markets = discover_markets_from_lanes(rpc.as_ref(), &static_lanes).await?;
-        let mut all = Vec::with_capacity(markets.len());
-        for (market_index, perp_market_pk) in markets {
+        let mut all = Vec::new();
+        if let Some(v3) = configured_queue_v3.as_ref() {
+            let markets = discover_markets_from_lanes(rpc.as_ref(), &static_lanes).await?;
+            let perp_market_pk = markets
+                .iter()
+                .find_map(|(market_index, perp_market_pk)| {
+                    (*market_index == v3.market_index).then_some(*perp_market_pk)
+                })
+                .unwrap_or_default();
             all.push(Arc::new(ExecutorState::new(
                 group_pk,
                 queue_pk,
-                market_index,
+                v3.market_index,
                 perp_market_pk,
                 static_lanes.clone(),
             )));
+        } else {
+            let markets = discover_markets_from_lanes(rpc.as_ref(), &static_lanes).await?;
+            all.reserve(markets.len());
+            for (market_index, perp_market_pk) in markets {
+                all.push(Arc::new(ExecutorState::new(
+                    group_pk,
+                    queue_pk,
+                    market_index,
+                    perp_market_pk,
+                    static_lanes.clone(),
+                )));
+            }
         }
         let primary = all.first().cloned();
         info!(
@@ -10807,9 +11771,8 @@ async fn async_main() -> Result<()> {
     // Phase 2: optional in-process optimistic state. If
     // CTM_RELAYER_LOCAL_STATE=true, fetch a one-time snapshot from the
     // legacy harness and seed an in-process ContinuumStateEngine. The
-    // relayer then owns its own copy and keeps margin precheck on the
-    // Rust hot path instead of falling back to /state/users. Misses can
-    // still bootstrap a single MangoAccount directly from RPC.
+    // relayer then owns its own copy and never hits the harness HTTP
+    // endpoint on the hot path again.
     let local_state = if config.local_state_enabled {
         match bootstrap_local_state(
             &config.local_state_bootstrap_url,
@@ -10825,9 +11788,7 @@ async fn async_main() -> Result<()> {
                 Some(Arc::new(PlMutex::new(engine)))
             }
             Err(err) => {
-                warn!(
-                    "local-state bootstrap failed; continuing without local margin state and using direct MangoAccount RPC reads on margin misses instead of /state/users: {err:#}"
-                );
+                warn!("local-state bootstrap failed; falling back to legacy HTTP path: {err:#}");
                 None
             }
         }
@@ -10846,6 +11807,8 @@ async fn async_main() -> Result<()> {
         http_client: reqwest::Client::new(),
         harness_readiness: Arc::new(Mutex::new(None)),
         executor: executor.clone(),
+        configured_queue_v3: configured_queue_v3.clone(),
+        known_v3_pages: Arc::new(StdMutex::new(HashSet::new())),
         execute_nonce: Arc::new(AtomicU64::new(1)),
         blocked_mango_accounts: Arc::new(Mutex::new(HashMap::new())),
         unique_addresses: unique_addresses.clone(),
@@ -10861,36 +11824,6 @@ async fn async_main() -> Result<()> {
         ingress_failure_memo: Arc::new(StdMutex::new(HashMap::new())),
         ingress_rate_slots: Arc::new(StdMutex::new(HashMap::new())),
     });
-
-    if let Some(group) = config.executor_group {
-        let engine_for_bootstrap = engine.clone();
-        tokio::spawn(async move {
-            loop {
-                match engine_for_bootstrap
-                    .bootstrap_group_static_account_mirror(group)
-                    .await
-                {
-                    Ok(mirror) => {
-                        info!(
-                            group = %group,
-                            banks = mirror.banks_by_token_index.len(),
-                            perps = mirror.perps_by_market_index.len(),
-                            "configured group static account mirror bootstrapped"
-                        );
-                        break;
-                    }
-                    Err(err) => {
-                        warn!(
-                            group = %group,
-                            error = %err,
-                            "configured group static account mirror not ready yet; retrying"
-                        );
-                        sleep(Duration::from_millis(1_000)).await;
-                    }
-                }
-            }
-        });
-    }
 
     // Spawn the bg submitter worker pool. Each worker shares the receiver
     // via a tokio Mutex (work-stealing). Workers exit when the channel
@@ -11176,12 +12109,8 @@ mod tests {
                 fallback_oracles: vec![usdc_fallback],
             },
         );
-        group_mirror
-            .perps_by_market_index
-            .insert(0, sol_market.clone());
-        group_mirror
-            .perps_by_market_index
-            .insert(1, btc_market.clone());
+        group_mirror.perps_by_market_index.insert(0, sol_market.clone());
+        group_mirror.perps_by_market_index.insert(1, btc_market.clone());
 
         let mango_mirror = MangoAccountMirror {
             token_indices: vec![0],
@@ -11218,10 +12147,7 @@ mod tests {
             usdc_fallback,
         ];
         assert_eq!(
-            derived
-                .iter()
-                .map(|account| account.pubkey)
-                .collect::<Vec<_>>(),
+            derived.iter().map(|account| account.pubkey).collect::<Vec<_>>(),
             expected_pubkeys
         );
         assert!(!derived[0].is_writable);
@@ -11249,8 +12175,10 @@ mod tests {
             ..envelope_a.clone()
         };
 
-        let v1_a = canonical_user_intent_message_v1(group, mango_account, user_owner, &envelope_a);
-        let v1_b = canonical_user_intent_message_v1(group, mango_account, user_owner, &envelope_b);
+        let v1_a =
+            canonical_user_intent_message_v1(group, mango_account, user_owner, &envelope_a);
+        let v1_b =
+            canonical_user_intent_message_v1(group, mango_account, user_owner, &envelope_b);
         let v2_a = canonical_user_intent_message_v2(
             group,
             mango_account,
@@ -12326,20 +13254,16 @@ mod tests {
         let hashes: HashSet<[u8; 32]> = lanes.iter().map(|lane| lane.hash).collect();
 
         assert_eq!(lanes.len(), 2);
-        assert!(
-            hashes.contains(&hash_execution_queue_accounts_for_ctm_enqueue(
-                group,
-                execution_queue,
-                &remaining_accounts,
-            ))
-        );
-        assert!(
-            hashes.contains(&hash_execution_queue_accounts_for_legacy_direct_enqueue(
-                group,
-                execution_queue,
-                &remaining_accounts,
-            ))
-        );
+        assert!(hashes.contains(&hash_execution_queue_accounts_for_ctm_enqueue(
+            group,
+            execution_queue,
+            &remaining_accounts,
+        )));
+        assert!(hashes.contains(&hash_execution_queue_accounts_for_legacy_direct_enqueue(
+            group,
+            execution_queue,
+            &remaining_accounts,
+        )));
     }
 
     #[test]

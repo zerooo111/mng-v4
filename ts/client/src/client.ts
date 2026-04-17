@@ -101,6 +101,11 @@ import {
   buildExecutionQueueEnqueueCtmWithIntentIxs,
   buildExecutionQueueEnqueueLiquidityIx,
   buildExecutionQueueExecuteIx,
+  buildExecutionQueueV3EnqueueCtmWithIntentIxs,
+  buildExecutionQueueV3EnqueueDirectWithIntentIxs,
+  buildExecutionQueueV3ExecuteIx,
+  buildExecutionQueueV3InitMarketPageIx,
+  decodeExecutionQueueV3MarketRoot,
   encodePerpBatchIntentQueuePayload,
   encodePerpCancelAllOrdersBySideQueuePayload,
   encodePerpCancelAllOrdersQueuePayload,
@@ -108,6 +113,10 @@ import {
   encodePerpCancelOrderByClientOrderIdQueuePayload,
   encodePerpCancelOrderQueuePayload,
   encodePerpPlaceOrderV2QueuePayload,
+  executionQueueV3AbsPageNoForSequence,
+  executionQueueV3NextEnqueueSequence,
+  executionQueueV3PageSlotForSequence,
+  findExecutionQueuePageV3Pda,
   QueueItemKind,
 } from './executionQueue';
 import { buildCanonicalHealthRemainingAccountKeys } from './healthAccounts';
@@ -230,6 +239,39 @@ export type ExecutionQueuePerpBatchIntentWithIntentParams =
   ExecutionQueueBaseCtmParams & {
     operations: ExecutionQueuePerpBatchIntentOp[];
   };
+
+export type ExecutionQueueV3EnqueueCtmWithIntentParams = {
+  queueRoot: PublicKey;
+  marketIndex: number;
+  remainingAccounts: AccountMeta[];
+  payload: Uint8Array;
+  sequence: bigint | BN | number;
+  minExecuteSlot: bigint | BN | number;
+  expiresAtSlot?: bigint | BN | number;
+  userOwner: PublicKey;
+  mangoAccount: PublicKey;
+  userSigner: IntentSigner;
+  ctmSigner: IntentSigner;
+};
+
+export type ExecutionQueueV3EnqueueDirectWithIntentParams = {
+  queueRoot: PublicKey;
+  marketIndex: number;
+  remainingAccounts: AccountMeta[];
+  payload: Uint8Array;
+  minExecuteSlot?: bigint | BN | number;
+  expiresAtSlot?: bigint | BN | number;
+  userOwner: PublicKey;
+  mangoAccount: PublicKey;
+  userSigner: IntentSigner;
+};
+
+export type ExecutionQueueV3ExecuteParams = {
+  queueRoot: PublicKey;
+  marketIndex: number;
+  remainingAccounts: AccountMeta[];
+  maxItems: number;
+};
 
 export type TxCallbackOptions = {
   txid: string;
@@ -6230,50 +6272,6 @@ export class MangoClient {
     serumOpenOrdersForMarket: [Serum3Market, PublicKey][] = [],
     openbookOpenOrdersForMarket: [OpenbookV2Market, PublicKey][] = [],
   ): Promise<PublicKey[]> {
-    const requiredTokenIndices = uniq(
-      [
-        ...mangoAccounts
-          .map((mangoAccount) => mangoAccount.tokens.map((t) => t.tokenIndex))
-          .flat()
-          .filter((tokenIndex) => tokenIndex !== TokenPosition.TokenIndexUnset),
-        ...banks.map((bank) => bank.tokenIndex),
-      ] as TokenIndex[],
-    );
-    if (
-      requiredTokenIndices.some(
-        (tokenIndex) => !group.banksMapByTokenIndex.has(tokenIndex),
-      )
-    ) {
-      await group.reloadBanks(this);
-    }
-    if (
-      requiredTokenIndices.some(
-        (tokenIndex) => !group.mintInfosMapByTokenIndex.has(tokenIndex),
-      )
-    ) {
-      await group.reloadMintInfos(this);
-    }
-
-    const requiredPerpMarketIndices = uniq(
-      [
-        ...mangoAccounts
-          .map((mangoAccount) => mangoAccount.perps.map((p) => p.marketIndex))
-          .flat()
-          .filter(
-            (marketIndex) =>
-              marketIndex !== PerpPosition.PerpMarketIndexUnset,
-          ),
-        ...perpMarkets.map((perpMarket) => perpMarket.perpMarketIndex),
-      ] as PerpMarketIndex[],
-    );
-    if (
-      requiredPerpMarketIndices.some(
-        (marketIndex) => !group.perpMarketsMapByMarketIndex.has(marketIndex),
-      )
-    ) {
-      await group.reloadPerpMarkets(this);
-    }
-
     const tokenPositionIndices = mangoAccounts
       .map((mangoAccount) => mangoAccount.tokens.map((t) => t.tokenIndex))
       .flat();
@@ -6583,24 +6581,12 @@ export class MangoClient {
     perpMarketIndex: PerpMarketIndex,
     userOwner?: PublicKey,
   ): Promise<AccountMeta[]> {
-    if (!group.perpMarketsMapByMarketIndex.has(perpMarketIndex)) {
-      await group.reloadPerpMarkets(this);
-    }
     const perpMarket = group.getPerpMarketByMarketIndex(perpMarketIndex);
-    if (!group.banksMapByTokenIndex.has(perpMarket.settleTokenIndex)) {
-      await group.reloadBanks(this);
-    }
-    if (!group.mintInfosMapByTokenIndex.has(perpMarket.settleTokenIndex)) {
-      await group.reloadMintInfos(this);
-    }
-    const settlementBank = group.getFirstBankByTokenIndex(
-      perpMarket.settleTokenIndex,
-    );
     const healthRemainingAccounts: PublicKey[] =
       await this.buildHealthRemainingAccounts(
         group,
         [mangoAccount],
-        [settlementBank],
+        [group.getFirstBankForPerpSettlement()],
         [perpMarket],
       );
 
@@ -6684,8 +6670,9 @@ export class MangoClient {
 
     if (exists === undefined) {
       const ai = await this.connection.getAccountInfo(riskSidecar);
-      exists = !!ai && ai.owner.equals(this.programId);
-      this.riskSidecarExistsCache.set(cacheKey, exists);
+      const resolvedExists = !!ai && ai.owner.equals(this.programId);
+      exists = resolvedExists;
+      this.riskSidecarExistsCache.set(cacheKey, resolvedExists);
     }
 
     if (!exists) {
@@ -6693,6 +6680,62 @@ export class MangoClient {
     }
 
     return [{ pubkey: riskSidecar, isSigner: false, isWritable }];
+  }
+
+  private async fetchExecutionQueueV3MarketRoot(queueRoot: PublicKey) {
+    const accountInfo = await this.connection.getAccountInfo(queueRoot);
+    if (!accountInfo) {
+      throw new Error(`missing execution queue v3 root account ${queueRoot.toBase58()}`);
+    }
+    return decodeExecutionQueueV3MarketRoot(Buffer.from(accountInfo.data));
+  }
+
+  private async prepareExecutionQueueV3Page(
+    group: Group,
+    queueRoot: PublicKey,
+    sequence: bigint,
+  ): Promise<{
+    authorityState: PublicKey;
+    queuePage: PublicKey;
+    initInstructions: TransactionInstruction[];
+    marketIndex: number;
+  }> {
+    const root = await this.fetchExecutionQueueV3MarketRoot(queueRoot);
+    const pageSlot = executionQueueV3PageSlotForSequence(
+      sequence,
+      root.pageSize,
+      root.numPages,
+    );
+    const assignedAbsPageNo = executionQueueV3AbsPageNoForSequence(
+      sequence,
+      root.pageSize,
+    );
+    const queuePage = findExecutionQueuePageV3Pda(
+      this.programId,
+      queueRoot,
+      pageSlot,
+    );
+    const initInstructions: TransactionInstruction[] = [];
+    const pageAccount = await this.connection.getAccountInfo(queuePage);
+    if (!pageAccount) {
+      initInstructions.push(
+        buildExecutionQueueV3InitMarketPageIx({
+          programId: this.programId,
+          group: group.publicKey,
+          authorityState: root.authorityState,
+          queueRoot,
+          payer: this.walletPk,
+          pageSlot,
+          assignedAbsPageNo,
+        }),
+      );
+    }
+    return {
+      authorityState: root.authorityState,
+      queuePage,
+      initInstructions,
+      marketIndex: root.marketIndex,
+    };
   }
 
   public async executionQueueEnqueueCtmWithIntent(
@@ -6766,6 +6809,119 @@ export class MangoClient {
       marketIndex,
       remainingAccounts,
       maxItems,
+    });
+    return await this.sendAndConfirmTransactionForGroup(group, [executeIx], opts);
+  }
+
+  public async executionQueueV3EnqueueCtmWithIntent(
+    group: Group,
+    params: ExecutionQueueV3EnqueueCtmWithIntentParams,
+    opts: SendTransactionOpts = {},
+  ): Promise<MangoSignatureStatus> {
+    const sequence = BigInt(params.sequence.toString());
+    const pagePlan = await this.prepareExecutionQueueV3Page(
+      group,
+      params.queueRoot,
+      sequence,
+    );
+    if (pagePlan.marketIndex !== params.marketIndex) {
+      throw new Error(
+        `queue root market mismatch: root=${pagePlan.marketIndex} params=${params.marketIndex}`,
+      );
+    }
+    const built = buildExecutionQueueV3EnqueueCtmWithIntentIxs({
+      programId: this.programId,
+      group: group.publicKey,
+      authorityState: pagePlan.authorityState,
+      queueRoot: params.queueRoot,
+      queuePage: pagePlan.queuePage,
+      marketIndex: params.marketIndex,
+      remainingAccounts: params.remainingAccounts,
+      payload: params.payload,
+      sequence,
+      minExecuteSlot: params.minExecuteSlot,
+      expiresAtSlot: params.expiresAtSlot,
+      userOwner: params.userOwner,
+      mangoAccount: params.mangoAccount,
+      userSigner: params.userSigner,
+      ctmSigner: params.ctmSigner,
+    });
+
+    return await this.sendAndConfirmTransactionForGroup(
+      group,
+      [...pagePlan.initInstructions, ...built.instructions],
+      opts,
+    );
+  }
+
+  public async executionQueueV3EnqueueDirectWithIntent(
+    group: Group,
+    params: ExecutionQueueV3EnqueueDirectWithIntentParams,
+    opts: SendTransactionOpts = {},
+  ): Promise<MangoSignatureStatus> {
+    const root = await this.fetchExecutionQueueV3MarketRoot(params.queueRoot);
+    if (root.marketIndex !== params.marketIndex) {
+      throw new Error(
+        `queue root market mismatch: root=${root.marketIndex} params=${params.marketIndex}`,
+      );
+    }
+    const nextSequence = executionQueueV3NextEnqueueSequence(root);
+    const pagePlan = await this.prepareExecutionQueueV3Page(
+      group,
+      params.queueRoot,
+      nextSequence,
+    );
+    const built = buildExecutionQueueV3EnqueueDirectWithIntentIxs({
+      programId: this.programId,
+      group: group.publicKey,
+      authorityState: pagePlan.authorityState,
+      queueRoot: params.queueRoot,
+      queuePage: pagePlan.queuePage,
+      marketIndex: params.marketIndex,
+      remainingAccounts: params.remainingAccounts,
+      payload: params.payload,
+      minExecuteSlot: params.minExecuteSlot,
+      expiresAtSlot: params.expiresAtSlot,
+      userOwner: params.userOwner,
+      mangoAccount: params.mangoAccount,
+      userSigner: params.userSigner,
+    });
+
+    return await this.sendAndConfirmTransactionForGroup(
+      group,
+      [...pagePlan.initInstructions, ...built.instructions],
+      opts,
+    );
+  }
+
+  public async executionQueueV3Execute(
+    group: Group,
+    params: ExecutionQueueV3ExecuteParams,
+    opts: SendTransactionOpts = {},
+  ): Promise<MangoSignatureStatus> {
+    const root = await this.fetchExecutionQueueV3MarketRoot(params.queueRoot);
+    if (root.marketIndex !== params.marketIndex) {
+      throw new Error(
+        `queue root market mismatch: root=${root.marketIndex} params=${params.marketIndex}`,
+      );
+    }
+    const queuePage = findExecutionQueuePageV3Pda(
+      this.programId,
+      params.queueRoot,
+      executionQueueV3PageSlotForSequence(
+        root.nextSequenceToExecute,
+        root.pageSize,
+        root.numPages,
+      ),
+    );
+    const executeIx = buildExecutionQueueV3ExecuteIx({
+      programId: this.programId,
+      group: group.publicKey,
+      authorityState: root.authorityState,
+      queueRoot: params.queueRoot,
+      queuePage,
+      remainingAccounts: params.remainingAccounts,
+      maxItems: params.maxItems,
     });
     return await this.sendAndConfirmTransactionForGroup(group, [executeIx], opts);
   }

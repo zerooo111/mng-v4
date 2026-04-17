@@ -28,7 +28,6 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use serde::Deserialize;
@@ -89,32 +88,32 @@ pub async fn sse_handler(
     // --- Build mapped stream ---
     let raw = BroadcastStream::new(tx.subscribe());
 
+    // tokio_stream::StreamExt::filter_map takes a sync FnMut → Option<T>;
+    // all our mapping operations are synchronous (serialise + Arc ops), so no
+    // async wrapper is needed here.
     let mapped = raw.filter_map(move |result| {
-        let metrics = Arc::clone(&metrics);
-        async move {
-            match result {
-                Ok(ev) => {
-                    // Skip events already covered by the snapshot the client
-                    // fetched before subscribing.
-                    if from_seq > 0 {
-                        if let Some(seq) = ev.sequence() {
-                            if seq <= from_seq {
-                                return None;
-                            }
+        match result {
+            Ok(ev) => {
+                // Skip events already covered by the snapshot the client
+                // fetched before subscribing.
+                if from_seq > 0 {
+                    if let Some(seq) = ev.sequence() {
+                        if seq <= from_seq {
+                            return None;
                         }
                     }
-                    let data = serde_json::to_string(&ev.0).unwrap_or_default();
-                    Some(Ok::<Event, Infallible>(
-                        Event::default().event("event").data(data),
-                    ))
                 }
-                Err(BroadcastStreamRecvError::Lagged(n)) => {
-                    metrics.inc_lagged();
-                    // Tell the client to re-fetch snapshot and re-subscribe.
-                    Some(Ok(Event::default()
-                        .event("resync")
-                        .data(format!("lagged_by={n}"))))
-                }
+                let data = serde_json::to_string(&ev.0).unwrap_or_default();
+                Some(Ok::<Event, Infallible>(
+                    Event::default().event("event").data(data),
+                ))
+            }
+            Err(BroadcastStreamRecvError::Lagged(n)) => {
+                metrics.inc_lagged();
+                // Tell the client to re-fetch snapshot and re-subscribe.
+                Some(Ok(Event::default()
+                    .event("resync")
+                    .data(format!("lagged_by={n}"))))
             }
         }
     });
