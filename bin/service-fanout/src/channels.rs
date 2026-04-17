@@ -1,13 +1,4 @@
 /// Per-market broadcast channels and snapshot cache.
-///
-/// `ChannelRegistry` is the single source of truth for:
-/// - The `broadcast::Sender<Arc<EventEnvelope>>` that fans out events O(1)
-///   to all SSE subscribers of a given market.
-/// - The `RwLock<MarketSnapshot>` that stores the latest state for new
-///   client onboarding (snapshot-then-stream reconnect pattern).
-///
-/// Both maps are `DashMap`-backed for lock-free concurrent access from
-/// the ingest handler (writer) and many SSE handlers (readers).
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -123,13 +114,12 @@ impl ChannelRegistry {
     /// Called by the ingest handler for every incoming event.
     ///
     /// 1. Ensures sender + snapshot exist for the market.
-    /// 2. Broadcasts `ev` to all current subscribers (O(1)).
-    /// 3. Applies `ev` to the snapshot under a write lock (held for
-    ///    microseconds — never across an `.await`).
+    /// 2. Applies the event to the snapshot, assigning the next cursor.
+    /// 3. Broadcasts the cursor-tagged event to all current subscribers.
     ///
     /// Returns the number of active receivers the event was delivered to
     /// (may be 0 if nobody is subscribed yet).
-    pub async fn dispatch(&self, ev: Arc<EventEnvelope>) -> usize {
+    pub async fn dispatch(&self, ev: EventEnvelope) -> usize {
         let market = match ev.market() {
             Some(m) => m.to_string(),
             None => return 0,
@@ -138,12 +128,44 @@ impl ChannelRegistry {
         let tx = self.get_or_create_sender(&market);
         let snap = self.get_or_create_snapshot(&market);
 
-        // Broadcast first (O(1), non-blocking).
-        let receiver_count = tx.send(Arc::clone(&ev)).unwrap_or(0);
-
-        // Update snapshot (write lock, no await inside).
-        snap.write().await.apply(&ev);
+        // Apply first so snapshot and cursor state are visible before any
+        // subscriber sees the event on the live stream.
+        let ev = snap.write().await.apply(ev);
+        let receiver_count = tx.send(ev).unwrap_or(0);
 
         receiver_count
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn dispatch_assigns_cursor_before_broadcast() {
+        let registry = ChannelRegistry::new(16, 8);
+        let tx = registry.get_or_create_sender("0");
+        let mut rx = tx.subscribe();
+
+        let delivered = registry
+            .dispatch(
+                crate::types::EventEnvelope::from_value(serde_json::json!({
+                    "market": "0",
+                    "sequence": "1",
+                    "ts_ms": 100
+                }))
+                .unwrap(),
+            )
+            .await;
+
+        assert_eq!(delivered, 1);
+
+        let ev = rx.recv().await.unwrap();
+        assert_eq!(ev.cursor(), 1);
+
+        let snapshot = registry.get_snapshot("0").unwrap();
+        let snapshot = snapshot.read().await;
+        assert_eq!(snapshot.last_cursor, 1);
+        assert_eq!(snapshot.first_cursor(), Some(1));
     }
 }

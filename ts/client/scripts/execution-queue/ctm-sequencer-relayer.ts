@@ -77,7 +77,51 @@ const RELAYER_DEFAULT_EXPIRES_AT_SLOT = BigInt(
   process.env.CTM_RELAYER_DEFAULT_EXPIRES_AT_SLOT ?? '0',
 );
 const EXECUTION_QUEUE_BUFFER_PK = process.env.EXECUTION_QUEUE_BUFFER_PK;
-const RELAYER_EVENT_SINK_URL = process.env.CTM_RELAYER_EVENT_SINK_URL || '';
+const RELAYER_HARNESS_BASE_URL = (
+  process.env.CTM_RELAYER_HARNESS_BASE_URL || ''
+).trim().replace(/\/+$/, '');
+
+function parseBoolEnv(raw: string | undefined, defaultValue: boolean): boolean {
+  if (raw === undefined) {
+    return defaultValue;
+  }
+  return raw === '1' || raw.toLowerCase() === 'true';
+}
+
+function normalizeBaseUrl(raw: string | undefined): string {
+  return (raw || '').trim().replace(/\/+$/, '');
+}
+
+function resolveRelayerEventSinkUrl(): string {
+  const explicit = normalizeBaseUrl(process.env.CTM_RELAYER_EVENT_SINK_URL);
+  if (explicit) {
+    return explicit;
+  }
+
+  const fanoutMode = (
+    process.env.CTM_FANOUT_MODE ||
+    (parseBoolEnv(process.env.CTM_FANOUT_ENABLED, false) ? 'local' : 'disabled')
+  )
+    .trim()
+    .toLowerCase();
+
+  if (
+    fanoutMode === 'local' ||
+    fanoutMode === 'external' ||
+    fanoutMode === 'gateway'
+  ) {
+    const fanoutBaseUrl =
+      normalizeBaseUrl(process.env.CTM_FANOUT_BASE_URL) ||
+      'http://127.0.0.1:9094';
+    return `${fanoutBaseUrl}/ingest`;
+  }
+
+  return RELAYER_HARNESS_BASE_URL
+    ? `${RELAYER_HARNESS_BASE_URL}/ingest/relay-intent`
+    : '';
+}
+
+const RELAYER_EVENT_SINK_URL = resolveRelayerEventSinkUrl();
 const RELAYER_EVENT_SINK_AUTH_TOKEN =
   process.env.CTM_RELAYER_EVENT_SINK_AUTH_TOKEN || '';
 const RELAYER_PRIORITIZATION_FEE = Number(

@@ -19,6 +19,13 @@ path = "src/main.rs"
 [dependencies]
 anyhow             = "1.0"
 async-trait        = "0.1"
+redis              = { version = "0.24", features = ["aio", "tokio-comp", "connection-manager", "streams"] }
+reqwest            = { version = "=0.11.17", default-features = false, features = ["json", "rustls-tls"] }
+# redis 0.24 → url 2.x → idna. idna 0.5+ uses icu_locale_core 2.x which
+# requires rustc 1.86.  Pin url + idna to the last versions that do not
+# pull in the ICU crate family (compatible with our rustc 1.70 floor).
+url                = "=2.4.1"
+idna               = "=0.4.0"
 axum               = { version = "0.6", features = ["headers"] }   # resolves to 0.6.20
 base64             = "=0.21.7"
 dashmap            = "=4.0.2"
@@ -58,6 +65,9 @@ lock_api           = "=0.4.12"
 # pin-project 1.1.11 requires 1.71; 1.1.3 requires 1.56.
 pin-project          = "=1.1.3"
 pin-project-internal = "=1.1.3"
+# indexmap 2.14.0 is edition 2024; pin to the Rust-1.70-compatible release
+# already used in the main workspace.
+indexmap             = "=2.0.0"
 # ryu 1.0.23 requires 1.71; 1.0.20 requires 1.36.
 ryu                  = "=1.0.20"
 

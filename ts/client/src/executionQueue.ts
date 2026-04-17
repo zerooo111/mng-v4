@@ -286,6 +286,22 @@ export type DecodedExecutionQueueV3MarketRoot = {
   recipeVersion: number;
 };
 
+export const EXECUTION_QUEUE_V3_PAGE_CREATE_SPACE = 8;
+export const EXECUTION_QUEUE_V3_PAGE_SPACE = 59464;
+export const EXECUTION_QUEUE_V3_MAX_REALLOC_INSTRUCTION_BYTES = 10240;
+
+export type BuildExecutionQueueV3CreateMarketPageParams = {
+  programId: PublicKey;
+  group: PublicKey;
+  authorityState: PublicKey;
+  queueRoot: PublicKey;
+  payer: PublicKey;
+  pageSlot: number;
+};
+
+export type BuildExecutionQueueV3ResizeMarketPageParams =
+  BuildExecutionQueueV3CreateMarketPageParams;
+
 export type BuildExecutionQueueV3InitMarketPageParams = {
   programId: PublicKey;
   group: PublicKey;
@@ -1071,6 +1087,64 @@ export function buildExecutionQueueV3InitMarketPageIx(
       anchorInstructionDiscriminator('execution_queue_v3_init_market_page'),
       u16ToLe(params.pageSlot),
       u64ToLe(params.assignedAbsPageNo),
+    ]),
+  });
+}
+
+export function buildExecutionQueueV3CreateMarketPageIx(
+  params: BuildExecutionQueueV3CreateMarketPageParams,
+): TransactionInstruction {
+  const queuePage = findExecutionQueuePageV3Pda(
+    params.programId,
+    params.queueRoot,
+    params.pageSlot,
+  );
+  return new TransactionInstruction({
+    programId: params.programId,
+    keys: [
+      { pubkey: params.group, isSigner: false, isWritable: false },
+      { pubkey: params.authorityState, isSigner: false, isWritable: false },
+      { pubkey: params.queueRoot, isSigner: false, isWritable: true },
+      { pubkey: queuePage, isSigner: false, isWritable: true },
+      { pubkey: params.payer, isSigner: true, isWritable: true },
+      {
+        pubkey: SystemProgram.programId,
+        isSigner: false,
+        isWritable: false,
+      },
+    ],
+    data: Buffer.concat([
+      anchorInstructionDiscriminator('execution_queue_v3_create_market_page'),
+      u16ToLe(params.pageSlot),
+    ]),
+  });
+}
+
+export function buildExecutionQueueV3ResizeMarketPageIx(
+  params: BuildExecutionQueueV3ResizeMarketPageParams,
+): TransactionInstruction {
+  const queuePage = findExecutionQueuePageV3Pda(
+    params.programId,
+    params.queueRoot,
+    params.pageSlot,
+  );
+  return new TransactionInstruction({
+    programId: params.programId,
+    keys: [
+      { pubkey: params.group, isSigner: false, isWritable: false },
+      { pubkey: params.authorityState, isSigner: false, isWritable: false },
+      { pubkey: params.queueRoot, isSigner: false, isWritable: true },
+      { pubkey: queuePage, isSigner: false, isWritable: true },
+      { pubkey: params.payer, isSigner: true, isWritable: true },
+      {
+        pubkey: SystemProgram.programId,
+        isSigner: false,
+        isWritable: false,
+      },
+    ],
+    data: Buffer.concat([
+      anchorInstructionDiscriminator('execution_queue_v3_resize_market_page'),
+      u16ToLe(params.pageSlot),
     ]),
   });
 }

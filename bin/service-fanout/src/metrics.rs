@@ -6,9 +6,9 @@
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::extract::State;
 
 use crate::app::AppState;
 
@@ -37,6 +37,18 @@ pub struct Metrics {
     // --- auth side ---
     /// Requests that failed authentication.
     pub auth_failures: AtomicU64,
+
+    // --- redis side (only meaningful when FANOUT_REDIS_URL is set) ---
+    /// Events successfully published to Redis.
+    pub redis_published: AtomicU64,
+    /// Failed Redis PUBLISH calls (connection error / timeout).
+    pub redis_publish_errors: AtomicU64,
+    /// Events received from Redis subscriber and dispatched locally.
+    pub redis_subscriber_dispatched: AtomicU64,
+    /// Events successfully forwarded upstream to the harness ingest path.
+    pub upstream_forwarded: AtomicU64,
+    /// Failed upstream forward attempts (HTTP error / non-2xx).
+    pub upstream_forward_errors: AtomicU64,
 }
 
 impl Metrics {
@@ -68,6 +80,22 @@ impl Metrics {
     }
     pub fn inc_auth_failure(&self) {
         self.auth_failures.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_redis_published(&self) {
+        self.redis_published.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_redis_publish_error(&self) {
+        self.redis_publish_errors.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_redis_subscriber_dispatched(&self) {
+        self.redis_subscriber_dispatched
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_upstream_forwarded(&self) {
+        self.upstream_forwarded.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_upstream_forward_error(&self) {
+        self.upstream_forward_errors.fetch_add(1, Ordering::Relaxed);
     }
 
     // -----------------------------------------------------------------------
@@ -119,6 +147,36 @@ impl Metrics {
             "fanout_auth_failures_total",
             "Requests that failed JWT or API-key authentication",
             self.auth_failures.load(Ordering::Relaxed),
+        );
+        write_counter(
+            &mut out,
+            "fanout_redis_published_total",
+            "Events successfully published to Redis (multi-instance mode only)",
+            self.redis_published.load(Ordering::Relaxed),
+        );
+        write_counter(
+            &mut out,
+            "fanout_redis_publish_errors_total",
+            "Failed Redis PUBLISH calls (connection error / timeout)",
+            self.redis_publish_errors.load(Ordering::Relaxed),
+        );
+        write_counter(
+            &mut out,
+            "fanout_redis_subscriber_dispatched_total",
+            "Events received from Redis subscriber and dispatched locally",
+            self.redis_subscriber_dispatched.load(Ordering::Relaxed),
+        );
+        write_counter(
+            &mut out,
+            "fanout_upstream_forwarded_total",
+            "Events successfully forwarded to the upstream ingest endpoint",
+            self.upstream_forwarded.load(Ordering::Relaxed),
+        );
+        write_counter(
+            &mut out,
+            "fanout_upstream_forward_errors_total",
+            "Failed forward attempts to the upstream ingest endpoint",
+            self.upstream_forward_errors.load(Ordering::Relaxed),
         );
 
         out

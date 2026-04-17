@@ -21,6 +21,7 @@ RUN_DIR="${LOCALNET_DIR}/run"
 PID_DIR="${RUN_DIR}/pids"
 FRONTEND_RUN_DIR="${FRONTEND_DIR}/.localdev"
 EXECUTION_ENGINE_BIN="${MNG_DIR}/target/debug/service-mango-execution-engine"
+FANOUT_BIN="${MNG_DIR}/bin/service-fanout/target/debug/service-fanout"
 KEYPAIRS_DIR="${KEYPAIRS_DIR:-${MNG_DIR}/keypairs}"
 SCREEN_DIR="${SCREEN_DIR:-${ROOT_DIR}/.screen}"
 USE_SCREEN="${USE_SCREEN:-true}"
@@ -43,6 +44,7 @@ CTM_RELAYER_IMPL="${CTM_RELAYER_IMPL:-rust}"
 CTM_EXECUTION_ENGINE_HTTP_BIND_ADDR="${CTM_EXECUTION_ENGINE_HTTP_BIND_ADDR:-127.0.0.1:9093}"
 EXECUTION_QUEUE_ENGINE_ENABLED="${EXECUTION_QUEUE_ENGINE_ENABLED:-true}"
 HARNESS_BIND_ADDR="${HARNESS_BIND_ADDR:-127.0.0.1:9091}"
+CONTINUUM_HARNESS_RELAY_INGEST_TOKEN="${CONTINUUM_HARNESS_RELAY_INGEST_TOKEN:-}"
 HARNESS_BACKEND="${HARNESS_BACKEND:-rust-backend}"
 HARNESS_MODE="${HARNESS_MODE:-$([[ "${STACK_CLUSTER}" == "devnet" ]] && echo devnet || echo local)}"
 HARNESS_ENABLE_AIRDROP="${HARNESS_ENABLE_AIRDROP:-false}"
@@ -76,6 +78,26 @@ CTM_RELAYER_LOCAL_STATE="${CTM_RELAYER_LOCAL_STATE:-true}"
 CTM_RELAYER_LOCAL_STATE_BOOTSTRAP_URL="${CTM_RELAYER_LOCAL_STATE_BOOTSTRAP_URL:-http://${HARNESS_BIND_ADDR}/state/full?view=confirmed}"
 CTM_RELAYER_LOCAL_STATE_BOOTSTRAP_TIMEOUT_MS="${CTM_RELAYER_LOCAL_STATE_BOOTSTRAP_TIMEOUT_MS:-30000}"
 CTM_RELAYER_HARNESS_REJECT_MARKET_DRIFT="${CTM_RELAYER_HARNESS_REJECT_MARKET_DRIFT:-false}"
+CTM_FANOUT_MODE="${CTM_FANOUT_MODE:-disabled}"
+FANOUT_BIND_ADDR="${FANOUT_BIND_ADDR:-127.0.0.1:9094}"
+CTM_FANOUT_BASE_URL="${CTM_FANOUT_BASE_URL:-http://127.0.0.1:${FANOUT_BIND_ADDR##*:}}"
+CTM_RELAYER_EVENT_SINK_URL="${CTM_RELAYER_EVENT_SINK_URL:-}"
+FANOUT_AUTH_DISABLED="${FANOUT_AUTH_DISABLED:-true}"
+FANOUT_CHANNEL_CAPACITY="${FANOUT_CHANNEL_CAPACITY:-4096}"
+FANOUT_SNAPSHOT_MAX_EVENTS="${FANOUT_SNAPSHOT_MAX_EVENTS:-256}"
+FANOUT_MAX_CONNECTIONS="${FANOUT_MAX_CONNECTIONS:-2000}"
+FANOUT_MAX_CONNECTIONS_PER_USER="${FANOUT_MAX_CONNECTIONS_PER_USER:-10}"
+FANOUT_INGEST_SECRET="${FANOUT_INGEST_SECRET:-}"
+FANOUT_REDIS_URL="${FANOUT_REDIS_URL:-}"
+FANOUT_REDIS_STREAM_KEY="${FANOUT_REDIS_STREAM_KEY:-fanout:events}"
+FANOUT_REDIS_STREAM_MAXLEN="${FANOUT_REDIS_STREAM_MAXLEN:-100000}"
+FANOUT_REDIS_STREAM_BLOCK_MS="${FANOUT_REDIS_STREAM_BLOCK_MS:-1000}"
+FANOUT_UPSTREAM_INGEST_URL="${FANOUT_UPSTREAM_INGEST_URL:-http://${HARNESS_BIND_ADDR}/ingest/relay-intent}"
+FANOUT_UPSTREAM_AUTH_TOKEN="${FANOUT_UPSTREAM_AUTH_TOKEN:-${CONTINUUM_HARNESS_RELAY_INGEST_TOKEN}}"
+FANOUT_UPSTREAM_TIMEOUT_MS="${FANOUT_UPSTREAM_TIMEOUT_MS:-1000}"
+FANOUT_RUST_LOG="${FANOUT_RUST_LOG:-info}"
+FANOUT_INGEST_URL="${FANOUT_INGEST_URL:-http://127.0.0.1:${FANOUT_BIND_ADDR##*:}/ingest}"
+FANOUT_HEALTH_URL="${FANOUT_HEALTH_URL:-http://127.0.0.1:${FANOUT_BIND_ADDR##*:}/healthz}"
 
 REQUIRED_SOLANA_VERSION="${REQUIRED_SOLANA_VERSION:-1.16.7}"
 SOLANA_116_BIN_DIR="${SOLANA_116_BIN_DIR:-/home/ec2-user/.local/solana-1.16.7-release/bin}"
@@ -95,6 +117,7 @@ DEPLOY_TRANSPORT="${DEPLOY_TRANSPORT:-udp}" # udp|quic|auto
 HARNESS_START_TIMEOUT_SECS="${HARNESS_START_TIMEOUT_SECS:-300}"
 RELAYER_START_TIMEOUT_SECS="${RELAYER_START_TIMEOUT_SECS:-300}"
 BRIDGE_START_TIMEOUT_SECS="${BRIDGE_START_TIMEOUT_SECS:-300}"
+FANOUT_START_TIMEOUT_SECS="${FANOUT_START_TIMEOUT_SECS:-120}"
 FRONTEND_START_TIMEOUT_SECS="${FRONTEND_START_TIMEOUT_SECS:-300}"
 NGINX_START_TIMEOUT_SECS="${NGINX_START_TIMEOUT_SECS:-60}"
 SUPERVISOR_HEALTH_START_SECS="${SUPERVISOR_HEALTH_START_SECS:-20}"
@@ -120,6 +143,7 @@ VALIDATOR_PID_FILE="${PID_DIR}/validator.pid"
 RELAYER_PID_FILE="${PID_DIR}/relayer.pid"
 HARNESS_PID_FILE="${PID_DIR}/harness.pid"
 BRIDGE_PID_FILE="${PID_DIR}/bridge.pid"
+FANOUT_PID_FILE="${PID_DIR}/fanout.pid"
 FRONTEND_PID_FILE="${FRONTEND_RUN_DIR}/frontend.pid"
 
 mkdir -p "${LOG_DIR}" "${RUN_DIR}" "${PID_DIR}" "${FRONTEND_RUN_DIR}"
@@ -169,6 +193,38 @@ derive_ws_url() {
       ;;
     *)
       echo "${url}"
+      ;;
+  esac
+}
+
+normalize_fanout_mode() {
+  local raw="${CTM_FANOUT_MODE,,}"
+  case "${raw}" in
+    local|external|gateway)
+      echo "${raw}"
+      ;;
+    *)
+      echo "disabled"
+      ;;
+  esac
+}
+
+fanout_uses_local_service() {
+  [[ "$(normalize_fanout_mode)" == "local" ]]
+}
+
+resolve_relayer_event_sink_url() {
+  if [[ -n "${CTM_RELAYER_EVENT_SINK_URL}" ]]; then
+    echo "${CTM_RELAYER_EVENT_SINK_URL}"
+    return
+  fi
+
+  case "$(normalize_fanout_mode)" in
+    local|external|gateway)
+      echo "${CTM_FANOUT_BASE_URL%/}/ingest"
+      ;;
+    *)
+      echo "http://${HARNESS_BIND_ADDR}/ingest/relay-intent"
       ;;
   esac
 }
@@ -339,6 +395,7 @@ stop_all() {
   stop_pid_file "${FRONTEND_PID_FILE}" "frontend"
   stop_pid_file "${BRIDGE_PID_FILE}" "bridge"
   stop_pid_file "${RELAYER_PID_FILE}" "relayer"
+  stop_pid_file "${FANOUT_PID_FILE}" "fanout"
   stop_pid_file "${HARNESS_PID_FILE}" "harness"
   if [[ "${STACK_CLUSTER}" != "devnet" ]]; then
     stop_pid_file "${VALIDATOR_PID_FILE}" "validator"
@@ -348,6 +405,7 @@ stop_all() {
   pkill -f 'ts/client/scripts/execution-queue/continuum-state-harness.ts' 2>/dev/null || true
   pkill -f 'ts/client/scripts/execution-queue/ctm-sequencer-relayer.ts' 2>/dev/null || true
   pkill -f 'service-mango-execution-engine' 2>/dev/null || true
+  pkill -f 'service-fanout' 2>/dev/null || true
   pkill -f 'solana -u .* program deploy .*mango_v4.so' 2>/dev/null || true
   if [[ "${STACK_CLUSTER}" != "devnet" ]]; then
     pkill -f 'solana-test-validator --ledger /home/ec2-user/stagin4/mng-v4/.localnet/ledger' 2>/dev/null || true
@@ -649,12 +707,13 @@ start_harness_and_relayer() {
     echo "Missing config: ${E2E_CONFIG_PATH}" >&2
     exit 1
   fi
-  local buffer_pk usdc_mint group_pk queue_pk relayer_http_port
+  local buffer_pk usdc_mint group_pk queue_pk relayer_http_port relayer_event_sink_url
   buffer_pk="$(read_cfg_field executionQueueBuffer)"
   usdc_mint="$(read_cfg_field usdcMint)"
   group_pk="$(read_cfg_field group)"
   queue_pk="$(read_cfg_field executionQueue)"
   relayer_http_port="${CTM_EXECUTION_ENGINE_HTTP_BIND_ADDR##*:}"
+  relayer_event_sink_url="$(resolve_relayer_event_sink_url)"
   if [[ -z "${buffer_pk}" || "${buffer_pk}" == "undefined" ]]; then
     buffer_pk="${queue_pk}"
   fi
@@ -706,6 +765,64 @@ start_harness_and_relayer() {
     "${HARNESS_PID_FILE}" \
     "${LOG_DIR}/continuum-harness.log"
 
+  if fanout_uses_local_service; then
+    if [[ -x "${FANOUT_BIN}" ]]; then
+      start_detached_service \
+        "fanout" \
+        "${FANOUT_PID_FILE}" \
+        "${MNG_DIR}" \
+        "${LOG_DIR}/service-fanout.log" \
+        "${FANOUT_HEALTH_URL}" \
+        env \
+        FANOUT_BIND_ADDR="${FANOUT_BIND_ADDR}" \
+        FANOUT_AUTH_DISABLED="${FANOUT_AUTH_DISABLED}" \
+        FANOUT_CHANNEL_CAPACITY="${FANOUT_CHANNEL_CAPACITY}" \
+        FANOUT_SNAPSHOT_MAX_EVENTS="${FANOUT_SNAPSHOT_MAX_EVENTS}" \
+        FANOUT_MAX_CONNECTIONS="${FANOUT_MAX_CONNECTIONS}" \
+        FANOUT_MAX_CONNECTIONS_PER_USER="${FANOUT_MAX_CONNECTIONS_PER_USER}" \
+        FANOUT_INGEST_SECRET="${FANOUT_INGEST_SECRET}" \
+        FANOUT_REDIS_URL="${FANOUT_REDIS_URL}" \
+        FANOUT_REDIS_STREAM_KEY="${FANOUT_REDIS_STREAM_KEY}" \
+        FANOUT_REDIS_STREAM_MAXLEN="${FANOUT_REDIS_STREAM_MAXLEN}" \
+        FANOUT_REDIS_STREAM_BLOCK_MS="${FANOUT_REDIS_STREAM_BLOCK_MS}" \
+        FANOUT_UPSTREAM_INGEST_URL="${FANOUT_UPSTREAM_INGEST_URL}" \
+        FANOUT_UPSTREAM_AUTH_TOKEN="${FANOUT_UPSTREAM_AUTH_TOKEN}" \
+        FANOUT_UPSTREAM_TIMEOUT_MS="${FANOUT_UPSTREAM_TIMEOUT_MS}" \
+        RUST_LOG="${FANOUT_RUST_LOG}" \
+        "${FANOUT_BIN}"
+    else
+      start_detached_service \
+        "fanout" \
+        "${FANOUT_PID_FILE}" \
+        "${MNG_DIR}" \
+        "${LOG_DIR}/service-fanout.log" \
+        "${FANOUT_HEALTH_URL}" \
+        env \
+        FANOUT_BIND_ADDR="${FANOUT_BIND_ADDR}" \
+        FANOUT_AUTH_DISABLED="${FANOUT_AUTH_DISABLED}" \
+        FANOUT_CHANNEL_CAPACITY="${FANOUT_CHANNEL_CAPACITY}" \
+        FANOUT_SNAPSHOT_MAX_EVENTS="${FANOUT_SNAPSHOT_MAX_EVENTS}" \
+        FANOUT_MAX_CONNECTIONS="${FANOUT_MAX_CONNECTIONS}" \
+        FANOUT_MAX_CONNECTIONS_PER_USER="${FANOUT_MAX_CONNECTIONS_PER_USER}" \
+        FANOUT_INGEST_SECRET="${FANOUT_INGEST_SECRET}" \
+        FANOUT_REDIS_URL="${FANOUT_REDIS_URL}" \
+        FANOUT_REDIS_STREAM_KEY="${FANOUT_REDIS_STREAM_KEY}" \
+        FANOUT_REDIS_STREAM_MAXLEN="${FANOUT_REDIS_STREAM_MAXLEN}" \
+        FANOUT_REDIS_STREAM_BLOCK_MS="${FANOUT_REDIS_STREAM_BLOCK_MS}" \
+        FANOUT_UPSTREAM_INGEST_URL="${FANOUT_UPSTREAM_INGEST_URL}" \
+        FANOUT_UPSTREAM_AUTH_TOKEN="${FANOUT_UPSTREAM_AUTH_TOKEN}" \
+        FANOUT_UPSTREAM_TIMEOUT_MS="${FANOUT_UPSTREAM_TIMEOUT_MS}" \
+        RUST_LOG="${FANOUT_RUST_LOG}" \
+        cargo run --manifest-path "${MNG_DIR}/bin/service-fanout/Cargo.toml"
+    fi
+    wait_for_http_or_fail \
+      "fanout" \
+      "${FANOUT_HEALTH_URL}" \
+      "${FANOUT_START_TIMEOUT_SECS}" \
+      "${FANOUT_PID_FILE}" \
+      "${LOG_DIR}/service-fanout.log"
+  fi
+
   if [[ "${CTM_RELAYER_IMPL}" == "rust" ]]; then
     if [[ -x "${EXECUTION_ENGINE_BIN}" ]]; then
       start_detached_service \
@@ -723,7 +840,9 @@ start_harness_and_relayer() {
         CTM_EXECUTION_ENGINE_HTTP_BIND_ADDR="${CTM_EXECUTION_ENGINE_HTTP_BIND_ADDR}" \
         CTM_RELAYER_PAYER_KEYPAIR="${CTM_RELAYER_PAYER_KEYPAIR}" \
         CTM_RELAYER_CTM_KEYPAIR="${CTM_RELAYER_CTM_KEYPAIR}" \
-        CTM_RELAYER_EVENT_SINK_URL="http://${HARNESS_BIND_ADDR}/ingest/relay-intent" \
+        CTM_FANOUT_MODE="${CTM_FANOUT_MODE}" \
+        CTM_FANOUT_BASE_URL="${CTM_FANOUT_BASE_URL}" \
+        CTM_RELAYER_EVENT_SINK_URL="${relayer_event_sink_url}" \
         EXECUTION_QUEUE_CRANK_RELAY_EVENT_LOG_PATH="${CONTINUUM_EVENT_LOG_PATH}" \
         EXECUTION_QUEUE_BUFFER_PK="${buffer_pk}" \
         EXECUTION_QUEUE_GROUP_PK="${group_pk}" \
@@ -764,7 +883,9 @@ start_harness_and_relayer() {
         CTM_EXECUTION_ENGINE_HTTP_BIND_ADDR="${CTM_EXECUTION_ENGINE_HTTP_BIND_ADDR}" \
         CTM_RELAYER_PAYER_KEYPAIR="${CTM_RELAYER_PAYER_KEYPAIR}" \
         CTM_RELAYER_CTM_KEYPAIR="${CTM_RELAYER_CTM_KEYPAIR}" \
-        CTM_RELAYER_EVENT_SINK_URL="http://${HARNESS_BIND_ADDR}/ingest/relay-intent" \
+        CTM_FANOUT_MODE="${CTM_FANOUT_MODE}" \
+        CTM_FANOUT_BASE_URL="${CTM_FANOUT_BASE_URL}" \
+        CTM_RELAYER_EVENT_SINK_URL="${relayer_event_sink_url}" \
         EXECUTION_QUEUE_CRANK_RELAY_EVENT_LOG_PATH="${CONTINUUM_EVENT_LOG_PATH}" \
         EXECUTION_QUEUE_BUFFER_PK="${buffer_pk}" \
         EXECUTION_QUEUE_GROUP_PK="${group_pk}" \
@@ -806,7 +927,9 @@ start_harness_and_relayer() {
       CTM_RELAYER_BIND_ADDR=127.0.0.1:9090 \
       CTM_RELAYER_PAYER_KEYPAIR="${CTM_RELAYER_PAYER_KEYPAIR}" \
       CTM_RELAYER_CTM_KEYPAIR="${CTM_RELAYER_CTM_KEYPAIR}" \
-      CTM_RELAYER_EVENT_SINK_URL="http://${HARNESS_BIND_ADDR}/ingest/relay-intent" \
+      CTM_FANOUT_MODE="${CTM_FANOUT_MODE}" \
+      CTM_FANOUT_BASE_URL="${CTM_FANOUT_BASE_URL}" \
+      CTM_RELAYER_EVENT_SINK_URL="${relayer_event_sink_url}" \
       EXECUTION_QUEUE_BUFFER_PK="${buffer_pk}" \
       CTM_RELAYER_SEQUENCE_STATE_PATH="${RELAYER_SEQUENCE_STATE_PATH}" \
       CTM_RELAYER_MIN_EXECUTE_SLOT_OFFSET=1 \
@@ -923,6 +1046,11 @@ status_all() {
   fi
   echo "harness:   $(pid_is_running "${HARNESS_PID_FILE}" && echo running || echo stopped)"
   echo "backend:   ${HARNESS_BACKEND}"
+  if fanout_uses_local_service; then
+    echo "fanout:    $(pid_is_running "${FANOUT_PID_FILE}" && echo running || echo stopped)"
+  else
+    echo "fanout:    $(normalize_fanout_mode)"
+  fi
   echo "relayer:   $(pid_is_running "${RELAYER_PID_FILE}" && echo running || echo stopped)"
   echo "bridge:    $(pid_is_running "${BRIDGE_PID_FILE}" && echo running || echo stopped)"
   echo "frontend:  $(pid_is_running "${FRONTEND_PID_FILE}" && echo running || echo stopped)"
@@ -940,12 +1068,19 @@ status_all() {
     fi
   fi
   echo "ports:"
-  ss -ltn | rg ':(443|8070|8899|9090|9091|9092|9093)\b' || true
+  ss -ltn | rg ':(443|8070|8899|9090|9091|9092|9093|9094)\b' || true
   echo "health:"
   if curl -fsS "http://127.0.0.1:9091/healthz" >/dev/null 2>&1; then
     echo "  harness: ok"
   else
     echo "  harness: fail"
+  fi
+  if fanout_uses_local_service; then
+    if curl -fsS "${FANOUT_HEALTH_URL}" >/dev/null 2>&1; then
+      echo "  fanout:  ok"
+    else
+      echo "  fanout:  fail"
+    fi
   fi
   if curl -fsS "http://127.0.0.1:9092/healthz" >/dev/null 2>&1; then
     echo "  bridge:  ok"

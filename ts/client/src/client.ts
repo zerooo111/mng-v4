@@ -101,11 +101,16 @@ import {
   buildExecutionQueueEnqueueCtmWithIntentIxs,
   buildExecutionQueueEnqueueLiquidityIx,
   buildExecutionQueueExecuteIx,
+  buildExecutionQueueV3CreateMarketPageIx,
   buildExecutionQueueV3EnqueueCtmWithIntentIxs,
   buildExecutionQueueV3EnqueueDirectWithIntentIxs,
   buildExecutionQueueV3ExecuteIx,
   buildExecutionQueueV3InitMarketPageIx,
+  buildExecutionQueueV3ResizeMarketPageIx,
   decodeExecutionQueueV3MarketRoot,
+  EXECUTION_QUEUE_V3_MAX_REALLOC_INSTRUCTION_BYTES,
+  EXECUTION_QUEUE_V3_PAGE_CREATE_SPACE,
+  EXECUTION_QUEUE_V3_PAGE_SPACE,
   encodePerpBatchIntentQueuePayload,
   encodePerpCancelAllOrdersBySideQueuePayload,
   encodePerpCancelAllOrdersQueuePayload,
@@ -6717,7 +6722,39 @@ export class MangoClient {
     );
     const initInstructions: TransactionInstruction[] = [];
     const pageAccount = await this.connection.getAccountInfo(queuePage);
+    let pageLen = pageAccount?.data.length ?? 0;
+    const pageInitialized =
+      !!pageAccount && pageAccount.data.subarray(0, 8).some((byte) => byte !== 0);
     if (!pageAccount) {
+      pageLen = EXECUTION_QUEUE_V3_PAGE_CREATE_SPACE;
+      initInstructions.push(
+        buildExecutionQueueV3CreateMarketPageIx({
+          programId: this.programId,
+          group: group.publicKey,
+          authorityState: root.authorityState,
+          queueRoot,
+          payer: this.walletPk,
+          pageSlot,
+        }),
+      );
+    }
+    while (pageLen < EXECUTION_QUEUE_V3_PAGE_SPACE) {
+      initInstructions.push(
+        buildExecutionQueueV3ResizeMarketPageIx({
+          programId: this.programId,
+          group: group.publicKey,
+          authorityState: root.authorityState,
+          queueRoot,
+          payer: this.walletPk,
+          pageSlot,
+        }),
+      );
+      pageLen = Math.min(
+        pageLen + EXECUTION_QUEUE_V3_MAX_REALLOC_INSTRUCTION_BYTES,
+        EXECUTION_QUEUE_V3_PAGE_SPACE,
+      );
+    }
+    if (!pageInitialized) {
       initInstructions.push(
         buildExecutionQueueV3InitMarketPageIx({
           programId: this.programId,
@@ -6736,6 +6773,67 @@ export class MangoClient {
       initInstructions,
       marketIndex: root.marketIndex,
     };
+  }
+
+  private async ensureExecutionQueueV3PageReady(
+    group: Group,
+    queueRoot: PublicKey,
+    sequence: bigint,
+    opts: SendTransactionOpts = {},
+  ): Promise<{
+    authorityState: PublicKey;
+    queuePage: PublicKey;
+    marketIndex: number;
+  }> {
+    let lastErr: Error | undefined;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const pagePlan = await this.prepareExecutionQueueV3Page(
+        group,
+        queueRoot,
+        sequence,
+      );
+      if (pagePlan.initInstructions.length === 0) {
+        return {
+          authorityState: pagePlan.authorityState,
+          queuePage: pagePlan.queuePage,
+          marketIndex: pagePlan.marketIndex,
+        };
+      }
+
+      try {
+        await this.sendAndConfirmTransactionForGroup(
+          group,
+          pagePlan.initInstructions,
+          {
+            ...opts,
+            confirmInBackground: false,
+            skipConfirmation: false,
+          },
+        );
+      } catch (err) {
+        lastErr = err as Error;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+    }
+
+    const pagePlan = await this.prepareExecutionQueueV3Page(
+      group,
+      queueRoot,
+      sequence,
+    );
+    if (pagePlan.initInstructions.length === 0) {
+      return {
+        authorityState: pagePlan.authorityState,
+        queuePage: pagePlan.queuePage,
+        marketIndex: pagePlan.marketIndex,
+      };
+    }
+
+    throw new Error(
+      `failed to prepare execution queue v3 page ${pagePlan.queuePage.toBase58()}: ${
+        lastErr?.message ?? 'page remained unprepared'
+      }`,
+    );
   }
 
   public async executionQueueEnqueueCtmWithIntent(
@@ -6819,10 +6917,11 @@ export class MangoClient {
     opts: SendTransactionOpts = {},
   ): Promise<MangoSignatureStatus> {
     const sequence = BigInt(params.sequence.toString());
-    const pagePlan = await this.prepareExecutionQueueV3Page(
+    const pagePlan = await this.ensureExecutionQueueV3PageReady(
       group,
       params.queueRoot,
       sequence,
+      opts,
     );
     if (pagePlan.marketIndex !== params.marketIndex) {
       throw new Error(
@@ -6849,7 +6948,7 @@ export class MangoClient {
 
     return await this.sendAndConfirmTransactionForGroup(
       group,
-      [...pagePlan.initInstructions, ...built.instructions],
+      built.instructions,
       opts,
     );
   }
@@ -6866,10 +6965,11 @@ export class MangoClient {
       );
     }
     const nextSequence = executionQueueV3NextEnqueueSequence(root);
-    const pagePlan = await this.prepareExecutionQueueV3Page(
+    const pagePlan = await this.ensureExecutionQueueV3PageReady(
       group,
       params.queueRoot,
       nextSequence,
+      opts,
     );
     const built = buildExecutionQueueV3EnqueueDirectWithIntentIxs({
       programId: this.programId,
@@ -6889,7 +6989,7 @@ export class MangoClient {
 
     return await this.sendAndConfirmTransactionForGroup(
       group,
-      [...pagePlan.initInstructions, ...built.instructions],
+      built.instructions,
       opts,
     );
   }

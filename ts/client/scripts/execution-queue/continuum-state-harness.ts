@@ -6165,7 +6165,7 @@ async function runOnchainReconciliation(
   const replaySnapshot = engine.getSnapshot('confirmed');
   const drift = buildReconciliationSnapshot(replaySnapshot, onchainSnapshot);
   if (HARNESS_BACKEND === 'rust-backend') {
-    engine.bootstrapFromOnchainSnapshot(onchainSnapshot);
+    await engine.bootstrapFromOnchainSnapshot(onchainSnapshot);
   }
   onchainSync.snapshot = onchainSnapshot;
   onchainSync.queue = onchainState.queue;
@@ -6213,7 +6213,7 @@ async function refreshOnchainConfirmedState(
     return;
   }
   if (HARNESS_BACKEND === 'rust-backend') {
-    engine.bootstrapFromOnchainSnapshot(onchainState.snapshot);
+    await engine.bootstrapFromOnchainSnapshot(onchainState.snapshot);
   }
   onchainSync.snapshot = onchainState.snapshot;
   onchainSync.queue = onchainState.queue;
@@ -9495,8 +9495,8 @@ async function main(): Promise<void> {
       );
       if (bootstrappedOnchainState) {
         const snapshot = bootstrappedOnchainState.snapshot;
-        measureSync('startup.bootstrap_from_onchain_snapshot', () => {
-          engine.bootstrapFromOnchainSnapshot(snapshot);
+        await measureAsync('startup.bootstrap_from_onchain_snapshot', async () => {
+          await engine.bootstrapFromOnchainSnapshot(snapshot);
         });
         const userCount = Object.keys(snapshot.users).length;
         const marketCount = Object.keys(snapshot.markets).length;

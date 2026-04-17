@@ -2,7 +2,10 @@ use crate::accounts_ix::*;
 use crate::error::*;
 use crate::state::*;
 use anchor_lang::prelude::*;
+use anchor_lang::solana_program::entrypoint::MAX_PERMITTED_DATA_INCREASE;
 use anchor_lang::solana_program::hash::hashv;
+use anchor_lang::solana_program::program::invoke;
+use anchor_lang::solana_program::system_instruction;
 use super::execution_queue::{
     account_metas_from_infos, canonical_envelope_message, canonical_user_intent_message_v1,
     canonical_user_intent_message_v2, canonical_direct_dispatch_account_metas,
@@ -86,6 +89,40 @@ fn validate_page_assignment(page_slot: u16, assigned_abs_page_no: u64, num_pages
     Ok(())
 }
 
+fn resize_execution_queue_page_v3<'info>(
+    queue_page: &UncheckedAccount<'info>,
+    payer: &Signer<'info>,
+    system_program: &Program<'info, System>,
+) -> Result<()> {
+    let queue_page_ai = queue_page.to_account_info();
+    let current_len = queue_page_ai.data_len();
+    let target_len = EXECUTION_QUEUE_PAGE_V3_SPACE;
+
+    require!(current_len > 0, MangoError::SomeError);
+    if current_len >= target_len {
+        return Ok(());
+    }
+
+    let next_len = (current_len + MAX_PERMITTED_DATA_INCREASE).min(target_len);
+    let rent = Rent::get()?;
+    let needed_lamports = rent
+        .minimum_balance(next_len)
+        .saturating_sub(queue_page_ai.lamports());
+    if needed_lamports > 0 {
+        invoke(
+            &system_instruction::transfer(&payer.key(), queue_page_ai.key, needed_lamports),
+            &[
+                payer.to_account_info(),
+                queue_page_ai.clone(),
+                system_program.to_account_info(),
+            ],
+        )?;
+    }
+
+    queue_page_ai.realloc(next_len, true)?;
+    Ok(())
+}
+
 fn place_order_match_kind(order_type: PlaceOrderType) -> u8 {
     match order_type {
         PlaceOrderType::Market => QueueItemMatchKindV3::Market as u8,
@@ -114,14 +151,25 @@ fn aggressive_limit_price_lots(side: Side, order_type: PlaceOrderType, price_lot
     }
 }
 
+fn set_canonical_perp_account_recipe(item: &mut QueueItemV3, market_index: u16) {
+    item.recipe_kind = QueueAccountRecipeKindV3::CanonicalPerpV1 as u8;
+    item.recipe_len = EXECUTION_QUEUE_V3_CANONICAL_PERP_ACCOUNT_RECIPE_V1_LEN;
+    item.account_recipe =
+        CanonicalPerpAccountRecipeV3::new(market_index, item.op_class).encode();
+}
+
 fn populate_market_item_metadata(
     item: &mut QueueItemV3,
     decoded_payload: &DecodedQueuePayload,
     market_index: u16,
     mango_account_hint: Pubkey,
-) {
+) -> Result<()> {
     item.market_index = market_index;
     item.mango_account_hint = mango_account_hint;
+    require!(
+        mango_account_hint != Pubkey::default(),
+        MangoError::ExecutionQueueDispatchAccountLayoutInvalid
+    );
 
     match &decoded_payload.body {
         QueuePayloadBody::PerpPlaceOrderV2(place) => {
@@ -138,18 +186,23 @@ fn populate_market_item_metadata(
             item.match_side = side_match_side(place.side);
             item.match_limit_price_lots =
                 aggressive_limit_price_lots(place.side, place.order_type, place.price_lots);
+            set_canonical_perp_account_recipe(item, market_index);
         }
         QueuePayloadBody::PerpCancelOrder(_) => {
             item.op_class = QueueItemOpClassV3::GenericCancel as u8;
+            set_canonical_perp_account_recipe(item, market_index);
         }
         QueuePayloadBody::PerpCancelOrderByClientOrderId(_) => {
             item.op_class = QueueItemOpClassV3::GenericCancelByClientOrderId as u8;
+            set_canonical_perp_account_recipe(item, market_index);
         }
         QueuePayloadBody::PerpCancelAllOrders(_) | QueuePayloadBody::PerpCancelAllOrdersBySide(_) => {
             item.op_class = QueueItemOpClassV3::GenericCancelAll as u8;
+            set_canonical_perp_account_recipe(item, market_index);
         }
         QueuePayloadBody::LiquidityDeposit(_) | QueuePayloadBody::LiquidityWithdraw(_) => {}
     }
+    Ok(())
 }
 
 fn liquidity_op_class(kind: u8) -> u8 {
@@ -459,6 +512,24 @@ pub fn execution_queue_v3_configure_liquidity_root(
     Ok(())
 }
 
+pub fn execution_queue_v3_create_market_page(
+    _ctx: Context<ExecutionQueueV3CreateMarketPage>,
+    _page_slot: u16,
+) -> Result<()> {
+    Ok(())
+}
+
+pub fn execution_queue_v3_resize_market_page(
+    ctx: Context<ExecutionQueueV3ResizeMarketPage>,
+    _page_slot: u16,
+) -> Result<()> {
+    resize_execution_queue_page_v3(
+        &ctx.accounts.queue_page,
+        &ctx.accounts.payer,
+        &ctx.accounts.system_program,
+    )
+}
+
 pub fn execution_queue_v3_init_market_page(
     ctx: Context<ExecutionQueueV3InitMarketPage>,
     page_slot: u16,
@@ -471,7 +542,7 @@ pub fn execution_queue_v3_init_market_page(
         .bumps
         .get("queue_page")
         .ok_or_else(|| error!(MangoError::SomeError))?;
-    let queue_page = &mut ctx.accounts.queue_page;
+    let mut queue_page = ctx.accounts.queue_page.load_init()?;
     queue_page.init(
         ctx.accounts.queue_root.key(),
         page_slot,
@@ -480,6 +551,24 @@ pub fn execution_queue_v3_init_market_page(
         bump,
     );
     Ok(())
+}
+
+pub fn execution_queue_v3_create_liquidity_page(
+    _ctx: Context<ExecutionQueueV3CreateLiquidityPage>,
+    _page_slot: u16,
+) -> Result<()> {
+    Ok(())
+}
+
+pub fn execution_queue_v3_resize_liquidity_page(
+    ctx: Context<ExecutionQueueV3ResizeLiquidityPage>,
+    _page_slot: u16,
+) -> Result<()> {
+    resize_execution_queue_page_v3(
+        &ctx.accounts.queue_page,
+        &ctx.accounts.payer,
+        &ctx.accounts.system_program,
+    )
 }
 
 pub fn execution_queue_v3_init_liquidity_page(
@@ -494,7 +583,7 @@ pub fn execution_queue_v3_init_liquidity_page(
         .bumps
         .get("queue_page")
         .ok_or_else(|| error!(MangoError::SomeError))?;
-    let queue_page = &mut ctx.accounts.queue_page;
+    let mut queue_page = ctx.accounts.queue_page.load_init()?;
     queue_page.init(
         ctx.accounts.queue_root.key(),
         page_slot,
@@ -508,14 +597,14 @@ pub fn execution_queue_v3_init_liquidity_page(
 pub fn execution_queue_v3_close_market_page(
     ctx: Context<ExecutionQueueV3CloseMarketPage>,
 ) -> Result<()> {
+    let queue_page = ctx.accounts.queue_page.load()?;
     require!(
-        ctx.accounts.queue_page.live_count == 0,
+        queue_page.live_count == 0,
         MangoError::ExecutionQueueFull
     );
     require!(
         ctx.accounts.queue_root.live_count == 0
-            || ctx.accounts.queue_page.assigned_abs_page_no
-                != ctx.accounts.queue_root.head_abs_page_no(),
+            || queue_page.assigned_abs_page_no != ctx.accounts.queue_root.head_abs_page_no(),
         MangoError::ExecutionQueueV3PageInactive
     );
     Ok(())
@@ -524,14 +613,14 @@ pub fn execution_queue_v3_close_market_page(
 pub fn execution_queue_v3_close_liquidity_page(
     ctx: Context<ExecutionQueueV3CloseLiquidityPage>,
 ) -> Result<()> {
+    let queue_page = ctx.accounts.queue_page.load()?;
     require!(
-        ctx.accounts.queue_page.live_count == 0,
+        queue_page.live_count == 0,
         MangoError::ExecutionQueueFull
     );
     require!(
         ctx.accounts.queue_root.live_count == 0
-            || ctx.accounts.queue_page.assigned_abs_page_no
-                != ctx.accounts.queue_root.head_abs_page_no(),
+            || queue_page.assigned_abs_page_no != ctx.accounts.queue_root.head_abs_page_no(),
         MangoError::ExecutionQueueV3PageInactive
     );
     Ok(())
@@ -626,14 +715,15 @@ pub fn execution_queue_v3_enqueue_market(
         .accounts
         .queue_root
         .page_offset_for_sequence(envelope.sequence);
-    ctx.accounts
-        .queue_page
-        .prepare_for_write_target(
+    {
+        let mut queue_page = ctx.accounts.queue_page.load_mut()?;
+        queue_page.prepare_for_write_target(
             queue_root_key,
             page_slot,
             abs_page_no,
             ctx.accounts.queue_root.page_size,
         )?;
+    }
 
     let msg_hash = canonical_envelope_message(ctx.accounts.group.key(), &envelope);
     verify_ed25519_preinstruction(
@@ -681,10 +771,11 @@ pub fn execution_queue_v3_enqueue_market(
         envelope.accounts_hash,
         &payload,
     );
-    populate_market_item_metadata(&mut item, &decoded_payload, market_index, mango_account_hint);
-    ctx.accounts
-        .queue_page
-        .write_pending_item(ctx.accounts.queue_root.page_size, page_offset, item)?;
+    populate_market_item_metadata(&mut item, &decoded_payload, market_index, mango_account_hint)?;
+    {
+        let mut queue_page = ctx.accounts.queue_page.load_mut()?;
+        queue_page.write_pending_item(ctx.accounts.queue_root.page_size, page_offset, item)?;
+    }
     ctx.accounts.queue_root.note_enqueue(envelope.sequence);
 
     emit!(QueueItemEnqueued {
@@ -804,12 +895,15 @@ pub fn execution_queue_v3_enqueue_market_direct(
     let abs_page_no = ctx.accounts.queue_root.abs_page_no_for_sequence(sequence);
     let page_slot = ctx.accounts.queue_root.page_slot_for_sequence(sequence);
     let page_offset = ctx.accounts.queue_root.page_offset_for_sequence(sequence);
-    ctx.accounts.queue_page.prepare_for_write_target(
-        queue_root_key,
-        page_slot,
-        abs_page_no,
-        ctx.accounts.queue_root.page_size,
-    )?;
+    {
+        let mut queue_page = ctx.accounts.queue_page.load_mut()?;
+        queue_page.prepare_for_write_target(
+            queue_root_key,
+            page_slot,
+            abs_page_no,
+            ctx.accounts.queue_root.page_size,
+        )?;
+    }
 
     let min_execute_slot = envelope
         .min_execute_slot
@@ -833,10 +927,11 @@ pub fn execution_queue_v3_enqueue_market_direct(
         user_signature_keys
             .map(|(mango_account_key, _)| mango_account_key)
             .unwrap_or_default(),
-    );
-    ctx.accounts
-        .queue_page
-        .write_pending_item(ctx.accounts.queue_root.page_size, page_offset, item)?;
+    )?;
+    {
+        let mut queue_page = ctx.accounts.queue_page.load_mut()?;
+        queue_page.write_pending_item(ctx.accounts.queue_root.page_size, page_offset, item)?;
+    }
     ctx.accounts.queue_root.note_enqueue(sequence);
 
     emit!(QueueItemEnqueued {
@@ -890,14 +985,15 @@ pub fn execution_queue_v3_enqueue_liquidity(
     let abs_page_no = ctx.accounts.queue_root.abs_page_no_for_sequence(sequence);
     let page_slot = ctx.accounts.queue_root.page_slot_for_sequence(sequence);
     let page_offset = ctx.accounts.queue_root.page_offset_for_sequence(sequence);
-    ctx.accounts
-        .queue_page
-        .prepare_for_write_target(
+    {
+        let mut queue_page = ctx.accounts.queue_page.load_mut()?;
+        queue_page.prepare_for_write_target(
             queue_root_key,
             page_slot,
             abs_page_no,
             ctx.accounts.queue_root.page_size,
         )?;
+    }
 
     let payload_hash = hashv(&[&payload]).to_bytes();
     let accounts_hash = hash_accounts(&account_metas_from_infos(dispatch_accounts));
@@ -919,9 +1015,10 @@ pub fn execution_queue_v3_enqueue_liquidity(
     );
     item.market_index = u16::MAX;
     item.op_class = liquidity_op_class(kind);
-    ctx.accounts
-        .queue_page
-        .write_pending_item(ctx.accounts.queue_root.page_size, page_offset, item)?;
+    {
+        let mut queue_page = ctx.accounts.queue_page.load_mut()?;
+        queue_page.write_pending_item(ctx.accounts.queue_root.page_size, page_offset, item)?;
+    }
     ctx.accounts.queue_root.note_enqueue(sequence);
 
     emit!(QueueItemEnqueued {
@@ -970,22 +1067,25 @@ pub fn execution_queue_v3_execute_market(
         let page_size = ctx.accounts.queue_root.page_size;
         let gap_wait_slots = ctx.accounts.queue_root.gap_wait_slots as u64;
 
-        require!(
-            ctx.accounts.queue_page.page_state == QueuePageStateV3::Active as u8,
-            MangoError::ExecutionQueueV3PageInactive
-        );
-        if ctx.accounts.queue_page.page_slot != head_page_slot
-            || ctx.accounts.queue_page.assigned_abs_page_no != head_abs_page_no
         {
-            break;
+            let queue_page = ctx.accounts.queue_page.load()?;
+            require!(
+                queue_page.page_state == QueuePageStateV3::Active as u8,
+                MangoError::ExecutionQueueV3PageInactive
+            );
+            if queue_page.page_slot != head_page_slot
+                || queue_page.assigned_abs_page_no != head_abs_page_no
+            {
+                break;
+            }
+            queue_page.validate_target(queue_root_key, head_page_slot, head_abs_page_no)?;
         }
-        ctx.accounts
-            .queue_page
-            .validate_target(queue_root_key, head_page_slot, head_abs_page_no)?;
 
-        let Some(head_item) =
-            pending_head_item_on_page(&ctx.accounts.queue_page, page_size, next_sequence)
-        else {
+        let head_item = {
+            let queue_page = ctx.accounts.queue_page.load()?;
+            pending_head_item_on_page(&queue_page, page_size, next_sequence)
+        };
+        let Some(head_item) = head_item else {
             if ctx.accounts.queue_root.max_seen_sequence < next_sequence {
                 break;
             }
@@ -1000,12 +1100,8 @@ pub fn execution_queue_v3_execute_market(
                     .gap_observed_slot
                     .saturating_add(gap_wait_slots)
             {
-                skip_market_head_gaps(
-                    &mut ctx.accounts.queue_root,
-                    &ctx.accounts.queue_page,
-                    group_key,
-                    market_index,
-                );
+                let queue_page = ctx.accounts.queue_page.load()?;
+                skip_market_head_gaps(&mut ctx.accounts.queue_root, &queue_page, group_key, market_index);
                 continue;
             }
             break;
@@ -1031,7 +1127,10 @@ pub fn execution_queue_v3_execute_market(
         );
 
         if candidate.expires_at_slot != 0 && clock.slot > candidate.expires_at_slot {
-            clear_market_head_and_advance(&mut ctx.accounts.queue_root, &mut ctx.accounts.queue_page)?;
+            {
+                let mut queue_page = ctx.accounts.queue_page.load_mut()?;
+                clear_market_head_and_advance(&mut ctx.accounts.queue_root, &mut queue_page)?;
+            }
             emit!(QueueItemProcessed {
                 group: group_key,
                 market_index,
@@ -1050,10 +1149,10 @@ pub fn execution_queue_v3_execute_market(
         let decoded_payload = match decode_queue_payload(&candidate.payload) {
             Ok(payload) => payload,
             Err(_) => {
-                clear_market_head_and_advance(
-                    &mut ctx.accounts.queue_root,
-                    &mut ctx.accounts.queue_page,
-                )?;
+                {
+                    let mut queue_page = ctx.accounts.queue_page.load_mut()?;
+                    clear_market_head_and_advance(&mut ctx.accounts.queue_root, &mut queue_page)?;
+                }
                 emit!(QueueItemProcessed {
                     group: group_key,
                     market_index,
@@ -1066,7 +1165,10 @@ pub fn execution_queue_v3_execute_market(
         };
 
         if queue_item_kind_for_payload_variant(decoded_payload.variant) != candidate.kind {
-            clear_market_head_and_advance(&mut ctx.accounts.queue_root, &mut ctx.accounts.queue_page)?;
+            {
+                let mut queue_page = ctx.accounts.queue_page.load_mut()?;
+                clear_market_head_and_advance(&mut ctx.accounts.queue_root, &mut queue_page)?;
+            }
             emit!(QueueItemProcessed {
                 group: group_key,
                 market_index,
@@ -1079,7 +1181,10 @@ pub fn execution_queue_v3_execute_market(
 
         let item_health_region = queue_health_region_spec(decoded_payload.variant);
         if let Some(reason) = prevalidate_terminal_ctm_payload(&decoded_payload, now_ts) {
-            clear_market_head_and_advance(&mut ctx.accounts.queue_root, &mut ctx.accounts.queue_page)?;
+            {
+                let mut queue_page = ctx.accounts.queue_page.load_mut()?;
+                clear_market_head_and_advance(&mut ctx.accounts.queue_root, &mut queue_page)?;
+            }
             emit!(QueueItemProcessed {
                 group: group_key,
                 market_index,
@@ -1097,7 +1202,10 @@ pub fn execution_queue_v3_execute_market(
         }
 
         if item_health_region.is_some() && candidate.retries >= EXECUTION_QUEUE_MAX_RETRIES {
-            clear_market_head_and_advance(&mut ctx.accounts.queue_root, &mut ctx.accounts.queue_page)?;
+            {
+                let mut queue_page = ctx.accounts.queue_page.load_mut()?;
+                clear_market_head_and_advance(&mut ctx.accounts.queue_root, &mut queue_page)?;
+            }
             emit!(QueueItemProcessed {
                 group: group_key,
                 market_index,
@@ -1110,16 +1218,22 @@ pub fn execution_queue_v3_execute_market(
 
         if let Some(spec) = item_health_region {
             if queue_health_region_begin(dispatch_accounts, spec).is_err() {
-                let retries = ctx.accounts.queue_page.increment_retry(
-                    ctx.accounts.queue_root.page_size,
-                    ctx.accounts.queue_root.head_page_offset(),
-                    clock.slot,
-                )?;
+                let retries = {
+                    let mut queue_page = ctx.accounts.queue_page.load_mut()?;
+                    queue_page.increment_retry(
+                        ctx.accounts.queue_root.page_size,
+                        ctx.accounts.queue_root.head_page_offset(),
+                        clock.slot,
+                    )?
+                };
                 if retries >= EXECUTION_QUEUE_MAX_RETRIES {
-                    clear_market_head_and_advance(
-                        &mut ctx.accounts.queue_root,
-                        &mut ctx.accounts.queue_page,
-                    )?;
+                    {
+                        let mut queue_page = ctx.accounts.queue_page.load_mut()?;
+                        clear_market_head_and_advance(
+                            &mut ctx.accounts.queue_root,
+                            &mut queue_page,
+                        )?;
+                    }
                     emit!(QueueItemProcessed {
                         group: group_key,
                         market_index,
@@ -1151,7 +1265,10 @@ pub fn execution_queue_v3_execute_market(
         };
 
         if dispatch_result.is_ok() {
-            clear_market_head_and_advance(&mut ctx.accounts.queue_root, &mut ctx.accounts.queue_page)?;
+            {
+                let mut queue_page = ctx.accounts.queue_page.load_mut()?;
+                clear_market_head_and_advance(&mut ctx.accounts.queue_root, &mut queue_page)?;
+            }
             emit!(QueueItemProcessed {
                 group: group_key,
                 market_index,
@@ -1166,13 +1283,19 @@ pub fn execution_queue_v3_execute_market(
             return dispatch_result;
         }
 
-        let retries = ctx.accounts.queue_page.increment_retry(
-            ctx.accounts.queue_root.page_size,
-            ctx.accounts.queue_root.head_page_offset(),
-            clock.slot,
-        )?;
+        let retries = {
+            let mut queue_page = ctx.accounts.queue_page.load_mut()?;
+            queue_page.increment_retry(
+                ctx.accounts.queue_root.page_size,
+                ctx.accounts.queue_root.head_page_offset(),
+                clock.slot,
+            )?
+        };
         if retries >= EXECUTION_QUEUE_MAX_RETRIES {
-            clear_market_head_and_advance(&mut ctx.accounts.queue_root, &mut ctx.accounts.queue_page)?;
+            {
+                let mut queue_page = ctx.accounts.queue_page.load_mut()?;
+                clear_market_head_and_advance(&mut ctx.accounts.queue_root, &mut queue_page)?;
+            }
             emit!(QueueItemProcessed {
                 group: group_key,
                 market_index,
@@ -1246,22 +1369,25 @@ pub fn execution_queue_v3_execute_market_multi(
         let page_size = ctx.accounts.queue_root.page_size;
         let gap_wait_slots = ctx.accounts.queue_root.gap_wait_slots as u64;
 
-        require!(
-            ctx.accounts.queue_page.page_state == QueuePageStateV3::Active as u8,
-            MangoError::ExecutionQueueV3PageInactive
-        );
-        if ctx.accounts.queue_page.page_slot != head_page_slot
-            || ctx.accounts.queue_page.assigned_abs_page_no != head_abs_page_no
         {
-            break;
+            let queue_page = ctx.accounts.queue_page.load()?;
+            require!(
+                queue_page.page_state == QueuePageStateV3::Active as u8,
+                MangoError::ExecutionQueueV3PageInactive
+            );
+            if queue_page.page_slot != head_page_slot
+                || queue_page.assigned_abs_page_no != head_abs_page_no
+            {
+                break;
+            }
+            queue_page.validate_target(queue_root_key, head_page_slot, head_abs_page_no)?;
         }
-        ctx.accounts
-            .queue_page
-            .validate_target(queue_root_key, head_page_slot, head_abs_page_no)?;
 
-        let Some(head_item) =
-            pending_head_item_on_page(&ctx.accounts.queue_page, page_size, next_sequence)
-        else {
+        let head_item = {
+            let queue_page = ctx.accounts.queue_page.load()?;
+            pending_head_item_on_page(&queue_page, page_size, next_sequence)
+        };
+        let Some(head_item) = head_item else {
             if ctx.accounts.queue_root.max_seen_sequence < next_sequence {
                 break;
             }
@@ -1276,12 +1402,8 @@ pub fn execution_queue_v3_execute_market_multi(
                     .gap_observed_slot
                     .saturating_add(gap_wait_slots)
             {
-                skip_market_head_gaps(
-                    &mut ctx.accounts.queue_root,
-                    &ctx.accounts.queue_page,
-                    group_key,
-                    market_index,
-                );
+                let queue_page = ctx.accounts.queue_page.load()?;
+                skip_market_head_gaps(&mut ctx.accounts.queue_root, &queue_page, group_key, market_index);
                 continue;
             }
             break;
@@ -1307,7 +1429,10 @@ pub fn execution_queue_v3_execute_market_multi(
         );
 
         if candidate.expires_at_slot != 0 && clock.slot > candidate.expires_at_slot {
-            clear_market_head_and_advance(&mut ctx.accounts.queue_root, &mut ctx.accounts.queue_page)?;
+            {
+                let mut queue_page = ctx.accounts.queue_page.load_mut()?;
+                clear_market_head_and_advance(&mut ctx.accounts.queue_root, &mut queue_page)?;
+            }
             emit!(QueueItemProcessed {
                 group: group_key,
                 market_index,
@@ -1333,10 +1458,10 @@ pub fn execution_queue_v3_execute_market_multi(
         let decoded_payload = match decode_queue_payload(&candidate.payload) {
             Ok(payload) => payload,
             Err(_) => {
-                clear_market_head_and_advance(
-                    &mut ctx.accounts.queue_root,
-                    &mut ctx.accounts.queue_page,
-                )?;
+                {
+                    let mut queue_page = ctx.accounts.queue_page.load_mut()?;
+                    clear_market_head_and_advance(&mut ctx.accounts.queue_root, &mut queue_page)?;
+                }
                 emit!(QueueItemProcessed {
                     group: group_key,
                     market_index,
@@ -1349,7 +1474,10 @@ pub fn execution_queue_v3_execute_market_multi(
         };
 
         if queue_item_kind_for_payload_variant(decoded_payload.variant) != candidate.kind {
-            clear_market_head_and_advance(&mut ctx.accounts.queue_root, &mut ctx.accounts.queue_page)?;
+            {
+                let mut queue_page = ctx.accounts.queue_page.load_mut()?;
+                clear_market_head_and_advance(&mut ctx.accounts.queue_root, &mut queue_page)?;
+            }
             emit!(QueueItemProcessed {
                 group: group_key,
                 market_index,
@@ -1362,7 +1490,10 @@ pub fn execution_queue_v3_execute_market_multi(
 
         let item_health_region = queue_health_region_spec(decoded_payload.variant);
         if let Some(reason) = prevalidate_terminal_ctm_payload(&decoded_payload, now_ts) {
-            clear_market_head_and_advance(&mut ctx.accounts.queue_root, &mut ctx.accounts.queue_page)?;
+            {
+                let mut queue_page = ctx.accounts.queue_page.load_mut()?;
+                clear_market_head_and_advance(&mut ctx.accounts.queue_root, &mut queue_page)?;
+            }
             emit!(QueueItemProcessed {
                 group: group_key,
                 market_index,
@@ -1380,7 +1511,10 @@ pub fn execution_queue_v3_execute_market_multi(
         }
 
         if item_health_region.is_some() && candidate.retries >= EXECUTION_QUEUE_MAX_RETRIES {
-            clear_market_head_and_advance(&mut ctx.accounts.queue_root, &mut ctx.accounts.queue_page)?;
+            {
+                let mut queue_page = ctx.accounts.queue_page.load_mut()?;
+                clear_market_head_and_advance(&mut ctx.accounts.queue_root, &mut queue_page)?;
+            }
             emit!(QueueItemProcessed {
                 group: group_key,
                 market_index,
@@ -1393,16 +1527,22 @@ pub fn execution_queue_v3_execute_market_multi(
 
         if let Some(spec) = item_health_region {
             if queue_health_region_begin(dispatch_accounts, spec).is_err() {
-                let retries = ctx.accounts.queue_page.increment_retry(
-                    ctx.accounts.queue_root.page_size,
-                    ctx.accounts.queue_root.head_page_offset(),
-                    clock.slot,
-                )?;
+                let retries = {
+                    let mut queue_page = ctx.accounts.queue_page.load_mut()?;
+                    queue_page.increment_retry(
+                        ctx.accounts.queue_root.page_size,
+                        ctx.accounts.queue_root.head_page_offset(),
+                        clock.slot,
+                    )?
+                };
                 if retries >= EXECUTION_QUEUE_MAX_RETRIES {
-                    clear_market_head_and_advance(
-                        &mut ctx.accounts.queue_root,
-                        &mut ctx.accounts.queue_page,
-                    )?;
+                    {
+                        let mut queue_page = ctx.accounts.queue_page.load_mut()?;
+                        clear_market_head_and_advance(
+                            &mut ctx.accounts.queue_root,
+                            &mut queue_page,
+                        )?;
+                    }
                     emit!(QueueItemProcessed {
                         group: group_key,
                         market_index,
@@ -1434,7 +1574,10 @@ pub fn execution_queue_v3_execute_market_multi(
         };
 
         if dispatch_result.is_ok() {
-            clear_market_head_and_advance(&mut ctx.accounts.queue_root, &mut ctx.accounts.queue_page)?;
+            {
+                let mut queue_page = ctx.accounts.queue_page.load_mut()?;
+                clear_market_head_and_advance(&mut ctx.accounts.queue_root, &mut queue_page)?;
+            }
             emit!(QueueItemProcessed {
                 group: group_key,
                 market_index,
@@ -1449,13 +1592,19 @@ pub fn execution_queue_v3_execute_market_multi(
             return dispatch_result;
         }
 
-        let retries = ctx.accounts.queue_page.increment_retry(
-            ctx.accounts.queue_root.page_size,
-            ctx.accounts.queue_root.head_page_offset(),
-            clock.slot,
-        )?;
+        let retries = {
+            let mut queue_page = ctx.accounts.queue_page.load_mut()?;
+            queue_page.increment_retry(
+                ctx.accounts.queue_root.page_size,
+                ctx.accounts.queue_root.head_page_offset(),
+                clock.slot,
+            )?
+        };
         if retries >= EXECUTION_QUEUE_MAX_RETRIES {
-            clear_market_head_and_advance(&mut ctx.accounts.queue_root, &mut ctx.accounts.queue_page)?;
+            {
+                let mut queue_page = ctx.accounts.queue_page.load_mut()?;
+                clear_market_head_and_advance(&mut ctx.accounts.queue_root, &mut queue_page)?;
+            }
             emit!(QueueItemProcessed {
                 group: group_key,
                 market_index,
@@ -1486,28 +1635,36 @@ pub fn execution_queue_v3_drop_market(
 
     let head_abs_page_no = ctx.accounts.queue_root.abs_page_no_for_sequence(sequence);
     let head_page_slot = ctx.accounts.queue_root.page_slot_for_sequence(sequence);
-    ctx.accounts.queue_page.validate_target(
-        ctx.accounts.queue_root.key(),
-        head_page_slot,
-        head_abs_page_no,
-    )?;
+    {
+        let queue_page = ctx.accounts.queue_page.load()?;
+        queue_page.validate_target(
+            ctx.accounts.queue_root.key(),
+            head_page_slot,
+            head_abs_page_no,
+        )?;
+    }
 
     let offset = ctx.accounts.queue_root.page_offset_for_sequence(sequence) as usize;
-    let item = ctx.accounts.queue_page.items[offset].clone();
+    let item = {
+        let queue_page = ctx.accounts.queue_page.load()?;
+        queue_page.items[offset]
+    };
     require!(
         item.status == QueueItemStatusV3::Pending as u8 && item.sequence == sequence,
         MangoError::ExecutionQueueSequenceNotPending
     );
 
-    ctx.accounts
-        .queue_page
-        .clear_item(ctx.accounts.queue_root.page_size, offset as u16)?;
+    {
+        let mut queue_page = ctx.accounts.queue_page.load_mut()?;
+        queue_page.clear_item(ctx.accounts.queue_root.page_size, offset as u16)?;
+    }
     ctx.accounts.queue_root.live_count = ctx.accounts.queue_root.live_count.saturating_sub(1);
     if sequence == ctx.accounts.queue_root.next_sequence_to_execute {
         ctx.accounts.queue_root.next_sequence_to_execute =
             ctx.accounts.queue_root.next_sequence_to_execute.saturating_add(1);
         ctx.accounts.queue_root.gap_observed_slot = 0;
-        normalize_market_head_within_page(&mut ctx.accounts.queue_root, &ctx.accounts.queue_page);
+        let queue_page = ctx.accounts.queue_page.load()?;
+        normalize_market_head_within_page(&mut ctx.accounts.queue_root, &queue_page);
     }
 
     emit!(QueueItemProcessed {
@@ -1552,22 +1709,25 @@ pub fn execution_queue_v3_execute_liquidity(
         let page_size = ctx.accounts.queue_root.page_size;
         let gap_wait_slots = EXECUTION_QUEUE_V3_DEFAULT_GAP_WAIT_SLOTS as u64;
 
-        require!(
-            ctx.accounts.queue_page.page_state == QueuePageStateV3::Active as u8,
-            MangoError::ExecutionQueueV3PageInactive
-        );
-        if ctx.accounts.queue_page.page_slot != head_page_slot
-            || ctx.accounts.queue_page.assigned_abs_page_no != head_abs_page_no
         {
-            break;
+            let queue_page = ctx.accounts.queue_page.load()?;
+            require!(
+                queue_page.page_state == QueuePageStateV3::Active as u8,
+                MangoError::ExecutionQueueV3PageInactive
+            );
+            if queue_page.page_slot != head_page_slot
+                || queue_page.assigned_abs_page_no != head_abs_page_no
+            {
+                break;
+            }
+            queue_page.validate_target(queue_root_key, head_page_slot, head_abs_page_no)?;
         }
-        ctx.accounts
-            .queue_page
-            .validate_target(queue_root_key, head_page_slot, head_abs_page_no)?;
 
-        let Some(head_item) =
-            pending_head_item_on_page(&ctx.accounts.queue_page, page_size, next_sequence)
-        else {
+        let head_item = {
+            let queue_page = ctx.accounts.queue_page.load()?;
+            pending_head_item_on_page(&queue_page, page_size, next_sequence)
+        };
+        let Some(head_item) = head_item else {
             if ctx.accounts.queue_root.max_seen_sequence < next_sequence {
                 break;
             }
@@ -1582,11 +1742,8 @@ pub fn execution_queue_v3_execute_liquidity(
                     .gap_observed_slot
                     .saturating_add(gap_wait_slots)
             {
-                skip_liquidity_head_gaps(
-                    &mut ctx.accounts.queue_root,
-                    &ctx.accounts.queue_page,
-                    group_key,
-                );
+                let queue_page = ctx.accounts.queue_page.load()?;
+                skip_liquidity_head_gaps(&mut ctx.accounts.queue_root, &queue_page, group_key);
                 continue;
             }
             break;
@@ -1618,10 +1775,10 @@ pub fn execution_queue_v3_execute_liquidity(
         let decoded_payload = match decode_queue_payload(&candidate.payload) {
             Ok(payload) => payload,
             Err(_) => {
-                clear_liquidity_head_and_advance(
-                    &mut ctx.accounts.queue_root,
-                    &mut ctx.accounts.queue_page,
-                )?;
+                {
+                    let mut queue_page = ctx.accounts.queue_page.load_mut()?;
+                    clear_liquidity_head_and_advance(&mut ctx.accounts.queue_root, &mut queue_page)?;
+                }
                 emit!(QueueItemProcessed {
                     group: group_key,
                     market_index: u16::MAX,
@@ -1634,10 +1791,10 @@ pub fn execution_queue_v3_execute_liquidity(
         };
 
         if queue_item_kind_for_payload_variant(decoded_payload.variant) != candidate.kind {
-            clear_liquidity_head_and_advance(
-                &mut ctx.accounts.queue_root,
-                &mut ctx.accounts.queue_page,
-            )?;
+            {
+                let mut queue_page = ctx.accounts.queue_page.load_mut()?;
+                clear_liquidity_head_and_advance(&mut ctx.accounts.queue_root, &mut queue_page)?;
+            }
             emit!(QueueItemProcessed {
                 group: group_key,
                 market_index: u16::MAX,
@@ -1658,10 +1815,10 @@ pub fn execution_queue_v3_execute_liquidity(
         );
 
         if dispatch_result.is_ok() {
-            clear_liquidity_head_and_advance(
-                &mut ctx.accounts.queue_root,
-                &mut ctx.accounts.queue_page,
-            )?;
+            {
+                let mut queue_page = ctx.accounts.queue_page.load_mut()?;
+                clear_liquidity_head_and_advance(&mut ctx.accounts.queue_root, &mut queue_page)?;
+            }
             emit!(QueueItemProcessed {
                 group: group_key,
                 market_index: u16::MAX,
@@ -1674,10 +1831,10 @@ pub fn execution_queue_v3_execute_liquidity(
 
         let next_retry = candidate.retries.saturating_add(1);
         if next_retry >= EXECUTION_QUEUE_MAX_RETRIES {
-            clear_liquidity_head_and_advance(
-                &mut ctx.accounts.queue_root,
-                &mut ctx.accounts.queue_page,
-            )?;
+            {
+                let mut queue_page = ctx.accounts.queue_page.load_mut()?;
+                clear_liquidity_head_and_advance(&mut ctx.accounts.queue_root, &mut queue_page)?;
+            }
             emit!(QueueItemProcessed {
                 group: group_key,
                 market_index: u16::MAX,
@@ -1688,13 +1845,16 @@ pub fn execution_queue_v3_execute_liquidity(
             continue;
         }
 
-        ctx.accounts.queue_page.set_retry_backoff(
-            ctx.accounts.queue_root.page_size,
-            ctx.accounts.queue_root.head_page_offset(),
-            clock.slot,
-            next_retry,
-            1,
-        )?;
+        {
+            let mut queue_page = ctx.accounts.queue_page.load_mut()?;
+            queue_page.set_retry_backoff(
+                ctx.accounts.queue_root.page_size,
+                ctx.accounts.queue_root.head_page_offset(),
+                clock.slot,
+                next_retry,
+                1,
+            )?;
+        }
         break;
     }
 

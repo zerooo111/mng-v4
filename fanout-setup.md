@@ -19,16 +19,19 @@ backend instance and `continuum-proxy-rust` on the gateway instance.
                   │  GET /events/stream/:market ──────────────────┼──► BACKEND :9094/stream/:market
                   │  GET /events/snapshot/:market ────────────────┼──► BACKEND :9094/snapshot/:market
                   │  GET /events/markets ──────────────────────── ┼──► BACKEND :9094/markets
-                  │                                               │
-                  │  fanout-relay task ◄── /state/stream (SSE) ───┼──► BACKEND :9091 (harness)
-                  │       │ POST /ingest ──────────────────────── ┼──► BACKEND :9094/ingest
                   └───────────────────────────────────────────────┘
 
                       BACKEND MACHINE  (this machine)
                   ┌───────────────────────────────────────────────┐
+                  │  execution engine  :9090 / :9093             │
+                  │       │                                       │
+                  │       └──── POST /ingest ──────────────────►  │
                   │  service-fanout  :9094                        │
                   │                                               │
-                  │  POST /ingest ◄── from proxy relay task       │
+                  │  POST /ingest ◄── from execution engine       │
+                  │       │                                       │
+                  │       └──── POST /ingest/relay-intent ─────►  │
+                  │                      harness :9091             │
                   │       │                                       │
                   │  broadcast::channel per market                │
                   │       │                                       │
@@ -41,7 +44,8 @@ backend instance and `continuum-proxy-rust` on the gateway instance.
 ```
 
 Firewall rule on the backend: **only the gateway machine's IP is allowed to reach
-port 9094**. Port 9091 (harness) remains accessible to the proxy for the relay task.
+port 9094**. Port 9091 (harness) remains accessible only where the proxy still
+needs direct harness reads.
 
 ---
 
@@ -80,8 +84,12 @@ Environment=FANOUT_MAX_CONNECTIONS=2000
 Environment=FANOUT_AUTH_DISABLED=true
 
 # Guards /ingest against rogue event injection.
-# Set the same value in the proxy's FANOUT_INGEST_SECRET.
+# Set the same value in CTM_RELAYER_EVENT_SINK_AUTH_TOKEN if you enable
+# authenticated relayer -> fanout ingest in a future relayer build.
 Environment=FANOUT_INGEST_SECRET=<shared-ingest-secret>
+
+# Preserve harness lane-guard + diagnostics side effects.
+Environment=FANOUT_UPSTREAM_INGEST_URL=http://127.0.0.1:9091/ingest/relay-intent
 
 ExecStart=/home/hetalkenaudekar/mng-v4/bin/service-fanout/target/release/service-fanout
 Restart=on-failure
@@ -102,63 +110,26 @@ sudo systemctl status stagin4-devnet-fanout
 
 ---
 
-## 2. Event pipeline — wiring harness → fanout
+## 2. Event pipeline — execution engine → fanout → harness
 
-The execution engine sends events to the harness at
-`http://127.0.0.1:9091/ingest/relay-intent`. The harness processes them for
-on-chain state. The fanout service needs a copy of the same events so it can
-broadcast them to SSE subscribers.
+Keep fanout behind the relayer feature gate until the deployment decision is
+final. Enable local/backend fanout with:
 
-**Recommended: add a fanout relay task to `continuum-proxy-rust`.**
-
-The proxy already has an identical pattern in `src/trade_ingest.rs`
-(subscribes to `/state/stream/trades`, parses events, inserts to TimescaleDB).
-A new `src/fanout_relay.rs` module follows the same shape:
-
-1. Proxy connects to `STATE_HARNESS_ADDR/state/stream` (SSE, long-lived).
-2. Each SSE `event: event` frame is forwarded via `POST FANOUT_ADDR/ingest`
-   with header `X-Ingest-Secret: <FANOUT_INGEST_SECRET>`.
-3. On upstream disconnect, back off and reconnect (same as `trade_ingest.rs`).
-
-```rust
-// src/fanout_relay.rs (sketch — mirrors trade_ingest.rs structure)
-pub async fn run(http_client: reqwest::Client, harness_base: String, fanout_base: String, ingest_secret: Option<String>) {
-    loop {
-        if let Err(e) = connect_and_relay(&http_client, &harness_base, &fanout_base, &ingest_secret).await {
-            warn!("Fanout relay error: {e}, reconnecting...");
-        }
-        tokio::time::sleep(Duration::from_secs(2)).await;
-    }
-}
-
-async fn connect_and_relay(...) -> Result<()> {
-    // GET {harness_base}/state/stream (SSE, accept: text/event-stream)
-    // For each "data:" line received:
-    //   POST {fanout_base}/ingest  with the raw JSON body
-    //   X-Ingest-Secret: {secret}  (if configured)
-    //   fire-and-forget — do not await the response or stall the stream
-}
+```bash
+CTM_FANOUT_MODE=local
+CTM_FANOUT_BASE_URL=http://127.0.0.1:9094
 ```
 
-> **Note on event schema compatibility:** The fanout service requires each
-> ingest payload to have a `"market"` field (market pubkey string) for routing.
-> Verify that `/state/stream` events from the harness include this field before
-> wiring. If the harness emits a different envelope, add a thin mapping step in
-> `connect_and_relay` before forwarding.
+Fanout handles the realtime reader plane and mirrors the same payload upstream
+to the harness when `FANOUT_UPSTREAM_INGEST_URL` is configured:
 
-Add to `src/main.rs`:
-```rust
-// Fanout relay — forward harness SSE events to fanout /ingest
-if !args.fanout_addr.is_empty() {
-    let relay_client = http_client.client.clone();
-    let relay_harness = args.state_harness_addr.clone();
-    let relay_fanout  = args.fanout_addr.clone();
-    let relay_secret  = std::env::var("FANOUT_INGEST_SECRET").ok();
-    tokio::spawn(async move {
-        fanout_relay::run(relay_client, relay_harness, relay_fanout, relay_secret).await;
-    });
-}
-```
+1. Execution engine posts `relay_intent_accepted` / `relay_intent_status` to `service-fanout`.
+2. Fanout updates its per-market snapshot ring and SSE broadcast channels.
+3. Fanout forwards the same JSON payload to `http://127.0.0.1:9091/ingest/relay-intent`.
+4. The harness keeps its existing lane-guard, optimistic-status, and diagnostics side effects.
+
+This keeps the relayer's hot path isolated from public readers without forcing
+the harness to give up its internal relay-intent ingest semantics.
 
 ---
 
@@ -169,13 +140,10 @@ Add to the proxy's `.env` or deployment config:
 ```bash
 # Backend machine IP and fanout port
 FANOUT_ADDR=http://<backend-machine-ip>:9094
-
-# Must match FANOUT_INGEST_SECRET on the backend
-FANOUT_INGEST_SECRET=<shared-ingest-secret>
 ```
 
-Restart the proxy after setting these. The fanout relay task starts automatically
-when `FANOUT_ADDR` is non-empty.
+Restart the proxy after setting this so `/events/*` routes resolve to the
+backend fanout service.
 
 ---
 
@@ -199,9 +167,9 @@ sudo ufw status numbered
 ```
 
 With these rules:
-- External clients **cannot** reach `/ingest` directly — they must go through the proxy.
-- The proxy can call `/ingest` (relay) and `/stream/:market`, `/snapshot/:market`, `/markets`.
-- The execution engine calls the harness on loopback (unchanged).
+- External clients **cannot** reach `/ingest` directly — they must go through the proxy for reads only.
+- The proxy can call `/stream/:market`, `/snapshot/:market`, and `/markets`.
+- The execution engine calls fanout on loopback, and fanout mirrors to the harness on loopback.
 
 ---
 
@@ -347,10 +315,12 @@ Phase 3's user snapshot functionality is effectively served by the harness read
 path already exposed through the proxy. The per-market WebSocket variant is the
 only genuinely missing item.
 
-### Phase 4 — Redis Scale-Out ⬜ (not needed yet)
+### Phase 4 — Redis Scale-Out ⚠️ (implemented, not default)
 
-Not implemented. Single fanout instance handles up to ~2000 concurrent SSE
-connections (50 MB memory). Implement when that limit is approached.
+Redis-backed multi-instance fanout now uses Redis Streams for replayable
+distribution between fanout instances. Single-instance mode remains the default
+for devnet and modest deployments; enable Redis only when you actually need
+horizontal fanout capacity.
 
 ---
 
@@ -359,8 +329,8 @@ connections (50 MB memory). Implement when that limit is approached.
 ```
 Goal from fanout.md                        Achieved?  How
 ─────────────────────────────────────────────────────────────────────────────
-Zero code changes to execution engine      ✅         CTM_RELAYER_EVENT_SINK_URL unchanged;
-                                                      relay task in proxy reads harness SSE
+Zero code changes to execution engine      ✅         Submit/execute path stays untouched;
+                                                      only relayer env selects the sink topology
 
 No mutex contention on engine hot path     ✅         Fanout is a separate process;
                                                       engine never knows clients exist
@@ -386,7 +356,8 @@ Internal /ingest not reachable externally  ✅         Firewall blocks port 9094
 
 Prometheus metrics                         ✅         Both proxy and fanout expose OpenMetrics
 
-Horizontal scale-out path                  ⬜         Phase 4 Redis — not needed yet
+Horizontal scale-out path                  ⚠️         Redis Streams-based fanout is implemented;
+                                                      enable only when a single instance is saturated
 WebSocket variant                          ❌         Phase 3 — not yet built
 ```
 
@@ -394,9 +365,8 @@ WebSocket variant                          ❌         Phase 3 — not yet built
 
 ## 10. Remaining tasks before production
 
-1. ~~**Implement `fanout_relay.rs` in the proxy**~~ ✅ Done — `src/fanout_relay.rs` written, wired into `main.rs`.
-2. ~~**Verify harness SSE event schema**~~ ✅ Done — confirmed `"market"` is an integer index string (`"0"`, `"1"`, `"2"`); relay pre-filters on `"market"` key presence.
-3. **Create the systemd unit file** on the backend machine (template in §1).
-4. **Set firewall rules** (§4).
-5. **Set `FANOUT_ADDR` and `FANOUT_INGEST_SECRET`** in the proxy environment (§3) and rebuild/restart the proxy.
-6. **WebSocket variant** (`GET /ws/:market`) — implement in fanout Phase 3 if WS clients are needed.
+1. **Create the systemd unit file** on the backend machine (template in §1).
+2. **Set firewall rules** (§4).
+3. **Set `CTM_FANOUT_MODE=local` and `CTM_FANOUT_BASE_URL=http://127.0.0.1:9094`** in the relayer environment when you want backend fanout enabled.
+4. **Set `FANOUT_ADDR`** in the proxy environment (§3) and rebuild/restart the proxy.
+5. **WebSocket variant** (`GET /ws/:market`) — implement in fanout Phase 3 if WS clients are needed.

@@ -23,6 +23,7 @@ import type {
   } from './continuumHarness';
 
 type NativeContinuumStateEngine = {
+  bootstrapFromOnchainSnapshotJsonAsync(snapshotJson: string): Promise<void>;
   bootstrapFromOnchainSnapshotJson(snapshotJson: string): void;
   ingestRelayIntentJson(eventJson: string): void;
   ingestRelayIntentStatusJson?: (eventJson: string) => void;
@@ -84,8 +85,8 @@ class RustContinuumStateEngine implements ContinuumHarnessBackend {
 
   constructor(private readonly native: NativeContinuumStateEngine) {}
 
-  bootstrapFromOnchainSnapshot(snapshot: EngineSnapshot): void {
-    this.native.bootstrapFromOnchainSnapshotJson(JSON.stringify(snapshot));
+  async bootstrapFromOnchainSnapshot(snapshot: EngineSnapshot): Promise<void> {
+    await this.native.bootstrapFromOnchainSnapshotJsonAsync(JSON.stringify(snapshot));
   }
 
   findIntent(

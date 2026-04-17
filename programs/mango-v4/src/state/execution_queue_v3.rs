@@ -6,11 +6,14 @@ use std::mem::size_of;
 
 pub const EXECUTION_QUEUE_V3_MAX_PAGE_SIZE: usize = 128;
 pub const EXECUTION_QUEUE_V3_MAX_NUM_PAGES: u16 = 64;
+pub const EXECUTION_QUEUE_PAGE_V3_CREATE_SPACE: usize = 8;
 
 pub const EXECUTION_QUEUE_V3_DEFAULT_GAP_WAIT_SLOTS: u16 = 4;
 pub const EXECUTION_QUEUE_V3_DEFAULT_LIQUIDITY_DELAY_SLOTS: u16 = 25;
 pub const EXECUTION_QUEUE_V3_DEFAULT_MAX_COMPACTION_DISTANCE: u8 = 16;
 pub const EXECUTION_QUEUE_V3_DEFAULT_MIN_EXPIRY_BUFFER_SLOTS: u8 = 4;
+pub const EXECUTION_QUEUE_V3_ACCOUNT_RECIPE_LEN: usize = 24;
+pub const EXECUTION_QUEUE_V3_CANONICAL_PERP_ACCOUNT_RECIPE_V1_LEN: u8 = 8;
 
 pub const EXECUTION_QUEUE_AUTHORITY_STATE_SPACE: usize =
     8 + size_of::<ExecutionQueueAuthorityState>();
@@ -69,12 +72,85 @@ pub enum QueuePageStateV3 {
     Retired = 2,
 }
 
+#[repr(u8)]
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueueAccountRecipeKindV3 {
+    None = 0,
+    CanonicalPerpV1 = 1,
+}
+
+pub mod queue_account_recipe_v3 {
+    pub const LANE_CLASS_PERP_CANONICAL: u8 = 0;
+    pub const ACCOUNT_LOCATOR_MANGO_ACCOUNT_HINT: u8 = 0;
+    pub const BANK_SELECTOR_CANONICAL: u8 = 0;
+    pub const ORACLE_SELECTOR_CANONICAL: u8 = 0;
+    pub const FLAG_USE_MANGO_ACCOUNT_OWNER: u8 = 1 << 0;
+}
+
 pub mod queue_item_flags_v3 {
     pub const HEALTH_GATED: u8 = 1 << 0;
     pub const PRECHECK_REQUIRED: u8 = 1 << 1;
     pub const AGGRESSIVE_CANDIDATE: u8 = 1 << 2;
     pub const SUPERSEDABLE: u8 = 1 << 3;
     pub const FIXED_BAND_BUDGET: u8 = 1 << 4;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CanonicalPerpAccountRecipeV3 {
+    pub market_index: u16,
+    pub op_class: u8,
+    pub lane_class: u8,
+    pub account_locator: u8,
+    pub bank_selector: u8,
+    pub oracle_selector: u8,
+    pub flags: u8,
+}
+
+impl CanonicalPerpAccountRecipeV3 {
+    pub fn new(market_index: u16, op_class: u8) -> Self {
+        Self {
+            market_index,
+            op_class,
+            lane_class: queue_account_recipe_v3::LANE_CLASS_PERP_CANONICAL,
+            account_locator: queue_account_recipe_v3::ACCOUNT_LOCATOR_MANGO_ACCOUNT_HINT,
+            bank_selector: queue_account_recipe_v3::BANK_SELECTOR_CANONICAL,
+            oracle_selector: queue_account_recipe_v3::ORACLE_SELECTOR_CANONICAL,
+            flags: queue_account_recipe_v3::FLAG_USE_MANGO_ACCOUNT_OWNER,
+        }
+    }
+
+    pub fn encode(self) -> [u8; EXECUTION_QUEUE_V3_ACCOUNT_RECIPE_LEN] {
+        let mut bytes = [0u8; EXECUTION_QUEUE_V3_ACCOUNT_RECIPE_LEN];
+        bytes[0..2].copy_from_slice(&self.market_index.to_le_bytes());
+        bytes[2] = self.op_class;
+        bytes[3] = self.lane_class;
+        bytes[4] = self.account_locator;
+        bytes[5] = self.bank_selector;
+        bytes[6] = self.oracle_selector;
+        bytes[7] = self.flags;
+        bytes
+    }
+
+    pub fn decode(
+        recipe_kind: u8,
+        recipe_len: u8,
+        account_recipe: &[u8; EXECUTION_QUEUE_V3_ACCOUNT_RECIPE_LEN],
+    ) -> Option<Self> {
+        if recipe_kind != QueueAccountRecipeKindV3::CanonicalPerpV1 as u8
+            || recipe_len != EXECUTION_QUEUE_V3_CANONICAL_PERP_ACCOUNT_RECIPE_V1_LEN
+        {
+            return None;
+        }
+        Some(Self {
+            market_index: u16::from_le_bytes([account_recipe[0], account_recipe[1]]),
+            op_class: account_recipe[2],
+            lane_class: account_recipe[3],
+            account_locator: account_recipe[4],
+            bank_selector: account_recipe[5],
+            oracle_selector: account_recipe[6],
+            flags: account_recipe[7],
+        })
+    }
 }
 
 #[account]
@@ -364,7 +440,8 @@ impl LiquidityQueueRootV3 {
     }
 }
 
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
+#[zero_copy]
+#[derive(Debug)]
 pub struct QueueItemV3 {
     pub sequence: u64,
     pub min_execute_slot: u64,
@@ -377,24 +454,23 @@ pub struct QueueItemV3 {
     pub payload_hash: [u8; 32],
     pub accounts_hash: [u8; 32],
     pub compact_key: [u8; 16],
-    pub account_recipe: [u8; 24],
+    pub account_recipe: [u8; EXECUTION_QUEUE_V3_ACCOUNT_RECIPE_LEN],
+    pub market_index: u16,
+    pub failure_code: u16,
+    pub payload_len: u16,
     pub kind: u8,
     pub status: u8,
     pub retries: u8,
     pub flags: u8,
     pub op_class: u8,
-    pub market_index: u16,
-    pub failure_code: u16,
     pub recipe_kind: u8,
     pub recipe_len: u8,
     pub match_kind: u8,
     pub match_side: u8,
-    pub _padding0: [u8; 2],
-    pub payload_len: u16,
-    pub _padding1: [u8; 6],
+    pub _padding0: [u8; 1],
     pub payload: [u8; EXECUTION_QUEUE_PAYLOAD_MAX],
 }
-const_assert_eq!(size_of::<QueueItemV3>(), 472);
+const_assert_eq!(size_of::<QueueItemV3>(), 464);
 const_assert_eq!(size_of::<QueueItemV3>() % 8, 0);
 
 impl Default for QueueItemV3 {
@@ -411,27 +487,26 @@ impl Default for QueueItemV3 {
             payload_hash: [0; 32],
             accounts_hash: [0; 32],
             compact_key: [0; 16],
-            account_recipe: [0; 24],
+            account_recipe: [0; EXECUTION_QUEUE_V3_ACCOUNT_RECIPE_LEN],
+            market_index: 0,
+            failure_code: 0,
+            payload_len: 0,
             kind: QueueItemKind::CtmWrapped as u8,
             status: QueueItemStatusV3::Empty as u8,
             retries: 0,
             flags: 0,
             op_class: QueueItemOpClassV3::GenericPerpPlace as u8,
-            market_index: 0,
-            failure_code: 0,
             recipe_kind: 0,
             recipe_len: 0,
             match_kind: QueueItemMatchKindV3::None as u8,
             match_side: QueueItemMatchSideV3::Bid as u8,
-            _padding0: [0; 2],
-            payload_len: 0,
-            _padding1: [0; 6],
+            _padding0: [0; 1],
             payload: [0; EXECUTION_QUEUE_PAYLOAD_MAX],
         }
     }
 }
 
-#[account]
+#[account(zero_copy)]
 #[derive(Debug)]
 pub struct ExecutionQueuePageV3 {
     pub queue_root: Pubkey,
@@ -444,7 +519,7 @@ pub struct ExecutionQueuePageV3 {
     pub _padding0: [u8; 16],
     pub items: [QueueItemV3; EXECUTION_QUEUE_V3_MAX_PAGE_SIZE],
 }
-const_assert_eq!(size_of::<ExecutionQueuePageV3>(), 60480);
+const_assert_eq!(size_of::<ExecutionQueuePageV3>(), 59456);
 const_assert_eq!(size_of::<ExecutionQueuePageV3>() % 8, 0);
 
 impl ExecutionQueuePageV3 {
@@ -789,5 +864,26 @@ mod tests {
         assert_eq!(page.assigned_abs_page_no, 16);
         assert_eq!(page.first_pending_offset, 64);
         assert_eq!(page.live_count, 0);
+    }
+
+    #[test]
+    fn canonical_perp_account_recipe_round_trips() {
+        let recipe = CanonicalPerpAccountRecipeV3::new(
+            42,
+            QueueItemOpClassV3::GenericCancelByClientOrderId as u8,
+        );
+        let encoded = recipe.encode();
+        let decoded = CanonicalPerpAccountRecipeV3::decode(
+            QueueAccountRecipeKindV3::CanonicalPerpV1 as u8,
+            EXECUTION_QUEUE_V3_CANONICAL_PERP_ACCOUNT_RECIPE_V1_LEN,
+            &encoded,
+        )
+        .unwrap();
+
+        assert_eq!(decoded, recipe);
+        assert_eq!(
+            decoded.flags,
+            queue_account_recipe_v3::FLAG_USE_MANGO_ACCOUNT_OWNER
+        );
     }
 }

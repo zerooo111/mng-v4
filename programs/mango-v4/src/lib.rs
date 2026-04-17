@@ -745,6 +745,24 @@ pub mod mango_v4 {
         Ok(())
     }
 
+    pub fn execution_queue_v3_create_market_page(
+        ctx: Context<ExecutionQueueV3CreateMarketPage>,
+        page_slot: u16,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_v3_create_market_page(ctx, page_slot)?;
+        Ok(())
+    }
+
+    pub fn execution_queue_v3_resize_market_page(
+        ctx: Context<ExecutionQueueV3ResizeMarketPage>,
+        page_slot: u16,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_v3_resize_market_page(ctx, page_slot)?;
+        Ok(())
+    }
+
     pub fn execution_queue_v3_init_market_page(
         ctx: Context<ExecutionQueueV3InitMarketPage>,
         page_slot: u16,
@@ -752,6 +770,24 @@ pub mod mango_v4 {
     ) -> Result<()> {
         #[cfg(feature = "enable-gpl")]
         instructions::execution_queue_v3_init_market_page(ctx, page_slot, assigned_abs_page_no)?;
+        Ok(())
+    }
+
+    pub fn execution_queue_v3_create_liquidity_page(
+        ctx: Context<ExecutionQueueV3CreateLiquidityPage>,
+        page_slot: u16,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_v3_create_liquidity_page(ctx, page_slot)?;
+        Ok(())
+    }
+
+    pub fn execution_queue_v3_resize_liquidity_page(
+        ctx: Context<ExecutionQueueV3ResizeLiquidityPage>,
+        page_slot: u16,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_v3_resize_liquidity_page(ctx, page_slot)?;
         Ok(())
     }
 

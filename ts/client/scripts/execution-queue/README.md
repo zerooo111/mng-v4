@@ -139,7 +139,7 @@ CLUSTER_OVERRIDE=devnet \
 CLUSTER_URL_OVERRIDE=http://127.0.0.1:8899 \
 CTM_RELAYER_PAYER_KEYPAIR=~/.config/solana/id.json \
 CTM_RELAYER_CTM_KEYPAIR=~/.config/solana/id.json \
-CTM_RELAYER_EVENT_SINK_URL=http://127.0.0.1:9091/ingest/relay-intent \
+CTM_FANOUT_MODE=disabled \
 CTM_RELAYER_HARNESS_BASE_URL=http://127.0.0.1:9091 \
 EXECUTION_QUEUE_GROUP_PK=<group-pubkey> \
 EXECUTION_QUEUE_PK=<queue-pubkey> \
@@ -157,6 +157,10 @@ Rust engine exposes `GET /healthz` and `GET /metrics` on
 When `CTM_RELAYER_HARNESS_BASE_URL` is set, submit now performs a cached pre-enqueue harness gate:
 `/healthz` must be fresh, on-chain reconciliation must be fresh when enabled, and any market with
 active harness reconciliation drift is rejected before the relayer sends the enqueue transaction.
+Relay lifecycle egress is now runtime-gated:
+- `CTM_FANOUT_MODE=disabled` keeps the legacy direct harness sink (`/ingest/relay-intent`)
+- `CTM_FANOUT_MODE=local` routes through local `service-fanout` on `CTM_FANOUT_BASE_URL` and can mirror back to the harness via `FANOUT_UPSTREAM_INGEST_URL`
+- `CTM_FANOUT_MODE=external|gateway` routes to an external fanout base URL without requiring another relayer code change
 
 Quick checks:
 
@@ -271,7 +275,8 @@ CLUSTER_URL_OVERRIDE=https://api.devnet.solana.com \
 CTM_RELAYER_PAYER_KEYPAIR=~/.config/solana/id.json \
 CTM_RELAYER_CTM_KEYPAIR=~/.config/solana/id.json \
 CTM_RELAYER_PROGRAM_ID=<optional-program-id-override> \
-CTM_RELAYER_EVENT_SINK_URL=http://127.0.0.1:9091/ingest/relay-intent \
+CTM_FANOUT_MODE=disabled \
+CTM_RELAYER_HARNESS_BASE_URL=http://127.0.0.1:9091 \
 CTM_RELAYER_EVENT_SINK_AUTH_TOKEN=<optional-token> \
 yarn ctm-sequencer-relayer
 ```
@@ -358,8 +363,14 @@ In the devnet stack this means:
 - event log: `.devnet/run/continuum-harness-<group>.jsonl`
 - txn log: `.devnet/run/continuum-harness-<group>.txns.jsonl`
 
-The harness accepts relayer lifecycle events at:
+By default the relayer lifecycle sink remains the harness:
 - `POST /ingest/relay-intent`
+
+When `CTM_FANOUT_MODE=local|external|gateway`, the relayer resolves the sink to:
+- `POST <CTM_FANOUT_BASE_URL>/ingest`
+
+For local fanout deployments that still need harness-side lane-guard/diagnostic effects, configure:
+- `FANOUT_UPSTREAM_INGEST_URL=http://127.0.0.1:9091/ingest/relay-intent`
 
 and persists both:
 - `relay_intent_accepted`
@@ -372,7 +383,14 @@ This is the file to consult first when a bot says:
 
 ### Key Endpoints
 
-- `POST /ingest/relay-intent`
+Fanout egress:
+- `POST /ingest`
+- `GET /stream/:market`
+- `GET /snapshot/:market`
+- `GET /markets`
+
+Harness read plane:
+
 - `GET /state/markets?markets=<id,id>&view=optimistic|confirmed&depth=10&book=summary|full`
 - `GET /state/markets/:market?view=optimistic|confirmed`
 - `GET /state/users/:owner?view=optimistic|confirmed`

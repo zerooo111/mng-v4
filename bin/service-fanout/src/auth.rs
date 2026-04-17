@@ -129,8 +129,7 @@ fn verify_jwt_hs256(token: &str, secret: &str) -> Result<AuthClaims, &'static st
 
     // --- Verify signature ---
     let signing_input = format!("{header_b64}.{payload_b64}");
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-        .map_err(|_| "invalid HMAC key")?;
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).map_err(|_| "invalid HMAC key")?;
     mac.update(signing_input.as_bytes());
     let expected = mac.finalize().into_bytes();
 
@@ -230,14 +229,17 @@ impl ConnectionState {
     pub async fn acquire(
         self: &Arc<Self>,
         user_id: String,
-        metrics: &crate::metrics::Metrics,
+        metrics: &Arc<crate::metrics::Metrics>,
     ) -> Result<ConnectionGuard, (StatusCode, &'static str)> {
         // --- Global semaphore ---
         let permit = Arc::clone(&self.semaphore)
             .try_acquire_owned()
             .map_err(|_| {
                 metrics.inc_connections_rejected();
-                (StatusCode::SERVICE_UNAVAILABLE, "server connection limit reached")
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "server connection limit reached",
+                )
             })?;
 
         // --- Per-user counter ---
@@ -263,7 +265,7 @@ impl ConnectionState {
             user_id,
             user_connections: Arc::clone(&self.user_connections),
             _permit: permit,
-            metrics_ptr: metrics as *const _ as usize,
+            metrics: Arc::clone(metrics),
         })
     }
 }
@@ -278,10 +280,7 @@ pub struct ConnectionGuard {
     user_id: String,
     user_connections: Arc<DashMap<String, AtomicU32>>,
     _permit: OwnedSemaphorePermit,
-    /// Raw pointer to the `Metrics` instance inside `AppState`.
-    /// Safety: `AppState` (and therefore `Metrics`) lives for the entire
-    /// process lifetime — well beyond any individual connection guard.
-    metrics_ptr: usize,
+    metrics: Arc<crate::metrics::Metrics>,
 }
 
 impl Drop for ConnectionGuard {
@@ -289,11 +288,6 @@ impl Drop for ConnectionGuard {
         if let Some(counter) = self.user_connections.get(&self.user_id) {
             counter.fetch_sub(1, Ordering::Relaxed);
         }
-        // Safety: see field doc above.
-        let metrics = unsafe { &*(self.metrics_ptr as *const crate::metrics::Metrics) };
-        metrics.dec_subscriber();
+        self.metrics.dec_subscriber();
     }
 }
-
-// ConnectionGuard is Send: all fields are Send.
-unsafe impl Send for ConnectionGuard {}

@@ -3,6 +3,7 @@
 /// Clients call this before opening the SSE stream to get:
 /// - `last_sequence` — the sequence watermark to pass as `?from=N` to
 ///   `/stream/{market}` so they don't replay already-seen events.
+/// - `last_cursor` — the precise fanout watermark to pass as `?cursor=N`.
 /// - `recent_events` — the last ≤256 events, for immediate display and
 ///   offline replay without needing a separate history API.
 ///
@@ -15,6 +16,7 @@ use axum::Json;
 
 use crate::app::AppState;
 use crate::auth::AuthClaims;
+use crate::types::SnapshotResponse;
 
 // ---------------------------------------------------------------------------
 // Handler
@@ -39,7 +41,7 @@ pub async fn snapshot_handler(
         Some(snap_lock) => {
             // Read lock — clone the snapshot, drop the lock, then serialise.
             let snap = snap_lock.read().await.clone();
-            Json(snap).into_response()
+            Json(SnapshotResponse::from(&snap)).into_response()
         }
     }
 }

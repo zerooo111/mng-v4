@@ -2,18 +2,104 @@ use std::{
     any::Any,
     collections::{BTreeMap, HashMap},
     panic::{catch_unwind, AssertUnwindSafe},
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::Instant,
 };
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
-use crate::{ContinuumStateEngine, QueueView};
+use crate::{ContinuumStateEngine, EngineSnapshot, QueueView};
+
+// ---------------------------------------------------------------------------
+// Async bootstrap task
+//
+// Offloads the CPU-heavy `serde_json::from_str` call to a libuv worker
+// thread so the Node.js event loop stays responsive.  The mutex is only
+// held for the fast in-memory state-update phase that follows the parse,
+// so other NAPI methods remain unblocked during bootstrap.
+// ---------------------------------------------------------------------------
+
+pub struct BootstrapTask {
+    inner: Arc<Mutex<ContinuumStateEngine>>,
+    snapshot_json: String,
+}
+
+impl napi::Task for BootstrapTask {
+    type Output = ();
+    type JsValue = ();
+
+    fn compute(&mut self) -> napi::Result<Self::Output> {
+        // Phase 1: parse JSON outside the lock – this is the slow part.
+        let snapshot: EngineSnapshot = serde_json::from_str(&self.snapshot_json)
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+
+        // Phase 2: hold the lock only for the fast in-memory state update.
+        let started = Instant::now();
+        let mut guard = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                let mut recovered = poisoned.into_inner();
+                *recovered = ContinuumStateEngine::new();
+                crate::logging::log_error(
+                    "node.bootstrap_task",
+                    "rust-harness mutex was poisoned; engine state reset",
+                    BTreeMap::from([("operation".to_string(), "bootstrap_task".to_string())]),
+                );
+                return Err(napi::Error::from_reason(
+                    "rust-harness mutex was poisoned during async bootstrap; engine state reset",
+                ));
+            }
+        };
+
+        match catch_unwind(AssertUnwindSafe(|| guard.bootstrap_from_onchain_snapshot(snapshot))) {
+            Ok(Ok(())) => {
+                crate::logging::log_call_outcome(
+                    "bootstrap_from_onchain_snapshot_json_async",
+                    started.elapsed(),
+                    "ok",
+                    None,
+                    BTreeMap::new(),
+                );
+                Ok(())
+            }
+            Ok(Err(err)) => {
+                let message = err.to_string();
+                crate::logging::log_call_outcome(
+                    "bootstrap_from_onchain_snapshot_json_async",
+                    started.elapsed(),
+                    "error",
+                    Some(&message),
+                    BTreeMap::new(),
+                );
+                Err(napi::Error::from_reason(message))
+            }
+            Err(payload) => {
+                *guard = ContinuumStateEngine::new();
+                let message = format!(
+                    "rust-harness panic in bootstrap task: {}; engine state reset",
+                    panic_payload_message(payload)
+                );
+                crate::logging::log_call_outcome(
+                    "bootstrap_from_onchain_snapshot_json_async",
+                    started.elapsed(),
+                    "panic",
+                    Some(&message),
+                    BTreeMap::new(),
+                );
+                Err(napi::Error::from_reason(message))
+            }
+        }
+    }
+
+    fn resolve(&mut self, _env: napi::Env, _output: ()) -> napi::Result<()> {
+        Ok(())
+    }
+}
 
 #[napi]
 pub struct NativeContinuumStateEngine {
-    inner: Mutex<ContinuumStateEngine>,
+    inner: Arc<Mutex<ContinuumStateEngine>>,
 }
 
 #[napi]
@@ -22,8 +108,22 @@ impl NativeContinuumStateEngine {
     pub fn new() -> Self {
         crate::logging::init_native_logging();
         Self {
-            inner: Mutex::new(ContinuumStateEngine::new()),
+            inner: Arc::new(Mutex::new(ContinuumStateEngine::new())),
         }
+    }
+
+    /// Async variant – JSON parsing runs on a libuv worker thread so the
+    /// event loop stays free.  Prefer this over the sync variant in any
+    /// context that can `await` (periodic reconciliation, startup bootstrap).
+    #[napi(js_name = "bootstrapFromOnchainSnapshotJsonAsync")]
+    pub fn bootstrap_from_onchain_snapshot_json_async(
+        &self,
+        snapshot_json: String,
+    ) -> AsyncTask<BootstrapTask> {
+        AsyncTask::new(BootstrapTask {
+            inner: Arc::clone(&self.inner),
+            snapshot_json,
+        })
     }
 
     #[napi(js_name = "bootstrapFromOnchainSnapshotJson")]

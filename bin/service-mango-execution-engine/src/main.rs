@@ -23,16 +23,17 @@ use mango_v4::{
     },
     state::{
         load_orca_pool_state, load_raydium_pool_state, pyth_mainnet_sol_oracle,
-        pyth_mainnet_usdc_oracle, Bank, EventQueue, EventType, FillEvent, MangoAccountValue,
-        ExecutionQueuePageV3, OutEvent, PerpMarket, PerpMarketIndex, PerpMarketQueueRootV3,
-        QueueItemKind, QueueItemStatusV3, QueuePageStateV3, Side, TokenIndex,
-        EXECUTION_QUEUE_CTM_CAPACITY, EXECUTION_QUEUE_CTM_ITEMS_OFFSET,
-        EXECUTION_QUEUE_ITEM_ACCOUNTS_HASH_OFFSET, EXECUTION_QUEUE_ITEM_KIND_OFFSET,
-        EXECUTION_QUEUE_ITEM_MIN_EXECUTE_SLOT_OFFSET,
+        pyth_mainnet_usdc_oracle, queue_account_recipe_v3, Bank, CanonicalPerpAccountRecipeV3,
+        EventQueue, EventType, ExecutionQueuePageV3, FillEvent, MangoAccountValue, OutEvent,
+        PerpMarket, PerpMarketIndex, PerpMarketQueueRootV3, QueueItemKind, QueueItemStatusV3,
+        QueueItemV3, QueuePageStateV3, Side, TokenIndex, EXECUTION_QUEUE_CTM_CAPACITY,
+        EXECUTION_QUEUE_CTM_ITEMS_OFFSET, EXECUTION_QUEUE_ITEM_ACCOUNTS_HASH_OFFSET,
+        EXECUTION_QUEUE_ITEM_KIND_OFFSET, EXECUTION_QUEUE_ITEM_MIN_EXECUTE_SLOT_OFFSET,
         EXECUTION_QUEUE_ITEM_PAYLOAD_LEN_OFFSET, EXECUTION_QUEUE_ITEM_PAYLOAD_OFFSET,
         EXECUTION_QUEUE_ITEM_SEQUENCE_OFFSET, EXECUTION_QUEUE_ITEM_SIZE,
         EXECUTION_QUEUE_ITEM_STATUS_OFFSET, EXECUTION_QUEUE_LIQUIDITY_CAPACITY,
-        EXECUTION_QUEUE_LIQUIDITY_ITEMS_OFFSET,
+        EXECUTION_QUEUE_LIQUIDITY_ITEMS_OFFSET, EXECUTION_QUEUE_PAGE_V3_CREATE_SPACE,
+        EXECUTION_QUEUE_PAGE_V3_SPACE,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -42,7 +43,7 @@ use solana_client::{
     rpc_config::RpcSendTransactionConfig,
     rpc_request::{RpcError, RpcResponseErrorData},
 };
-use solana_program::{hash::hashv, pubkey};
+use solana_program::{entrypoint::MAX_PERMITTED_DATA_INCREASE, hash::hashv, pubkey};
 use solana_sdk::{
     account::ReadableAccount,
     commitment_config::CommitmentConfig,
@@ -413,9 +414,7 @@ impl Config {
         let sequence_submit_watch_poll_ms =
             parse_u64_env("CTM_RELAYER_SEQUENCE_SUBMIT_WATCH_POLL_MS", 250)?;
         let prioritization_fee = parse_u64_env("CTM_RELAYER_PRIORITIZATION_FEE", 0)?;
-        let event_sink_url = std::env::var("CTM_RELAYER_EVENT_SINK_URL")
-            .ok()
-            .filter(|v| !v.trim().is_empty());
+        let event_sink_url = resolve_event_sink_url();
         let harness_base_url = std::env::var("CTM_RELAYER_HARNESS_BASE_URL")
             .ok()
             .filter(|v| !v.trim().is_empty())
@@ -1842,6 +1841,63 @@ fn derive_harness_base_url(event_sink_url: Option<&str>) -> Option<String> {
         .map(|value| value.trim_end_matches('/').to_string())
 }
 
+fn normalize_optional_url(raw: Option<String>) -> Option<String> {
+    raw.map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn resolve_fanout_mode() -> String {
+    let mode = std::env::var("CTM_FANOUT_MODE")
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+    match mode {
+        Some(mode) => mode,
+        None if parse_bool_env("CTM_FANOUT_ENABLED", false) => "local".to_string(),
+        None => "disabled".to_string(),
+    }
+}
+
+fn resolve_event_sink_url() -> Option<String> {
+    let explicit_sink_url =
+        normalize_optional_url(std::env::var("CTM_RELAYER_EVENT_SINK_URL").ok());
+    let fanout_base_url = normalize_optional_url(std::env::var("CTM_FANOUT_BASE_URL").ok());
+    let harness_base_url =
+        normalize_optional_url(std::env::var("CTM_RELAYER_HARNESS_BASE_URL").ok());
+    let fanout_mode = resolve_fanout_mode();
+    resolve_event_sink_url_from_parts(
+        explicit_sink_url.as_deref(),
+        Some(fanout_mode.as_str()),
+        fanout_base_url.as_deref(),
+        harness_base_url.as_deref(),
+    )
+}
+
+fn resolve_event_sink_url_from_parts(
+    explicit_sink_url: Option<&str>,
+    fanout_mode: Option<&str>,
+    fanout_base_url: Option<&str>,
+    harness_base_url: Option<&str>,
+) -> Option<String> {
+    if let Some(explicit_sink_url) = explicit_sink_url {
+        return Some(explicit_sink_url.trim_end_matches('/').to_string());
+    }
+
+    match fanout_mode
+        .unwrap_or("disabled")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "local" | "external" | "gateway" => {
+            let base = fanout_base_url.unwrap_or("http://127.0.0.1:9094");
+            Some(format!("{}/ingest", base.trim_end_matches('/')))
+        }
+        _ => harness_base_url
+            .map(|base| format!("{}/ingest/relay-intent", base.trim_end_matches('/'))),
+    }
+}
+
 fn validate_harness_health(
     health: &HarnessHealthResponse,
     now_ms: u64,
@@ -1915,6 +1971,12 @@ struct Lane {
     name: String,
     remaining_accounts: Vec<AccountMeta>,
     hash: [u8; 32],
+}
+
+#[derive(Clone)]
+struct DerivedQueueLaneEntry {
+    sequence: u64,
+    lane: Lane,
 }
 
 fn lane_account_width(lane: &Lane) -> usize {
@@ -3060,6 +3122,7 @@ struct StaticPerpMarketMeta {
 
 #[derive(Clone, Debug, Default)]
 struct MangoAccountMirror {
+    owner: Pubkey,
     token_indices: Vec<TokenIndex>,
     perp_market_indices: Vec<PerpMarketIndex>,
     serum_open_orders: Vec<Pubkey>,
@@ -3310,12 +3373,10 @@ impl Engine {
             .ingress_failure_memo
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let entry = guard
-            .entry(user_key)
-            .or_insert_with(|| IngressFailureMemo {
-                count: 0,
-                last_seen_ms: now_ms,
-            });
+        let entry = guard.entry(user_key).or_insert_with(|| IngressFailureMemo {
+            count: 0,
+            last_seen_ms: now_ms,
+        });
         entry.count = entry.count.saturating_add(1);
         entry.last_seen_ms = now_ms;
     }
@@ -3447,11 +3508,10 @@ impl Engine {
         }
     }
 
-    async fn ensure_group_static_account_mirror(
+    async fn load_group_static_account_mirror(
         &self,
-        request: &SubmitIntentRequest,
         group: Pubkey,
-    ) -> Result<GroupStaticAccountMirror, Status> {
+    ) -> Result<GroupStaticAccountMirror> {
         if let Ok(cache) = self.group_account_mirrors.lock() {
             if let Some(mirror) = cache.get(&group) {
                 return Ok(mirror.clone());
@@ -3463,11 +3523,7 @@ impl Engine {
             .get_program_accounts(&self.config.program_id)
             .await
             .map_err(|err| {
-                self.reject_submit_request(
-                    request,
-                    Code::Unavailable,
-                    format!("group account mirror bootstrap failed for group={group}: {err}"),
-                )
+                anyhow!("group account mirror bootstrap failed for group={group}: {err}")
             })?;
 
         let mut mirror = GroupStaticAccountMirror::default();
@@ -3526,10 +3582,8 @@ impl Engine {
         }
 
         if mirror.banks_by_token_index.is_empty() && mirror.perps_by_market_index.is_empty() {
-            return Err(self.reject_submit_request(
-                request,
-                Code::Unavailable,
-                format!("group account mirror bootstrap found no bank/perp accounts for group={group}"),
+            return Err(anyhow!(
+                "group account mirror bootstrap found no bank/perp accounts for group={group}"
             ));
         }
 
@@ -3546,14 +3600,12 @@ impl Engine {
                 .get_multiple_accounts(&unique_fallback_pubkeys)
                 .await
                 .map_err(|err| {
-                    self.reject_submit_request(
-                        request,
-                        Code::Unavailable,
-                        format!("fallback oracle bootstrap failed for group={group}: {err}"),
-                    )
+                    anyhow!("fallback oracle bootstrap failed for group={group}: {err}")
                 })?;
-            for (fallback_pubkey, maybe_account) in
-                unique_fallback_pubkeys.iter().copied().zip(fetched.into_iter())
+            for (fallback_pubkey, maybe_account) in unique_fallback_pubkeys
+                .iter()
+                .copied()
+                .zip(fetched.into_iter())
             {
                 let mut accounts = vec![fallback_pubkey];
                 if let Some(account) = maybe_account {
@@ -3584,13 +3636,7 @@ impl Engine {
                 .rpc
                 .get_multiple_accounts(&unique_quote_oracle_pubkeys)
                 .await
-                .map_err(|err| {
-                    self.reject_submit_request(
-                        request,
-                        Code::Unavailable,
-                        format!("quote oracle bootstrap failed for group={group}: {err}"),
-                    )
-                })?;
+                .map_err(|err| anyhow!("quote oracle bootstrap failed for group={group}: {err}"))?;
             for (quote_oracle_pubkey, maybe_account) in unique_quote_oracle_pubkeys
                 .iter()
                 .copied()
@@ -3627,11 +3673,17 @@ impl Engine {
         Ok(mirror)
     }
 
-    async fn ensure_mango_account_mirror(
+    async fn ensure_group_static_account_mirror(
         &self,
         request: &SubmitIntentRequest,
-        mango_account: Pubkey,
-    ) -> Result<MangoAccountMirror, Status> {
+        group: Pubkey,
+    ) -> Result<GroupStaticAccountMirror, Status> {
+        self.load_group_static_account_mirror(group)
+            .await
+            .map_err(|err| self.reject_submit_request(request, Code::Unavailable, err.to_string()))
+    }
+
+    async fn load_mango_account_mirror(&self, mango_account: Pubkey) -> Result<MangoAccountMirror> {
         if let Ok(cache) = self.mango_account_mirrors.lock() {
             if let Some(mirror) = cache.get(&mango_account) {
                 return Ok(mirror.clone());
@@ -3642,34 +3694,39 @@ impl Engine {
             account
         } else {
             let account = self.rpc.get_account(&mango_account).await.map_err(|err| {
-                self.reject_submit_request(
-                    request,
-                    Code::Unavailable,
-                    format!("mango account mirror bootstrap failed for {mango_account}: {err}"),
-                )
+                anyhow!("mango account mirror bootstrap failed for {mango_account}: {err}")
             })?;
             let keyed = KeyedAccountSharedData::new(mango_account, account.into());
             self.seed_static_account_cache(std::iter::once(keyed.clone()));
             keyed
         };
 
-        let mirror =
-            build_mango_account_mirror_from_keyed_account(mango_account, &keyed_account).map_err(
-                |err| {
-                    self.reject_submit_request(
-                        request,
-                        Code::FailedPrecondition,
-                        format!(
-                            "failed to build mango account mirror for {mango_account}: {err}"
-                        ),
-                    )
-                },
-            )?;
+        let mirror = build_mango_account_mirror_from_keyed_account(mango_account, &keyed_account)
+            .map_err(|err| {
+            anyhow!("failed to build mango account mirror for {mango_account}: {err}")
+        })?;
         if let Ok(mut cache) = self.mango_account_mirrors.lock() {
             let entry = cache.entry(mango_account).or_insert_with(|| mirror.clone());
             return Ok(entry.clone());
         }
         Ok(mirror)
+    }
+
+    async fn ensure_mango_account_mirror(
+        &self,
+        request: &SubmitIntentRequest,
+        mango_account: Pubkey,
+    ) -> Result<MangoAccountMirror, Status> {
+        self.load_mango_account_mirror(mango_account)
+            .await
+            .map_err(|err| {
+                let code = if err.to_string().contains("bootstrap failed") {
+                    Code::Unavailable
+                } else {
+                    Code::FailedPrecondition
+                };
+                self.reject_submit_request(request, code, err.to_string())
+            })
     }
 
     async fn derive_submit_remaining_accounts(
@@ -3708,7 +3765,8 @@ impl Engine {
         })?;
 
         if !request.remaining_accounts.is_empty() {
-            let matches = supplied_account_metas_match(&request.remaining_accounts, &remaining_accounts);
+            let matches =
+                supplied_account_metas_match(&request.remaining_accounts, &remaining_accounts);
             if target.intent_version == INTENT_VERSION_V1 && !matches {
                 return Err(self.reject_submit_request(
                     request,
@@ -5053,7 +5111,8 @@ impl Engine {
                 gap_batch
             };
 
-            let mut instructions = vec![ComputeBudgetInstruction::set_compute_unit_limit(1_400_000)];
+            let mut instructions =
+                vec![ComputeBudgetInstruction::set_compute_unit_limit(1_400_000)];
             if self.config.executor_prioritization_fee > 0 {
                 instructions.push(ComputeBudgetInstruction::set_compute_unit_price(
                     self.config.executor_prioritization_fee,
@@ -5320,11 +5379,12 @@ impl Engine {
         self.configured_queue_v3.as_ref()
     }
 
-    async fn ensure_v3_market_page_known(
+    async fn prepare_v3_market_page_instructions(
         &self,
+        group: Pubkey,
         queue_root: Pubkey,
         sequence: u64,
-    ) -> Result<(Pubkey, u16, u64, bool), Status> {
+    ) -> Result<(Pubkey, Vec<Instruction>), Status> {
         let runtime = self
             .configured_queue_v3()
             .ok_or_else(|| Status::internal("configured v3 queue metadata unavailable"))?;
@@ -5332,14 +5392,21 @@ impl Engine {
         let abs_page_no = runtime.abs_page_no_for_sequence(sequence);
         let queue_page =
             find_execution_queue_v3_page_pda(self.config.program_id, queue_root, page_slot);
-
-        match self.rpc.get_account(&queue_page).await {
-            Ok(_) => {
+        let mut instructions = Vec::new();
+        let (mut page_len, page_initialized) = match self.rpc.get_account(&queue_page).await {
+            Ok(account) => {
                 self.known_v3_pages
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(queue_page);
-                Ok((queue_page, page_slot, abs_page_no, true))
+                (
+                    account.data.len(),
+                    account
+                        .data
+                        .get(0..8)
+                        .map(|bytes| bytes.iter().any(|byte| *byte != 0))
+                        .unwrap_or(false),
+                )
             }
             Err(err) => {
                 let msg = err.to_string().to_ascii_lowercase();
@@ -5347,13 +5414,141 @@ impl Engine {
                     || msg.contains("could not find account")
                     || msg.contains("not found")
                 {
-                    Ok((queue_page, page_slot, abs_page_no, false))
+                    instructions.push(build_execution_queue_v3_create_market_page_instruction(
+                        self.config.program_id,
+                        group,
+                        runtime.authority_state,
+                        queue_root,
+                        self.config.payer.pubkey(),
+                        page_slot,
+                    ));
+                    (EXECUTION_QUEUE_PAGE_V3_CREATE_SPACE, false)
                 } else {
-                    Err(Status::unavailable(format!(
+                    return Err(Status::unavailable(format!(
                         "failed to probe v3 queue page {queue_page}: {err}"
-                    )))
+                    )));
                 }
             }
+        };
+
+        while page_len < EXECUTION_QUEUE_PAGE_V3_SPACE {
+            instructions.push(build_execution_queue_v3_resize_market_page_instruction(
+                self.config.program_id,
+                group,
+                runtime.authority_state,
+                queue_root,
+                self.config.payer.pubkey(),
+                page_slot,
+            ));
+            page_len = (page_len + MAX_PERMITTED_DATA_INCREASE).min(EXECUTION_QUEUE_PAGE_V3_SPACE);
+        }
+
+        if !page_initialized {
+            instructions.push(build_execution_queue_v3_init_market_page_instruction(
+                self.config.program_id,
+                group,
+                runtime.authority_state,
+                queue_root,
+                self.config.payer.pubkey(),
+                page_slot,
+                abs_page_no,
+            ));
+        }
+
+        Ok((queue_page, instructions))
+    }
+
+    async fn submit_v3_market_page_prepare_tx(
+        &self,
+        instructions: Vec<Instruction>,
+    ) -> Result<Signature> {
+        let chain = self.blockhashes.snapshot().await;
+        let mut tx_instructions = instructions;
+        tx_instructions.insert(0, ComputeBudgetInstruction::set_compute_unit_limit(600_000));
+        if self.config.prioritization_fee > 0 {
+            tx_instructions.insert(
+                0,
+                ComputeBudgetInstruction::set_compute_unit_price(self.config.prioritization_fee),
+            );
+        }
+        let message = MessageV0::try_compile(
+            &self.config.payer.pubkey(),
+            &tx_instructions,
+            &[],
+            chain.blockhash,
+        )?;
+        let tx = VersionedTransaction::try_new(
+            solana_sdk::message::VersionedMessage::V0(message),
+            &[self.config.payer.as_ref()],
+        )?;
+        let send_cfg = RpcSendTransactionConfig {
+            skip_preflight: self.config.skip_preflight,
+            preflight_commitment: Some(CommitmentConfig::processed().commitment),
+            max_retries: self.config.submit_rpc_max_retries,
+            ..RpcSendTransactionConfig::default()
+        };
+        let signature = self.rpc.send_transaction_with_config(&tx, send_cfg).await?;
+        self.await_signature_result(signature, self.config.queue_wait_timeout_ms)
+            .await?;
+        Ok(signature)
+    }
+
+    async fn ensure_v3_market_page_ready(
+        &self,
+        group: Pubkey,
+        queue_root: Pubkey,
+        sequence: u64,
+    ) -> Result<Pubkey, Status> {
+        let mut last_err = None;
+        for attempt in 0..4 {
+            let (queue_page, instructions) = self
+                .prepare_v3_market_page_instructions(group, queue_root, sequence)
+                .await?;
+            if instructions.is_empty() {
+                self.known_v3_pages
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(queue_page);
+                return Ok(queue_page);
+            }
+
+            match self.submit_v3_market_page_prepare_tx(instructions).await {
+                Ok(signature) => {
+                    debug!(
+                        "prepared v3 queue page queue_root={} sequence={} attempt={} tx={}",
+                        queue_root,
+                        sequence,
+                        attempt + 1,
+                        signature
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        "v3 queue page preparation retry queue_root={} sequence={} attempt={} err={err:?}",
+                        queue_root,
+                        sequence,
+                        attempt + 1,
+                    );
+                    last_err = Some(err.to_string());
+                    sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+
+        let (queue_page, instructions) = self
+            .prepare_v3_market_page_instructions(group, queue_root, sequence)
+            .await?;
+        if instructions.is_empty() {
+            self.known_v3_pages
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(queue_page);
+            Ok(queue_page)
+        } else {
+            let reason = last_err.unwrap_or_else(|| "page remained unprepared".to_string());
+            Err(Status::unavailable(format!(
+                "failed to prepare v3 queue page {queue_page} for sequence {sequence}: {reason}"
+            )))
         }
     }
 
@@ -5404,15 +5599,14 @@ impl Engine {
         }
     }
 
-    async fn inspect_v3_near_head_lane_entries(
+    async fn inspect_v3_near_head_items(
         &self,
         queue_root: Pubkey,
         root: &PerpMarketQueueRootV3,
         head: &QueueHead,
         max_scan_items: usize,
-        max_unique_hashes: usize,
-    ) -> Result<Vec<(u64, [u8; 32])>> {
-        if max_scan_items == 0 || max_unique_hashes == 0 || head.reason != "ctm_pending" {
+    ) -> Result<Vec<QueueItemV3>> {
+        if max_scan_items == 0 || head.reason != "ctm_pending" {
             return Ok(Vec::new());
         }
 
@@ -5420,8 +5614,7 @@ impl Engine {
             .next_sequence
             .saturating_add(max_scan_items.saturating_sub(1) as u64)
             .min(head.max_seen_sequence);
-        let mut entries = Vec::new();
-        let mut seen = HashSet::new();
+        let mut items = Vec::new();
         let mut loaded_abs_page_no = None;
         let mut loaded_page = None;
         let mut sequence = head.next_sequence;
@@ -5455,23 +5648,21 @@ impl Engine {
                 break;
             }
 
-            if seen.insert(item.accounts_hash) {
-                entries.push((sequence, item.accounts_hash));
-                if entries.len() >= max_unique_hashes.min(20) {
-                    break;
-                }
+            items.push(item.clone());
+            if items.len() >= max_scan_items.min(20) {
+                break;
             }
 
             sequence = sequence.saturating_add(1);
         }
 
-        Ok(entries)
+        Ok(items)
     }
 
     async fn inspect_v3_market_queue(
         &self,
         executor: &Arc<ExecutorState>,
-    ) -> Result<(QueueHead, Vec<(u64, [u8; 32])>)> {
+    ) -> Result<(QueueHead, Vec<QueueItemV3>)> {
         let root = self
             .load_v3_market_root_account(executor.execution_queue)
             .await?;
@@ -5483,16 +5674,97 @@ impl Engine {
             None
         };
         let head = inspect_v3_queue_head(&root, head_page.as_ref());
-        let near_head_lane_entries = self
-            .inspect_v3_near_head_lane_entries(
+        let near_head_items = self
+            .inspect_v3_near_head_items(
                 executor.execution_queue,
                 &root,
                 &head,
                 self.config.executor_head_scan_items,
-                self.config.executor_target_lane_fanout.max(1).min(20),
             )
             .await?;
-        Ok((head, near_head_lane_entries))
+        Ok((head, near_head_items))
+    }
+
+    async fn derive_v3_recipe_lane_entries(
+        &self,
+        executor: &Arc<ExecutorState>,
+        items: &[QueueItemV3],
+    ) -> Result<Vec<DerivedQueueLaneEntry>> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let group_mirror = self
+            .load_group_static_account_mirror(executor.group)
+            .await?;
+        let mut mango_account_mirrors = HashMap::<Pubkey, MangoAccountMirror>::new();
+        let mut entries = Vec::new();
+
+        for item in items {
+            if item.status != QueueItemStatusV3::Pending as u8
+                || item.kind != QueueItemKind::CtmWrapped as u8
+            {
+                continue;
+            }
+            let Some(recipe) = CanonicalPerpAccountRecipeV3::decode(
+                item.recipe_kind,
+                item.recipe_len,
+                &item.account_recipe,
+            ) else {
+                continue;
+            };
+            if recipe.market_index != item.market_index
+                || recipe.market_index != executor.market_index
+                || recipe.op_class != item.op_class
+                || recipe.lane_class != queue_account_recipe_v3::LANE_CLASS_PERP_CANONICAL
+                || recipe.account_locator
+                    != queue_account_recipe_v3::ACCOUNT_LOCATOR_MANGO_ACCOUNT_HINT
+                || recipe.bank_selector != queue_account_recipe_v3::BANK_SELECTOR_CANONICAL
+                || recipe.oracle_selector != queue_account_recipe_v3::ORACLE_SELECTOR_CANONICAL
+                || (recipe.flags & queue_account_recipe_v3::FLAG_USE_MANGO_ACCOUNT_OWNER) == 0
+                || item.mango_account_hint == Pubkey::default()
+            {
+                continue;
+            }
+
+            let mango_mirror =
+                if let Some(mirror) = mango_account_mirrors.get(&item.mango_account_hint) {
+                    mirror.clone()
+                } else {
+                    let mirror = self
+                        .load_mango_account_mirror(item.mango_account_hint)
+                        .await?;
+                    mango_account_mirrors.insert(item.mango_account_hint, mirror.clone());
+                    mirror
+                };
+
+            let remaining_accounts = build_derived_perp_remaining_accounts(
+                executor.group,
+                item.mango_account_hint,
+                mango_mirror.owner,
+                recipe.market_index,
+                &group_mirror,
+                &mango_mirror,
+            )?;
+            let lane_name = format!("v3-recipe-{}", item.sequence);
+            let Some(lane) = expand_lane_variants(
+                lane_name,
+                &remaining_accounts,
+                executor.group,
+                executor.execution_queue,
+                true,
+            )
+            .into_iter()
+            .find(|lane| lane.hash == item.accounts_hash) else {
+                continue;
+            };
+            entries.push(DerivedQueueLaneEntry {
+                sequence: item.sequence,
+                lane,
+            });
+        }
+
+        Ok(entries)
     }
 
     async fn inspect_v3_next_enqueue_sequence(&self, queue_root: Pubkey) -> Result<u64> {
@@ -6197,20 +6469,23 @@ impl Engine {
 
             let mut instructions = vec![ComputeBudgetInstruction::set_compute_unit_limit(1_400_000)];
             if let Some(v3) = self.configured_queue_v3() {
-                let (queue_page, page_slot, abs_page_no, page_exists) = self
-                    .ensure_v3_market_page_known(execution_queue, sequence)
-                    .await?;
-                if !page_exists {
-                    instructions.push(build_execution_queue_v3_init_market_page_instruction(
-                        self.config.program_id,
-                        group,
-                        v3.authority_state,
-                        execution_queue,
-                        self.config.payer.pubkey(),
-                        page_slot,
-                        abs_page_no,
-                    ));
-                }
+                let queue_page = match self
+                    .ensure_v3_market_page_ready(group, execution_queue, sequence)
+                    .await
+                {
+                    Ok(queue_page) => queue_page,
+                    Err(err) => {
+                        self.recover_sequence_after_submit_error(
+                            &sequence_key,
+                            market_index,
+                            sequence,
+                            execution_queue,
+                            false,
+                        )
+                        .await;
+                        return Err(err);
+                    }
+                };
                 instructions.push(user_preinstruction);
                 instructions.push(ctm_preinstruction);
                 instructions.push(build_enqueue_instruction_v3(
@@ -6735,13 +7010,11 @@ impl Engine {
             target_kind: Some(request.target_kind),
             target_index: Some(request.target_index),
             accounts_hash: Some(bytes_to_hex(&envelope.accounts_hash)),
-            remaining_accounts_source: Some(
-                if request.intent_version == INTENT_VERSION_V2 {
-                    "relayer_derived".to_string()
-                } else {
-                    "legacy_caller_supplied".to_string()
-                },
-            ),
+            remaining_accounts_source: Some(if request.intent_version == INTENT_VERSION_V2 {
+                "relayer_derived".to_string()
+            } else {
+                "legacy_caller_supplied".to_string()
+            }),
             sequence: envelope.sequence.to_string(),
             kind: envelope.kind,
             payload_b64: base64::engine::general_purpose::STANDARD.encode(&request.payload),
@@ -7373,18 +7646,25 @@ impl Engine {
             .executor_head_refresh_ms
             .max(self.config.executor_head_lock_ms.max(2));
 
-        let effective_inspect_ms = if self.config.executor_optimistic_advance {
+        let effective_inspect_ms = if self.config.queue_topology.is_v3() {
+            0
+        } else if self.config.executor_optimistic_advance {
             self.config.executor_head_lock_ms.max(2)
         } else {
             inspect_interval_ms
         };
         let planner_lane_fanout = self.config.executor_target_lane_fanout.max(1).min(20);
+        let mut near_head_items = Vec::new();
         let mut near_head_lane_entries = Vec::new();
         let mut near_head_exact_hashes = Vec::new();
         let head = if now_ms.saturating_sub(last_inspect) >= effective_inspect_ms {
             let head = if self.config.queue_topology.is_v3() {
                 let (head, entries) = self.inspect_v3_market_queue(executor).await?;
-                near_head_lane_entries = entries;
+                near_head_items = entries;
+                near_head_lane_entries = near_head_items
+                    .iter()
+                    .map(|item| (item.sequence, item.accounts_hash))
+                    .collect();
                 head
             } else {
                 let accounts = self.rpc.get_account(&executor.execution_queue).await?;
@@ -7550,19 +7830,56 @@ impl Engine {
             }
         }
 
-        let mut lanes = executor.lanes_snapshot().await;
-        if lanes.is_empty() {
-            let _ = self.refresh_dynamic_lanes_from_event_log(executor).await;
-            lanes = executor.lanes_snapshot().await;
+        let derived_v3_lane_entries = if self.config.queue_topology.is_v3() {
+            match self
+                .derive_v3_recipe_lane_entries(executor, &near_head_items)
+                .await
+            {
+                Ok(entries) => entries,
+                Err(err) => {
+                    warn!(
+                        "executor v3 recipe-lane derivation failed market={} queue={} err={err:?}",
+                        executor.market_index, executor.execution_queue,
+                    );
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        if !derived_v3_lane_entries.is_empty() {
+            near_head_lane_entries = derived_v3_lane_entries
+                .iter()
+                .map(|entry| (entry.sequence, entry.lane.hash))
+                .collect();
+            near_head_exact_hashes = near_head_lane_entries
+                .iter()
+                .map(|(_, hash)| *hash)
+                .collect();
         }
-        // Phase 2B: filter to only lanes whose canonical-position [3]
-        // perp_market matches THIS executor's market. The lanes map is
-        // shared across all sub-executors so we always need to filter.
-        // The default Pubkey is a sentinel from market discovery fallback;
-        // when set, treat all lanes as matching (legacy behavior).
-        if executor.perp_market_pk != Pubkey::default() {
-            lanes.retain(|lane| executor.lane_matches_market(lane));
-        }
+
+        let using_derived_v3_lanes = !derived_v3_lane_entries.is_empty();
+        let mut lanes: Vec<Lane> = if using_derived_v3_lanes {
+            derived_v3_lane_entries
+                .iter()
+                .map(|entry| entry.lane.clone())
+                .collect()
+        } else {
+            let mut lanes = executor.lanes_snapshot().await;
+            if lanes.is_empty() {
+                let _ = self.refresh_dynamic_lanes_from_event_log(executor).await;
+                lanes = executor.lanes_snapshot().await;
+            }
+            // Phase 2B: filter to only lanes whose canonical-position [3]
+            // perp_market matches THIS executor's market. The lanes map is
+            // shared across all sub-executors so we always need to filter.
+            // The default Pubkey is a sentinel from market discovery fallback;
+            // when set, treat all lanes as matching (legacy behavior).
+            if executor.perp_market_pk != Pubkey::default() {
+                lanes.retain(|lane| executor.lane_matches_market(lane));
+            }
+            lanes
+        };
         if lanes.is_empty() {
             debug!(
                 "executor skipped: queue_count={} next_sequence={} market={} reason=no_lanes",
@@ -7604,9 +7921,14 @@ impl Engine {
                             .collect();
                         let mut matched_hashes: HashSet<[u8; 32]> =
                             matched.iter().map(|lane| lane.hash).collect();
-                        if !matched_hashes.contains(&hash) || matched.len() < ordered_hashes.len() {
+                        if (!matched_hashes.contains(&hash) || matched.len() < ordered_hashes.len())
+                            && !using_derived_v3_lanes
+                        {
                             let _ = self.refresh_dynamic_lanes_from_event_log(executor).await;
                             lanes = executor.lanes_snapshot().await;
+                            if executor.perp_market_pk != Pubkey::default() {
+                                lanes.retain(|lane| executor.lane_matches_market(lane));
+                            }
                             lanes_by_hash = lanes
                                 .iter()
                                 .cloned()
@@ -9062,10 +9384,7 @@ fn account_metas_to_proto(accounts: &[AccountMeta]) -> Vec<AccountMetaProto> {
         .collect()
 }
 
-fn supplied_account_metas_match(
-    supplied: &[AccountMetaProto],
-    derived: &[AccountMeta],
-) -> bool {
+fn supplied_account_metas_match(supplied: &[AccountMetaProto], derived: &[AccountMeta]) -> bool {
     supplied.len() == derived.len()
         && supplied.iter().zip(derived.iter()).all(|(left, right)| {
             left.pubkey == right.pubkey.to_string()
@@ -9086,11 +9405,11 @@ fn build_mango_account_mirror_from_keyed_account(
             data.len()
         ));
     }
-    let account = MangoAccountValue::from_bytes(&data[8..]).with_context(|| {
-        format!("failed to deserialize mango account {}", mango_account)
-    })?;
+    let account = MangoAccountValue::from_bytes(&data[8..])
+        .with_context(|| format!("failed to deserialize mango account {}", mango_account))?;
 
     Ok(MangoAccountMirror {
+        owner: account.fixed.owner,
         token_indices: account
             .active_token_positions()
             .map(|position| position.token_index)
@@ -9121,7 +9440,9 @@ fn build_derived_perp_remaining_accounts(
     let target_market = group_mirror
         .perps_by_market_index
         .get(&target_market_index)
-        .with_context(|| format!("perp market index {target_market_index} not found in group mirror"))?;
+        .with_context(|| {
+            format!("perp market index {target_market_index} not found in group mirror")
+        })?;
 
     let mut token_indices = mango_account_mirror.token_indices.clone();
     let mut perp_market_indices = mango_account_mirror.perp_market_indices.clone();
@@ -9164,7 +9485,12 @@ fn build_canonical_health_account_metas(
         let bank = group_mirror
             .banks_by_token_index
             .get(token_index)
-            .with_context(|| format!("bank for token index {} not found in group mirror", token_index))?;
+            .with_context(|| {
+                format!(
+                    "bank for token index {} not found in group mirror",
+                    token_index
+                )
+            })?;
         sections[0].push(bank.bank);
         sections[1].push(bank.oracle);
         sections[6].extend(bank.fallback_oracles.iter().copied());
@@ -9273,8 +9599,11 @@ fn expand_lane_variants(
         hash: enqueue_hash,
         remaining_accounts: raw_accounts,
     }];
-    let direct_hash =
-        hash_execution_queue_accounts_for_direct_enqueue(group, execution_queue, remaining_accounts);
+    let direct_hash = hash_execution_queue_accounts_for_direct_enqueue(
+        group,
+        execution_queue,
+        remaining_accounts,
+    );
     if direct_hash != enqueue_hash {
         lanes.push(Lane {
             name: format!("{lane_name}-direct"),
@@ -9572,8 +9901,7 @@ fn hash_execution_queue_accounts_for_legacy_direct_enqueue(
     if let Some(user_owner) = remaining_accounts.get(2).map(|account| account.pubkey) {
         fixed_accounts.push(AccountMeta::new(user_owner, true));
     }
-    let effective_remaining =
-        merge_effective_runtime_flags(remaining_accounts, &fixed_accounts);
+    let effective_remaining = merge_effective_runtime_flags(remaining_accounts, &fixed_accounts);
     let mut bytes = Vec::with_capacity(effective_remaining.len() * 34);
     for account in effective_remaining {
         bytes.extend_from_slice(account.pubkey.as_ref());
@@ -9724,6 +10052,52 @@ fn find_execution_queue_v3_page_pda(
         &program_id,
     )
     .0
+}
+
+fn build_execution_queue_v3_create_market_page_instruction(
+    program_id: Pubkey,
+    group: Pubkey,
+    authority_state: Pubkey,
+    queue_root: Pubkey,
+    payer: Pubkey,
+    page_slot: u16,
+) -> Instruction {
+    let queue_page = find_execution_queue_v3_page_pda(program_id, queue_root, page_slot);
+    Instruction {
+        program_id,
+        accounts: vec![
+            AccountMeta::new_readonly(group, false),
+            AccountMeta::new_readonly(authority_state, false),
+            AccountMeta::new(queue_root, false),
+            AccountMeta::new(queue_page, false),
+            AccountMeta::new(payer, true),
+            AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+        ],
+        data: mango_v4::instruction::ExecutionQueueV3CreateMarketPage { page_slot }.data(),
+    }
+}
+
+fn build_execution_queue_v3_resize_market_page_instruction(
+    program_id: Pubkey,
+    group: Pubkey,
+    authority_state: Pubkey,
+    queue_root: Pubkey,
+    payer: Pubkey,
+    page_slot: u16,
+) -> Instruction {
+    let queue_page = find_execution_queue_v3_page_pda(program_id, queue_root, page_slot);
+    Instruction {
+        program_id,
+        accounts: vec![
+            AccountMeta::new_readonly(group, false),
+            AccountMeta::new_readonly(authority_state, false),
+            AccountMeta::new(queue_root, false),
+            AccountMeta::new(queue_page, false),
+            AccountMeta::new(payer, true),
+            AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+        ],
+        data: mango_v4::instruction::ExecutionQueueV3ResizeMarketPage { page_slot }.data(),
+    }
 }
 
 fn build_execution_queue_v3_init_market_page_instruction(
@@ -11647,8 +12021,9 @@ async fn async_main() -> Result<()> {
             .await
             .with_context(|| format!("failed to fetch configured v3 queue root {queue_pk}"))?;
         let mut data: &[u8] = &account.data;
-        let root = PerpMarketQueueRootV3::try_deserialize(&mut data)
-            .with_context(|| format!("failed to deserialize configured v3 queue root {queue_pk}"))?;
+        let root = PerpMarketQueueRootV3::try_deserialize(&mut data).with_context(|| {
+            format!("failed to deserialize configured v3 queue root {queue_pk}")
+        })?;
         if root.group != group_pk {
             return Err(anyhow!(
                 "configured v3 queue root group mismatch: root.group={} configured.group={group_pk}",
@@ -11989,6 +12364,53 @@ mod tests {
     }
 
     #[test]
+    fn resolve_event_sink_url_prefers_explicit_value() {
+        assert_eq!(
+            resolve_event_sink_url_from_parts(
+                Some("http://custom.example/ingest"),
+                Some("local"),
+                Some("http://127.0.0.1:9094"),
+                Some("http://127.0.0.1:9091"),
+            ),
+            Some("http://custom.example/ingest".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_event_sink_url_uses_fanout_when_enabled() {
+        assert_eq!(
+            resolve_event_sink_url_from_parts(
+                None,
+                Some("local"),
+                Some("http://127.0.0.1:9094"),
+                Some("http://127.0.0.1:9091"),
+            ),
+            Some("http://127.0.0.1:9094/ingest".to_string())
+        );
+        assert_eq!(
+            resolve_event_sink_url_from_parts(None, Some("gateway"), None, None),
+            Some("http://127.0.0.1:9094/ingest".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_event_sink_url_falls_back_to_harness_when_fanout_disabled() {
+        assert_eq!(
+            resolve_event_sink_url_from_parts(
+                None,
+                Some("disabled"),
+                Some("http://127.0.0.1:9094"),
+                Some("http://127.0.0.1:9091"),
+            ),
+            Some("http://127.0.0.1:9091/ingest/relay-intent".to_string())
+        );
+        assert_eq!(
+            resolve_event_sink_url_from_parts(None, None, None, None),
+            None
+        );
+    }
+
+    #[test]
     fn parse_startup_flags_enables_health_check() {
         let flags = parse_startup_flags_from_iter(["--enable-health-check"]).unwrap();
         assert!(flags.enable_health_check);
@@ -12109,8 +12531,12 @@ mod tests {
                 fallback_oracles: vec![usdc_fallback],
             },
         );
-        group_mirror.perps_by_market_index.insert(0, sol_market.clone());
-        group_mirror.perps_by_market_index.insert(1, btc_market.clone());
+        group_mirror
+            .perps_by_market_index
+            .insert(0, sol_market.clone());
+        group_mirror
+            .perps_by_market_index
+            .insert(1, btc_market.clone());
 
         let mango_mirror = MangoAccountMirror {
             token_indices: vec![0],
@@ -12147,7 +12573,10 @@ mod tests {
             usdc_fallback,
         ];
         assert_eq!(
-            derived.iter().map(|account| account.pubkey).collect::<Vec<_>>(),
+            derived
+                .iter()
+                .map(|account| account.pubkey)
+                .collect::<Vec<_>>(),
             expected_pubkeys
         );
         assert!(!derived[0].is_writable);
@@ -12175,10 +12604,8 @@ mod tests {
             ..envelope_a.clone()
         };
 
-        let v1_a =
-            canonical_user_intent_message_v1(group, mango_account, user_owner, &envelope_a);
-        let v1_b =
-            canonical_user_intent_message_v1(group, mango_account, user_owner, &envelope_b);
+        let v1_a = canonical_user_intent_message_v1(group, mango_account, user_owner, &envelope_a);
+        let v1_b = canonical_user_intent_message_v1(group, mango_account, user_owner, &envelope_b);
         let v2_a = canonical_user_intent_message_v2(
             group,
             mango_account,
@@ -13254,16 +13681,20 @@ mod tests {
         let hashes: HashSet<[u8; 32]> = lanes.iter().map(|lane| lane.hash).collect();
 
         assert_eq!(lanes.len(), 2);
-        assert!(hashes.contains(&hash_execution_queue_accounts_for_ctm_enqueue(
-            group,
-            execution_queue,
-            &remaining_accounts,
-        )));
-        assert!(hashes.contains(&hash_execution_queue_accounts_for_legacy_direct_enqueue(
-            group,
-            execution_queue,
-            &remaining_accounts,
-        )));
+        assert!(
+            hashes.contains(&hash_execution_queue_accounts_for_ctm_enqueue(
+                group,
+                execution_queue,
+                &remaining_accounts,
+            ))
+        );
+        assert!(
+            hashes.contains(&hash_execution_queue_accounts_for_legacy_direct_enqueue(
+                group,
+                execution_queue,
+                &remaining_accounts,
+            ))
+        );
     }
 
     #[test]

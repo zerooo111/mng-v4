@@ -19,21 +19,31 @@
 /// | `FANOUT_API_KEYS`                 | *(none)*       | `key[:user[:tier]],...`            |
 /// | `FANOUT_JWT_SECRET`               | *(none)*       | HMAC-SHA256 secret for JWT auth    |
 /// | `FANOUT_INGEST_SECRET`            | *(none)*       | `X-Ingest-Secret` header value     |
+/// | `FANOUT_REDIS_URL`                | *(none)*       | Redis URL for multi-instance mode  |
+/// | `FANOUT_REDIS_STREAM_KEY`         | `fanout:events`| Redis stream name                  |
+/// | `FANOUT_REDIS_STREAM_MAXLEN`      | `100000`       | Approx retained event count        |
+/// | `FANOUT_REDIS_STREAM_BLOCK_MS`    | `1000`         | Subscriber XREAD block time        |
+/// | `FANOUT_UPSTREAM_INGEST_URL`      | *(none)*       | Optional harness ingest forwarder  |
+/// | `FANOUT_UPSTREAM_AUTH_TOKEN`      | *(none)*       | Bearer token for upstream ingest   |
+/// | `FANOUT_UPSTREAM_TIMEOUT_MS`      | `1000`         | Upstream forward timeout           |
 /// | `RUST_LOG`                        | `info`         | Tracing filter                     |
-
 mod app;
 mod auth;
 mod channels;
 mod ingest;
 mod metrics;
+mod redis_pubsub;
 mod snapshot;
 mod sse;
 mod types;
+
+use std::sync::Arc;
 
 use axum::{
     routing::{get, post},
     Router,
 };
+use tokio::sync::Mutex;
 use tracing::info;
 use tracing_subscriber::{fmt, EnvFilter};
 
@@ -73,7 +83,6 @@ async fn healthz_handler() -> axum::Json<serde_json::Value> {
 // ---------------------------------------------------------------------------
 
 fn main() -> anyhow::Result<()> {
-    // Tracing — mirrors execution engine style: RUST_LOG controls the filter.
     fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -92,25 +101,65 @@ fn main() -> anyhow::Result<()> {
         api_key_count = config.api_keys.len(),
         jwt_auth = config.jwt_secret.is_some(),
         ingest_secret = config.ingest_secret.is_some(),
+        redis = config.redis_url.is_some(),
+        redis_stream_key = %config.redis_stream_key,
+        redis_stream_maxlen = config.redis_stream_maxlen,
+        upstream_ingest = config.upstream_ingest_url.is_some(),
+        upstream_timeout_ms = config.upstream_timeout_ms,
         "service-fanout starting"
     );
 
-    let state = AppState::new(config);
-    let bind_addr = state.config.bind_addr;
-    let router = build_router(state);
-
-    // Multi-thread runtime with 8 MB stack — mirrors the execution engine
-    // runtime configuration.
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(8 * 1024 * 1024)
         .build()?
         .block_on(async move {
+            // Redis init must happen inside the async context.
+            let redis_publisher = if let Some(ref url) = config.redis_url {
+                let client = redis::Client::open(url.as_str())
+                    .map_err(|e| anyhow::anyhow!("Redis client open failed: {e}"))?;
+                let manager = redis::aio::ConnectionManager::new(client)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Redis ConnectionManager init failed: {e}"))?;
+                info!("redis: publisher connected to {url}");
+                Some(Arc::new(Mutex::new(manager)))
+            } else {
+                info!("redis: disabled (FANOUT_REDIS_URL not set) — single-instance mode");
+                None
+            };
+
+            let state = AppState::new(config, redis_publisher)?;
+            let bind_addr = state.config.bind_addr;
+
+            // Spawn the Redis subscriber task after AppState is built so we
+            // can cheaply clone the ChannelRegistry and Metrics handles.
+            if let Some(ref url) = state.config.redis_url {
+                let sub_url = url.clone();
+                let sub_stream_key = state.config.redis_stream_key.clone();
+                let sub_block_ms = state.config.redis_stream_block_ms;
+                let sub_channels = state.channels.clone();
+                let sub_metrics = Arc::clone(&state.metrics);
+                tokio::spawn(async move {
+                    redis_pubsub::run_subscriber(
+                        sub_url,
+                        sub_stream_key,
+                        sub_block_ms,
+                        sub_channels,
+                        sub_metrics,
+                    )
+                    .await;
+                });
+                info!("redis: subscriber task spawned");
+            }
+
+            let router = build_router(state);
+
             let listener = tokio::net::TcpListener::bind(bind_addr).await?;
             info!("listening on {bind_addr}");
             axum::Server::from_tcp(listener.into_std()?)?
                 .serve(router.into_make_service())
                 .await?;
+
             Ok::<_, anyhow::Error>(())
         })
 }

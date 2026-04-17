@@ -1,33 +1,16 @@
 /// GET /stream/{market} — SSE (Server-Sent Events) handler.
 ///
-/// ## Client protocol
-///
-/// 1. Fetch the current snapshot: `GET /snapshot/{market}`
-///    → note `last_sequence: N`
-/// 2. Open SSE stream: `GET /stream/{market}?from=N`
-///    → the handler skips buffered events with `sequence <= N` so the client
-///    receives only events that occurred *after* the snapshot.
-/// 3. If the client receives an `event: resync` frame it has fallen behind
-///    the broadcast ring buffer.  It should re-fetch the snapshot and
-///    re-subscribe.
-///
-/// ## Backpressure
-///
-/// The broadcast ring (4096 events per market) acts as the only buffer.  Slow
-/// clients that fall more than 4096 events behind are notified via the resync
-/// event; the publisher is never stalled.
-///
-/// ## Connection cleanup
-///
-/// `ConnectionGuard` (RAII) releases the semaphore permit and decrements the
-/// per-user counter when the stream is dropped — covers both graceful client
-/// disconnects and server-side cancellation.
+/// Client flow:
+/// 1. `GET /snapshot/{market}` and note `last_cursor` or legacy `last_sequence`
+/// 2. `GET /stream/{market}?cursor=<last_cursor>` for exact replay semantics
+/// 3. On `event: resync`, fetch a fresh snapshot and reconnect
 use std::convert::Infallible;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use serde::Deserialize;
@@ -38,6 +21,7 @@ use tracing::debug;
 
 use crate::app::AppState;
 use crate::auth::{AuthClaims, ConnectionGuard};
+use crate::types::MarketSnapshot;
 
 // ---------------------------------------------------------------------------
 // Query parameters
@@ -45,9 +29,10 @@ use crate::auth::{AuthClaims, ConnectionGuard};
 
 #[derive(Debug, Deserialize)]
 pub struct StreamQuery {
-    /// Sequence watermark from a prior snapshot fetch.  Events with
-    /// `sequence <= from` are skipped to avoid replaying already-seen data.
+    /// Legacy sequence watermark from a prior snapshot fetch.
     pub from: Option<u64>,
+    /// Precise fanout watermark from `/snapshot/{market}`.
+    pub cursor: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -60,12 +45,27 @@ pub async fn sse_handler(
     State(state): State<AppState>,
     claims: AuthClaims,
 ) -> impl IntoResponse {
-    // --- Resolve channel ---
-    // Use get_or_create so clients can subscribe before the first event
-    // arrives (e.g. during service start-up).
-    let tx = state.channels.get_or_create_sender(&market);
+    let tx = match state.channels.get_sender(&market) {
+        Some(tx) => tx,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                "market not found; fetch /markets or /snapshot first",
+            )
+                .into_response()
+        }
+    };
+    let snap_lock = match state.channels.get_snapshot(&market) {
+        Some(snap) => snap,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                "market not found; fetch /markets or /snapshot first",
+            )
+                .into_response()
+        }
+    };
 
-    // --- Connection limiting ---
     let guard = match state
         .connections
         .acquire(claims.user_id.clone(), &state.metrics)
@@ -79,66 +79,80 @@ pub async fn sse_handler(
         user = %claims.user_id,
         market = %market,
         from = ?params.from,
+        cursor = ?params.cursor,
         "SSE subscriber connected"
     );
 
-    let from_seq = params.from.unwrap_or(0);
+    // Subscribe before reading the snapshot so live events that arrive during
+    // snapshot cloning remain buffered in the broadcast ring.
+    let raw = BroadcastStream::new(tx.subscribe());
+    let snapshot = snap_lock.read().await.clone();
+    let snapshot_cursor = snapshot.last_cursor;
+    let requested_cursor = params.cursor;
+    let requested_sequence = params.from;
     let metrics = Arc::clone(&state.metrics);
 
-    // --- Build mapped stream ---
-    let raw = BroadcastStream::new(tx.subscribe());
+    let mut initial_events: Vec<Result<Event, Infallible>> = Vec::new();
+    if is_cursor_too_old(&snapshot, requested_cursor) {
+        initial_events.push(Ok(resync_event("cursor_out_of_replay_window")));
+    } else {
+        initial_events.extend(
+            snapshot
+                .replay_since(requested_cursor, requested_sequence)
+                .into_iter()
+                .map(|ev| Ok(data_event(ev.payload.as_ref()))),
+        );
+    }
 
-    // tokio_stream::StreamExt::filter_map takes a sync FnMut → Option<T>;
-    // all our mapping operations are synchronous (serialise + Arc ops), so no
-    // async wrapper is needed here.
-    let mapped = raw.filter_map(move |result| {
-        match result {
-            Ok(ev) => {
-                // Skip events already covered by the snapshot the client
-                // fetched before subscribing.
-                if from_seq > 0 {
-                    if let Some(seq) = ev.sequence() {
-                        if seq <= from_seq {
-                            return None;
-                        }
-                    }
-                }
-                let data = serde_json::to_string(&ev.0).unwrap_or_default();
-                Some(Ok::<Event, Infallible>(
-                    Event::default().event("event").data(data),
-                ))
+    let live = raw.filter_map(move |result| match result {
+        Ok(ev) => {
+            if ev.cursor() <= snapshot_cursor {
+                return None;
             }
-            Err(BroadcastStreamRecvError::Lagged(n)) => {
-                metrics.inc_lagged();
-                // Tell the client to re-fetch snapshot and re-subscribe.
-                Some(Ok(Event::default()
-                    .event("resync")
-                    .data(format!("lagged_by={n}"))))
-            }
+            Some(Ok::<Event, Infallible>(data_event(ev.payload())))
+        }
+        Err(BroadcastStreamRecvError::Lagged(n)) => {
+            metrics.inc_lagged();
+            Some(Ok(resync_event(&format!("lagged_by={n}"))))
         }
     });
 
-    // --- Wrap with RAII guard so cleanup fires on disconnect ---
+    let stream = tokio_stream::iter(initial_events).chain(live);
+
     let guarded: Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>> =
         Box::pin(GuardedStream {
-            inner: Box::pin(mapped),
+            inner: Box::pin(stream),
             _guard: guard,
         });
 
-    Sse::new(guarded).keep_alive(KeepAlive::default()).into_response()
+    Sse::new(guarded)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+fn data_event(payload: &str) -> Event {
+    Event::default().event("event").data(payload)
+}
+
+fn resync_event(reason: &str) -> Event {
+    Event::default().event("resync").data(reason)
+}
+
+fn is_cursor_too_old(snapshot: &MarketSnapshot, cursor: Option<u64>) -> bool {
+    let Some(cursor) = cursor else {
+        return false;
+    };
+    let Some(first_cursor) = snapshot.first_cursor() else {
+        return false;
+    };
+    snapshot.last_cursor > cursor && cursor.saturating_add(1) < first_cursor
 }
 
 // ---------------------------------------------------------------------------
 // GuardedStream — RAII wrapper
 // ---------------------------------------------------------------------------
 
-/// Wraps an inner `Stream` and holds a `ConnectionGuard`.  When the stream is
-/// dropped (client disconnect, handler cancellation, or normal EOF) the guard
-/// fires its `Drop` impl, decrementing the per-user counter and releasing the
-/// global semaphore permit.
 struct GuardedStream {
-    /// Pinned, boxed to avoid complex generic bounds — the allocation is
-    /// negligible compared to a live SSE connection.
     inner: Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>,
     _guard: ConnectionGuard,
 }
@@ -147,13 +161,48 @@ impl Stream for GuardedStream {
     type Item = Result<Event, Infallible>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // `self` is `Pin<&mut GuardedStream>`.  `inner` is already `Pin<Box<...>>`,
-        // so we can call `as_mut().poll_next` directly.
         self.inner.as_mut().poll_next(cx)
     }
 }
 
-// GuardedStream is Unpin because Pin<Box<T>>: Unpin for any T.
-// The compiler may not derive this automatically due to the dyn field;
-// assert it explicitly.
 impl Unpin for GuardedStream {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::EventEnvelope;
+
+    #[test]
+    fn detects_when_cursor_falls_outside_snapshot_replay_window() {
+        let mut snapshot = MarketSnapshot::new("0".to_string());
+        snapshot.max_events = 2;
+        snapshot.apply(
+            EventEnvelope::from_value(serde_json::json!({
+                "market": "0",
+                "sequence": "1",
+                "ts_ms": 1
+            }))
+            .unwrap(),
+        );
+        snapshot.apply(
+            EventEnvelope::from_value(serde_json::json!({
+                "market": "0",
+                "sequence": "2",
+                "ts_ms": 2
+            }))
+            .unwrap(),
+        );
+        snapshot.apply(
+            EventEnvelope::from_value(serde_json::json!({
+                "market": "0",
+                "sequence": "3",
+                "ts_ms": 3
+            }))
+            .unwrap(),
+        );
+
+        assert!(is_cursor_too_old(&snapshot, Some(0)));
+        assert!(!is_cursor_too_old(&snapshot, Some(2)));
+        assert!(!is_cursor_too_old(&snapshot, None));
+    }
+}

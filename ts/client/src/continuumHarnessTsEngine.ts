@@ -868,7 +868,7 @@ export class ContinuumStateEngine {
    * Sets baseline positions and confirmed watermarks so the harness
    * starts in sync with on-chain state.
    */
-  bootstrapFromOnchainSnapshot(snapshot: EngineSnapshot): void {
+  async bootstrapFromOnchainSnapshot(snapshot: EngineSnapshot): Promise<void> {
     if (this.baselineBootstrapped) {
       return; // Only bootstrap once
     }

@@ -1,18 +1,4 @@
-/// POST /ingest — receives events from the execution engine's event_sink_url.
-///
-/// This is the only write path in the fanout service.  It is intentionally
-/// unauthenticated (called from localhost / internal network).  An optional
-/// `FANOUT_INGEST_SECRET` check can be enabled for defence-in-depth.
-///
-/// On each call the handler:
-/// 1. Validates the optional ingest secret header.
-/// 2. Deserialises the body into an `EventEnvelope` (raw JSON — no schema
-///    coupling with the engine).
-/// 3. Calls `ChannelRegistry::dispatch`, which broadcasts to all subscribers
-///    and updates the snapshot — both O(1) / sub-millisecond.
-/// 4. Updates metrics counters (relaxed atomics, negligible cost).
-use std::sync::Arc;
-
+/// POST /ingest — receives events from the execution engine's event sink.
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
@@ -20,10 +6,96 @@ use axum::Json;
 use tracing::warn;
 
 use crate::app::AppState;
+use crate::redis_pubsub;
 use crate::types::EventEnvelope;
 
 // ---------------------------------------------------------------------------
-// Handler
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+fn check_ingest_secret(state: &AppState, headers: &HeaderMap) -> Result<(), StatusCode> {
+    if let Some(expected) = &state.config.ingest_secret {
+        let provided = headers
+            .get("x-ingest-secret")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if provided != expected.as_str() {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    }
+    Ok(())
+}
+
+async fn dispatch_event(state: &AppState, ev: EventEnvelope) -> Result<usize, StatusCode> {
+    if let Some(publisher) = &state.redis_publisher {
+        let market = ev.market().unwrap_or_default().to_string();
+        let payload = ev.payload().to_string();
+
+        let mut conn = publisher.lock().await;
+        match redis_pubsub::publish(
+            &mut conn,
+            &state.config.redis_stream_key,
+            state.config.redis_stream_maxlen,
+            &market,
+            &payload,
+        )
+        .await
+        {
+            Ok(_) => {
+                state.metrics.inc_redis_published();
+                Ok(0)
+            }
+            Err(err) => {
+                warn!("ingest: Redis append failed ({err})");
+                state.metrics.inc_redis_publish_error();
+                Err(StatusCode::SERVICE_UNAVAILABLE)
+            }
+        }
+    } else {
+        Ok(state.channels.dispatch(ev).await)
+    }
+}
+
+fn spawn_upstream_forward(state: &AppState, payload: String) {
+    let Some(url) = state.config.upstream_ingest_url.clone() else {
+        return;
+    };
+
+    let client = state.upstream_client.clone();
+    let auth_token = state.config.upstream_auth_token.clone();
+    let metrics = state.metrics.clone();
+
+    tokio::spawn(async move {
+        let mut request = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .body(payload);
+        if let Some(token) = auth_token {
+            request = request.bearer_auth(token);
+        }
+
+        match request.send().await {
+            Ok(response) if response.status().is_success() => {
+                metrics.inc_upstream_forwarded();
+            }
+            Ok(response) => {
+                warn!(
+                    status = %response.status(),
+                    url = %url,
+                    "ingest: upstream forward failed"
+                );
+                metrics.inc_upstream_forward_error();
+            }
+            Err(err) => {
+                warn!(url = %url, "ingest: upstream request failed ({err})");
+                metrics.inc_upstream_forward_error();
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Single-event handler
 // ---------------------------------------------------------------------------
 
 pub async fn ingest_handler(
@@ -31,30 +103,28 @@ pub async fn ingest_handler(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    // --- Optional ingest secret check ---
-    if let Some(expected) = &state.config.ingest_secret {
-        let provided = headers
-            .get("x-ingest-secret")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        if provided != expected.as_str() {
-            return StatusCode::UNAUTHORIZED.into_response();
-        }
+    if let Err(code) = check_ingest_secret(&state, &headers) {
+        return code.into_response();
     }
 
-    // --- Deserialise ---
     let value: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(err) => {
-            warn!("ingest: failed to deserialise body: {err}");
+            warn!("ingest: failed to deserialize body: {err}");
             state.metrics.inc_ingest_error();
             return StatusCode::BAD_REQUEST.into_response();
         }
     };
 
-    let ev = Arc::new(EventEnvelope(value));
+    let ev = match EventEnvelope::from_value(value) {
+        Ok(ev) => ev,
+        Err(err) => {
+            warn!("ingest: failed to normalize event: {err}");
+            state.metrics.inc_ingest_error();
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+    };
 
-    // Reject events with no market field — we can't route them.
     if ev.market().is_none() {
         warn!(
             "ingest: event missing 'market' field (event_type={:?})",
@@ -64,18 +134,30 @@ pub async fn ingest_handler(
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     }
 
-    // --- Broadcast + snapshot update ---
-    let receiver_count = state.channels.dispatch(Arc::clone(&ev)).await;
+    let market = ev.market().unwrap_or("?").to_string();
+    let event_type = ev.event_type().unwrap_or("?").to_string();
+    let sequence = ev.sequence().unwrap_or(0);
+    let upstream_payload = ev.payload().to_string();
+
+    spawn_upstream_forward(&state, upstream_payload);
+
+    let receiver_count = match dispatch_event(&state, ev).await {
+        Ok(receiver_count) => receiver_count,
+        Err(code) => {
+            state.metrics.inc_ingest_error();
+            return code.into_response();
+        }
+    };
 
     state.metrics.inc_ingested();
-    if receiver_count == 0 {
+    if receiver_count == 0 && state.redis_publisher.is_none() {
         state.metrics.inc_no_subscriber();
     }
 
     tracing::debug!(
-        market = ev.market().unwrap_or("?"),
-        event_type = ev.event_type().unwrap_or("?"),
-        sequence = ev.sequence().unwrap_or(0),
+        market = %market,
+        event_type = %event_type,
+        sequence,
         receivers = receiver_count,
         "ingest ok"
     );
@@ -84,48 +166,59 @@ pub async fn ingest_handler(
 }
 
 // ---------------------------------------------------------------------------
-// Batch ingest (optional — accepts a JSON array of events in one POST)
+// Batch handler
 // ---------------------------------------------------------------------------
 
-/// `POST /ingest/batch` — for callers that want to amortise HTTP overhead by
-/// sending multiple events per request.  Processes each element with the same
-/// logic as the single-event handler.
 pub async fn ingest_batch_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(events): Json<Vec<serde_json::Value>>,
 ) -> impl IntoResponse {
-    // --- Optional ingest secret check ---
-    if let Some(expected) = &state.config.ingest_secret {
-        let provided = headers
-            .get("x-ingest-secret")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        if provided != expected.as_str() {
-            return StatusCode::UNAUTHORIZED.into_response();
-        }
+    if let Err(code) = check_ingest_secret(&state, &headers) {
+        return code.into_response();
     }
 
     let mut ok = 0usize;
     let mut errors = 0usize;
 
     for value in events {
-        let ev = Arc::new(EventEnvelope(value));
+        let ev = match EventEnvelope::from_value(value) {
+            Ok(ev) => ev,
+            Err(err) => {
+                warn!("ingest/batch: failed to normalize event: {err}");
+                errors += 1;
+                state.metrics.inc_ingest_error();
+                continue;
+            }
+        };
+
         if ev.market().is_none() {
             errors += 1;
             state.metrics.inc_ingest_error();
             continue;
         }
-        let receiver_count = state.channels.dispatch(Arc::clone(&ev)).await;
-        state.metrics.inc_ingested();
-        if receiver_count == 0 {
-            state.metrics.inc_no_subscriber();
+
+        let upstream_payload = ev.payload().to_string();
+        spawn_upstream_forward(&state, upstream_payload);
+
+        match dispatch_event(&state, ev).await {
+            Ok(receiver_count) => {
+                state.metrics.inc_ingested();
+                if receiver_count == 0 && state.redis_publisher.is_none() {
+                    state.metrics.inc_no_subscriber();
+                }
+                ok += 1;
+            }
+            Err(code) => {
+                warn!("ingest/batch: dispatch failed with {code}");
+                errors += 1;
+                state.metrics.inc_ingest_error();
+            }
         }
-        ok += 1;
     }
 
     if errors > 0 {
-        warn!("ingest/batch: {errors} events skipped (missing 'market'), {ok} dispatched");
+        warn!("ingest/batch: {errors} events skipped, {ok} dispatched");
     }
 
     (
