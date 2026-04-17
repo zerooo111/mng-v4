@@ -10,6 +10,22 @@ Turn the current Mango v4 execution queue into a paged queue topology that scale
 - `accounts_hash` remains the execution anti-tamper root.
 - Head-driven execution, bounded gap handling, and deterministic failure handling stay on-chain.
 
+## Status Update
+
+As of the current Phase 1 implementation work:
+
+- the v3 paged queue state/accounts/instructions exist on-chain
+- the relayer can be feature-gated onto the v3 per-market queue path
+- v3 market enqueue, direct submit, single-lane execute, multi-lane execute, and admin drop are wired
+- the current perp intent-v2 path is preserved for market-domain routing
+- TS client support exists for v3 market PDAs and instruction builders
+
+What is still open before Phase 1 is fully closed:
+
+- focused integration coverage for page reuse, direct submit, multi-lane execute, and admin recovery
+- optional relayer/client surfacing for v3 liquidity if that queue is part of the immediate rollout
+- migration/bootstrap tooling for v2 to v3 cutover
+
 This note has two parts:
 
 1. The minimal viable implementation against the current codebase.
@@ -61,7 +77,6 @@ Phase 1 is the actual MVP:
 - introduce paged queue storage per queue domain
 - make CTM items self-describing enough for restart-safe execution
 - keep current per-market FIFO semantics
-- preserve the current perp `SubmitIntentRequest.intent_version = 2` ingress path
 - keep `accounts_hash` verification as the execution gate
 - add deterministic pre-checks and explicit queue-side expiry handling
 - do not add compaction yet
@@ -202,39 +217,6 @@ For perp CTM items, the relayer should derive the canonical remaining account la
 - current on-chain group, market, bank, and oracle mirrors
 
 The program still verifies `accounts_hash` at execution time. Recipe metadata is advisory and reconstructive only.
-
-### 6a. Preserve and formalize the v2 intent path
-
-Phase 1 should explicitly preserve the current perp intent-v2 ingress contract instead of replacing it with a new client signing flow.
-
-Current `SubmitIntentRequest` fields relevant to routing are:
-
-- `execution_queue`
-- `market`
-- `intent_version`
-- `target_kind`
-- `target_index`
-- `remaining_accounts`
-
-Current behavior in the repo is:
-
-- the relayer accepts `intent_version = 2`
-- the relayer only accepts `target_kind = PerpMarket` for v2
-- the relayer requires `target_index == request.market`
-- the relayer derives canonical perp remaining accounts from on-chain mirrors for v2
-- mismatched caller-supplied `remaining_accounts` are overridden for v2 instead of being trusted
-- both relayer enqueue and direct-submit fallback verify the current user intent v2 signature for perp flow
-
-Phase 1 rules should be:
-
-- pagination must not change the client-side v2 intent hash for perp queues
-- `target_kind = PerpMarket` and `target_index = market_index` map directly to `QueueDomain::PerpMarket { market_index, shard_id = 0 }`
-- `request.market` remains required and must equal `target_index`
-- `request.execution_queue` must match the derived market queue root PDA for `(group, target_index, 0)` and mismatches should be rejected
-- caller-supplied `remaining_accounts` remain advisory for v2; the relayer computes canonical remaining accounts and `accounts_hash`
-- the direct-submit fallback should derive the same market queue root and verify the same v2 user intent target
-
-Liquidity should not be retrofitted into the existing perp-only intent-v2 path in Phase 1. If user-signed liquidity ingress is needed later, that should be a new explicit target/version addition.
 
 ### 7. Keep current execution ordering semantics
 
@@ -464,77 +446,15 @@ Minimum required additions beyond the current item:
 
 For liquidity items, reuse the same page item envelope where practical, but only require the fields needed by liquidity execution.
 
-## Queue Identity Binding and Signature Versions
+## Signed Domain Binding
 
-The plan should distinguish between:
+Queue identity must be bound into both user and relayer signatures.
 
-- the current perp-only `user-intent-v2` path that already signs a market target
-- the broader future case where queue identity may include liquidity or `shard_id > 0`
-
-### Phase 1: keep the current perp user intent v2 message
-
-Current perp `user-intent-v2` is:
+### User intent hash
 
 ```text
-user_intent_message_v2 = SHA256(
-    "mango-v4-user-intent-v2",
-    group,
-    mango_account,
-    user_owner,
-    kind,
-    target_kind,
-    target_index,
-    payload_hash
-)
-```
-
-Phase 1 rules:
-
-- keep this user-intent-v2 hash unchanged for perp pagination
-- route the queue from `target_kind = PerpMarket` and `target_index = market_index`
-- do not add `accounts_hash` to the user-signed v2 message; the current v2 path relies on relayer canonicalization of remaining accounts
-- continue accepting legacy v1 user intent during rollout only as a compatibility fallback if needed
-
-### Phase 1: keep the current envelope message only if the queue root is instruction-bound
-
-Current relayer envelope is:
-
-```text
-envelope_message_v1 = SHA256(
-    "mango-v4-ctm-envelope-v1",
-    group,
-    sequence,
-    min_execute_slot,
-    kind,
-    payload_hash,
-    accounts_hash,
-    expires_at_slot
-)
-```
-
-Phase 1 rules:
-
-- this can remain unchanged in Phase 1 only if the v3 enqueue instruction derives and verifies the unique market queue root for `PerpMarket { market_index, shard_id = 0 }`
-- the queue root account and instruction arguments become the market-domain binding for the envelope in Phase 1
-- `accounts_hash` remains the anti-tamper root over canonical remaining accounts derived by the relayer
-
-With one queue root per market and `shard_id = 0`, instruction-level root verification is enough to avoid changing the client-side perp intent path immediately.
-
-### Future: add new signature domains only when queue identity actually expands
-
-If a later version adds:
-
-- user-signed liquidity ingress
-- `shard_id > 0`
-- multiple executable queue roots per market
-
-then add a new explicit signature version instead of silently mutating v2 semantics.
-
-Suggested future forms:
-
-```text
-user_intent_message_v3 = SHA256(
-    "mango-v4-user-intent-v3",
+user_intent_message = SHA256(
+    "fermi:user-intent-v2",
     group,
     domain_tag,
     market_index,
@@ -542,11 +462,16 @@ user_intent_message_v3 = SHA256(
     mango_account,
     user_owner,
     kind,
-    payload_hash
+    payload_hash,
+    accounts_hash
 )
+```
 
-envelope_message_v2 = SHA256(
-    "mango-v4-ctm-envelope-v2",
+### Relayer envelope hash
+
+```text
+envelope_message = SHA256(
+    "fermi:ctm-envelope-v2",
     group,
     domain_tag,
     market_index,
@@ -560,7 +485,14 @@ envelope_message_v2 = SHA256(
 )
 ```
 
-Do not silently redefine the existing `mango-v4-user-intent-v2` hash or the current perp client contract.
+Rules:
+
+- `domain_tag = PerpMarket` for perp flow
+- `domain_tag = Liquidity` for liquidity
+- `market_index = 0` for liquidity
+- `shard_id = 0` in v3
+
+Without this binding, the same payload could be replayed into the wrong queue namespace.
 
 ## Instruction Surface
 
@@ -593,16 +525,14 @@ Split enqueue by queue domain:
 For market enqueue:
 
 1. Decode `market_index` from payload.
-2. If the ingress path is `intent_version = 2`, require `target_kind = PerpMarket` and `target_index = market_index`.
-3. Set `domain = PerpMarket { market_index, shard_id = 0 }`.
-4. Derive the market queue root.
-5. Require the supplied `execution_queue` pubkey to equal that derived queue root.
-6. Check queue-local sequence window.
-7. Materialize item metadata.
-8. Resolve target page and offset.
-9. Create or validate the page PDA.
-10. Write the item.
-11. Update queue-root `max_seen_sequence` and `live_count`.
+2. Set `domain = PerpMarket { market_index, shard_id = 0 }`.
+3. Derive the market queue root.
+4. Check queue-local sequence window.
+5. Materialize item metadata.
+6. Resolve target page and offset.
+7. Create or validate the page PDA.
+8. Write the item.
+9. Update queue-root `max_seen_sequence` and `live_count`.
 
 For liquidity enqueue:
 
@@ -719,7 +649,6 @@ Page geometry should be immutable per queue root after initialization.
 - add liquidity enqueue
 - add market execute
 - add liquidity execute
-- preserve current perp intent-v2 routing and canonical remaining-account derivation
 - preserve current `accounts_hash` verification
 
 ## Step 3: Add self-describing metadata and restart-safe executor recovery
