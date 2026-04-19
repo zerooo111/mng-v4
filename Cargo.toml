@@ -2,6 +2,7 @@
 members = [
     "bin/*",
     "programs/mango-v4",
+    "programs/margin-trade",
     "lib/*",
     "rust-harness",
 ]

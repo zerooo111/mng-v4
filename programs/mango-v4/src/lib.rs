@@ -30,9 +30,10 @@ pub mod instructions;
 
 #[cfg(feature = "enable-gpl")]
 use instructions::{
-    CtmEnvelope, ExecutionQueueConfigParams, ExecutionQueueV3LiquidityRootConfigParams,
-    ExecutionQueueV3LiquidityRootCreateParams, ExecutionQueueV3MarketRootConfigParams,
-    ExecutionQueueV3MarketRootCreateParams,
+    CommitEntryV4, CtmEnvelope, ExecutionQueueConfigParams,
+    ExecutionQueueV3LiquidityRootConfigParams, ExecutionQueueV3LiquidityRootCreateParams,
+    ExecutionQueueV3MarketRootConfigParams, ExecutionQueueV3MarketRootCreateParams,
+    ExecutionQueueV4MarketRootConfigParams, ExecutionQueueV4MarketRootCreateParams, RevealArgsV4,
 };
 
 #[cfg(all(not(feature = "no-entrypoint"), not(feature = "enable-gpl")))]
@@ -46,7 +47,7 @@ use state::{
     TokenIndex, TCS_START_INCENTIVE,
 };
 
-declare_id!("Hjz5uX54acR4mhiNAih5Qd8yvxZTL5Zt4caFswrqP2Zu");
+declare_id!("9rpAcg1jNmUydb4QoeCeJBGf8JfRuxLciRbS7AHGnXEq");
 
 #[program]
 pub mod mango_v4 {
@@ -2273,6 +2274,100 @@ pub mod mango_v4 {
                 None => None,
             },
         )?;
+        Ok(())
+    }
+
+    ///
+    /// execution queue v4 (commit/reveal)
+    ///
+
+    pub fn execution_queue_v4_init_market_root(
+        ctx: Context<ExecutionQueueV4InitMarketRoot>,
+        market_index: u16,
+        shard_id: u8,
+        params: ExecutionQueueV4MarketRootCreateParams,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_v4_init_market_root(ctx, market_index, shard_id, params)?;
+        Ok(())
+    }
+
+    pub fn execution_queue_v4_configure_market_root(
+        ctx: Context<ExecutionQueueV4MarketRootAdmin>,
+        params: ExecutionQueueV4MarketRootConfigParams,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_v4_configure_market_root(ctx, params)?;
+        Ok(())
+    }
+
+    pub fn execution_queue_v4_create_market_page(
+        ctx: Context<ExecutionQueueV4CreateMarketPage>,
+        page_slot: u16,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_v4_create_market_page(ctx, page_slot)?;
+        Ok(())
+    }
+
+    pub fn execution_queue_v4_resize_market_page(
+        ctx: Context<ExecutionQueueV4ResizeMarketPage>,
+        page_slot: u16,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_v4_resize_market_page(ctx, page_slot)?;
+        Ok(())
+    }
+
+    pub fn execution_queue_v4_init_market_page(
+        ctx: Context<ExecutionQueueV4InitMarketPage>,
+        page_slot: u16,
+        assigned_abs_page_no: u64,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_v4_init_market_page(ctx, page_slot, assigned_abs_page_no)?;
+        Ok(())
+    }
+
+    pub fn execution_queue_v4_close_market_page(
+        ctx: Context<ExecutionQueueV4CloseMarketPage>,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_v4_close_market_page(ctx)?;
+        Ok(())
+    }
+
+    pub fn execution_queue_v4_drop_head_market(
+        ctx: Context<ExecutionQueueV4MarketPageAdmin>,
+        count: u16,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_v4_drop_head_market(ctx, count)?;
+        Ok(())
+    }
+
+    pub fn execution_queue_v4_commit_market(
+        ctx: Context<ExecutionQueueV4CommitMarket>,
+        market_index: u16,
+        first_sequence: u64,
+        entries: Vec<CommitEntryV4>,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_v4_commit_market(
+            ctx,
+            market_index,
+            first_sequence,
+            entries,
+        )?;
+        Ok(())
+    }
+
+    pub fn execution_queue_v4_reveal_execute_market(
+        ctx: Context<ExecutionQueueV4RevealExecuteMarket>,
+        reveals: Vec<RevealArgsV4>,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_v4_reveal_execute_market(ctx, reveals)?;
         Ok(())
     }
 

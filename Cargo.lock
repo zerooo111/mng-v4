@@ -3769,6 +3769,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "margin-trade"
+version = "0.1.0"
+dependencies = [
+ "anchor-lang 0.28.0",
+ "anchor-spl",
+ "solana-program",
+]
+
+[[package]]
 name = "matchers"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9088,6 +9097,25 @@ name = "utf-8"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09cc8ee72d2a9becf2f2febe0205bbed8fc6615b7cb429ad062dc7b7ddd036a9"
+
+[[package]]
+name = "v4-stress"
+version = "0.1.0"
+dependencies = [
+ "anchor-lang 0.28.0",
+ "anyhow",
+ "bincode",
+ "clap 3.2.25",
+ "fixed",
+ "mango-v4",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "solana-client",
+ "solana-program",
+ "solana-sdk",
+ "tokio",
+]
 
 [[package]]
 name = "valuable"

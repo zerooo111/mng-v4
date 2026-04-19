@@ -74,6 +74,14 @@ pub mod proto {
     tonic::include_proto!("ctmsequencer");
 }
 
+// v4 commit/reveal support — invoked from the per-market submit path once
+// a market is switched over to the v4 queue. See relayer_resilience.md and
+// commit_reveal_throughput.md in the repo root for design notes.
+mod v4_batcher;
+mod v4_builders;
+mod v4_pipeline;
+mod v4_reveal_packer;
+
 use proto::{
     ctm_sequencer_relayer_server::{CtmSequencerRelayer, CtmSequencerRelayerServer},
     AccountMeta as AccountMetaProto, SubmitIntentRequest, SubmitIntentResponse,
@@ -146,12 +154,54 @@ struct Config {
     executor_group: Option<Pubkey>,
     executor_queue: Option<Pubkey>,
     queue_topology: QueueTopology,
+    // v4 commit-reveal route ---------------------------------------------
+    v4_route_all: bool,
+    v4_group: Option<Pubkey>,
+    v4_authority_state: Option<Pubkey>,
+    v4_queue_root: Option<Pubkey>,
+    v4_queue_page0: Option<Pubkey>,
+    v4_perp_market: Option<Pubkey>,
+    v4_perp_bids: Option<Pubkey>,
+    v4_perp_asks: Option<Pubkey>,
+    v4_perp_event_queue: Option<Pubkey>,
+    v4_perp_oracle: Option<Pubkey>,
+    v4_usdc_bank: Option<Pubkey>,
+    v4_usdc_oracle: Option<Pubkey>,
+    v4_market_index: u16,
+    v4_reveal_spacing_ms: u64,
+    /// 0 disables periodic refresh (one-shot at startup only).
+    v4_page_init_refresh_secs: u64,
+    /// How often to compare local atomic counter with on-chain `next_enqueue_sequence`.
+    v4_drift_resync_interval_ms: u64,
+    /// Max sequences the local counter may be ahead of on-chain before forced rewind.
+    v4_drift_max_lookahead: u64,
+    /// Master switch for the autodrop worker.
+    v4_autodrop_enabled: bool,
+    /// Head must be unchanged for at least this many seconds before drop.
+    v4_autodrop_stall_secs: u64,
+    /// Reveal worker must have attempted at least this many sends for the
+    /// current head before the autodrop decides the head is unrevealable.
+    v4_autodrop_min_attempts: u64,
+    /// Rate limit so a runaway loop can't drain the queue.
+    v4_autodrop_max_per_min: u32,
+    /// How many head items each pause+drop+unpause tx clears.
+    v4_autodrop_count_per_call: u16,
+    /// Autodrop polling cadence.
+    v4_autodrop_poll_secs: u64,
     executor_lane_config_path: Option<PathBuf>,
     executor_lane_cache_path: Option<PathBuf>,
     executor_relay_event_log_path: Option<PathBuf>,
     sequence_state_path: PathBuf,
     min_execute_slot_offset: u64,
     verify_user_signature: bool,
+    /// When true, caller-supplied `remaining_accounts` are entirely ignored
+    /// and the relayer always uses the canonical set derived from the on-chain
+    /// mirror — even for v1 intents (which would normally reject on mismatch)
+    /// and v2 intents (which would normally warn on mismatch). Useful when
+    /// senders cannot be redeployed after market re-creation invalidates the
+    /// bids/asks/event_queue pubkeys.
+    /// Env: `CTM_RELAYER_IGNORE_SUPPLIED_REMAINING_ACCOUNTS=true`
+    ignore_supplied_remaining_accounts: bool,
     blockhash_refresh_ms: u64,
     skip_preflight: bool,
     submit_rpc_max_retries: Option<usize>,
@@ -397,6 +447,8 @@ impl Config {
         );
         let min_execute_slot_offset = parse_u64_env("CTM_RELAYER_MIN_EXECUTE_SLOT_OFFSET", 1)?;
         let verify_user_signature = parse_bool_env("CTM_RELAYER_VERIFY_USER_SIGNATURE", true);
+        let ignore_supplied_remaining_accounts =
+            parse_bool_env("CTM_RELAYER_IGNORE_SUPPLIED_REMAINING_ACCOUNTS", false);
         let blockhash_refresh_ms = parse_u64_env("CTM_RELAYER_BLOCKHASH_CACHE_MS", 250)?;
         let skip_preflight = matches!(
             std::env::var("CTM_RELAYER_SUBMIT_MODE").ok().as_deref(),
@@ -590,12 +642,49 @@ impl Config {
             executor_group,
             executor_queue,
             queue_topology,
+            v4_route_all: parse_bool_env("V4_ROUTE_ALL", false),
+            v4_group: parse_optional_pubkey_env("V4_GROUP")?,
+            v4_authority_state: parse_optional_pubkey_env("V4_AUTHORITY_STATE")?,
+            v4_queue_root: parse_optional_pubkey_env("V4_QUEUE_ROOT")?,
+            v4_queue_page0: parse_optional_pubkey_env("V4_QUEUE_PAGE0")?,
+            v4_perp_market: parse_optional_pubkey_env("V4_PERP_MARKET")?,
+            v4_perp_bids: parse_optional_pubkey_env("V4_PERP_BIDS")?,
+            v4_perp_asks: parse_optional_pubkey_env("V4_PERP_ASKS")?,
+            v4_perp_event_queue: parse_optional_pubkey_env("V4_PERP_EVENT_QUEUE")?,
+            v4_perp_oracle: parse_optional_pubkey_env("V4_PERP_ORACLE")?,
+            v4_usdc_bank: parse_optional_pubkey_env("V4_USDC_BANK")?,
+            v4_usdc_oracle: parse_optional_pubkey_env("V4_USDC_ORACLE")?,
+            v4_market_index: std::env::var("V4_MARKET_INDEX")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0u16),
+            v4_reveal_spacing_ms: std::env::var("V4_REVEAL_SPACING_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(50u64),
+            v4_page_init_refresh_secs: parse_u64_env("V4_PAGE_INIT_REFRESH_SECS", 0)?,
+            v4_drift_resync_interval_ms: parse_u64_env(
+                "V4_DRIFT_RESYNC_INTERVAL_MS",
+                3_000,
+            )?,
+            v4_drift_max_lookahead: parse_u64_env("V4_DRIFT_MAX_LOOKAHEAD", 64)?,
+            v4_autodrop_enabled: parse_bool_env("V4_AUTODROP_ENABLED", true),
+            v4_autodrop_stall_secs: parse_u64_env("V4_AUTODROP_STALL_SECS", 30)?,
+            v4_autodrop_min_attempts: parse_u64_env("V4_AUTODROP_MIN_ATTEMPTS", 6)?,
+            v4_autodrop_max_per_min: parse_u64_env("V4_AUTODROP_MAX_PER_MIN", 30)?
+                as u32,
+            v4_autodrop_count_per_call: parse_u64_env(
+                "V4_AUTODROP_COUNT_PER_CALL",
+                1,
+            )? as u16,
+            v4_autodrop_poll_secs: parse_u64_env("V4_AUTODROP_POLL_SECS", 10)?,
             executor_lane_config_path,
             executor_lane_cache_path,
             executor_relay_event_log_path,
             sequence_state_path,
             min_execute_slot_offset,
             verify_user_signature,
+            ignore_supplied_remaining_accounts,
             blockhash_refresh_ms,
             skip_preflight,
             submit_rpc_max_retries,
@@ -2597,6 +2686,12 @@ enum MarginCheckOp {
         side: Side,
         max_base_lots: i64,
         reduce_only: bool,
+        /// Limit price in native price_lots; used for on-chain-equivalent
+        /// `inside_price_limit` oracle-band check at enqueue.
+        price_lots: i64,
+        /// Unix ts; 0 = never expires. Non-zero with `expiry_timestamp < now_ts`
+        /// would be dropped on-chain as expired — reject at enqueue instead.
+        expiry_timestamp: u64,
     },
     CancelByOrderId {
         expected_order_id: u128,
@@ -2991,6 +3086,10 @@ struct Engine {
     configured_queue_v3: Option<QueueV3RuntimeConfig>,
     known_v3_pages: Arc<StdMutex<HashSet<Pubkey>>>,
     execute_nonce: Arc<AtomicU64>,
+    // v4 commit-reveal route state ----------------------------------------
+    v4_market: Option<Arc<v4_pipeline::V4MarketState>>,
+    v4_reveal_store: v4_pipeline::V4RevealStore,
+    v4_next_sequence: v4_pipeline::V4NextSequence,
     /// Mango accounts whose perp order slots are full. Keyed by account
     /// pubkey, value is the wall-clock ms when the block expires.  New
     /// intents targeting a blocked account are rejected immediately with
@@ -3763,6 +3862,25 @@ impl Engine {
                 format!("failed to derive remaining accounts in relayer: {err}"),
             )
         })?;
+
+        if self.config.ignore_supplied_remaining_accounts {
+            // Operator opted into "always derive" mode. Skip both the v1 reject
+            // and the v2 mismatch warn — the caller's supplied list is treated
+            // as advisory only and discarded. The mirror-derived set is the
+            // single source of truth.
+            if !request.remaining_accounts.is_empty() {
+                debug!(
+                    group = %request.group,
+                    market = %request.market,
+                    user_owner = %request.user_owner,
+                    mango_account = %request.mango_account,
+                    supplied_accounts = request.remaining_accounts.len(),
+                    derived_accounts = remaining_accounts.len(),
+                    "ignore-accounts mode: discarding caller-supplied remaining_accounts"
+                );
+            }
+            return Ok(remaining_accounts);
+        }
 
         if !request.remaining_accounts.is_empty() {
             let matches =
@@ -4570,6 +4688,62 @@ impl Engine {
                         format!("account is not eligible for new intents: {err}"),
                     )
                 })?;
+
+        // ---- Enqueue-time invariants that on-chain would otherwise reject ---
+        // Fail fast here so the caller gets a clear gRPC error instead of a
+        // silent commit + reveal failure. Mirrors the gates inside
+        // `perp_place_order`:
+        //   * order.expiry_timestamp < now_ts → on-chain drops as expired
+        //   * `perp_market.inside_price_limit(side, native_price, oracle)`
+        //     — we approximate `oracle` with the market's stable_price. The
+        //     stable_price is a smoothed oracle trail maintained by the
+        //     on-chain funding ix; it's conservative (lagged) and avoids a
+        //     separate oracle-account fetch on the hot path. An order priced
+        //     so far out that it fails even against the STABLE price would
+        //     fail against the spot oracle too.
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now_ts: u64 = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let stable_price = I80F48::from_num(target_market.stable_price_model.stable_price);
+        let quote_lot_size = I80F48::from_num(target_market.quote_lot_size);
+        let base_lot_size = I80F48::from_num(target_market.base_lot_size);
+        for op in margin_ops {
+            if let MarginCheckOp::Place {
+                side,
+                price_lots,
+                expiry_timestamp,
+                ..
+            } = op
+            {
+                if *expiry_timestamp > 0 && *expiry_timestamp < now_ts {
+                    return Err(self.reject_submit_request(
+                        request,
+                        Code::FailedPrecondition,
+                        format!(
+                            "order already expired at enqueue: expiry_timestamp={} < now_ts={}",
+                            expiry_timestamp, now_ts
+                        ),
+                    ));
+                }
+                if base_lot_size == I80F48::ZERO {
+                    continue;
+                }
+                let native_price =
+                    I80F48::from_num(*price_lots) * quote_lot_size / base_lot_size;
+                if !target_market.inside_price_limit(*side, native_price, stable_price) {
+                    return Err(self.reject_submit_request(
+                        request,
+                        Code::FailedPrecondition,
+                        format!(
+                            "order price outside oracle band (stable): side={:?} price_lots={} native_price={} stable_price={}",
+                            side, price_lots, native_price, stable_price
+                        ),
+                    ));
+                }
+            }
+        }
 
         let mut orders_by_id = margin_snapshot.orders_by_id;
         apply_margin_check_ops(
@@ -6468,6 +6642,127 @@ impl Engine {
             let prepare_elapsed = parse_started.elapsed().saturating_sub(parse_elapsed);
 
             let mut instructions = vec![ComputeBudgetInstruction::set_compute_unit_limit(1_400_000)];
+            // v4 commit-reveal route — assigns its own sequence and builds a
+            // 1-entry commit_market tx. Skips the v3/v2 enqueue branches.
+            if let Some(v4_mkt) = self.v4_market.clone() {
+                let accounts_hash =
+                    v4_pipeline::hash_dispatch_accounts_for_reveal(&v4_mkt, &remaining_accounts);
+                let v4_seq = self
+                    .v4_next_sequence
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                let commit_hash = v4_pipeline::canonical_commit_hash(
+                    v4_mkt.group,
+                    v4_mkt.market_index,
+                    v4_seq,
+                    0, // CtmWrapped
+                    &envelope.payload_hash,
+                    &accounts_hash,
+                    envelope.min_execute_slot,
+                    envelope.expires_at_slot,
+                );
+                debug!(
+                    target: "v4_commit_debug",
+                    seq = v4_seq,
+                    n_remaining = remaining_accounts.len(),
+                    payload_hash_hex = format!("{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                        envelope.payload_hash[0], envelope.payload_hash[1],
+                        envelope.payload_hash[2], envelope.payload_hash[3],
+                        envelope.payload_hash[4], envelope.payload_hash[5],
+                        envelope.payload_hash[6], envelope.payload_hash[7]),
+                    accounts_hash_hex = format!("{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                        accounts_hash[0], accounts_hash[1], accounts_hash[2], accounts_hash[3],
+                        accounts_hash[4], accounts_hash[5], accounts_hash[6], accounts_hash[7]),
+                    commit_hash_hex = format!("{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                        commit_hash[0], commit_hash[1], commit_hash[2], commit_hash[3],
+                        commit_hash[4], commit_hash[5], commit_hash[6], commit_hash[7]),
+                    min_execute_slot = envelope.min_execute_slot,
+                    expires_at_slot = envelope.expires_at_slot,
+                    "v4 commit"
+                );
+                let entry = mango_v4::instructions::CommitEntryV4 {
+                    commit_hash,
+                    min_execute_slot: envelope.min_execute_slot,
+                    expires_at_slot: envelope.expires_at_slot,
+                };
+                let user_intent_msg = v4_pipeline::canonical_user_intent_v2(
+                    v4_mkt.group,
+                    mango_account,
+                    user_owner,
+                    v4_mkt.market_index,
+                    &envelope.payload_hash,
+                );
+                {
+                    let mut store = self.v4_reveal_store.lock();
+                    store.insert(
+                        v4_seq,
+                        v4_pipeline::V4RevealEntry {
+                            sequence: v4_seq,
+                            payload: request.payload.clone(),
+                            payload_hash: envelope.payload_hash,
+                            dispatch_accounts: remaining_accounts.clone(),
+                            user_owner,
+                            mango_account,
+                            user_sig: Some(user_signature),
+                            user_intent_hash: Some(user_intent_msg),
+                        },
+                    );
+                }
+                // Build commit tx inline using engine payer as both payer
+                // and ctm signer (the devnet setup uses admin keypair as
+                // ctm_signer for v4 — matches v4-stress).
+                let commit_tx = v4_pipeline::build_commit_market_tx(
+                    &v4_mkt,
+                    &self.config.ctm,
+                    &self.config.payer,
+                    v4_seq,
+                    entry,
+                    chain.blockhash,
+                );
+                let sig = match self
+                    .rpc
+                    .send_transaction_with_config(
+                        &commit_tx,
+                        solana_client::rpc_config::RpcSendTransactionConfig {
+                            skip_preflight: true,
+                            max_retries: Some(0),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        // Remove the store entry so reveal worker doesn't try
+                        // to reveal a commit that never landed.
+                        {
+                            let mut store = self.v4_reveal_store.lock();
+                            store.remove(&v4_seq);
+                        }
+                        return Err(Status::internal(format!(
+                            "v4 commit send failed: {e}"
+                        )));
+                    }
+                };
+                self.metrics
+                    .ingress_accepted_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                status_ctx.with_signature(&sig);
+                self.maybe_emit_status_event(status_ctx.event(
+                    2,
+                    "submitted",
+                    None,
+                    None,
+                    None,
+                    None,
+                ))
+                .await;
+                return Ok(SubmitIntentResponse {
+                    sequence: v4_seq,
+                    tx_signature: sig.to_string(),
+                    user_intent_message: user_intent_msg.to_vec(),
+                    ctm_envelope_message: ctm_envelope_message.to_vec(),
+                });
+            }
             if let Some(v3) = self.configured_queue_v3() {
                 let queue_page = match self
                     .ensure_v3_market_page_ready(group, execution_queue, sequence)
@@ -9083,6 +9378,8 @@ fn decode_perp_place_order_margin_op(body: &[u8]) -> Result<MarginCheckOp> {
         side: order.side,
         max_base_lots: order.max_base_lots,
         reduce_only: order.reduce_only,
+        price_lots: order.price_lots,
+        expiry_timestamp: order.expiry_timestamp,
     })
 }
 
@@ -9231,6 +9528,8 @@ fn apply_margin_check_ops(
                 side,
                 max_base_lots,
                 reduce_only,
+                price_lots: _,
+                expiry_timestamp: _,
             } => {
                 let effective_lots = effective_requested_base_lots(
                     side,
@@ -12171,6 +12470,97 @@ async fn async_main() -> Result<()> {
         None
     };
 
+    // v4 market state — present when V4_ROUTE_ALL=1 and all pubkeys set.
+    let v4_market = if config.v4_route_all {
+        let all_set = config.v4_group.is_some()
+            && config.v4_authority_state.is_some()
+            && config.v4_queue_root.is_some()
+            && config.v4_queue_page0.is_some()
+            && config.v4_perp_market.is_some()
+            && config.v4_perp_bids.is_some()
+            && config.v4_perp_asks.is_some()
+            && config.v4_perp_event_queue.is_some()
+            && config.v4_perp_oracle.is_some()
+            && config.v4_usdc_bank.is_some()
+            && config.v4_usdc_oracle.is_some();
+        if !all_set {
+            return Err(anyhow!(
+                "V4_ROUTE_ALL=1 but some V4_* pubkey env vars are missing"
+            ));
+        }
+        // Read queue_root once to pick up page_size / num_pages so the commit
+        // and reveal builders can route to the correct queue_page PDA as the
+        // sequence crosses page boundaries.
+        let queue_root_pk = config.v4_queue_root.unwrap();
+        let (page_size, num_pages) = match rpc.get_account(&queue_root_pk).await {
+            Ok(acct) => match <mango_v4::state::PerpMarketCommitRootV4 as anchor_lang::AccountDeserialize>::try_deserialize(&mut &acct.data[..]) {
+                Ok(root) => (root.page_size, root.num_pages),
+                Err(e) => {
+                    warn!("v4 queue_root decode failed: {}; defaulting to 256/1", e);
+                    (256u16, 1u16)
+                }
+            },
+            Err(e) => {
+                warn!("v4 queue_root fetch failed: {}; defaulting to 256/1", e);
+                (256u16, 1u16)
+            }
+        };
+        let mkt = Arc::new(v4_pipeline::V4MarketState {
+            program_id: config.program_id,
+            group: config.v4_group.unwrap(),
+            authority_state: config.v4_authority_state.unwrap(),
+            queue_root: queue_root_pk,
+            queue_page0: config.v4_queue_page0.unwrap(),
+            perp_market: config.v4_perp_market.unwrap(),
+            perp_bids: config.v4_perp_bids.unwrap(),
+            perp_asks: config.v4_perp_asks.unwrap(),
+            perp_event_queue: config.v4_perp_event_queue.unwrap(),
+            perp_oracle: config.v4_perp_oracle.unwrap(),
+            usdc_bank: config.v4_usdc_bank.unwrap(),
+            usdc_oracle: config.v4_usdc_oracle.unwrap(),
+            market_index: config.v4_market_index,
+            page_size,
+            num_pages,
+        });
+        info!(
+            "v4 route enabled: group={} queue_root={} perp_market={} market_index={} page_size={} num_pages={}",
+            mkt.group, mkt.queue_root, mkt.perp_market, mkt.market_index,
+            mkt.page_size, mkt.num_pages
+        );
+        Some(mkt)
+    } else {
+        None
+    };
+
+    // Read starting sequence from chain so restarts don't collide.
+    let v4_start_seq: u64 = if let Some(mkt) = v4_market.as_ref() {
+        match rpc.get_account(&mkt.queue_root).await {
+            Ok(acct) => {
+                match <mango_v4::state::PerpMarketCommitRootV4 as anchor_lang::AccountDeserialize>::try_deserialize(
+                    &mut &acct.data[..],
+                ) {
+                    Ok(root) => {
+                        let s = root.next_enqueue_sequence();
+                        info!("v4 starting sequence = {}", s);
+                        s
+                    }
+                    Err(e) => {
+                        warn!("v4 queue_root deserialize failed: {}, starting at 0", e);
+                        0
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("v4 queue_root fetch failed: {}, starting at 0", e);
+                0
+            }
+        }
+    } else {
+        0
+    };
+    let v4_next_sequence = Arc::new(AtomicU64::new(v4_start_seq));
+    let v4_reveal_store: v4_pipeline::V4RevealStore = Arc::new(parking_lot::Mutex::new(std::collections::BTreeMap::new()));
+
     let engine = Arc::new(Engine {
         config: config.clone(),
         rpc: rpc.clone(),
@@ -12185,6 +12575,9 @@ async fn async_main() -> Result<()> {
         configured_queue_v3: configured_queue_v3.clone(),
         known_v3_pages: Arc::new(StdMutex::new(HashSet::new())),
         execute_nonce: Arc::new(AtomicU64::new(1)),
+        v4_market: v4_market.clone(),
+        v4_reveal_store: v4_reveal_store.clone(),
+        v4_next_sequence: v4_next_sequence.clone(),
         blocked_mango_accounts: Arc::new(Mutex::new(HashMap::new())),
         unique_addresses: unique_addresses.clone(),
         latency_optimistic_tracker: latency_optimistic_tracker.clone(),
@@ -12199,6 +12592,99 @@ async fn async_main() -> Result<()> {
         ingress_failure_memo: Arc::new(StdMutex::new(HashMap::new())),
         ingress_rate_slots: Arc::new(StdMutex::new(HashMap::new())),
     });
+
+    // v4 reveal worker — drains committed intents off-chain by submitting
+    // reveal_execute txs with configurable spacing. Only spawned when v4
+    // route is enabled.
+    //
+    // Plus three companion self-healing workers:
+    //   * page_init_worker  — ensures every page_slot in [0, num_pages) has
+    //                         an on-chain account; eliminates page-boundary
+    //                         commit failures.
+    //   * drift_resync      — periodically aligns the local atomic
+    //                         `v4_next_sequence` with on-chain
+    //                         `next_enqueue_sequence` so silent commit
+    //                         failures don't snowball.
+    //   * autodrop          — when head is unadvanceable for N seconds AND
+    //                         we've attempted reveals at least M times,
+    //                         issues an admin pause+drop+unpause tx.
+    if let Some(mkt) = engine.v4_market.clone() {
+        let rpc_c = engine.rpc.clone();
+        let payer_c = engine.config.payer.clone();
+        let admin_c = engine.config.ctm.clone();
+        let store_c = engine.v4_reveal_store.clone();
+        let spacing_ms = engine.config.v4_reveal_spacing_ms;
+        let stall = v4_pipeline::V4HeadStallState::default();
+
+        v4_pipeline::spawn_reveal_worker(
+            rpc_c.clone(),
+            mkt.clone(),
+            payer_c.clone(),
+            store_c,
+            spacing_ms,
+            stall.clone(),
+        );
+        info!("v4 reveal worker spawned (spacing_ms={})", spacing_ms);
+
+        // Page init: refresh every N seconds so a programmatic page bump
+        // gets picked up without a relayer restart. 0 disables periodic
+        // refresh (one-shot at startup only).
+        let page_refresh_secs = engine.config.v4_page_init_refresh_secs;
+        v4_pipeline::spawn_page_init_worker(
+            rpc_c.clone(),
+            mkt.clone(),
+            payer_c.clone(),
+            page_refresh_secs,
+        );
+        info!(
+            "v4 page-init worker spawned (refresh_secs={})",
+            page_refresh_secs
+        );
+
+        // Drift resync.
+        let drift_interval_ms = engine.config.v4_drift_resync_interval_ms;
+        let drift_max_lookahead = engine.config.v4_drift_max_lookahead;
+        v4_pipeline::spawn_drift_resync_worker(
+            rpc_c.clone(),
+            mkt.clone(),
+            engine.v4_next_sequence.clone(),
+            drift_interval_ms,
+            drift_max_lookahead,
+        );
+        info!(
+            "v4 drift-resync worker spawned (interval_ms={} max_lookahead={})",
+            drift_interval_ms, drift_max_lookahead
+        );
+
+        // Autodrop.
+        if engine.config.v4_autodrop_enabled {
+            let autodrop_cfg = v4_pipeline::V4AutodropConfig {
+                stall_threshold_secs: engine.config.v4_autodrop_stall_secs,
+                min_reveal_attempts: engine.config.v4_autodrop_min_attempts,
+                max_drops_per_minute: engine.config.v4_autodrop_max_per_min,
+                drop_count_per_call: engine.config.v4_autodrop_count_per_call,
+                poll_interval_secs: engine.config.v4_autodrop_poll_secs,
+                queue_soft_limit: 0,
+                queue_gap_wait_slots: 4,
+            };
+            v4_pipeline::spawn_autodrop_worker(
+                rpc_c.clone(),
+                mkt.clone(),
+                admin_c.clone(),
+                payer_c.clone(),
+                stall.clone(),
+                autodrop_cfg,
+            );
+            info!(
+                "v4 autodrop worker spawned (stall_secs={} min_attempts={} max_per_min={})",
+                engine.config.v4_autodrop_stall_secs,
+                engine.config.v4_autodrop_min_attempts,
+                engine.config.v4_autodrop_max_per_min
+            );
+        } else {
+            info!("v4 autodrop worker disabled (V4_AUTODROP_ENABLED=false)");
+        }
+    }
 
     // Spawn the bg submitter worker pool. Each worker shares the receiver
     // via a tokio Mutex (work-stealing). Workers exit when the channel
@@ -12747,6 +13233,8 @@ mod tests {
                 side: Side::Bid,
                 max_base_lots: 7,
                 reduce_only: false,
+                price_lots: 100,
+                expiry_timestamp: 0,
             }]
         );
     }

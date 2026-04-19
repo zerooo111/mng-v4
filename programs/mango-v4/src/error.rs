@@ -227,6 +227,20 @@ pub enum MangoError {
     ExecutionQueueV3PageInactive,
     #[msg("execution queue v3 page offset out of range")]
     ExecutionQueueV3PageOffsetOutOfRange,
+    #[msg("execution queue v4 commit batch is empty or exceeds the per-tx cap")]
+    ExecutionQueueV4InvalidCommitBatch,
+    #[msg("execution queue v4 commit batch hash does not match the relayer signature")]
+    ExecutionQueueV4CommitBatchHashMismatch,
+    #[msg("execution queue v4 reveal batch is empty or exceeds the per-tx cap")]
+    ExecutionQueueV4InvalidRevealBatch,
+    #[msg("execution queue v4 reveal does not match the stored commit hash")]
+    ExecutionQueueV4CommitRevealMismatch,
+    #[msg("execution queue v4 reveal refers to a non-pending or missing commit slot")]
+    ExecutionQueueV4RevealSlotNotCommitted,
+    #[msg("execution queue v4 reveal sequence is out of order")]
+    ExecutionQueueV4RevealOutOfOrder,
+    #[msg("execution queue v4 reveal envelope field disagrees with stored commit")]
+    ExecutionQueueV4RevealEnvelopeMismatch,
 }
 
 impl MangoError {
