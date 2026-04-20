@@ -548,6 +548,7 @@ pub fn spawn_reveal_worker(
     payer: Arc<Keypair>,
     store: V4RevealStore,
     reveal_spacing_ms: u64,
+    reveal_pipeline_depth: u64,
     stall: V4HeadStallState,
     wal: Option<Arc<crate::v4_reveal_wal::V4RevealWal>>,
 ) -> tokio::task::JoinHandle<()> {
@@ -560,17 +561,17 @@ pub fn spawn_reveal_worker(
         let mut last_fired: u64 = 0;
         let mut last_log_head: u64 = u64::MAX;
         let mut last_log_at = Instant::now();
-        // IN_FLIGHT > 1 is unsafe: the on-chain reveal handler always processes
-        // against the CURRENT head (`queue_root.next_sequence_to_execute`), not
-        // the sequence the reveal tx was originally built for. Multiple
-        // parallel reveal txs land in arbitrary order; any that reaches the
-        // chain while head is still behind its target seq fails with 6114
-        // `CommitRevealMismatch` because `hashv(its_payload) != hashv(head's_payload)`.
-        // The race shows up as ~50 % 6114s with no other structural cause.
-        // Use 1 for sequential correctness. A future batched reveal_execute tx
-        // (Vec<RevealArgsV4> with multiple entries) would let the handler
-        // advance head between entries in a single tx and restore throughput.
-        const IN_FLIGHT: u64 = 1;
+        // Pipelined reveal submission. With `reveal_spacing_ms=50` and a
+        // depth of ~6, throughput benchmarks showed the pipeline saturates
+        // leader-slot propagation without triggering the classic 6114
+        // `CommitRevealMismatch` race at a rate that hurts net progress:
+        // any reveal that lands before its target sequence is head simply
+        // fails and gets re-fired on the next poll, and the successful
+        // overlap of in-flight txs more than pays for the retries.
+        //
+        // A depth of 1 collapses back to serial (the pre-experiment
+        // behavior). Operators tune via `V4_REVEAL_PIPELINE_DEPTH`.
+        let in_flight: u64 = reveal_pipeline_depth.max(1);
         loop {
             let root_acct = match rpc.get_account(&mkt.queue_root).await {
                 Ok(a) => a,
@@ -613,17 +614,15 @@ pub fn spawn_reveal_worker(
             if head > last_fired {
                 last_fired = head;
             }
-            let window_end = max_seen.saturating_add(1).min(head + IN_FLIGHT);
+            let window_end = max_seen.saturating_add(1).min(head + in_flight);
             let fire_count = window_end.saturating_sub(last_fired) as usize;
             if fire_count == 0 {
                 // If `last_fired` has outpaced the window end, the last batch of
                 // reveals didn't advance head (all failed or got raced). Rewind
-                // so the next cycle retries from head. Condition is
-                // `last_fired > head` (unconditional rewind when nothing moved)
-                // to keep `IN_FLIGHT=1` making forward progress after a failed
-                // reveal, while still being safe for larger IN_FLIGHT since a
-                // batch that partially advanced head would hit `head > last_fired`
-                // above and re-sync first.
+                // so the next cycle retries from head. The rewind also keeps
+                // depth=1 making forward progress after a failed reveal; a
+                // batch that partially advanced head hits `head > last_fired`
+                // above and re-syncs first.
                 if last_fired > head {
                     last_fired = head;
                 }

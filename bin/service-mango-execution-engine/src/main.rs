@@ -170,6 +170,10 @@ struct Config {
     v4_usdc_oracle: Option<Pubkey>,
     v4_market_index: u16,
     v4_reveal_spacing_ms: u64,
+    /// Depth of the reveal-submission pipeline. With
+    /// `v4_reveal_spacing_ms=50`, a depth of ~6 was measured optimal in
+    /// throughput experiments. 1 collapses to serial.
+    v4_reveal_pipeline_depth: u64,
     /// 0 disables periodic refresh (one-shot at startup only).
     v4_page_init_refresh_secs: u64,
     /// How often to compare local atomic counter with on-chain `next_enqueue_sequence`.
@@ -665,6 +669,7 @@ impl Config {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(50u64),
+            v4_reveal_pipeline_depth: parse_u64_env("V4_REVEAL_PIPELINE_DEPTH", 6)?,
             v4_page_init_refresh_secs: parse_u64_env("V4_PAGE_INIT_REFRESH_SECS", 0)?,
             v4_drift_resync_interval_ms: parse_u64_env(
                 "V4_DRIFT_RESYNC_INTERVAL_MS",
@@ -12722,6 +12727,7 @@ async fn async_main() -> Result<()> {
         let admin_c = engine.config.ctm.clone();
         let store_c = engine.v4_reveal_store.clone();
         let spacing_ms = engine.config.v4_reveal_spacing_ms;
+        let pipeline_depth = engine.config.v4_reveal_pipeline_depth;
         let stall = v4_pipeline::V4HeadStallState::default();
 
         v4_pipeline::spawn_reveal_worker(
@@ -12730,10 +12736,14 @@ async fn async_main() -> Result<()> {
             payer_c.clone(),
             store_c,
             spacing_ms,
+            pipeline_depth,
             stall.clone(),
             engine.v4_reveal_wal.clone(),
         );
-        info!("v4 reveal worker spawned (spacing_ms={})", spacing_ms);
+        info!(
+            "v4 reveal worker spawned (spacing_ms={} pipeline_depth={})",
+            spacing_ms, pipeline_depth
+        );
 
         // Page init: refresh every N seconds so a programmatic page bump
         // gets picked up without a relayer restart. 0 disables periodic
