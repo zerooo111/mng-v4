@@ -1,3 +1,15 @@
+use super::execution_queue::{
+    account_metas_from_infos, canonical_direct_dispatch_account_metas, canonical_envelope_message,
+    canonical_user_intent_message_v1, canonical_user_intent_message_v2, decode_queue_payload,
+    dispatch_queue_payload, extract_user_owner_for_ctm_payload, hash_accounts,
+    prevalidate_terminal_ctm_payload, queue_health_region_begin, queue_health_region_end,
+    queue_health_region_spec, queue_item_kind_for_payload_variant, require_dispatch_market_index,
+    split_dispatch_accounts, terminal_ctm_failure_msg, validate_queue_payload_dispatch_accounts,
+    variant_uses_user_signature, verify_ed25519_preinstruction, verify_user_ed25519_preinstruction,
+    CtmEnvelope, DecodedQueuePayload, QueueItemEnqueued, QueueItemProcessed, QueuePayloadBody,
+    UserIntentTargetKind, DIRECT_SUBMIT_DELAY_SLOTS, EXECUTION_QUEUE_GAP_SKIP_LIMIT_PER_EXECUTE,
+    EXECUTION_QUEUE_MAX_RETRIES,
+};
 use crate::accounts_ix::*;
 use crate::error::*;
 use crate::state::*;
@@ -6,19 +18,6 @@ use anchor_lang::solana_program::entrypoint::MAX_PERMITTED_DATA_INCREASE;
 use anchor_lang::solana_program::hash::hashv;
 use anchor_lang::solana_program::program::invoke;
 use anchor_lang::solana_program::system_instruction;
-use super::execution_queue::{
-    account_metas_from_infos, canonical_envelope_message, canonical_user_intent_message_v1,
-    canonical_user_intent_message_v2, canonical_direct_dispatch_account_metas,
-    decode_queue_payload, extract_user_owner_for_ctm_payload, hash_accounts,
-    prevalidate_terminal_ctm_payload, queue_health_region_begin, queue_health_region_end,
-    queue_health_region_spec, queue_item_kind_for_payload_variant, require_dispatch_market_index,
-    split_dispatch_accounts, terminal_ctm_failure_msg, validate_queue_payload_dispatch_accounts,
-    variant_uses_user_signature, verify_ed25519_preinstruction,
-    verify_user_ed25519_preinstruction, CtmEnvelope, DecodedQueuePayload,
-    QueueItemEnqueued, QueueItemProcessed, QueuePayloadBody, UserIntentTargetKind,
-    dispatch_queue_payload, DIRECT_SUBMIT_DELAY_SLOTS, EXECUTION_QUEUE_GAP_SKIP_LIMIT_PER_EXECUTE,
-    EXECUTION_QUEUE_MAX_RETRIES,
-};
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
 pub struct ExecutionQueueV3MarketRootCreateParams {
@@ -77,7 +76,11 @@ fn validate_page_geometry(page_size: u16, num_pages: u16, soft_limit: u16) -> Re
     Ok(capacity)
 }
 
-fn validate_page_assignment(page_slot: u16, assigned_abs_page_no: u64, num_pages: u16) -> Result<()> {
+fn validate_page_assignment(
+    page_slot: u16,
+    assigned_abs_page_no: u64,
+    num_pages: u16,
+) -> Result<()> {
     require!(
         page_slot < num_pages,
         MangoError::ExecutionQueueV3PageSlotOutOfRange
@@ -154,8 +157,7 @@ fn aggressive_limit_price_lots(side: Side, order_type: PlaceOrderType, price_lot
 fn set_canonical_perp_account_recipe(item: &mut QueueItemV3, market_index: u16) {
     item.recipe_kind = QueueAccountRecipeKindV3::CanonicalPerpV1 as u8;
     item.recipe_len = EXECUTION_QUEUE_V3_CANONICAL_PERP_ACCOUNT_RECIPE_V1_LEN;
-    item.account_recipe =
-        CanonicalPerpAccountRecipeV3::new(market_index, item.op_class).encode();
+    item.account_recipe = CanonicalPerpAccountRecipeV3::new(market_index, item.op_class).encode();
 }
 
 fn populate_market_item_metadata(
@@ -173,7 +175,8 @@ fn populate_market_item_metadata(
 
     match &decoded_payload.body {
         QueuePayloadBody::PerpPlaceOrderV2(place) => {
-            let mut flags = queue_item_flags_v3::HEALTH_GATED | queue_item_flags_v3::PRECHECK_REQUIRED;
+            let mut flags =
+                queue_item_flags_v3::HEALTH_GATED | queue_item_flags_v3::PRECHECK_REQUIRED;
             if !matches!(
                 place.order_type,
                 PlaceOrderType::PostOnly | PlaceOrderType::PostOnlySlide
@@ -196,7 +199,8 @@ fn populate_market_item_metadata(
             item.op_class = QueueItemOpClassV3::GenericCancelByClientOrderId as u8;
             set_canonical_perp_account_recipe(item, market_index);
         }
-        QueuePayloadBody::PerpCancelAllOrders(_) | QueuePayloadBody::PerpCancelAllOrdersBySide(_) => {
+        QueuePayloadBody::PerpCancelAllOrders(_)
+        | QueuePayloadBody::PerpCancelAllOrdersBySide(_) => {
             item.op_class = QueueItemOpClassV3::GenericCancelAll as u8;
             set_canonical_perp_account_recipe(item, market_index);
         }
@@ -207,7 +211,9 @@ fn populate_market_item_metadata(
 
 fn liquidity_op_class(kind: u8) -> u8 {
     match kind {
-        k if k == QueueItemKind::LiquidityDeposit as u8 => QueueItemOpClassV3::LiquidityDeposit as u8,
+        k if k == QueueItemKind::LiquidityDeposit as u8 => {
+            QueueItemOpClassV3::LiquidityDeposit as u8
+        }
         k if k == QueueItemKind::LiquidityWithdraw as u8 => {
             QueueItemOpClassV3::LiquidityWithdraw as u8
         }
@@ -278,8 +284,7 @@ fn normalize_market_head_within_page(
         {
             break;
         }
-        queue_root.next_sequence_to_execute =
-            queue_root.next_sequence_to_execute.saturating_add(1);
+        queue_root.next_sequence_to_execute = queue_root.next_sequence_to_execute.saturating_add(1);
         queue_root.gap_observed_slot = 0;
     }
 
@@ -329,6 +334,7 @@ fn skip_market_head_gaps(
             sequence: next_seq,
             kind: QueueItemKind::CtmWrapped as u8,
             status: QueueItemStatusV3::Skipped as u8,
+            failure_code: 0,
         });
         queue_root.next_sequence_to_execute = next_seq.saturating_add(1);
         queue_root.gap_observed_slot = 0;
@@ -353,8 +359,7 @@ fn normalize_liquidity_head_within_page(
         {
             break;
         }
-        queue_root.next_sequence_to_execute =
-            queue_root.next_sequence_to_execute.saturating_add(1);
+        queue_root.next_sequence_to_execute = queue_root.next_sequence_to_execute.saturating_add(1);
         queue_root.gap_observed_slot = 0;
     }
 
@@ -438,7 +443,10 @@ pub fn execution_queue_v3_init_market_root(
     shard_id: u8,
     params: ExecutionQueueV3MarketRootCreateParams,
 ) -> Result<()> {
-    require!(shard_id == 0, MangoError::ExecutionQueueV3UnsupportedShardId);
+    require!(
+        shard_id == 0,
+        MangoError::ExecutionQueueV3UnsupportedShardId
+    );
     validate_page_geometry(params.page_size, params.num_pages, params.soft_limit)?;
 
     let bump = *ctx
@@ -468,7 +476,11 @@ pub fn execution_queue_v3_configure_market_root(
     params: ExecutionQueueV3MarketRootConfigParams,
 ) -> Result<()> {
     let queue_root = &mut ctx.accounts.queue_root;
-    validate_page_geometry(queue_root.page_size, queue_root.num_pages, params.soft_limit)?;
+    validate_page_geometry(
+        queue_root.page_size,
+        queue_root.num_pages,
+        params.soft_limit,
+    )?;
     queue_root.soft_limit = params.soft_limit;
     queue_root.recipe_version = params.recipe_version;
     queue_root.gap_wait_slots = params.gap_wait_slots;
@@ -598,10 +610,7 @@ pub fn execution_queue_v3_close_market_page(
     ctx: Context<ExecutionQueueV3CloseMarketPage>,
 ) -> Result<()> {
     let queue_page = ctx.accounts.queue_page.load()?;
-    require!(
-        queue_page.live_count == 0,
-        MangoError::ExecutionQueueFull
-    );
+    require!(queue_page.live_count == 0, MangoError::ExecutionQueueFull);
     require!(
         ctx.accounts.queue_root.live_count == 0
             || queue_page.assigned_abs_page_no != ctx.accounts.queue_root.head_abs_page_no(),
@@ -614,10 +623,7 @@ pub fn execution_queue_v3_close_liquidity_page(
     ctx: Context<ExecutionQueueV3CloseLiquidityPage>,
 ) -> Result<()> {
     let queue_page = ctx.accounts.queue_page.load()?;
-    require!(
-        queue_page.live_count == 0,
-        MangoError::ExecutionQueueFull
-    );
+    require!(queue_page.live_count == 0, MangoError::ExecutionQueueFull);
     require!(
         ctx.accounts.queue_root.live_count == 0
             || queue_page.assigned_abs_page_no != ctx.accounts.queue_root.head_abs_page_no(),
@@ -658,7 +664,9 @@ pub fn execution_queue_v3_enqueue_market(
     require_dispatch_market_index(dispatch_accounts, market_index)?;
 
     let clock = Clock::get()?;
-    ctx.accounts.authority_state.maybe_activate_pending_ctm(clock.slot);
+    ctx.accounts
+        .authority_state
+        .maybe_activate_pending_ctm(clock.slot);
     require!(
         ctx.accounts.queue_root.paused_ingress == 0,
         MangoError::ExecutionQueueIngressPaused
@@ -771,7 +779,12 @@ pub fn execution_queue_v3_enqueue_market(
         envelope.accounts_hash,
         &payload,
     );
-    populate_market_item_metadata(&mut item, &decoded_payload, market_index, mango_account_hint)?;
+    populate_market_item_metadata(
+        &mut item,
+        &decoded_payload,
+        market_index,
+        mango_account_hint,
+    )?;
     {
         let mut queue_page = ctx.accounts.queue_page.load_mut()?;
         queue_page.write_pending_item(ctx.accounts.queue_root.page_size, page_offset, item)?;
@@ -891,7 +904,9 @@ pub fn execution_queue_v3_enqueue_market_direct(
     }
 
     let sequence = ctx.accounts.queue_root.next_enqueue_sequence();
-    ctx.accounts.queue_root.validate_enqueue_sequence(sequence)?;
+    ctx.accounts
+        .queue_root
+        .validate_enqueue_sequence(sequence)?;
     let abs_page_no = ctx.accounts.queue_root.abs_page_no_for_sequence(sequence);
     let page_slot = ctx.accounts.queue_root.page_slot_for_sequence(sequence);
     let page_offset = ctx.accounts.queue_root.page_offset_for_sequence(sequence);
@@ -981,7 +996,9 @@ pub fn execution_queue_v3_enqueue_liquidity(
         MangoError::ExecutionQueueIngressPaused
     );
     let sequence = ctx.accounts.queue_root.next_enqueue_sequence();
-    ctx.accounts.queue_root.validate_enqueue_sequence(sequence)?;
+    ctx.accounts
+        .queue_root
+        .validate_enqueue_sequence(sequence)?;
     let abs_page_no = ctx.accounts.queue_root.abs_page_no_for_sequence(sequence);
     let page_slot = ctx.accounts.queue_root.page_slot_for_sequence(sequence);
     let page_offset = ctx.accounts.queue_root.page_offset_for_sequence(sequence);
@@ -1137,6 +1154,7 @@ pub fn execution_queue_v3_execute_market(
                 sequence: candidate.sequence,
                 kind: candidate.kind,
                 status: QueueItemStatusV3::Failed as u8,
+                failure_code: 0,
             });
             continue;
         }
@@ -1159,6 +1177,7 @@ pub fn execution_queue_v3_execute_market(
                     sequence: candidate.sequence,
                     kind: candidate.kind,
                     status: QueueItemStatusV3::Failed as u8,
+                    failure_code: 0,
                 });
                 continue;
             }
@@ -1175,6 +1194,7 @@ pub fn execution_queue_v3_execute_market(
                 sequence: candidate.sequence,
                 kind: candidate.kind,
                 status: QueueItemStatusV3::Failed as u8,
+                failure_code: 0,
             });
             continue;
         }
@@ -1191,6 +1211,7 @@ pub fn execution_queue_v3_execute_market(
                 sequence: candidate.sequence,
                 kind: candidate.kind,
                 status: QueueItemStatusV3::Failed as u8,
+                failure_code: 0,
             });
             msg!(
                 "{} seq={} reason={:?}",
@@ -1212,6 +1233,7 @@ pub fn execution_queue_v3_execute_market(
                 sequence: candidate.sequence,
                 kind: candidate.kind,
                 status: QueueItemStatusV3::Failed as u8,
+                failure_code: 0,
             });
             continue;
         }
@@ -1240,6 +1262,7 @@ pub fn execution_queue_v3_execute_market(
                         sequence: candidate.sequence,
                         kind: candidate.kind,
                         status: QueueItemStatusV3::Failed as u8,
+                        failure_code: 0,
                     });
                     continue;
                 }
@@ -1275,6 +1298,7 @@ pub fn execution_queue_v3_execute_market(
                 sequence: candidate.sequence,
                 kind: candidate.kind,
                 status: QueueItemStatusV3::Executed as u8,
+                failure_code: 0,
             });
             continue;
         }
@@ -1302,6 +1326,7 @@ pub fn execution_queue_v3_execute_market(
                 sequence: candidate.sequence,
                 kind: candidate.kind,
                 status: QueueItemStatusV3::Failed as u8,
+                failure_code: 0,
             });
             continue;
         }
@@ -1439,6 +1464,7 @@ pub fn execution_queue_v3_execute_market_multi(
                 sequence: candidate.sequence,
                 kind: candidate.kind,
                 status: QueueItemStatusV3::Failed as u8,
+                failure_code: 0,
             });
             continue;
         }
@@ -1468,6 +1494,7 @@ pub fn execution_queue_v3_execute_market_multi(
                     sequence: candidate.sequence,
                     kind: candidate.kind,
                     status: QueueItemStatusV3::Failed as u8,
+                    failure_code: 0,
                 });
                 continue;
             }
@@ -1484,6 +1511,7 @@ pub fn execution_queue_v3_execute_market_multi(
                 sequence: candidate.sequence,
                 kind: candidate.kind,
                 status: QueueItemStatusV3::Failed as u8,
+                failure_code: 0,
             });
             continue;
         }
@@ -1500,6 +1528,7 @@ pub fn execution_queue_v3_execute_market_multi(
                 sequence: candidate.sequence,
                 kind: candidate.kind,
                 status: QueueItemStatusV3::Failed as u8,
+                failure_code: 0,
             });
             msg!(
                 "{} seq={} reason={:?}",
@@ -1521,6 +1550,7 @@ pub fn execution_queue_v3_execute_market_multi(
                 sequence: candidate.sequence,
                 kind: candidate.kind,
                 status: QueueItemStatusV3::Failed as u8,
+                failure_code: 0,
             });
             continue;
         }
@@ -1549,6 +1579,7 @@ pub fn execution_queue_v3_execute_market_multi(
                         sequence: candidate.sequence,
                         kind: candidate.kind,
                         status: QueueItemStatusV3::Failed as u8,
+                        failure_code: 0,
                     });
                     continue;
                 }
@@ -1584,6 +1615,7 @@ pub fn execution_queue_v3_execute_market_multi(
                 sequence: candidate.sequence,
                 kind: candidate.kind,
                 status: QueueItemStatusV3::Executed as u8,
+                failure_code: 0,
             });
             continue;
         }
@@ -1611,6 +1643,7 @@ pub fn execution_queue_v3_execute_market_multi(
                 sequence: candidate.sequence,
                 kind: candidate.kind,
                 status: QueueItemStatusV3::Failed as u8,
+                failure_code: 0,
             });
             continue;
         }
@@ -1660,8 +1693,11 @@ pub fn execution_queue_v3_drop_market(
     }
     ctx.accounts.queue_root.live_count = ctx.accounts.queue_root.live_count.saturating_sub(1);
     if sequence == ctx.accounts.queue_root.next_sequence_to_execute {
-        ctx.accounts.queue_root.next_sequence_to_execute =
-            ctx.accounts.queue_root.next_sequence_to_execute.saturating_add(1);
+        ctx.accounts.queue_root.next_sequence_to_execute = ctx
+            .accounts
+            .queue_root
+            .next_sequence_to_execute
+            .saturating_add(1);
         ctx.accounts.queue_root.gap_observed_slot = 0;
         let queue_page = ctx.accounts.queue_page.load()?;
         normalize_market_head_within_page(&mut ctx.accounts.queue_root, &queue_page);
@@ -1673,6 +1709,7 @@ pub fn execution_queue_v3_drop_market(
         sequence,
         kind: item.kind,
         status: QueueItemStatusV3::Failed as u8,
+        failure_code: 0,
     });
     Ok(())
 }
@@ -1777,7 +1814,10 @@ pub fn execution_queue_v3_execute_liquidity(
             Err(_) => {
                 {
                     let mut queue_page = ctx.accounts.queue_page.load_mut()?;
-                    clear_liquidity_head_and_advance(&mut ctx.accounts.queue_root, &mut queue_page)?;
+                    clear_liquidity_head_and_advance(
+                        &mut ctx.accounts.queue_root,
+                        &mut queue_page,
+                    )?;
                 }
                 emit!(QueueItemProcessed {
                     group: group_key,
@@ -1785,6 +1825,7 @@ pub fn execution_queue_v3_execute_liquidity(
                     sequence: candidate.sequence,
                     kind: candidate.kind,
                     status: QueueItemStatusV3::Failed as u8,
+                    failure_code: 0,
                 });
                 continue;
             }
@@ -1801,6 +1842,7 @@ pub fn execution_queue_v3_execute_liquidity(
                 sequence: candidate.sequence,
                 kind: candidate.kind,
                 status: QueueItemStatusV3::Failed as u8,
+                failure_code: 0,
             });
             continue;
         }
@@ -1825,6 +1867,7 @@ pub fn execution_queue_v3_execute_liquidity(
                 sequence: candidate.sequence,
                 kind: candidate.kind,
                 status: QueueItemStatusV3::Executed as u8,
+                failure_code: 0,
             });
             continue;
         }
@@ -1841,6 +1884,7 @@ pub fn execution_queue_v3_execute_liquidity(
                 sequence: candidate.sequence,
                 kind: candidate.kind,
                 status: QueueItemStatusV3::Failed as u8,
+                failure_code: 0,
             });
             continue;
         }

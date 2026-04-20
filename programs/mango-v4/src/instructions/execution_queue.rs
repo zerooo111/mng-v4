@@ -47,6 +47,46 @@ pub struct QueueItemProcessed {
     pub sequence: u64,
     pub kind: u8,
     pub status: u8,
+    /// `QueueFailureCode` value explaining why this item terminalized.
+    /// `None = 0` for `Revealed` status. Populated on `Failed` / `Skipped`
+    /// so indexers and the relayer can attribute no-ops without re-reading
+    /// program logs. Appended to the event schema so existing borsh
+    /// decoders that stop after `status` still parse earlier fields.
+    pub failure_code: u8,
+}
+
+/// Canonical reasons an execution-queue item terminalized without a
+/// successful dispatch. Populated on `QueueItemProcessed.failure_code`.
+/// Values are stable and additive — new codes append at the end; the
+/// numeric values must not be reused.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueueFailureCode {
+    None = 0,
+    Expired = 1,
+    DecodeFailed = 2,
+    PayloadVariantInvalid = 3,
+    PayloadKindMismatch = 4,
+    HealthRegionBeginFailed = 5,
+    InsufficientMargin = 6,
+    BeingLiquidated = 7,
+    Bankrupt = 8,
+    OracleStale = 9,
+    OracleConfidence = 10,
+    PriceBandExceeded = 11,
+    MarketReduceOnly = 12,
+    TokenReduceOnly = 13,
+    TokenForceClose = 14,
+    AccountFrozen = 15,
+    GroupHalted = 16,
+    BankBorrowLimit = 17,
+    BankNetBorrowsLimit = 18,
+    BankDepositLimit = 19,
+    GroupDepositLimit = 20,
+    WouldSelfTrade = 21,
+    RetriesExhausted = 22,
+    GapSkipped = 23,
+    Other = 255,
 }
 
 const ED25519_INSTRUCTION_HEADER_LEN: usize = 2;
@@ -735,8 +775,9 @@ fn validate_perp_place_order_health_accounts(
         MangoError::ExecutionQueuePerpHealthAccountsInvalid
     );
 
-    let account_loader = AccountLoader::<MangoAccountFixed>::try_from(&dispatch_accounts[spec.account_index])
-        .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?;
+    let account_loader =
+        AccountLoader::<MangoAccountFixed>::try_from(&dispatch_accounts[spec.account_index])
+            .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?;
     let account = account_loader
         .load_full()
         .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?;
@@ -793,12 +834,7 @@ fn validate_perp_place_order_health_accounts(
             .scanned_serum_oo(&serum3_orders.open_orders)
             .map(|_| ())
             .map_err(map_execution_queue_perp_health_validation_error)
-            .with_context(|| {
-                format!(
-                    "missing serum3 open orders {}",
-                    serum3_orders.open_orders
-                )
-            })?;
+            .with_context(|| format!("missing serum3 open orders {}", serum3_orders.open_orders))?;
     }
 
     for openbook_v2_orders in account.active_openbook_v2_orders() {
@@ -1054,7 +1090,24 @@ pub(crate) fn queue_health_region_begin(
         AccountLoader::<MangoAccountFixed>::try_from(&dispatch_accounts[spec.account_index])
             .map_err(|_| error!(MangoError::ExecutionQueueDispatchAccountLayoutInvalid))?;
     let mut account = account.load_full_mut()?;
-    require!(!account.fixed.is_in_health_region(), MangoError::SomeError);
+
+    // Self-heal stuck `in_health_region` flags. A prior tx that called
+    // `queue_health_region_begin` and then errored mid-CPI (before
+    // `queue_health_region_end` ran) leaves the account marked as "in
+    // region" forever, which made every future reveal for that account
+    // fail silently in the enqueue path. There is no re-entrancy risk
+    // here — this helper is only invoked inside a single top-level
+    // reveal_execute_market ix, which runs sequentially — so clearing
+    // the flag at the start of a fresh begin is safe. The stored
+    // `pre_init_health` would also be stale; wipe it too.
+    if account.fixed.is_in_health_region() {
+        msg!(
+            "queue_health_region_begin: cleared stale in_health_region flag on {}",
+            account.fixed.name()
+        );
+        account.fixed.set_in_health_region(false);
+        account.fixed.health_region_begin_init_health = 0;
+    }
 
     let group = account.fixed.group;
     let health_accounts = if dispatch_accounts.len() > spec.health_accounts_start {
@@ -1300,6 +1353,7 @@ pub fn execution_queue_drop_ctm(
         sequence,
         kind: item.kind,
         status: QueueItemStatus::Failed as u8,
+        failure_code: 0,
     });
     Ok(())
 }
@@ -1815,6 +1869,7 @@ pub fn execution_queue_execute(
                                 sequence: skip_seq,
                                 kind: QueueItemKind::CtmWrapped as u8,
                                 status: QueueItemStatus::Skipped as u8,
+                                failure_code: 0,
                             });
                             queue.sub_queue_headers[slot].next_sequence_to_execute =
                                 skip_seq.saturating_add(1);
@@ -1875,6 +1930,7 @@ pub fn execution_queue_execute(
                     sequence: candidate.sequence,
                     kind: candidate.kind,
                     status: QueueItemStatus::Failed as u8,
+                    failure_code: 0,
                 });
                 continue;
             }
@@ -1894,6 +1950,7 @@ pub fn execution_queue_execute(
                 sequence: candidate.sequence,
                 kind: candidate.kind,
                 status: QueueItemStatus::Failed as u8,
+                failure_code: 0,
             });
             continue;
         }
@@ -1910,6 +1967,7 @@ pub fn execution_queue_execute(
                     sequence: candidate.sequence,
                     kind: candidate.kind,
                     status: QueueItemStatus::Failed as u8,
+                    failure_code: 0,
                 });
                 msg!(
                     "{} seq={} reason={:?}",
@@ -1933,6 +1991,7 @@ pub fn execution_queue_execute(
                 sequence: candidate.sequence,
                 kind: candidate.kind,
                 status: QueueItemStatus::Failed as u8,
+                failure_code: 0,
             });
             continue;
         }
@@ -1951,6 +2010,7 @@ pub fn execution_queue_execute(
                             sequence: candidate.sequence,
                             kind: candidate.kind,
                             status: QueueItemStatus::Failed as u8,
+                            failure_code: 0,
                         });
                         continue;
                     }
@@ -1991,6 +2051,7 @@ pub fn execution_queue_execute(
                 sequence: candidate.sequence,
                 kind: candidate.kind,
                 status: QueueItemStatus::Executed as u8,
+                failure_code: 0,
             });
             continue;
         }
@@ -2011,6 +2072,7 @@ pub fn execution_queue_execute(
                     sequence: candidate.sequence,
                     kind: candidate.kind,
                     status: QueueItemStatus::Failed as u8,
+                    failure_code: 0,
                 });
                 continue;
             }
@@ -2028,6 +2090,7 @@ pub fn execution_queue_execute(
                 sequence: candidate.sequence,
                 kind: candidate.kind,
                 status: QueueItemStatus::Failed as u8,
+                failure_code: 0,
             });
             continue;
         }
@@ -2198,6 +2261,7 @@ pub fn execution_queue_execute_multi(
                                 sequence: skip_seq,
                                 kind: QueueItemKind::CtmWrapped as u8,
                                 status: QueueItemStatus::Skipped as u8,
+                                failure_code: 0,
                             });
                             queue.sub_queue_headers[slot].next_sequence_to_execute =
                                 skip_seq.saturating_add(1);
@@ -2249,6 +2313,7 @@ pub fn execution_queue_execute_multi(
                     sequence: candidate.sequence,
                     kind: candidate.kind,
                     status: QueueItemStatus::Failed as u8,
+                    failure_code: 0,
                 });
                 continue;
             }
@@ -2266,6 +2331,7 @@ pub fn execution_queue_execute_multi(
                 sequence: candidate.sequence,
                 kind: candidate.kind,
                 status: QueueItemStatus::Failed as u8,
+                failure_code: 0,
             });
             continue;
         }
@@ -2282,6 +2348,7 @@ pub fn execution_queue_execute_multi(
                     sequence: candidate.sequence,
                     kind: candidate.kind,
                     status: QueueItemStatus::Failed as u8,
+                    failure_code: 0,
                 });
                 msg!(
                     "{} seq={} reason={:?}",
@@ -2305,6 +2372,7 @@ pub fn execution_queue_execute_multi(
                 sequence: candidate.sequence,
                 kind: candidate.kind,
                 status: QueueItemStatus::Failed as u8,
+                failure_code: 0,
             });
             continue;
         }
@@ -2323,6 +2391,7 @@ pub fn execution_queue_execute_multi(
                             sequence: candidate.sequence,
                             kind: candidate.kind,
                             status: QueueItemStatus::Failed as u8,
+                            failure_code: 0,
                         });
                         continue;
                     }
@@ -2359,6 +2428,7 @@ pub fn execution_queue_execute_multi(
                 sequence: candidate.sequence,
                 kind: candidate.kind,
                 status: QueueItemStatus::Executed as u8,
+                failure_code: 0,
             });
             continue;
         }
@@ -2378,6 +2448,7 @@ pub fn execution_queue_execute_multi(
                     sequence: candidate.sequence,
                     kind: candidate.kind,
                     status: QueueItemStatus::Failed as u8,
+                    failure_code: 0,
                 });
                 continue;
             }

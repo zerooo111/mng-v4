@@ -13,14 +13,14 @@ use anchor_lang::solana_program::program::invoke;
 use anchor_lang::solana_program::system_instruction;
 
 use super::execution_queue::{
-    account_metas_from_infos, canonical_user_intent_message_v2, decode_queue_payload,
-    dispatch_queue_payload, extract_user_owner_for_ctm_payload, hash_accounts,
-    prevalidate_terminal_ctm_payload, queue_health_region_begin, queue_health_region_end,
-    queue_health_region_spec, queue_item_kind_for_payload_variant, require_dispatch_market_index,
-    terminal_ctm_failure_msg, validate_queue_payload_dispatch_accounts, variant_uses_user_signature,
-    verify_ed25519_preinstruction, verify_user_ed25519_preinstruction, QueueItemEnqueued,
-    QueueItemProcessed, UserIntentTargetKind, EXECUTION_QUEUE_GAP_SKIP_LIMIT_PER_EXECUTE,
-    EXECUTION_QUEUE_MAX_RETRIES,
+    canonical_user_intent_message_v2, decode_queue_payload, dispatch_queue_payload,
+    extract_user_owner_for_ctm_payload, prevalidate_terminal_ctm_payload,
+    queue_health_region_begin, queue_health_region_end, queue_health_region_spec,
+    queue_item_kind_for_payload_variant, require_dispatch_market_index, terminal_ctm_failure_msg,
+    validate_queue_payload_dispatch_accounts, variant_uses_user_signature,
+    verify_ed25519_preinstruction, verify_user_ed25519_preinstruction, QueueFailureCode,
+    QueueItemEnqueued, QueueItemProcessed, UserIntentTargetKind,
+    EXECUTION_QUEUE_GAP_SKIP_LIMIT_PER_EXECUTE,
 };
 
 // ---------------------------------------------------------------------------
@@ -74,21 +74,31 @@ fn canonical_commit_message_v5(
     sequence: u64,
     kind: u8,
     payload_hash: &[u8; 32],
-    accounts_hash: &[u8; 32],
     min_execute_slot: u64,
     expires_at_slot: u64,
 ) -> [u8; 32] {
-    // NOTE: kept on the same wire as v4 ("mango-v4-commit-v1"). The
-    // message binds (group, market_index, sequence, kind, hashes,
-    // timing) — the storage layout is off-wire and doesn't participate.
+    // Wire version bumped to v5 because we dropped `accounts_hash` from the
+    // binding. Rationale: including accounts_hash let an observer with a
+    // candidate list of mango_accounts fingerprint which account committed
+    // *before* reveal, since they could replay the hash computation. Removing
+    // accounts_hash gives proper commit-time privacy.
+    //
+    // The mango_account → payload binding is still enforced at reveal via the
+    // user's ed25519 signature over `canonical_user_intent_v2`, which covers
+    // (group, mango_account, user_owner, kind, target_kind, target_index,
+    // payload_hash). A malicious relayer cannot substitute a different
+    // mango_account without failing that signature check.
+    //
+    // Changing the wire prefix means stored v4 commits can't be revealed
+    // against v5 reveals — callers must drain any in-flight queue before
+    // upgrade (we do this via WAL truncate in the relayer restart flow).
     hashv(&[
-        b"mango-v4-commit-v1",
+        b"mango-v5-commit-v1",
         group.as_ref(),
         &market_index.to_le_bytes(),
         &sequence.to_le_bytes(),
         &[kind],
         payload_hash,
-        accounts_hash,
         &min_execute_slot.to_le_bytes(),
         &expires_at_slot.to_le_bytes(),
     ])
@@ -143,11 +153,7 @@ pub fn execution_queue_v5_resize(ctx: Context<ExecutionQueueV5Resize>) -> Result
         .saturating_sub(queue_ai.lamports());
     if needed_lamports > 0 {
         invoke(
-            &system_instruction::transfer(
-                &ctx.accounts.payer.key(),
-                queue_ai.key,
-                needed_lamports,
-            ),
+            &system_instruction::transfer(&ctx.accounts.payer.key(), queue_ai.key, needed_lamports),
             &[
                 ctx.accounts.payer.to_account_info(),
                 queue_ai.clone(),
@@ -169,7 +175,11 @@ pub fn execution_queue_v5_init(ctx: Context<ExecutionQueueV5Init>) -> Result<()>
         .get("queue")
         .ok_or_else(|| error!(MangoError::SomeError))?;
     let mut queue = ctx.accounts.queue.load_init()?;
-    queue.init(ctx.accounts.group.key(), ctx.accounts.authority_state.key(), bump);
+    queue.init(
+        ctx.accounts.group.key(),
+        ctx.accounts.authority_state.key(),
+        bump,
+    );
     Ok(())
 }
 
@@ -177,7 +187,10 @@ pub fn execution_queue_v5_configure_market(
     ctx: Context<ExecutionQueueV5Admin>,
     params: ExecutionQueueV5ConfigureMarketParams,
 ) -> Result<()> {
-    require!(params.shard_id == 0, MangoError::ExecutionQueueV3UnsupportedShardId);
+    require!(
+        params.shard_id == 0,
+        MangoError::ExecutionQueueV3UnsupportedShardId
+    );
     let mut queue = ctx.accounts.queue.load_mut()?;
     require!(
         queue.header.layout_version == EXECUTION_QUEUE_V5_LAYOUT_VERSION,
@@ -232,6 +245,34 @@ pub fn execution_queue_v5_set_global_pause(
     let mut queue = ctx.accounts.queue.load_mut()?;
     queue.header.paused_ingress = u8::from(params.pause_ingress);
     queue.header.paused_execute = u8::from(params.pause_execute);
+    Ok(())
+}
+
+/// Set the per-commit retry budget used inside `reveal_execute_market`.
+///
+/// Passing `max_retries == 0` resets the stored value to 0, which the
+/// reveal handler interprets as "use default" (see
+/// `EXECUTION_QUEUE_V5_DEFAULT_MAX_RETRIES`). Any other value is bounded by
+/// `EXECUTION_QUEUE_V5_MAX_RETRIES_CAP` to avoid pathological CU waste on a
+/// genuinely-undispatchable head.
+pub fn execution_queue_v5_set_max_retries(
+    ctx: Context<ExecutionQueueV5Admin>,
+    max_retries: u8,
+) -> Result<()> {
+    require!(
+        max_retries <= EXECUTION_QUEUE_V5_MAX_RETRIES_CAP,
+        MangoError::ExecutionQueueV5InvalidMaxRetries
+    );
+    let mut queue = ctx.accounts.queue.load_mut()?;
+    let previous = queue.header.max_retries;
+    queue.header.max_retries = max_retries;
+    let effective = queue.header.max_retries_effective();
+    msg!(
+        "execution_queue_v5_set_max_retries: previous={} stored={} effective={}",
+        previous,
+        max_retries,
+        effective
+    );
     Ok(())
 }
 
@@ -303,7 +344,10 @@ pub fn execution_queue_v5_commit_market(
         .find_sub_queue(market_index)
         .ok_or_else(|| error!(MangoError::ExecutionQueueV5SubQueueNotConfigured))?;
     let shard_id = queue.sub_queue_headers[idx].shard_id;
-    require!(shard_id == 0, MangoError::ExecutionQueueV3UnsupportedShardId);
+    require!(
+        shard_id == 0,
+        MangoError::ExecutionQueueV3UnsupportedShardId
+    );
     require!(
         queue.sub_queue_headers[idx].paused_ingress == 0,
         MangoError::ExecutionQueueIngressPaused
@@ -346,6 +390,29 @@ pub fn execution_queue_v5_commit_market(
         item.ingress_slot = clock.slot;
         item.status = CommitStatusV5::Committed as u8;
         queue.write_commit(idx, item)?;
+
+        // Observability: per-entry commit log. 8-byte hash prefix lets the
+        // off-chain indexer pair the on-chain commit with the executor's
+        // debug log and with the eventual reveal attempt's mismatch diag.
+        let hash_prefix = u64::from_le_bytes([
+            entry.commit_hash[0],
+            entry.commit_hash[1],
+            entry.commit_hash[2],
+            entry.commit_hash[3],
+            entry.commit_hash[4],
+            entry.commit_hash[5],
+            entry.commit_hash[6],
+            entry.commit_hash[7],
+        ]);
+        msg!(
+            "v5 commit seq={} market={} hash_prefix={:#x} min_exec={} exp={} ingress={}",
+            seq,
+            market_index,
+            hash_prefix,
+            entry.min_execute_slot,
+            entry.expires_at_slot,
+            clock.slot,
+        );
 
         emit!(QueueItemEnqueued {
             group: ctx.accounts.group.key(),
@@ -391,6 +458,7 @@ fn skip_sub_queue_head_gaps_v5(
             sequence: next_seq,
             kind: QueueItemKind::CtmWrapped as u8,
             status: CommitStatusV5::Failed as u8,
+            failure_code: QueueFailureCode::GapSkipped as u8,
         });
         // Gap: no committed item at head. Advance over it without touching
         // live_count (it wasn't counted). `gap_observed_slot` reset is below.
@@ -485,6 +553,13 @@ pub fn execution_queue_v5_reveal_execute_market(
             break;
         }
         if head_item.expires_at_slot != 0 && clock.slot > head_item.expires_at_slot {
+            msg!(
+                "v5 reveal seq={} market_index={} expired: clock.slot={} expires_at_slot={}",
+                head_item.sequence,
+                market_index,
+                clock.slot,
+                head_item.expires_at_slot
+            );
             ctx.accounts.queue.load_mut()?.clear_head(sub_queue_idx)?;
             emit!(QueueItemProcessed {
                 group: group_key,
@@ -492,6 +567,7 @@ pub fn execution_queue_v5_reveal_execute_market(
                 sequence: head_item.sequence,
                 kind: QueueItemKind::CtmWrapped as u8,
                 status: CommitStatusV5::Failed as u8,
+                failure_code: QueueFailureCode::Expired as u8,
             });
             continue;
         }
@@ -505,29 +581,87 @@ pub fn execution_queue_v5_reveal_execute_market(
         let dispatch_accounts = &ctx.remaining_accounts[cursor..cursor + count];
         cursor += count;
 
-        // Recompute commit_hash and compare to the stored one. Any mismatch
-        // — wrong accounts, wrong payload, wrong kind, wrong envelope — fails here.
+        // Recompute commit_hash and compare to stored. accounts_hash is NOT
+        // part of the v5 commit binding (privacy — dropped in the v5 wire).
+        // The mango_account binding is enforced below via the user ed25519
+        // signature over `canonical_user_intent_v2`, which covers
+        // (group, mango_account, user_owner, kind, target_kind, target_index,
+        // payload_hash). A relayer substituting dispatch_accounts would fail
+        // that signature check for user-signed variants; non-user-signed
+        // variants rely on perp_market / bank constraints enforced by
+        // `validate_queue_payload_dispatch_accounts` below.
         let payload_hash = hashv(&[&reveal.payload]).to_bytes();
-        let accounts_hash = hash_accounts(&account_metas_from_infos(dispatch_accounts));
         let expected_commit_hash = canonical_commit_message_v5(
             group_key,
             market_index,
             head_item.sequence,
             reveal.kind,
             &payload_hash,
-            &accounts_hash,
             head_item.min_execute_slot,
             head_item.expires_at_slot,
         );
-        require!(
-            expected_commit_hash == head_item.commit_hash,
-            MangoError::ExecutionQueueV5CommitRevealMismatch
-        );
+        if expected_commit_hash != head_item.commit_hash {
+            // Surface diverging inputs so 6122 is diagnosable from tx logs
+            // without having to reproduce executor state. 8-byte prefixes
+            // are enough to disambiguate in practice.
+            let expected_prefix = u64::from_le_bytes([
+                expected_commit_hash[0],
+                expected_commit_hash[1],
+                expected_commit_hash[2],
+                expected_commit_hash[3],
+                expected_commit_hash[4],
+                expected_commit_hash[5],
+                expected_commit_hash[6],
+                expected_commit_hash[7],
+            ]);
+            let stored_prefix = u64::from_le_bytes([
+                head_item.commit_hash[0],
+                head_item.commit_hash[1],
+                head_item.commit_hash[2],
+                head_item.commit_hash[3],
+                head_item.commit_hash[4],
+                head_item.commit_hash[5],
+                head_item.commit_hash[6],
+                head_item.commit_hash[7],
+            ]);
+            let payload_prefix = u64::from_le_bytes([
+                payload_hash[0],
+                payload_hash[1],
+                payload_hash[2],
+                payload_hash[3],
+                payload_hash[4],
+                payload_hash[5],
+                payload_hash[6],
+                payload_hash[7],
+            ]);
+            msg!(
+                "v5 reveal commit_hash mismatch: seq={} market={} kind={} \
+                 expected_prefix={:#x} stored_prefix={:#x} \
+                 payload_prefix={:#x} payload_len={} \
+                 min_exec={} exp={}",
+                head_item.sequence,
+                market_index,
+                reveal.kind,
+                expected_prefix,
+                stored_prefix,
+                payload_prefix,
+                reveal.payload.len(),
+                head_item.min_execute_slot,
+                head_item.expires_at_slot,
+            );
+            return err!(MangoError::ExecutionQueueV5CommitRevealMismatch);
+        }
 
         // Decode + variant-level pre-validation.
         let decoded_payload = match decode_queue_payload(&reveal.payload) {
             Ok(p) if p.flags == 0 => p,
-            _ => {
+            Ok(p) => {
+                msg!(
+                    "v5 reveal seq={} market_index={} rejected: non-zero payload flags={}",
+                    head_item.sequence,
+                    market_index,
+                    p.flags
+                );
                 ctx.accounts.queue.load_mut()?.clear_head(sub_queue_idx)?;
                 emit!(QueueItemProcessed {
                     group: group_key,
@@ -535,6 +669,25 @@ pub fn execution_queue_v5_reveal_execute_market(
                     sequence: head_item.sequence,
                     kind: reveal.kind,
                     status: CommitStatusV5::Failed as u8,
+                    failure_code: QueueFailureCode::PayloadVariantInvalid as u8,
+                });
+                continue;
+            }
+            Err(err) => {
+                msg!(
+                    "v5 reveal seq={} market_index={} payload decode failed: {:?}",
+                    head_item.sequence,
+                    market_index,
+                    err
+                );
+                ctx.accounts.queue.load_mut()?.clear_head(sub_queue_idx)?;
+                emit!(QueueItemProcessed {
+                    group: group_key,
+                    market_index,
+                    sequence: head_item.sequence,
+                    kind: reveal.kind,
+                    status: CommitStatusV5::Failed as u8,
+                    failure_code: QueueFailureCode::DecodeFailed as u8,
                 });
                 continue;
             }
@@ -552,6 +705,7 @@ pub fn execution_queue_v5_reveal_execute_market(
                 sequence: head_item.sequence,
                 kind: reveal.kind,
                 status: CommitStatusV5::Failed as u8,
+                failure_code: QueueFailureCode::Expired as u8,
             });
             msg!(
                 "{} seq={} reason={:?}",
@@ -592,12 +746,40 @@ pub fn execution_queue_v5_reveal_execute_market(
         // Health region wrap + dispatch.
         let item_health_region = queue_health_region_spec(decoded_payload.variant);
         if let Some(spec) = item_health_region {
-            if queue_health_region_begin(dispatch_accounts, spec).is_err() {
-                let retries = {
+            if let Err(err) = queue_health_region_begin(dispatch_accounts, spec) {
+                let (terminal, mut failure_code) = classify_dispatch_failure(&err);
+                // If classify_dispatch_failure didn't match, tag the
+                // failure as the generic health-region begin error so
+                // indexers still see a meaningful code.
+                if failure_code == QueueFailureCode::Other {
+                    failure_code = QueueFailureCode::HealthRegionBeginFailed;
+                }
+                msg!(
+                    "v5 reveal seq={} market_index={} health_region_begin failed (terminal={}): {:?}",
+                    head_item.sequence,
+                    market_index,
+                    terminal,
+                    err
+                );
+                let (retries, max_retries) = {
                     let mut queue = ctx.accounts.queue.load_mut()?;
-                    queue.increment_retry(sub_queue_idx, head_item.sequence, clock.slot)?
+                    let max = queue.header.max_retries_effective();
+                    let r = queue.increment_retry(sub_queue_idx, head_item.sequence, clock.slot)?;
+                    (r, max)
                 };
-                if retries >= EXECUTION_QUEUE_MAX_RETRIES {
+                if terminal || retries >= max_retries {
+                    if !terminal {
+                        failure_code = QueueFailureCode::RetriesExhausted;
+                    }
+                    msg!(
+                        "v5 reveal seq={} market_index={} terminalizing health-region failure (retries={}/{}, terminal={}, code={:?}) — clearing head",
+                        head_item.sequence,
+                        market_index,
+                        retries,
+                        max_retries,
+                        terminal,
+                        failure_code,
+                    );
                     ctx.accounts.queue.load_mut()?.clear_head(sub_queue_idx)?;
                     emit!(QueueItemProcessed {
                         group: group_key,
@@ -605,6 +787,7 @@ pub fn execution_queue_v5_reveal_execute_market(
                         sequence: head_item.sequence,
                         kind: reveal.kind,
                         status: CommitStatusV5::Failed as u8,
+                        failure_code: failure_code as u8,
                     });
                     continue;
                 }
@@ -642,14 +825,54 @@ pub fn execution_queue_v5_reveal_execute_market(
                     sequence: head_item.sequence,
                     kind: reveal.kind,
                     status: CommitStatusV5::Revealed as u8,
+                    failure_code: QueueFailureCode::None as u8,
                 });
             }
-            Err(_) => {
-                let retries = {
+            Err(err) => {
+                // P1.5: classify predictable/deterministic dispatch failures
+                // and terminalize them immediately as no-op queue consumers,
+                // rather than burning retry budget that will fail the same
+                // way each time. Retries stay available for genuinely
+                // transient issues (RPC hiccups, flash-loan contention).
+                //
+                // The current terminal set: insufficient-margin (InvalidHealth,
+                // HealthMustBePositive, HealthMustBePositiveOrIncrease,
+                // BeingLiquidated), oracle issues (OracleStale,
+                // OracleConfidence), and perp market price-band rejections
+                // (SpotPriceBandExceeded). Each of these is a function of
+                // state that can't change within the same tx sequence and
+                // will fail identically on retry.
+                let (terminal, mut failure_code) = classify_dispatch_failure(&err);
+                msg!(
+                    "v5 reveal seq={} market_index={} dispatch failed (terminal={}): {:?}",
+                    head_item.sequence,
+                    market_index,
+                    terminal,
+                    err
+                );
+                let (retries, max_retries) = {
                     let mut queue = ctx.accounts.queue.load_mut()?;
-                    queue.increment_retry(sub_queue_idx, head_item.sequence, clock.slot)?
+                    let max = queue.header.max_retries_effective();
+                    let r = queue.increment_retry(sub_queue_idx, head_item.sequence, clock.slot)?;
+                    (r, max)
                 };
-                if retries >= EXECUTION_QUEUE_MAX_RETRIES {
+                if terminal || retries >= max_retries {
+                    if !terminal {
+                        // Non-terminal err that simply ran out of retry
+                        // budget — emit a distinct code so indexers can
+                        // separate "hit our retry cap" from "classified
+                        // deterministic failure".
+                        failure_code = QueueFailureCode::RetriesExhausted;
+                    }
+                    msg!(
+                        "v5 reveal seq={} market={} terminalizing (retries={}/{}, terminal={}, code={:?}) — clearing head",
+                        head_item.sequence,
+                        market_index,
+                        retries,
+                        max_retries,
+                        terminal,
+                        failure_code,
+                    );
                     ctx.accounts.queue.load_mut()?.clear_head(sub_queue_idx)?;
                     emit!(QueueItemProcessed {
                         group: group_key,
@@ -657,6 +880,7 @@ pub fn execution_queue_v5_reveal_execute_market(
                         sequence: head_item.sequence,
                         kind: reveal.kind,
                         status: CommitStatusV5::Failed as u8,
+                        failure_code: failure_code as u8,
                     });
                     continue;
                 }
@@ -665,4 +889,75 @@ pub fn execution_queue_v5_reveal_execute_market(
         }
     }
     Ok(())
+}
+
+/// Classifier: returns `(terminal, failure_code)` for a dispatch failure.
+/// `terminal == true` means the error will produce the same result on
+/// retry (same tx sequence + same underlying oracle/health state), so
+/// the reveal handler terminalizes the head immediately instead of
+/// burning the retry budget. `failure_code` is the `QueueFailureCode`
+/// value emitted on the `QueueItemProcessed` event.
+///
+/// The list is intentionally conservative — false negatives (mislabel
+/// a terminal error as transient) just cost an extra retry attempt.
+/// False positives (mislabel a transient error as terminal) would drop
+/// an intent that could have succeeded, which is worse.
+fn classify_dispatch_failure(err: &anchor_lang::error::Error) -> (bool, QueueFailureCode) {
+    use anchor_lang::error::Error::*;
+    let code = match err {
+        AnchorError(ae) => ae.error_code_number,
+        _ => return (false, QueueFailureCode::Other),
+    };
+    // MangoError → QueueFailureCode mapping for deterministic errors.
+    // Every entry is terminal.
+    let mapped = match code.checked_sub(6000) {
+        Some(c)
+            if c == MangoError::HealthMustBePositive as u32
+                || c == MangoError::HealthMustBePositiveOrIncrease as u32
+                || c == MangoError::HealthMustBeNegative as u32
+                || c == MangoError::InvalidHealth as u32 =>
+        {
+            Some(QueueFailureCode::InsufficientMargin)
+        }
+        Some(c) if c == MangoError::BeingLiquidated as u32 => {
+            Some(QueueFailureCode::BeingLiquidated)
+        }
+        Some(c) if c == MangoError::IsBankrupt as u32 => Some(QueueFailureCode::Bankrupt),
+        Some(c) if c == MangoError::OracleStale as u32 => Some(QueueFailureCode::OracleStale),
+        Some(c) if c == MangoError::OracleConfidence as u32 => {
+            Some(QueueFailureCode::OracleConfidence)
+        }
+        Some(c) if c == MangoError::SpotPriceBandExceeded as u32 => {
+            Some(QueueFailureCode::PriceBandExceeded)
+        }
+        Some(c) if c == MangoError::MarketInReduceOnlyMode as u32 => {
+            Some(QueueFailureCode::MarketReduceOnly)
+        }
+        Some(c) if c == MangoError::TokenInReduceOnlyMode as u32 => {
+            Some(QueueFailureCode::TokenReduceOnly)
+        }
+        Some(c) if c == MangoError::TokenInForceClose as u32 => {
+            Some(QueueFailureCode::TokenForceClose)
+        }
+        Some(c) if c == MangoError::AccountIsFrozen as u32 => Some(QueueFailureCode::AccountFrozen),
+        Some(c) if c == MangoError::GroupIsHalted as u32 => Some(QueueFailureCode::GroupHalted),
+        Some(c) if c == MangoError::BankBorrowLimitReached as u32 => {
+            Some(QueueFailureCode::BankBorrowLimit)
+        }
+        Some(c) if c == MangoError::BankNetBorrowsLimitReached as u32 => {
+            Some(QueueFailureCode::BankNetBorrowsLimit)
+        }
+        Some(c) if c == MangoError::BankDepositLimit as u32 => {
+            Some(QueueFailureCode::BankDepositLimit)
+        }
+        Some(c) if c == MangoError::DepositLimit as u32 => {
+            Some(QueueFailureCode::GroupDepositLimit)
+        }
+        Some(c) if c == MangoError::WouldSelfTrade as u32 => Some(QueueFailureCode::WouldSelfTrade),
+        _ => None,
+    };
+    match mapped {
+        Some(fc) => (true, fc),
+        None => (false, QueueFailureCode::Other),
+    }
 }
