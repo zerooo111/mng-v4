@@ -18,7 +18,7 @@
 use anchor_lang::{AccountDeserialize, InstructionData, ToAccountMetas};
 use anyhow::{anyhow, Result};
 use mango_v4::instructions::{CommitEntryV4, RevealArgsV4};
-use mango_v4::state::PerpMarketCommitRootV4;
+use mango_v4::state::{PerpMarketCommitRootV4, EXECUTION_QUEUE_COMMIT_PAGE_V4_SPACE};
 use solana_client::{
     nonblocking::rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig,
 };
@@ -96,6 +96,11 @@ pub struct V4MarketState {
     pub market_index: u16,
     pub page_size: u16,
     pub num_pages: u16,
+    /// Fee payer pubkey used on every reveal tx. Stored so the accounts_hash
+    /// computation can flag-merge against it — the Solana runtime promotes the
+    /// payer to writable+signer globally, which flows into the on-chain
+    /// `hash_accounts(account_metas_from_infos(...))` computation.
+    pub payer: Pubkey,
 }
 
 impl V4MarketState {
@@ -184,16 +189,26 @@ pub fn hash_dispatch_accounts_for_reveal(
     mkt: &V4MarketState,
     dispatch_accounts: &[AccountMeta],
 ) -> [u8; 32] {
-    // Fixed accounts the relayer adds to every reveal tx, with on-chain
-    // writability matching the `#[derive(Accounts)]` struct for
-    // ExecutionQueueV4RevealExecuteMarket.
-    let fixed: [AccountMeta; 6] = [
+    // Accounts the reveal tx contains OUTSIDE the dispatch slice, with the
+    // flags the Solana runtime will merge across the whole tx. These come from
+    // three sources:
+    //   1. `ExecutionQueueV4RevealExecuteMarket` Anchor Accounts struct (group,
+    //      auth, queue_root, queue_page, instructions sysvar).
+    //   2. The trailing `program_id` the reveal builder pushes onto
+    //      `remaining_accounts` so the dispatch CPI has it visible.
+    //   3. The tx-level payer — Solana promotes it to `is_signer=true,
+    //      is_writable=true` for every ix it appears in, including any
+    //      dispatch position that happens to be the same pubkey. Missing this
+    //      caused ~50% of reveals to fail with 6114 because the relayer's
+    //      accounts_hash diverged from `account_metas_from_infos` on-chain.
+    let fixed: [AccountMeta; 7] = [
         AccountMeta::new(mkt.group, false),            // group — `#[account(mut)]`
         AccountMeta::new_readonly(mkt.authority_state, false),
         AccountMeta::new(mkt.queue_root, false),       // queue_root — `#[account(mut)]`
         AccountMeta::new(mkt.queue_page0, false),      // queue_page (any page, same flags)
         AccountMeta::new_readonly(INSTRUCTIONS_SYSVAR_ID, false),
         AccountMeta::new_readonly(mkt.program_id, false), // trailing program_id
+        AccountMeta { pubkey: mkt.payer, is_signer: true, is_writable: true },
     ];
     let mut flags: BTreeMap<Pubkey, (bool, bool)> = BTreeMap::new();
     for a in fixed.iter().chain(dispatch_accounts.iter()) {
@@ -534,6 +549,7 @@ pub fn spawn_reveal_worker(
     store: V4RevealStore,
     reveal_spacing_ms: u64,
     stall: V4HeadStallState,
+    wal: Option<Arc<crate::v4_reveal_wal::V4RevealWal>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let send_cfg = RpcSendTransactionConfig {
@@ -544,7 +560,17 @@ pub fn spawn_reveal_worker(
         let mut last_fired: u64 = 0;
         let mut last_log_head: u64 = u64::MAX;
         let mut last_log_at = Instant::now();
-        const IN_FLIGHT: u64 = 6;
+        // IN_FLIGHT > 1 is unsafe: the on-chain reveal handler always processes
+        // against the CURRENT head (`queue_root.next_sequence_to_execute`), not
+        // the sequence the reveal tx was originally built for. Multiple
+        // parallel reveal txs land in arbitrary order; any that reaches the
+        // chain while head is still behind its target seq fails with 6114
+        // `CommitRevealMismatch` because `hashv(its_payload) != hashv(head's_payload)`.
+        // The race shows up as ~50 % 6114s with no other structural cause.
+        // Use 1 for sequential correctness. A future batched reveal_execute tx
+        // (Vec<RevealArgsV4> with multiple entries) would let the handler
+        // advance head between entries in a single tx and restore throughput.
+        const IN_FLIGHT: u64 = 1;
         loop {
             let root_acct = match rpc.get_account(&mkt.queue_root).await {
                 Ok(a) => a,
@@ -590,7 +616,15 @@ pub fn spawn_reveal_worker(
             let window_end = max_seen.saturating_add(1).min(head + IN_FLIGHT);
             let fire_count = window_end.saturating_sub(last_fired) as usize;
             if fire_count == 0 {
-                if last_fired > head + 2 {
+                // If `last_fired` has outpaced the window end, the last batch of
+                // reveals didn't advance head (all failed or got raced). Rewind
+                // so the next cycle retries from head. Condition is
+                // `last_fired > head` (unconditional rewind when nothing moved)
+                // to keep `IN_FLIGHT=1` making forward progress after a failed
+                // reveal, while still being safe for larger IN_FLIGHT since a
+                // batch that partially advanced head would hit `head > last_fired`
+                // above and re-sync first.
+                if last_fired > head {
                     last_fired = head;
                 }
                 tokio::time::sleep(Duration::from_millis(500)).await;
@@ -641,11 +675,23 @@ pub fn spawn_reveal_worker(
             last_fired += fire_count as u64;
 
             // Garbage-collect store entries below head.
-            {
+            let gc_count = {
                 let mut g = store.lock();
                 let to_drop: Vec<u64> = g.range(..head).map(|(k, _)| *k).collect();
+                let n = to_drop.len();
                 for k in to_drop {
                     g.remove(&k);
+                }
+                n
+            };
+            // Compact the WAL periodically so successful-commit records
+            // don't accumulate on disk. Only after at least one GC'd entry —
+            // otherwise every cycle would rewrite the file unnecessarily.
+            if gc_count > 0 {
+                if let Some(w) = wal.as_ref() {
+                    if let Err(e) = w.compact(head) {
+                        warn!(target: "v4_reveal", error = %e, head, "WAL compaction failed");
+                    }
                 }
             }
 
@@ -871,10 +917,10 @@ pub async fn wait_for_signature_confirmation(
 // Page auto-initialization (one-shot at startup, on-demand during drift)
 // ---------------------------------------------------------------------------
 
-/// Full size of an initialized `CommitPageV4` account (matches on-chain
-/// `EXECUTION_QUEUE_COMMIT_PAGE_V4_SPACE`). Used to decide when the chunked
-/// grow loop is done.
-const COMMIT_PAGE_V4_FULL_SIZE: u64 = 24_648;
+/// Full size of an initialized `CommitPageV4` account. Sourced from the
+/// onchain crate so an on-chain layout change doesn't silently drift out of
+/// sync with the offchain chunked-grow loop.
+const COMMIT_PAGE_V4_FULL_SIZE: u64 = EXECUTION_QUEUE_COMMIT_PAGE_V4_SPACE as u64;
 /// Solana max per-tx realloc grow.
 const MAX_PERMITTED_DATA_INCREASE: u64 = 10_240;
 
@@ -1087,6 +1133,7 @@ pub fn spawn_drift_resync_worker(
     rpc: Arc<RpcClient>,
     mkt: Arc<V4MarketState>,
     next_seq: V4NextSequence,
+    reveal_store: V4RevealStore,
     interval_ms: u64,
     max_lookahead: u64,
 ) -> tokio::task::JoinHandle<()> {
@@ -1112,20 +1159,34 @@ pub fn spawn_drift_resync_worker(
             } else {
                 parsed.max_seen_sequence.saturating_add(1)
             };
+            // Don't rewind below the highest seq we already have reveal material
+            // for — those seqs either already committed on-chain (and the stored
+            // payload is what their reveals need) or are in flight. Rewinding
+            // past them would let a later submit overwrite the store entry, and
+            // if the original's commit had already landed, the on-chain
+            // `commit_hash` check would fail at reveal time (6114).
+            let max_stored_seq: u64 = {
+                let store = reveal_store.lock();
+                store.keys().next_back().copied().unwrap_or(0)
+            };
+            let safe_rewind_target = on_chain_next.max(max_stored_seq.saturating_add(1));
+
             let local = next_seq.load(Ordering::Acquire);
             if local > on_chain_next.saturating_add(max_lookahead) {
                 warn!(
                     target: "v4_drift",
                     local,
                     on_chain_next,
+                    max_stored_seq,
+                    rewind_to = safe_rewind_target,
                     drift = local - on_chain_next,
-                    "local counter drifted; rewinding to on_chain_next"
+                    "local counter drifted; rewinding past in-flight reveal-store entries"
                 );
-                // Rewind. This is safe even with concurrent submits: a
-                // concurrent fetch_add will produce a duplicate sequence,
-                // which the on-chain validate_commit_sequence rejects as
-                // out-of-range, and the next resync rewinds again.
-                next_seq.store(on_chain_next, Ordering::Release);
+                // Rewind to the max of on_chain_next and (highest stored seq + 1)
+                // so we never reassign a seq that has reveal material in flight.
+                if local > safe_rewind_target {
+                    next_seq.store(safe_rewind_target, Ordering::Release);
+                }
             } else if local + 16 < on_chain_next {
                 // We're behind on-chain (someone else committed). Catch up.
                 info!(
@@ -1135,6 +1196,20 @@ pub fn spawn_drift_resync_worker(
                     "local counter behind on-chain; advancing"
                 );
                 next_seq.store(on_chain_next, Ordering::Release);
+            }
+
+            // Garbage-collect reveal_store entries for seqs the chain has
+            // already executed or dropped (seq < next_sequence_to_execute).
+            // Their payloads are no longer reachable by any reveal, and keeping
+            // them inflates the "highest stored seq" floor we refuse to rewind
+            // past.
+            {
+                let mut store = reveal_store.lock();
+                let cutoff = parsed.next_sequence_to_execute;
+                let stale: Vec<u64> = store.range(..cutoff).map(|(k, _)| *k).collect();
+                for k in stale {
+                    store.remove(&k);
+                }
             }
         }
     })
@@ -1151,8 +1226,6 @@ pub struct V4AutodropConfig {
     pub max_drops_per_minute: u32,
     pub drop_count_per_call: u16,
     pub poll_interval_secs: u64,
-    pub queue_soft_limit: u16,
-    pub queue_gap_wait_slots: u16,
 }
 
 impl V4AutodropConfig {
@@ -1163,8 +1236,6 @@ impl V4AutodropConfig {
             max_drops_per_minute: 30,
             drop_count_per_call: 1,
             poll_interval_secs: 10,
-            queue_soft_limit: 0,
-            queue_gap_wait_slots: 4,
         }
     }
 }
@@ -1217,13 +1288,50 @@ pub fn spawn_autodrop_worker(
 
             let (head, head_age, live_count, attempts) = stall.snapshot();
             let Some(age) = head_age else { continue };
-            if live_count == 0 {
-                continue;
-            }
             if age.as_secs() < cfg.stall_threshold_secs {
                 continue;
             }
-            if attempts < cfg.min_reveal_attempts {
+            // If live_count > 0, the usual stall-reveal-drop cadence applies.
+            // If live_count == 0 but head is still stalled, we may be sitting on
+            // *page-level* orphans: a prior run left items in a specific slot
+            // with per-page live_count > 0 while queue_root.live_count reached
+            // 0. New commits landing on that slot will fail at
+            // `prepare_for_write_target` with `ExecutionQueueFull`. Confirm the
+            // head's page has live items before firing — avoids no-op admin txs
+            // during normal idle gaps.
+            //
+            // Skip `min_reveal_attempts` in the orphan-repair branch because
+            // the reveal worker never fires (there's nothing to reveal when
+            // queue_root.live_count == 0), so `attempts` would never cross the
+            // threshold and the wedge would persist.
+            let in_orphan_repair = if live_count == 0 {
+                let (head_page, _) = derive_queue_page_pda(
+                    &mkt.program_id,
+                    &mkt.queue_root,
+                    (head / mkt.page_size.max(1) as u64 % mkt.num_pages.max(1) as u64) as u16,
+                );
+                let has_page_orphans = match rpc.get_account(&head_page).await {
+                    Ok(acct) if acct.data.len() >= 50 => {
+                        // Layout: disc(8) + queue_root(32) + assigned_abs_page_no(8)
+                        // + live_count(u16 at offset 48).
+                        u16::from_le_bytes([acct.data[48], acct.data[49]]) > 0
+                    }
+                    _ => false,
+                };
+                if !has_page_orphans {
+                    continue;
+                }
+                warn!(
+                    target: "v4_autodrop",
+                    head,
+                    page = %head_page,
+                    "queue_root.live_count=0 but head's page has orphans; firing repair"
+                );
+                true
+            } else {
+                false
+            };
+            if !in_orphan_repair && attempts < cfg.min_reveal_attempts {
                 continue;
             }
 
@@ -1245,21 +1353,29 @@ pub fn spawn_autodrop_worker(
                 history.push(now);
             }
 
-            // For drop_head_market we need the page that owns the current head
-            // sequence — derive from queue_root state.
-            let head_page_slot = match rpc.get_account(&mkt.queue_root).await {
-                Ok(a) => match PerpMarketCommitRootV4::try_deserialize(&mut &a.data[..]) {
-                    Ok(r) => r.page_slot_for_sequence(r.next_sequence_to_execute),
+            // For drop_head_market we need the page that owns the current
+            // head sequence — derive from queue_root state. Also capture
+            // the live `soft_limit` and `gap_wait_slots` so the atomic
+            // pause+drop+unpause doesn't silently reset a queue that was
+            // tuned away from relayer defaults.
+            let (head_page_slot, live_soft_limit, live_gap_wait_slots) =
+                match rpc.get_account(&mkt.queue_root).await {
+                    Ok(a) => match PerpMarketCommitRootV4::try_deserialize(&mut &a.data[..]) {
+                        Ok(r) => (
+                            r.page_slot_for_sequence(r.next_sequence_to_execute),
+                            r.soft_limit,
+                            r.gap_wait_slots,
+                        ),
+                        Err(e) => {
+                            warn!(target: "v4_autodrop", error = %e, "queue_root decode failed");
+                            continue;
+                        }
+                    },
                     Err(e) => {
-                        warn!(target: "v4_autodrop", error = %e, "queue_root decode failed");
+                        warn!(target: "v4_autodrop", error = %e, "queue_root fetch failed");
                         continue;
                     }
-                },
-                Err(e) => {
-                    warn!(target: "v4_autodrop", error = %e, "queue_root fetch failed");
-                    continue;
-                }
-            };
+                };
             let (head_page_pda, _) =
                 derive_queue_page_pda(&mkt.program_id, &mkt.queue_root, head_page_slot);
 
@@ -1284,8 +1400,8 @@ pub fn spawn_autodrop_worker(
                 &admin,
                 &payer,
                 cfg.drop_count_per_call,
-                cfg.queue_soft_limit,
-                cfg.queue_gap_wait_slots,
+                live_soft_limit,
+                live_gap_wait_slots,
                 bh,
             );
             warn!(

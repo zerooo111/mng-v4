@@ -34,6 +34,7 @@ use solana_sdk::{
 };
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+use tracing::warn;
 
 pub const V4_MAX_BATCH: usize = 50;
 pub const V4_MAX_IDLE_BEFORE_FLUSH: Duration = Duration::from_millis(1000);
@@ -137,60 +138,75 @@ async fn flush(
     buf: &mut Vec<PendingCommit>,
     tx: &mpsc::Sender<CommitBatch>,
 ) {
-    if buf.is_empty() {
-        return;
+    // The onchain commit instruction stores entry `i` under sequence
+    // `first_sequence + i`. A gap in the buffered sequences would silently
+    // corrupt the queue page layout and require admin cleanup to recover.
+    // Emit one batch per contiguous run so this invariant holds at runtime
+    // (and not only in debug builds).
+    while !buf.is_empty() {
+        let mut contiguous_len = 1;
+        while contiguous_len < buf.len()
+            && buf[contiguous_len].sequence == buf[contiguous_len - 1].sequence + 1
+        {
+            contiguous_len += 1;
+        }
+        if contiguous_len < buf.len() {
+            warn!(
+                last_contiguous = buf[contiguous_len - 1].sequence,
+                next_after_gap = buf[contiguous_len].sequence,
+                market_index = ctx.market_index,
+                "v4 batcher: non-contiguous sequences detected; splitting batch at gap"
+            );
+        }
+
+        let first_sequence = buf[0].sequence;
+        let page_slot = buf[0].expected_page_slot;
+        let queue_page = (ctx.page_pda_for_slot)(page_slot);
+
+        let entries: Vec<CommitEntryV4> = buf[..contiguous_len]
+            .iter()
+            .map(|p| p.entry.clone())
+            .collect();
+
+        let msg = canonical_commit_batch_message(
+            ctx.group,
+            ctx.market_index,
+            ctx.shard_id,
+            first_sequence,
+            &entries,
+        );
+        let sig_bytes: [u8; 64] = ctm_signer
+            .sign_message(&msg)
+            .as_ref()
+            .try_into()
+            .expect("ed25519 sig is 64 bytes");
+        // multi-sig form is forward-compatible if we ever attach user sigs here.
+        let ed25519_preix = build_multi_ed25519_instruction(&[(
+            ctm_signer.pubkey(),
+            sig_bytes,
+            msg.to_vec(),
+        )]);
+
+        let commit_ix = build_commit_market_instruction(
+            ctx.program_id,
+            ctx.group,
+            ctx.authority_state,
+            ctx.queue_root,
+            queue_page,
+            ctx.market_index,
+            first_sequence,
+            entries,
+        );
+
+        let batch = CommitBatch {
+            first_sequence,
+            page_slot,
+            ed25519_preix,
+            commit_ix,
+        };
+        let _ = tx.send(batch).await;
+        buf.drain(..contiguous_len);
     }
-
-    // Validate strictly-increasing sequences (defense in depth; ingress should
-    // already guarantee this).
-    for w in buf.windows(2) {
-        debug_assert_eq!(w[1].sequence, w[0].sequence + 1);
-    }
-
-    let first_sequence = buf[0].sequence;
-    let page_slot = buf[0].expected_page_slot;
-    let queue_page = (ctx.page_pda_for_slot)(page_slot);
-
-    let entries: Vec<CommitEntryV4> = buf.iter().map(|p| p.entry.clone()).collect();
-
-    let msg = canonical_commit_batch_message(
-        ctx.group,
-        ctx.market_index,
-        ctx.shard_id,
-        first_sequence,
-        &entries,
-    );
-    let sig_bytes: [u8; 64] = ctm_signer
-        .sign_message(&msg)
-        .as_ref()
-        .try_into()
-        .expect("ed25519 sig is 64 bytes");
-    // multi-sig form is forward-compatible if we ever attach user sigs here.
-    let ed25519_preix = build_multi_ed25519_instruction(&[(
-        ctm_signer.pubkey(),
-        sig_bytes,
-        msg.to_vec(),
-    )]);
-
-    let commit_ix = build_commit_market_instruction(
-        ctx.program_id,
-        ctx.group,
-        ctx.authority_state,
-        ctx.queue_root,
-        queue_page,
-        ctx.market_index,
-        first_sequence,
-        entries,
-    );
-
-    let batch = CommitBatch {
-        first_sequence,
-        page_slot,
-        ed25519_preix,
-        commit_ix,
-    };
-    let _ = tx.send(batch).await;
-    buf.clear();
 }
 
 #[cfg(test)]
@@ -271,6 +287,49 @@ mod tests {
             .expect("some");
         assert_eq!(batch.first_sequence, 0);
         drop(tx_in);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn batcher_splits_at_sequence_gap() {
+        // If the buffer holds sequences [10, 11, 13], the batcher must emit
+        // two batches: [10, 11] first, then [13]. Otherwise the onchain
+        // commit instruction would store entry 13's commit_hash under
+        // sequence 12 (first_sequence + i).
+        let (tx_in, rx_in) = mpsc::channel::<PendingCommit>(16);
+        let (tx_out, mut rx_out) = mpsc::channel::<CommitBatch>(4);
+        let ctm = Keypair::new();
+        let ctx = BatcherMarketContext {
+            program_id: Pubkey::new_unique(),
+            group: Pubkey::new_unique(),
+            authority_state: Pubkey::new_unique(),
+            queue_root: Pubkey::new_unique(),
+            market_index: 7,
+            shard_id: 0,
+            page_pda_for_slot: std::sync::Arc::new(|_| Pubkey::new_unique()),
+        };
+        let handle = tokio::spawn(async move { run_batcher(ctx, ctm, rx_in, tx_out).await });
+
+        for seq in [10u64, 11, 13] {
+            tx_in
+                .send(PendingCommit {
+                    sequence: seq,
+                    entry: CommitEntryV4 {
+                        commit_hash: [seq as u8; 32],
+                        min_execute_slot: 0,
+                        expires_at_slot: 0,
+                    },
+                    expected_page_slot: 0,
+                })
+                .await
+                .unwrap();
+        }
+        drop(tx_in);
+
+        let first_batch = rx_out.recv().await.expect("first batch");
+        assert_eq!(first_batch.first_sequence, 10);
+        let second_batch = rx_out.recv().await.expect("second batch from gap split");
+        assert_eq!(second_batch.first_sequence, 13);
         handle.await.unwrap();
     }
 }

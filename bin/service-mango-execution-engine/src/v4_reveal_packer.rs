@@ -2,16 +2,21 @@
 //!
 //! The reveal worker must not overflow Solana's per-tx 1232-byte packet
 //! budget. Each reveal contributes:
-//!   * variable ix data  — payload bytes + a 2-byte length + 1 byte kind +
-//!     1 byte dispatch_accounts_count + 4 bytes borsh-vec prefix (once per
-//!     batch header)
-//!   * unique dispatch accounts — any pubkeys not already in the shared
-//!     prefix cost 32 bytes each
+//!   * variable ix data  — payload bytes + 4-byte borsh-vec prefix +
+//!     1 byte kind + 1 byte dispatch_accounts_count
+//!   * dispatch accounts — each one appended as a full AccountMeta
+//!     (32 bytes pubkey + 1 byte signer/writable flags)
 //!   * optional ed25519 pre-instruction entry for variants that require a
 //!     user signature (142 bytes per sig header+pubkey+sig+32-byte msg)
 //!
 //! `pack_reveal_batch` greedily adds reveals in strict sequence order until
 //! the next reveal would exceed the remaining budget.
+//!
+//! Per-reveal dispatch accounts are NEVER de-duplicated across reveals. The
+//! onchain reveal handler uses a cursor into `remaining_accounts` and reads
+//! exactly `dispatch_accounts_count` contiguous entries per reveal before
+//! hashing them — any dedupe would make the second and later reveals slice
+//! the wrong accounts and fail the commit-hash check.
 
 use crate::v4_builders::build_reveal_execute_market_instruction;
 use mango_v4::instructions::RevealArgsV4;
@@ -23,7 +28,6 @@ use solana_sdk::{
     signature::Signer,
     transaction::Transaction,
 };
-use std::collections::BTreeSet;
 
 /// Upper bound on a serialized Solana legacy transaction.
 pub const SOLANA_MAX_TX_BYTES: usize = 1232;
@@ -53,16 +57,13 @@ pub struct PackResult {
     pub estimated_tx_bytes: usize,
 }
 
-/// Greedy packing of head-ordered reveals into a single tx. `shared_prefix`
-/// is the list of fixture accounts (queue_root/page/group/etc.) already in
-/// the tx's account list; dispatch accounts that match are free, new ones
-/// cost 32 bytes.
-pub fn pack_reveal_batch(
-    candidates: &[RevealCandidate],
-    fixed_tx_overhead: usize,
-    shared_prefix: &[Pubkey],
-) -> PackResult {
-    let mut seen: BTreeSet<Pubkey> = shared_prefix.iter().copied().collect();
+/// Greedy packing of head-ordered reveals into a single tx.
+///
+/// Each reveal's `dispatch_accounts` list is appended in full (no dedupe
+/// across reveals) so the onchain cursor can slice the correct contiguous
+/// range for each reveal. Byte costs are counted against the 1232-byte tx
+/// budget without any dedupe discount.
+pub fn pack_reveal_batch(candidates: &[RevealCandidate], fixed_tx_overhead: usize) -> PackResult {
     let mut reveals: Vec<RevealArgsV4> = Vec::new();
     let mut remaining_accounts: Vec<AccountMeta> = Vec::new();
     let mut user_sigs: Vec<(Pubkey, [u8; 64], Vec<u8>)> = Vec::new();
@@ -73,12 +74,7 @@ pub fn pack_reveal_batch(
         let fixed_fields = 1 /* kind */ + 1 /* dispatch_accounts_count */;
         let ix_delta = payload_bytes + fixed_fields;
 
-        let mut new_account_bytes: usize = 0;
-        for meta in &cand.dispatch_accounts {
-            if !seen.contains(&meta.pubkey) {
-                new_account_bytes += 32 + 1; // pubkey + 1 byte for the meta flag
-            }
-        }
+        let new_account_bytes = cand.dispatch_accounts.len() * (32 + 1);
 
         let sig_delta = cand.user_sig.as_ref().map(|_| 142).unwrap_or(0);
 
@@ -91,11 +87,7 @@ pub fn pack_reveal_batch(
         // path, which this packer intentionally does not handle.
         estimated = next;
         reveals.push(cand.args.clone());
-        for meta in &cand.dispatch_accounts {
-            if seen.insert(meta.pubkey) {
-                remaining_accounts.push(meta.clone());
-            }
-        }
+        remaining_accounts.extend(cand.dispatch_accounts.iter().cloned());
         if let Some((pk, sig, msg)) = &cand.user_sig {
             user_sigs.push((*pk, *sig, msg.to_vec()));
         }
@@ -167,7 +159,7 @@ mod tests {
     #[test]
     fn packer_stops_before_overflow() {
         let cands: Vec<RevealCandidate> = (0..20).map(|i| mk_candidate(i, 45, true)).collect();
-        let res = pack_reveal_batch(&cands, 400, &[]);
+        let res = pack_reveal_batch(&cands, 400);
         assert!(!res.reveals.is_empty());
         assert!(res.estimated_tx_bytes <= SOLANA_MAX_TX_BYTES - PACK_HEADROOM_BYTES);
     }
@@ -176,8 +168,47 @@ mod tests {
     fn packer_fits_more_without_user_sigs() {
         let with_sig: Vec<_> = (0..30).map(|i| mk_candidate(i, 45, true)).collect();
         let no_sig: Vec<_> = (0..30).map(|i| mk_candidate(i, 45, false)).collect();
-        let a = pack_reveal_batch(&with_sig, 400, &[]);
-        let b = pack_reveal_batch(&no_sig, 400, &[]);
+        let a = pack_reveal_batch(&with_sig, 400);
+        let b = pack_reveal_batch(&no_sig, 400);
         assert!(b.reveals.len() > a.reveals.len());
+    }
+
+    #[test]
+    fn shared_dispatch_accounts_are_not_deduped_across_reveals() {
+        // Two reveals for the same market share the same dispatch accounts.
+        // The packer must append both reveals' accounts in full so the
+        // onchain cursor can slice each reveal's contiguous range correctly.
+        let shared = vec![
+            AccountMeta::new(Pubkey::new_unique(), false),
+            AccountMeta::new_readonly(Pubkey::new_unique(), false),
+            AccountMeta::new_readonly(Pubkey::new_unique(), false),
+        ];
+        let mk = |seq: u64| RevealCandidate {
+            sequence: seq,
+            args: RevealArgsV4 {
+                payload: vec![0u8; 16],
+                kind: 0,
+                dispatch_accounts_count: shared.len() as u8,
+            },
+            dispatch_accounts: shared.clone(),
+            user_sig: None,
+        };
+        let cands = vec![mk(10), mk(11)];
+        let res = pack_reveal_batch(&cands, 200);
+
+        assert_eq!(res.reveals.len(), 2);
+        assert_eq!(res.remaining_accounts.len(), 2 * shared.len());
+
+        // Each reveal's cursor slice must equal its original dispatch_accounts.
+        for (i, reveal) in res.reveals.iter().enumerate() {
+            let count = reveal.dispatch_accounts_count as usize;
+            let start = i * shared.len();
+            let slice = &res.remaining_accounts[start..start + count];
+            for (j, meta) in slice.iter().enumerate() {
+                assert_eq!(meta.pubkey, shared[j].pubkey, "reveal {i} account {j}");
+                assert_eq!(meta.is_signer, shared[j].is_signer);
+                assert_eq!(meta.is_writable, shared[j].is_writable);
+            }
+        }
     }
 }

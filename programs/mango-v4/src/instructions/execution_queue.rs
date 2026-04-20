@@ -2127,6 +2127,18 @@ pub fn execution_queue_execute_multi(
         .map(|lane| hash_accounts(&account_metas_from_infos(lane)))
         .collect();
 
+    // Caller-supplied `lane_hashes` must agree with the accounts actually
+    // passed in `remaining_accounts`. The program still uses the precomputed
+    // hashes for lane matching; the equality check tightens the ABI so
+    // callers can't silently disagree with the program about the lane
+    // layout.
+    for (i, declared) in lane_hashes.iter().enumerate() {
+        require!(
+            *declared == precomputed_lane_hashes[i],
+            MangoError::ExecutionQueueAccountsHashMismatch
+        );
+    }
+
     for _ in 0..max_items {
         let mut candidate: Option<ExecutableCandidate> = None;
         let mut blocked = false;

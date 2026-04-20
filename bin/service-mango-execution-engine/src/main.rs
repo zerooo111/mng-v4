@@ -81,6 +81,7 @@ mod v4_batcher;
 mod v4_builders;
 mod v4_pipeline;
 mod v4_reveal_packer;
+mod v4_reveal_wal;
 
 use proto::{
     ctm_sequencer_relayer_server::{CtmSequencerRelayer, CtmSequencerRelayerServer},
@@ -188,6 +189,8 @@ struct Config {
     v4_autodrop_count_per_call: u16,
     /// Autodrop polling cadence.
     v4_autodrop_poll_secs: u64,
+    /// Path to the reveal-material WAL file. Empty disables persistence.
+    v4_reveal_wal_path: Option<PathBuf>,
     executor_lane_config_path: Option<PathBuf>,
     executor_lane_cache_path: Option<PathBuf>,
     executor_relay_event_log_path: Option<PathBuf>,
@@ -678,6 +681,10 @@ impl Config {
                 1,
             )? as u16,
             v4_autodrop_poll_secs: parse_u64_env("V4_AUTODROP_POLL_SECS", 10)?,
+            v4_reveal_wal_path: std::env::var("V4_REVEAL_WAL_PATH")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from),
             executor_lane_config_path,
             executor_lane_cache_path,
             executor_relay_event_log_path,
@@ -3090,6 +3097,11 @@ struct Engine {
     v4_market: Option<Arc<v4_pipeline::V4MarketState>>,
     v4_reveal_store: v4_pipeline::V4RevealStore,
     v4_next_sequence: v4_pipeline::V4NextSequence,
+    /// Durable WAL for reveal material. Populated before every commit tx
+    /// send so the reveal worker can still find the payload + accounts +
+    /// signature after a relayer restart. `None` disables persistence (the
+    /// in-memory store still works for single-process scenarios).
+    v4_reveal_wal: Option<Arc<v4_reveal_wal::V4RevealWal>>,
     /// Mango accounts whose perp order slots are full. Keyed by account
     /// pubkey, value is the wall-clock ms when the block expires.  New
     /// intents targeting a blocked account are rejected immediately with
@@ -6691,21 +6703,31 @@ impl Engine {
                     v4_mkt.market_index,
                     &envelope.payload_hash,
                 );
+                let reveal_entry = v4_pipeline::V4RevealEntry {
+                    sequence: v4_seq,
+                    payload: request.payload.clone(),
+                    payload_hash: envelope.payload_hash,
+                    dispatch_accounts: remaining_accounts.clone(),
+                    user_owner,
+                    mango_account,
+                    user_sig: Some(user_signature),
+                    user_intent_hash: Some(user_intent_msg),
+                };
+                // Durable WAL append MUST land before the commit tx is sent.
+                // If the process dies between tx send and reveal, the WAL is
+                // the only thing that lets the reveal worker reconstruct
+                // payload + accounts + user_sig on restart.
+                if let Some(wal) = self.v4_reveal_wal.as_ref() {
+                    if let Err(e) = wal.append_insert(&reveal_entry) {
+                        warn!("v4 reveal WAL append failed for seq {v4_seq}: {e}");
+                        return Err(Status::internal(format!(
+                            "v4 reveal WAL append failed: {e}"
+                        )));
+                    }
+                }
                 {
                     let mut store = self.v4_reveal_store.lock();
-                    store.insert(
-                        v4_seq,
-                        v4_pipeline::V4RevealEntry {
-                            sequence: v4_seq,
-                            payload: request.payload.clone(),
-                            payload_hash: envelope.payload_hash,
-                            dispatch_accounts: remaining_accounts.clone(),
-                            user_owner,
-                            mango_account,
-                            user_sig: Some(user_signature),
-                            user_intent_hash: Some(user_intent_msg),
-                        },
-                    );
+                    store.insert(v4_seq, reveal_entry);
                 }
                 // Build commit tx inline using engine payer as both payer
                 // and ctm signer (the devnet setup uses admin keypair as
@@ -6733,10 +6755,18 @@ impl Engine {
                     Ok(s) => s,
                     Err(e) => {
                         // Remove the store entry so reveal worker doesn't try
-                        // to reveal a commit that never landed.
+                        // to reveal a commit that never landed. Tombstone the
+                        // WAL too so a subsequent replay doesn't resurrect it.
                         {
                             let mut store = self.v4_reveal_store.lock();
                             store.remove(&v4_seq);
+                        }
+                        if let Some(wal) = self.v4_reveal_wal.as_ref() {
+                            if let Err(werr) = wal.append_remove(v4_seq) {
+                                warn!(
+                                    "v4 reveal WAL tombstone failed for seq {v4_seq}: {werr}"
+                                );
+                            }
                         }
                         return Err(Status::internal(format!(
                             "v4 commit send failed: {e}"
@@ -9778,8 +9808,21 @@ fn build_canonical_health_account_metas(
     openbook_open_orders: &[Pubkey],
     group_mirror: &GroupStaticAccountMirror,
 ) -> Result<Vec<AccountMeta>> {
-    let mut sections: Vec<Vec<Pubkey>> = vec![Vec::new(); 7];
-
+    // ScanningAccountRetriever on-chain requires strict 1:1 alignment between
+    // banks ↔ bank_oracles and between perp_markets ↔ perp_oracles (see
+    // programs/mango-v4/src/health/account_retriever.rs — it computes
+    // perps_start = n_banks * 2 and serum3_start = perps_start + 2 * n_perps,
+    // then slices ais[serum3_start..]). If the same oracle pubkey backs two
+    // perp markets (e.g. every SOL-PERP market on this deploy shares the Pyth
+    // SOL oracle), global dedup collapses the perp_oracles section to a single
+    // entry and the on-chain slice panics with "range start index N out of
+    // range for slice of length M". Match the canonical lib/client builder
+    // (`context::derive_health_check_remaining_account_metas`): emit sections
+    // in order without cross-section dedup, and only dedup fallback_oracles
+    // against themselves and the token_oracles list.
+    let mut banks: Vec<Pubkey> = Vec::new();
+    let mut token_oracles: Vec<Pubkey> = Vec::new();
+    let mut fallback_candidates: Vec<Pubkey> = Vec::new();
     for token_index in token_indices {
         let bank = group_mirror
             .banks_by_token_index
@@ -9790,30 +9833,50 @@ fn build_canonical_health_account_metas(
                     token_index
                 )
             })?;
-        sections[0].push(bank.bank);
-        sections[1].push(bank.oracle);
-        sections[6].extend(bank.fallback_oracles.iter().copied());
+        banks.push(bank.bank);
+        token_oracles.push(bank.oracle);
+        fallback_candidates.extend(bank.fallback_oracles.iter().copied());
     }
+
+    let mut perp_markets: Vec<Pubkey> = Vec::new();
+    let mut perp_oracles: Vec<Pubkey> = Vec::new();
     for market_index in perp_market_indices {
         let market = group_mirror
             .perps_by_market_index
             .get(market_index)
             .with_context(|| format!("perp market {} not found in group mirror", market_index))?;
-        sections[2].push(market.market);
-        sections[3].push(market.oracle);
+        perp_markets.push(market.market);
+        perp_oracles.push(market.oracle);
     }
-    sections[4].extend(serum_open_orders.iter().copied());
-    sections[5].extend(openbook_open_orders.iter().copied());
 
-    let mut seen = HashSet::new();
-    let mut ordered = Vec::new();
-    for section in sections {
-        for pubkey in section {
-            if seen.insert(pubkey) {
-                ordered.push(AccountMeta::new_readonly(pubkey, false));
-            }
+    let mut fallback_oracles: Vec<Pubkey> = Vec::new();
+    let mut fallback_seen: HashSet<Pubkey> = HashSet::new();
+    for key in fallback_candidates {
+        if key == Pubkey::default() || token_oracles.contains(&key) {
+            continue;
+        }
+        if fallback_seen.insert(key) {
+            fallback_oracles.push(key);
         }
     }
+
+    let mut ordered: Vec<AccountMeta> = Vec::with_capacity(
+        banks.len()
+            + token_oracles.len()
+            + perp_markets.len()
+            + perp_oracles.len()
+            + serum_open_orders.len()
+            + openbook_open_orders.len()
+            + fallback_oracles.len(),
+    );
+    let to_meta = |pk: Pubkey| AccountMeta::new_readonly(pk, false);
+    ordered.extend(banks.into_iter().map(to_meta));
+    ordered.extend(token_oracles.into_iter().map(to_meta));
+    ordered.extend(perp_markets.into_iter().map(to_meta));
+    ordered.extend(perp_oracles.into_iter().map(to_meta));
+    ordered.extend(serum_open_orders.iter().copied().map(to_meta));
+    ordered.extend(openbook_open_orders.iter().copied().map(to_meta));
+    ordered.extend(fallback_oracles.into_iter().map(to_meta));
     Ok(ordered)
 }
 
@@ -12521,6 +12584,7 @@ async fn async_main() -> Result<()> {
             market_index: config.v4_market_index,
             page_size,
             num_pages,
+            payer: config.payer.pubkey(),
         });
         info!(
             "v4 route enabled: group={} queue_root={} perp_market={} market_index={} page_size={} num_pages={}",
@@ -12532,34 +12596,77 @@ async fn async_main() -> Result<()> {
         None
     };
 
-    // Read starting sequence from chain so restarts don't collide.
-    let v4_start_seq: u64 = if let Some(mkt) = v4_market.as_ref() {
+    // Read starting sequences from chain so restarts don't collide:
+    // `next_enqueue_sequence` drives the local atomic counter (for new
+    // commits); `next_sequence_to_execute` (the on-chain head) filters WAL
+    // replay so already-executed entries aren't re-staged.
+    let (v4_start_seq, v4_head_seq): (u64, u64) = if let Some(mkt) = v4_market.as_ref() {
         match rpc.get_account(&mkt.queue_root).await {
             Ok(acct) => {
                 match <mango_v4::state::PerpMarketCommitRootV4 as anchor_lang::AccountDeserialize>::try_deserialize(
                     &mut &acct.data[..],
                 ) {
                     Ok(root) => {
-                        let s = root.next_enqueue_sequence();
-                        info!("v4 starting sequence = {}", s);
-                        s
+                        let next = root.next_enqueue_sequence();
+                        let head = root.next_sequence_to_execute;
+                        info!("v4 starting sequence = {} head = {}", next, head);
+                        (next, head)
                     }
                     Err(e) => {
                         warn!("v4 queue_root deserialize failed: {}, starting at 0", e);
-                        0
+                        (0, 0)
                     }
                 }
             }
             Err(e) => {
                 warn!("v4 queue_root fetch failed: {}, starting at 0", e);
-                0
+                (0, 0)
             }
         }
     } else {
-        0
+        (0, 0)
     };
     let v4_next_sequence = Arc::new(AtomicU64::new(v4_start_seq));
-    let v4_reveal_store: v4_pipeline::V4RevealStore = Arc::new(parking_lot::Mutex::new(std::collections::BTreeMap::new()));
+
+    // Open the reveal WAL (if configured) and replay live entries at or
+    // above the current on-chain head. This survives relayer restarts: a
+    // commit that landed on-chain but whose process died before reveal can
+    // still be revealed after restart without admin autodrop.
+    let v4_reveal_wal: Option<Arc<v4_reveal_wal::V4RevealWal>> =
+        match config.v4_reveal_wal_path.as_ref() {
+            Some(path) => match v4_reveal_wal::V4RevealWal::open(path) {
+                Ok(w) => {
+                    info!("v4 reveal WAL opened at {path:?}");
+                    Some(Arc::new(w))
+                }
+                Err(e) => {
+                    warn!("v4 reveal WAL open failed ({path:?}): {e}; persistence disabled");
+                    None
+                }
+            },
+            None => None,
+        };
+    let mut v4_initial_entries: std::collections::BTreeMap<u64, v4_pipeline::V4RevealEntry> =
+        std::collections::BTreeMap::new();
+    if let Some(wal) = v4_reveal_wal.as_ref() {
+        match wal.replay_live(v4_head_seq) {
+            Ok(entries) => {
+                if !entries.is_empty() {
+                    info!(
+                        "v4 reveal WAL replay: {} entries restored (head={})",
+                        entries.len(),
+                        v4_head_seq
+                    );
+                }
+                v4_initial_entries = entries;
+            }
+            Err(e) => {
+                warn!("v4 reveal WAL replay failed: {e}; starting with empty store");
+            }
+        }
+    }
+    let v4_reveal_store: v4_pipeline::V4RevealStore =
+        Arc::new(parking_lot::Mutex::new(v4_initial_entries));
 
     let engine = Arc::new(Engine {
         config: config.clone(),
@@ -12578,6 +12685,7 @@ async fn async_main() -> Result<()> {
         v4_market: v4_market.clone(),
         v4_reveal_store: v4_reveal_store.clone(),
         v4_next_sequence: v4_next_sequence.clone(),
+        v4_reveal_wal: v4_reveal_wal.clone(),
         blocked_mango_accounts: Arc::new(Mutex::new(HashMap::new())),
         unique_addresses: unique_addresses.clone(),
         latency_optimistic_tracker: latency_optimistic_tracker.clone(),
@@ -12623,6 +12731,7 @@ async fn async_main() -> Result<()> {
             store_c,
             spacing_ms,
             stall.clone(),
+            engine.v4_reveal_wal.clone(),
         );
         info!("v4 reveal worker spawned (spacing_ms={})", spacing_ms);
 
@@ -12648,6 +12757,7 @@ async fn async_main() -> Result<()> {
             rpc_c.clone(),
             mkt.clone(),
             engine.v4_next_sequence.clone(),
+            engine.v4_reveal_store.clone(),
             drift_interval_ms,
             drift_max_lookahead,
         );
@@ -12664,8 +12774,6 @@ async fn async_main() -> Result<()> {
                 max_drops_per_minute: engine.config.v4_autodrop_max_per_min,
                 drop_count_per_call: engine.config.v4_autodrop_count_per_call,
                 poll_interval_secs: engine.config.v4_autodrop_poll_secs,
-                queue_soft_limit: 0,
-                queue_gap_wait_slots: 4,
             };
             v4_pipeline::spawn_autodrop_worker(
                 rpc_c.clone(),

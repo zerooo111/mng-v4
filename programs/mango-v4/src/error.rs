@@ -241,6 +241,8 @@ pub enum MangoError {
     ExecutionQueueV4RevealOutOfOrder,
     #[msg("execution queue v4 reveal envelope field disagrees with stored commit")]
     ExecutionQueueV4RevealEnvelopeMismatch,
+    #[msg("execution queue envelope has min_execute_slot > expires_at_slot")]
+    ExecutionQueueEnvelopeTimingInvalid,
 }
 
 impl MangoError {

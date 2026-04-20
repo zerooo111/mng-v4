@@ -521,6 +521,14 @@ pub fn execution_queue_v4_commit_market(
                 entry.expires_at_slot >= clock.slot,
                 MangoError::ExecutionQueueEnvelopeExpired
             );
+            // Reject items that would sit at the head until their
+            // min_execute_slot only to be immediately culled as expired —
+            // an admission-time liveness check that saves a wasted reveal
+            // attempt and an autodrop.
+            require!(
+                entry.min_execute_slot <= entry.expires_at_slot,
+                MangoError::ExecutionQueueEnvelopeTimingInvalid
+            );
         }
 
         let offset = ctx.accounts.queue_root.page_offset_for_sequence(seq);
@@ -537,15 +545,19 @@ pub fn execution_queue_v4_commit_market(
             queue_page.write_pending_item(root_page_size, offset, item)?;
         }
         ctx.accounts.queue_root.note_commit(seq);
-    }
 
-    emit!(QueueItemEnqueued {
-        group: ctx.accounts.group.key(),
-        market_index,
-        sequence: first_sequence,
-        kind: QueueItemKind::CtmWrapped as u8,
-        min_execute_slot: entries.last().unwrap().min_execute_slot,
-    });
+        // One event per entry so indexers attribute each sequence to its
+        // own min_execute_slot. A single batch-level event used to carry
+        // `sequence = first_sequence` but `min_execute_slot = last entry's`,
+        // which misreported timing to dashboards and alerting.
+        emit!(QueueItemEnqueued {
+            group: ctx.accounts.group.key(),
+            market_index,
+            sequence: seq,
+            kind: QueueItemKind::CtmWrapped as u8,
+            min_execute_slot: entry.min_execute_slot,
+        });
+    }
     Ok(())
 }
 
