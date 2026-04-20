@@ -47,7 +47,7 @@ use std::{
 
 mod real_e2e;
 
-const PROGRAM_ID_STR: &str = "9Vua6curfL8cUk8nJDRbDdYzMgQLYadeW2yaf4EhUKip";
+const PROGRAM_ID_STR: &str = "9rpAcg1jNmUydb4QoeCeJBGf8JfRuxLciRbS7AHGnXEq";
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -131,6 +131,23 @@ struct Args {
     /// Extras state file path.
     #[clap(long, default_value = "/tmp/v4-extras-state.json")]
     extras_state: PathBuf,
+    /// For bootstrap-extra-markets: reuse this on-chain oracle (Pyth etc.)
+    /// instead of creating a fresh stub oracle + base mint.
+    #[clap(long)]
+    perp_oracle_override: Option<String>,
+    /// For bootstrap-extra-markets: PerpMarket base_decimals (default matches
+    /// current SOL-PERP sizing of 5 for a $0.001/SOL tick).
+    #[clap(long, default_value_t = 5u8)]
+    bootstrap_base_decimals: u8,
+    /// For bootstrap-extra-markets: base_lot_size.
+    #[clap(long, default_value_t = 100i64)]
+    bootstrap_base_lot_size: i64,
+    /// For bootstrap-extra-markets: quote_lot_size.
+    #[clap(long, default_value_t = 1i64)]
+    bootstrap_quote_lot_size: i64,
+    /// For bootstrap-extra-markets: number of queue pages to init.
+    #[clap(long, default_value_t = 4u16)]
+    bootstrap_num_pages: u16,
 }
 
 fn program_id() -> Pubkey {
@@ -770,6 +787,12 @@ async fn main() -> Result<()> {
             let kp_path = args.payer.clone().ok_or_else(|| anyhow!("--payer required"))?;
             let admin = read_keypair_file(&kp_path).map_err(|e| anyhow!("kp: {e}"))?;
             let market = real_e2e::MarketState::load(&args.market_state)?;
+            let perp_oracle_override = args
+                .perp_oracle_override
+                .as_ref()
+                .map(|s| s.parse::<solana_sdk::pubkey::Pubkey>())
+                .transpose()
+                .map_err(|e| anyhow!("bad --perp-oracle-override: {e}"))?;
             real_e2e::bootstrap_extra_markets(real_e2e::BootstrapExtraMarketsArgs {
                 rpc: args.rpc.clone(),
                 admin_keypair: admin,
@@ -778,6 +801,11 @@ async fn main() -> Result<()> {
                 first_market_index: args.first_market_index,
                 count: args.extra_count,
                 base_price: args.base_price,
+                perp_oracle_override,
+                base_decimals: args.bootstrap_base_decimals,
+                base_lot_size: args.bootstrap_base_lot_size,
+                quote_lot_size: args.bootstrap_quote_lot_size,
+                num_pages: args.bootstrap_num_pages,
             })
             .await?;
             return Ok(());

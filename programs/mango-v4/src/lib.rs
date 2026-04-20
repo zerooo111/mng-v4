@@ -1458,6 +1458,14 @@ pub mod mango_v4 {
         Ok(())
     }
 
+    pub fn perp_admin_repair_stale_orders(
+        ctx: Context<PerpAdminRepairStaleOrders>,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::perp_admin_repair_stale_orders(ctx)?;
+        Ok(())
+    }
+
     pub fn perp_deactivate_position(ctx: Context<PerpDeactivatePosition>) -> Result<()> {
         #[cfg(feature = "enable-gpl")]
         instructions::perp_deactivate_position(ctx)?;

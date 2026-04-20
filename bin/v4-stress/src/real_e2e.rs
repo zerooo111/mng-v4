@@ -1827,6 +1827,13 @@ pub struct BootstrapExtraMarketsArgs {
     pub first_market_index: u16,
     pub count: u16,
     pub base_price: f64,
+    /// If Some, use this oracle instead of creating a stub oracle + base mint.
+    pub perp_oracle_override: Option<Pubkey>,
+    pub base_decimals: u8,
+    pub base_lot_size: i64,
+    pub quote_lot_size: i64,
+    /// Number of queue pages to create+resize+init (slots 0..num_pages-1).
+    pub num_pages: u16,
 }
 
 pub async fn bootstrap_extra_markets(args: BootstrapExtraMarketsArgs) -> Result<()> {
@@ -1848,42 +1855,49 @@ pub async fn bootstrap_extra_markets(args: BootstrapExtraMarketsArgs) -> Result<
         let bal = rpc.get_balance(&admin.pubkey()).await?;
         println!("=== bootstrap market_index={} (admin balance={:.3} SOL) ===", pmi, bal as f64 / 1e9);
 
-        // Unique base mint for decimals+oracle
-        let base_mint_kp = Keypair::new();
+        // Oracle — either reuse a provided (Pyth) oracle or create a stub.
+        let (perp_oracle, base_mint_str) = if let Some(override_oracle) = args.perp_oracle_override
         {
-            let rent = rpc.get_minimum_balance_for_rent_exemption(82).await?;
-            let create = system_instruction::create_account(
-                &admin.pubkey(),
-                &base_mint_kp.pubkey(),
-                rent,
-                82,
-                &SPL_TOKEN,
-            );
-            let init = init_mint_ix(&base_mint_kp.pubkey(), &admin.pubkey(), 9);
-            send_confirmed(&rpc, vec![create, init], admin, &[&base_mint_kp]).await?;
-        }
+            // Pyth / sponsored feed — no new mint or stub oracle required.
+            (override_oracle, String::new())
+        } else {
+            // Unique base mint for decimals+oracle
+            let base_mint_kp = Keypair::new();
+            {
+                let rent = rpc.get_minimum_balance_for_rent_exemption(82).await?;
+                let create = system_instruction::create_account(
+                    &admin.pubkey(),
+                    &base_mint_kp.pubkey(),
+                    rent,
+                    82,
+                    &SPL_TOKEN,
+                );
+                let init = init_mint_ix(&base_mint_kp.pubkey(), &admin.pubkey(), 9);
+                send_confirmed(&rpc, vec![create, init], admin, &[&base_mint_kp]).await?;
+            }
 
-        // Stub oracle
-        let perp_oracle_kp = Keypair::new();
-        {
-            let ix = Instruction {
-                program_id: program,
-                accounts: mango_v4::accounts::StubOracleCreate {
-                    group,
-                    oracle: perp_oracle_kp.pubkey(),
-                    admin: admin.pubkey(),
-                    mint: base_mint_kp.pubkey(),
-                    payer: admin.pubkey(),
-                    system_program: solana_sdk::system_program::id(),
-                }
-                .to_account_metas(None),
-                data: mango_v4::instruction::StubOracleCreate {
-                    price: fixed::types::I80F48::from_num(args.base_price),
-                }
-                .data(),
-            };
-            send_confirmed(&rpc, vec![ix], admin, &[&perp_oracle_kp]).await?;
-        }
+            let perp_oracle_kp = Keypair::new();
+            {
+                let ix = Instruction {
+                    program_id: program,
+                    accounts: mango_v4::accounts::StubOracleCreate {
+                        group,
+                        oracle: perp_oracle_kp.pubkey(),
+                        admin: admin.pubkey(),
+                        mint: base_mint_kp.pubkey(),
+                        payer: admin.pubkey(),
+                        system_program: solana_sdk::system_program::id(),
+                    }
+                    .to_account_metas(None),
+                    data: mango_v4::instruction::StubOracleCreate {
+                        price: fixed::types::I80F48::from_num(args.base_price),
+                    }
+                    .data(),
+                };
+                send_confirmed(&rpc, vec![ix], admin, &[&perp_oracle_kp]).await?;
+            }
+            (perp_oracle_kp.pubkey(), base_mint_kp.pubkey().to_string())
+        };
 
         // Pre-allocate bids/asks/event_queue
         let bids_kp = Keypair::new();
@@ -1914,7 +1928,7 @@ pub async fn bootstrap_extra_markets(args: BootstrapExtraMarketsArgs) -> Result<
                 accounts: mango_v4::accounts::PerpCreateMarket {
                     group,
                     admin: admin.pubkey(),
-                    oracle: perp_oracle_kp.pubkey(),
+                    oracle: perp_oracle,
                     perp_market,
                     bids: bids_kp.pubkey(),
                     asks: asks_kp.pubkey(),
@@ -1927,12 +1941,12 @@ pub async fn bootstrap_extra_markets(args: BootstrapExtraMarketsArgs) -> Result<
                     name: format!("M{}-PERP", pmi),
                     oracle_config: OracleConfigParams {
                         conf_filter: 0.1,
-                        max_staleness_slots: None,
+                        max_staleness_slots: Some(600),
                     },
                     settle_token_index: 0,
                     perp_market_index: pmi,
-                    quote_lot_size: 100,
-                    base_lot_size: 100,
+                    quote_lot_size: args.quote_lot_size,
+                    base_lot_size: args.base_lot_size,
                     maint_base_asset_weight: 0.95,
                     init_base_asset_weight: 0.9,
                     maint_base_liab_weight: 1.05,
@@ -1945,7 +1959,7 @@ pub async fn bootstrap_extra_markets(args: BootstrapExtraMarketsArgs) -> Result<
                     max_funding: 0.05,
                     min_funding: 0.05,
                     impact_quantity: 100,
-                    base_decimals: 9,
+                    base_decimals: args.base_decimals,
                     group_insurance_fund: true,
                     fee_penalty: 0.0,
                     settle_fee_flat: 0.0,
@@ -1980,7 +1994,7 @@ pub async fn bootstrap_extra_markets(args: BootstrapExtraMarketsArgs) -> Result<
                     shard_id: 0,
                     params: mango_v4::instructions::ExecutionQueueV4MarketRootCreateParams {
                         page_size: 256,
-                        num_pages: 4,
+                        num_pages: args.num_pages,
                         soft_limit: 0,
                         gap_wait_slots: 4,
                     },
@@ -1990,26 +2004,28 @@ pub async fn bootstrap_extra_markets(args: BootstrapExtraMarketsArgs) -> Result<
             send_confirmed(&rpc, vec![ix], admin, &[]).await?;
         }
 
-        // queue_page0: create + resize + init
+        // All queue pages: create + resize + init for each slot 0..num_pages-1.
         let queue_page0 = find_commit_queue_page_pda(program, queue_root, 0);
-        {
+        const TARGET: usize = 8 + std::mem::size_of::<mango_v4::state::CommitPageV4>();
+        for page_slot in 0..args.num_pages {
+            let page_pda = find_commit_queue_page_pda(program, queue_root, page_slot);
+            println!("  page_slot={} pda={}", page_slot, page_pda);
             let create_ix = Instruction {
                 program_id: program,
                 accounts: mango_v4::accounts::ExecutionQueueV4CreateMarketPage {
                     group,
                     authority_state,
                     queue_root,
-                    queue_page: queue_page0,
+                    queue_page: page_pda,
                     payer: admin.pubkey(),
                     system_program: solana_sdk::system_program::id(),
                 }
                 .to_account_metas(None),
-                data: mango_v4::instruction::ExecutionQueueV4CreateMarketPage { page_slot: 0 }.data(),
+                data: mango_v4::instruction::ExecutionQueueV4CreateMarketPage { page_slot }.data(),
             };
             send_confirmed(&rpc, vec![create_ix], admin, &[]).await?;
-            const TARGET: usize = 8 + std::mem::size_of::<mango_v4::state::CommitPageV4>();
             loop {
-                let acct = rpc.get_account(&queue_page0).await?;
+                let acct = rpc.get_account(&page_pda).await?;
                 if acct.data.len() >= TARGET {
                     break;
                 }
@@ -2019,12 +2035,13 @@ pub async fn bootstrap_extra_markets(args: BootstrapExtraMarketsArgs) -> Result<
                         group,
                         authority_state,
                         queue_root,
-                        queue_page: queue_page0,
+                        queue_page: page_pda,
                         payer: admin.pubkey(),
                         system_program: solana_sdk::system_program::id(),
                     }
                     .to_account_metas(None),
-                    data: mango_v4::instruction::ExecutionQueueV4ResizeMarketPage { page_slot: 0 }.data(),
+                    data: mango_v4::instruction::ExecutionQueueV4ResizeMarketPage { page_slot }
+                        .data(),
                 };
                 send_confirmed(&rpc, vec![resize_ix], admin, &[]).await?;
             }
@@ -2034,12 +2051,12 @@ pub async fn bootstrap_extra_markets(args: BootstrapExtraMarketsArgs) -> Result<
                     group,
                     authority_state,
                     queue_root,
-                    queue_page: queue_page0,
+                    queue_page: page_pda,
                 }
                 .to_account_metas(None),
                 data: mango_v4::instruction::ExecutionQueueV4InitMarketPage {
-                    page_slot: 0,
-                    assigned_abs_page_no: 0,
+                    page_slot,
+                    assigned_abs_page_no: page_slot as u64,
                 }
                 .data(),
             };
@@ -2048,16 +2065,16 @@ pub async fn bootstrap_extra_markets(args: BootstrapExtraMarketsArgs) -> Result<
 
         state.markets.push(ExtraMarket {
             perp_market_index: pmi,
-            base_mint: base_mint_kp.pubkey().to_string(),
-            perp_oracle: perp_oracle_kp.pubkey().to_string(),
+            base_mint: base_mint_str,
+            perp_oracle: perp_oracle.to_string(),
             perp_market: perp_market.to_string(),
             perp_bids: bids_kp.pubkey().to_string(),
             perp_asks: asks_kp.pubkey().to_string(),
             perp_event_queue: eq_kp.pubkey().to_string(),
             queue_root: queue_root.to_string(),
             queue_page0: queue_page0.to_string(),
-            base_lot_size: 100,
-            quote_lot_size: 100,
+            base_lot_size: args.base_lot_size,
+            quote_lot_size: args.quote_lot_size,
         });
         state.save(&args.extras_output)?;
         println!("market_index={} ready. state={}", pmi, args.extras_output.display());

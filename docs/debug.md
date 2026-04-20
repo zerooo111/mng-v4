@@ -218,6 +218,109 @@ direct submit rejected reason=order already expired at enqueue: expiry_timestamp
 direct submit rejected reason=order price outside oracle band (stable): side=Bid price_lots=… native_price=… stable_price=…
 ```
 
+## 16. Systemd binary built from wrong source tree
+
+**Symptom:** 100 % of `submit_intent` calls rejected with `group account mirror bootstrap found no bank/perp accounts for group=<X>`; 100 % of autodrop admin txs fail with `InstructionError(1, UnsupportedProgramId)`. Env `PROGRAM_ID` matches what's deployed on-chain; on-chain program is healthy. Orderbook stops updating.
+
+**Root cause:** the systemd unit `stagin4-devnet-relayer.service` runs `/home/hetalkenaudekar/stagin4/mng-v4/target/release/service-mango-execution-engine`. That path resolves (via symlink) to `/home/hetalkenaudekar/mng-v4/…`, which is a **separate source checkout** on a different branch (`vc6`) with a different `declare_id!` in `programs/mango-v4/src/lib.rs`. When a binary is built there, `crate::ID` (used by Anchor's `Owner` derive for `Bank::owner()` etc.) is the stale pubkey. Mirror bootstrap's `LoadZeroCopy::load::<Bank>()` returns `AccountOwnedByWrongProgram` for every bank → mirror empty → every intent rejected. Same root cause blocks autodrop: admin ixs built with the stale program id hit a nonexistent address → `UnsupportedProgramId`.
+
+**Diagnosis:**
+```bash
+# Compare declare_id across trees:
+grep declare_id /home/hetalkenaudekar/stagin4/experimental/exp2/mng-v4/programs/mango-v4/src/lib.rs
+grep declare_id /home/hetalkenaudekar/mng-v4/programs/mango-v4/src/lib.rs
+# Check which binary systemd actually runs:
+ls -la /home/hetalkenaudekar/stagin4/mng-v4/target/release/service-mango-execution-engine
+readlink -f /home/hetalkenaudekar/stagin4/mng-v4
+```
+
+**Fix:** rebuild from the tree whose `declare_id!` matches `PROGRAM_ID` in env, then swap the binary in place:
+```bash
+sudo systemctl stop stagin4-devnet-relayer.service
+sudo cp /home/hetalkenaudekar/stagin4/experimental/exp2/mng-v4/target/release/service-mango-execution-engine \
+        /home/hetalkenaudekar/mng-v4/target/release/service-mango-execution-engine
+sudo chown hetalkenaudekar:hetalkenaudekar /home/hetalkenaudekar/mng-v4/target/release/service-mango-execution-engine
+sudo systemctl start stagin4-devnet-relayer.service
+```
+
+**Why swap-in-place instead of re-pointing systemd:** the symlink `stagin4/mng-v4 -> ~/mng-v4` is load-bearing for other processes (harness, bridge, scripts) that read `.devnet/run` and `.devnet/logs` under that path. Keeping the path stable and only replacing the binary is the minimum-blast-radius fix.
+
+**Prevention:** only ever build+deploy from the tree whose `declare_id!` matches the on-chain program. If two trees exist (work-in-progress on a separate branch), keep one designated as "production source" and refuse to let systemd point at anything else. Consider adding a post-build hook that asserts `strings target/release/…` contains the raw bytes of the env `PROGRAM_ID` before the binary is blessed.
+
+## 17. Permanent queue wedge: `drop_head_market: dropped 0 items` forever
+
+**Symptom:** autodrop txs confirm successfully on-chain but `queue_root.next_sequence_to_execute` never advances; on-chain log shows `drop_head_market: dropped 0 items` every call. Reveals silently no-op at the same page-mismatch check. Eventually new commits hit `ExecutionQueueFull` because `next_sequence_to_execute + admission_limit` sits behind the enqueue tail.
+
+**Root cause:** an on-chain invariant break. The slot holding the head's abs page has already been reassigned forward:
+```
+queue_root.head (next_sequence_to_execute=8398) → abs_page=32, page_slot=0
+queue_page0.assigned_abs_page_no = 36   ← already advanced to the tail
+```
+`drop_head_market` bails at `queue_page.assigned_abs_page_no != head_abs_page` (line ~400 of `execution_queue_v4.rs`), and so does `reveal_execute_market` (line ~598). Neither can advance head. `queue_root.live_count` stays > 0, so the `admin_repair_orphaned_items` fast path (which triggers only when `queue_root.live_count == 0`) is also out of reach.
+
+**How it happens:** `CommitPageV4::prepare_for_write_target` gates reassignment on the *per-page* `live_count` (line ~287), not on `queue_root.live_count`. If items for the head's abs page were cleared out-of-band (e.g., wiped by a mis-sized `prepare_for_write_target` in an earlier commit that raced with head advancement), the per-page count hits 0 while queue_root still thinks those sequences are live. Next commit for the slot wraps it to a new abs page and zeroes the items array — permanently burying the head's data.
+
+**Recovery options** (neither is free):
+
+1. **Fresh queue_root bootstrap** — close/retire the wedged `queue_root` + its pages, create new ones, update `V4_QUEUE_ROOT` / `V4_QUEUE_PAGE0` in `devnet-stack.env`, restart relayer + harness. Keeps the perp market + orderbook + balances intact; just resets the commit-reveal queue. ~15 min of admin ops, no code change.
+
+2. **Program upgrade** — patch `drop_head_market` so that when `queue_page.assigned_abs_page_no` is *ahead of* `head_abs_page`, it treats the head's abs page as irrecoverable and jumps `next_sequence_to_execute` forward to the start of the page currently held. Requires rebuild + `solana program deploy --program-id <keypair>`. Preserves queue state.
+
+**Operationally**, option 1 is the lower-risk path. Option 2 is the correct long-term fix — add it to the next program rev.
+
+**Is this wedge reachable in normal operation?** No — the desync between `queue_page.live_count` and `queue_root.live_count` requires the interpretation of those on-disk bytes to change between the writer and the reader. Every *same-binary* code path that decrements per-page `live_count` also decrements queue-root `live_count` and advances the head in the same transaction; Solana serializes account writes, so there is no in-flight race. The vector is almost exclusively **in-place program upgrades that alter the packed layout of `CommitPageV4` or `PerpMarketCommitRootV4`** — field offsets shift, stale bytes re-interpret as 0 for the field the new binary reads, and the two counters diverge.
+
+**Structural ways to make it impossible** (ordered by invasiveness):
+
+1. **Gate page reassignment on queue_root progress, not per-page count.** In `CommitPageV4::prepare_for_write_target`, require `queue_root.next_sequence_to_execute >= (self.assigned_abs_page_no + 1) * page_size as u64` before allowing `self.assigned_abs_page_no` to change. This ties the slot's "free to reuse" state to the global head pointer — even if the per-page counter reads as 0 due to layout drift, the slot won't be overwritten while the head still references it.
+2. **Schema versioning.** Add a `version: u8` to both structs; every load asserts `version == EXPECTED`; every upgrade that changes layout bumps the version and ships a one-shot migration ix. This contains the blast radius of layout drift to a known, operator-driven event.
+3. **Append-only struct discipline.** Never move an existing field. Consume bytes from `_padding` / `reserved` when adding new state. If reserved space is exhausted, version-bump (rule 2) is the escape hatch.
+4. **Emergency `admin_force_advance_head(new_head_sequence)` ix.** The eject valve when structural guards fail. Gated on admin key + `paused_execute`, bounded so it cannot rewind.
+
+Rule 1 alone would have prevented this incident. Combined with rule 2 it's defense-in-depth.
+
+**Observed recovery** (2026-04-19): a fresh `queue_root` + 4 pages were bootstrapped at `market_index=1` (same program, same group, same USDC bank, same Pyth SOL oracle), and `V4_QUEUE_ROOT` / `V4_QUEUE_PAGE0` / `V4_PERP_MARKET` / `V4_PERP_BIDS|ASKS|EVENT_QUEUE` / `V4_MARKET_INDEX` in `devnet-stack.env` flipped to the new values. Relayer + harness restarted. Head began advancing within seconds (0 → 202 in ~2 min). The wedged market-0 queue_root is left in place (there is no `close_market_root` handler, and closing pages requires `page.live_count == 0`) but is off the critical path.
+
+**Detection signal**: autodrop log shows "admin drop landed" yet `queue_root state head=` stays at the same sequence across many polls, and `max_seen_sequence` also plateaus because new commits hit `ExecutionQueueFull` silently (skip_preflight buries it). Combined: `max_seen - head` approaches but never exceeds `num_pages × page_size`.
+
+## 18. Drift-rewind reassigns in-flight sequences → 6114 `CommitRevealMismatch`
+
+**Symptom:** ~50 % of `PerpPlaceOrderV2` reveals fail on-chain at the `commit_hash` check (error 6114) while `PerpCancelOrderByClientOrderId` reveals don't. On-chain orderbook never receives any real `perp_place_order` dispatch — bids/asks account data is 123 720 bytes of which only the 8-byte Anchor discriminator is nonzero. Autodrop picks up the dead items; head advances but no orders ever land.
+
+**Root cause — four-step interaction, no program redeploy required:**
+
+1. **Silent commit failures.** Relayer sends commits with `skip_preflight=true, max_retries=0` and never polls `getSignatureStatuses`. On-chain rejections (e.g. `InvalidSequenceNumber`, 6076 `ExecutionQueueFull`, 6106 `AssignedPageMismatch`) are invisible; the local `v4_next_sequence` counter still advanced via the prior `fetch_add`.
+2. **Drift-rewind reassigns sequences.** `spawn_drift_resync_worker` rewinds the local counter to `on_chain_next_sequence_to_execute` whenever drift exceeds `V4_DRIFT_MAX_LOOKAHEAD` (default 64). The next `submit_intent` gets a sequence number that already had a commit_hash stored on-chain from a prior submit.
+3. **`v4_reveal_store.insert(seq, entry)` overwrites.** `BTreeMap::insert` replaces an existing entry silently. The reveal_store now holds the NEW submit's (payload, dispatch, user_sig), but on-chain's `CommitItemV4[seq].commit_hash` still contains the ORIGINAL submit's commit_hash (new commit tx for the reassigned seq fails with duplicate-sequence on-chain, silently).
+4. **6114 fires at reveal.** Reveal worker rebuilds the reveal tx from the (overwritten) stored payload; on-chain recomputes `expected_commit_hash` using `hashv(reveal.payload)` which is the NEW payload hash. `expected != head_item.commit_hash` → `ExecutionQueueV4CommitRevealMismatch`. Tx reverts; head stays on the item. Autodrop eventually clears it.
+
+**Why place orders fail more than cancels:** coincidental timing — cancels tend to be sent for seqs that haven't been drift-rewound-reassigned (fewer bots cancel simultaneously), and place orders are the bulk of submit volume so they hit the reassigned seqs more often. The underlying mechanism is payload-agnostic.
+
+**Diagnostic signature:** grep the relayer's `v4_commit_debug` log for a single sequence — if you see the same `seq=N` with two or more distinct `commit_hash_hex=` values in the same session, you're hitting this bug. In one sample session 325 sequences (3.3 %) had multiple distinct commit_hashes logged.
+
+**Fix** (shipped in `v4_pipeline::spawn_drift_resync_worker`):
+```rust
+let max_stored_seq: u64 = {
+    let store = reveal_store.lock();
+    store.keys().next_back().copied().unwrap_or(0)
+};
+let safe_rewind_target = on_chain_next.max(max_stored_seq.saturating_add(1));
+if local > safe_rewind_target {
+    next_seq.store(safe_rewind_target, Ordering::Release);
+}
+```
+Plus: GC `reveal_store` entries below `queue_root.next_sequence_to_execute` each tick, so the floor doesn't keep the rewind target artificially high.
+
+After deploy, the per-seq duplicate-commit_hash pattern stopped and the post-fix test run showed `OK=51, ERR=0` on the next 51 `perp_market` txs (vs. the pre-fix 50/50 split).
+
+**Lesson — structural, not redeploy-triggered:** the whole class of wedges documented in §17 was attributed to "in-place program redeploys that alter struct layout." This §18 failure shows the structural fixes listed there (gate page reassignment on `queue_root` progress; schema versioning) are also needed to defend against the *non-redeploy* version of the bug. The drift rewind + skip_preflight + in-memory reveal_store trio can produce the same wedge state without any schema drift.
+
+**Three complementary relayer-side fixes** (first one shipped; others noted for follow-up):
+
+1. ✅ Drift-rewind respects `max_stored_seq + 1` (this fix).
+2. 📋 Poll `getSignatureStatuses` after commit send; remove reveal_store entry on failure. Catches #1 in the root-cause chain directly.
+3. 📋 Persist reveal_store to disk (sqlite / JSON snapshot) so relayer restarts don't lose mid-flight commit material — prevents a separate mechanism that causes commit_hash↔payload divergence across process boundaries.
+
 ## Quick reference — self-healing worker log targets
 
 | Worker | Target | Key events |
