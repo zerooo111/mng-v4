@@ -30,10 +30,11 @@ pub mod instructions;
 
 #[cfg(feature = "enable-gpl")]
 use instructions::{
-    CommitEntryV4, CtmEnvelope, ExecutionQueueConfigParams,
+    CommitEntryV5, CtmEnvelope, ExecutionQueueConfigParams,
     ExecutionQueueV3LiquidityRootConfigParams, ExecutionQueueV3LiquidityRootCreateParams,
     ExecutionQueueV3MarketRootConfigParams, ExecutionQueueV3MarketRootCreateParams,
-    ExecutionQueueV4MarketRootConfigParams, ExecutionQueueV4MarketRootCreateParams, RevealArgsV4,
+    ExecutionQueueV5ConfigureMarketParams, ExecutionQueueV5GlobalPauseParams,
+    ExecutionQueueV5SubQueueConfigParams, RevealArgsV5,
 };
 
 #[cfg(all(not(feature = "no-entrypoint"), not(feature = "enable-gpl")))]
@@ -2286,82 +2287,78 @@ pub mod mango_v4 {
     }
 
     ///
-    /// execution queue v4 (commit/reveal)
+    /// execution queue v5 (single-account ring buffer, commit/reveal)
     ///
 
-    pub fn execution_queue_v4_init_market_root(
-        ctx: Context<ExecutionQueueV4InitMarketRoot>,
+    pub fn execution_queue_v5_create(ctx: Context<ExecutionQueueV5Create>) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_v5_create(ctx)?;
+        Ok(())
+    }
+
+    pub fn execution_queue_v5_resize(ctx: Context<ExecutionQueueV5Resize>) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_v5_resize(ctx)?;
+        Ok(())
+    }
+
+    pub fn execution_queue_v5_init(ctx: Context<ExecutionQueueV5Init>) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_v5_init(ctx)?;
+        Ok(())
+    }
+
+    pub fn execution_queue_v5_configure_market(
+        ctx: Context<ExecutionQueueV5Admin>,
+        params: ExecutionQueueV5ConfigureMarketParams,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_v5_configure_market(ctx, params)?;
+        Ok(())
+    }
+
+    pub fn execution_queue_v5_configure_sub_queue(
+        ctx: Context<ExecutionQueueV5Admin>,
+        params: ExecutionQueueV5SubQueueConfigParams,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_v5_configure_sub_queue(ctx, params)?;
+        Ok(())
+    }
+
+    pub fn execution_queue_v5_set_global_pause(
+        ctx: Context<ExecutionQueueV5Admin>,
+        params: ExecutionQueueV5GlobalPauseParams,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_v5_set_global_pause(ctx, params)?;
+        Ok(())
+    }
+
+    pub fn execution_queue_v5_drop_head_market(
+        ctx: Context<ExecutionQueueV5Admin>,
         market_index: u16,
-        shard_id: u8,
-        params: ExecutionQueueV4MarketRootCreateParams,
-    ) -> Result<()> {
-        #[cfg(feature = "enable-gpl")]
-        instructions::execution_queue_v4_init_market_root(ctx, market_index, shard_id, params)?;
-        Ok(())
-    }
-
-    pub fn execution_queue_v4_configure_market_root(
-        ctx: Context<ExecutionQueueV4MarketRootAdmin>,
-        params: ExecutionQueueV4MarketRootConfigParams,
-    ) -> Result<()> {
-        #[cfg(feature = "enable-gpl")]
-        instructions::execution_queue_v4_configure_market_root(ctx, params)?;
-        Ok(())
-    }
-
-    pub fn execution_queue_v4_create_market_page(
-        ctx: Context<ExecutionQueueV4CreateMarketPage>,
-        page_slot: u16,
-    ) -> Result<()> {
-        #[cfg(feature = "enable-gpl")]
-        instructions::execution_queue_v4_create_market_page(ctx, page_slot)?;
-        Ok(())
-    }
-
-    pub fn execution_queue_v4_resize_market_page(
-        ctx: Context<ExecutionQueueV4ResizeMarketPage>,
-        page_slot: u16,
-    ) -> Result<()> {
-        #[cfg(feature = "enable-gpl")]
-        instructions::execution_queue_v4_resize_market_page(ctx, page_slot)?;
-        Ok(())
-    }
-
-    pub fn execution_queue_v4_init_market_page(
-        ctx: Context<ExecutionQueueV4InitMarketPage>,
-        page_slot: u16,
-        assigned_abs_page_no: u64,
-    ) -> Result<()> {
-        #[cfg(feature = "enable-gpl")]
-        instructions::execution_queue_v4_init_market_page(ctx, page_slot, assigned_abs_page_no)?;
-        Ok(())
-    }
-
-    pub fn execution_queue_v4_close_market_page(
-        ctx: Context<ExecutionQueueV4CloseMarketPage>,
-    ) -> Result<()> {
-        #[cfg(feature = "enable-gpl")]
-        instructions::execution_queue_v4_close_market_page(ctx)?;
-        Ok(())
-    }
-
-    pub fn execution_queue_v4_drop_head_market(
-        ctx: Context<ExecutionQueueV4MarketPageAdmin>,
         count: u16,
     ) -> Result<()> {
         #[cfg(feature = "enable-gpl")]
-        instructions::execution_queue_v4_drop_head_market(ctx, count)?;
+        instructions::execution_queue_v5_drop_head_market(ctx, market_index, count)?;
         Ok(())
     }
 
-    pub fn execution_queue_v4_commit_market(
-        ctx: Context<ExecutionQueueV4CommitMarket>,
+    pub fn execution_queue_v5_close(ctx: Context<ExecutionQueueV5Close>) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_v5_close(ctx)?;
+        Ok(())
+    }
+
+    pub fn execution_queue_v5_commit_market(
+        ctx: Context<ExecutionQueueV5CommitMarket>,
         market_index: u16,
         first_sequence: u64,
-        entries: Vec<CommitEntryV4>,
+        entries: Vec<CommitEntryV5>,
     ) -> Result<()> {
         #[cfg(feature = "enable-gpl")]
-        instructions::execution_queue_v4_commit_market(
+        instructions::execution_queue_v5_commit_market(
             ctx,
             market_index,
             first_sequence,
@@ -2370,12 +2367,13 @@ pub mod mango_v4 {
         Ok(())
     }
 
-    pub fn execution_queue_v4_reveal_execute_market(
-        ctx: Context<ExecutionQueueV4RevealExecuteMarket>,
-        reveals: Vec<RevealArgsV4>,
+    pub fn execution_queue_v5_reveal_execute_market(
+        ctx: Context<ExecutionQueueV5RevealExecuteMarket>,
+        market_index: u16,
+        reveals: Vec<RevealArgsV5>,
     ) -> Result<()> {
         #[cfg(feature = "enable-gpl")]
-        instructions::execution_queue_v4_reveal_execute_market(ctx, reveals)?;
+        instructions::execution_queue_v5_reveal_execute_market(ctx, market_index, reveals)?;
         Ok(())
     }
 

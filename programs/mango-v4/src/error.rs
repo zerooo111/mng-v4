@@ -243,6 +243,18 @@ pub enum MangoError {
     ExecutionQueueV4RevealEnvelopeMismatch,
     #[msg("execution queue envelope has min_execute_slot > expires_at_slot")]
     ExecutionQueueEnvelopeTimingInvalid,
+    #[msg("execution queue v5 operation targets an empty sub-queue")]
+    ExecutionQueueEmpty,
+    #[msg("execution queue v5 commit batch is empty or exceeds the per-tx cap")]
+    ExecutionQueueV5InvalidCommitBatch,
+    #[msg("execution queue v5 reveal batch is empty or exceeds the per-tx cap")]
+    ExecutionQueueV5InvalidRevealBatch,
+    #[msg("execution queue v5 reveal does not match the stored commit hash")]
+    ExecutionQueueV5CommitRevealMismatch,
+    #[msg("execution queue v5 account layout is not at its full, initialized size")]
+    ExecutionQueueV5LayoutNotReady,
+    #[msg("execution queue v5 sub-queue is not configured for this market")]
+    ExecutionQueueV5SubQueueNotConfigured,
 }
 
 impl MangoError {

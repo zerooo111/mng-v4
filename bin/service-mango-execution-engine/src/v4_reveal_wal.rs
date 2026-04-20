@@ -70,6 +70,16 @@ struct WalEntry {
     /// this crate doesn't derive Serialize for fixed arrays longer than 32.
     user_sig: Option<Vec<u8>>,
     user_intent_hash: Option<[u8; 32]>,
+    /// Envelope fields added in v5. `#[serde(default)]` on each so older
+    /// WAL lines (pre-v5) still parse; they default to 0, which matches
+    /// the legacy "immediate execute, no expiry" semantics that v4 used
+    /// for every reveal.
+    #[serde(default)]
+    min_execute_slot: u64,
+    #[serde(default)]
+    expires_at_slot: u64,
+    #[serde(default)]
+    kind: u8,
 }
 
 impl From<&V4RevealEntry> for WalEntry {
@@ -83,6 +93,9 @@ impl From<&V4RevealEntry> for WalEntry {
             mango_account: e.mango_account.to_bytes(),
             user_sig: e.user_sig.map(|s| s.to_vec()),
             user_intent_hash: e.user_intent_hash,
+            min_execute_slot: e.min_execute_slot,
+            expires_at_slot: e.expires_at_slot,
+            kind: e.kind,
         }
     }
 }
@@ -98,6 +111,9 @@ impl From<&WalEntry> for V4RevealEntry {
             mango_account: Pubkey::new_from_array(w.mango_account),
             user_sig: w.user_sig.as_ref().and_then(|v| <[u8; 64]>::try_from(&v[..]).ok()),
             user_intent_hash: w.user_intent_hash,
+            min_execute_slot: w.min_execute_slot,
+            expires_at_slot: w.expires_at_slot,
+            kind: w.kind,
         }
     }
 }
@@ -256,6 +272,9 @@ mod tests {
             mango_account: Pubkey::new_unique(),
             user_sig: Some([9u8; 64]),
             user_intent_hash: Some([seq as u8; 32]),
+            min_execute_slot: 0,
+            expires_at_slot: 0,
+            kind: 0,
         }
     }
 

@@ -77,11 +77,9 @@ pub mod proto {
 // v4 commit/reveal support — invoked from the per-market submit path once
 // a market is switched over to the v4 queue. See relayer_resilience.md and
 // commit_reveal_throughput.md in the repo root for design notes.
-mod v4_batcher;
-mod v4_builders;
 mod v4_pipeline;
-mod v4_reveal_packer;
 mod v4_reveal_wal;
+mod v5_pipeline;
 
 use proto::{
     ctm_sequencer_relayer_server::{CtmSequencerRelayer, CtmSequencerRelayerServer},
@@ -195,6 +193,13 @@ struct Config {
     v4_autodrop_poll_secs: u64,
     /// Path to the reveal-material WAL file. Empty disables persistence.
     v4_reveal_wal_path: Option<PathBuf>,
+    // v5 commit-reveal route ---------------------------------------------
+    /// When true, submit_intent uses the v5 single-account queue.
+    /// Reuses all V4_* pubkey env vars (same group/perp/oracle); only
+    /// the queue PDA is derived, not read from env.
+    v5_route_all: bool,
+    /// Path to the v5 reveal WAL. Empty disables persistence.
+    v5_reveal_wal_path: Option<PathBuf>,
     executor_lane_config_path: Option<PathBuf>,
     executor_lane_cache_path: Option<PathBuf>,
     executor_relay_event_log_path: Option<PathBuf>,
@@ -687,6 +692,11 @@ impl Config {
             )? as u16,
             v4_autodrop_poll_secs: parse_u64_env("V4_AUTODROP_POLL_SECS", 10)?,
             v4_reveal_wal_path: std::env::var("V4_REVEAL_WAL_PATH")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from),
+            v5_route_all: parse_bool_env("V5_ROUTE_ALL", false),
+            v5_reveal_wal_path: std::env::var("V5_REVEAL_WAL_PATH")
                 .ok()
                 .filter(|s| !s.is_empty())
                 .map(PathBuf::from),
@@ -3098,15 +3108,11 @@ struct Engine {
     configured_queue_v3: Option<QueueV3RuntimeConfig>,
     known_v3_pages: Arc<StdMutex<HashSet<Pubkey>>>,
     execute_nonce: Arc<AtomicU64>,
-    // v4 commit-reveal route state ----------------------------------------
-    v4_market: Option<Arc<v4_pipeline::V4MarketState>>,
-    v4_reveal_store: v4_pipeline::V4RevealStore,
-    v4_next_sequence: v4_pipeline::V4NextSequence,
-    /// Durable WAL for reveal material. Populated before every commit tx
-    /// send so the reveal worker can still find the payload + accounts +
-    /// signature after a relayer restart. `None` disables persistence (the
-    /// in-memory store still works for single-process scenarios).
-    v4_reveal_wal: Option<Arc<v4_reveal_wal::V4RevealWal>>,
+    // v5 commit-reveal route state ----------------------------------------
+    v5_market: Option<Arc<v5_pipeline::V5MarketState>>,
+    v5_reveal_store: v5_pipeline::V5RevealStore,
+    v5_next_sequence: v5_pipeline::V5NextSequence,
+    v5_reveal_wal: Option<Arc<v4_reveal_wal::V4RevealWal>>,
     /// Mango accounts whose perp order slots are full. Keyed by account
     /// pubkey, value is the wall-clock ms when the block expires.  New
     /// intents targeting a blocked account are rejected immediately with
@@ -6659,18 +6665,18 @@ impl Engine {
             let prepare_elapsed = parse_started.elapsed().saturating_sub(parse_elapsed);
 
             let mut instructions = vec![ComputeBudgetInstruction::set_compute_unit_limit(1_400_000)];
-            // v4 commit-reveal route — assigns its own sequence and builds a
-            // 1-entry commit_market tx. Skips the v3/v2 enqueue branches.
-            if let Some(v4_mkt) = self.v4_market.clone() {
+            // v5 commit-reveal route — single-account ring-buffer queue.
+            // Identical commit/reveal semantics to v4, no page PDAs.
+            if let Some(v5_mkt) = self.v5_market.clone() {
                 let accounts_hash =
-                    v4_pipeline::hash_dispatch_accounts_for_reveal(&v4_mkt, &remaining_accounts);
-                let v4_seq = self
-                    .v4_next_sequence
+                    v5_pipeline::hash_dispatch_accounts_for_reveal(&v5_mkt, &remaining_accounts);
+                let v5_seq = self
+                    .v5_next_sequence
                     .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                let commit_hash = v4_pipeline::canonical_commit_hash(
-                    v4_mkt.group,
-                    v4_mkt.market_index,
-                    v4_seq,
+                let commit_hash = v5_pipeline::canonical_commit_hash(
+                    v5_mkt.group,
+                    v5_mkt.market_index,
+                    v5_seq,
                     0, // CtmWrapped
                     &envelope.payload_hash,
                     &accounts_hash,
@@ -6678,8 +6684,8 @@ impl Engine {
                     envelope.expires_at_slot,
                 );
                 debug!(
-                    target: "v4_commit_debug",
-                    seq = v4_seq,
+                    target: "v5_commit_debug",
+                    seq = v5_seq,
                     n_remaining = remaining_accounts.len(),
                     payload_hash_hex = format!("{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
                         envelope.payload_hash[0], envelope.payload_hash[1],
@@ -6694,22 +6700,22 @@ impl Engine {
                         commit_hash[4], commit_hash[5], commit_hash[6], commit_hash[7]),
                     min_execute_slot = envelope.min_execute_slot,
                     expires_at_slot = envelope.expires_at_slot,
-                    "v4 commit"
+                    "v5 commit"
                 );
-                let entry = mango_v4::instructions::CommitEntryV4 {
+                let entry = mango_v4::instructions::CommitEntryV5 {
                     commit_hash,
                     min_execute_slot: envelope.min_execute_slot,
                     expires_at_slot: envelope.expires_at_slot,
                 };
-                let user_intent_msg = v4_pipeline::canonical_user_intent_v2(
-                    v4_mkt.group,
+                let user_intent_msg = v5_pipeline::canonical_user_intent_v2(
+                    v5_mkt.group,
                     mango_account,
                     user_owner,
-                    v4_mkt.market_index,
+                    v5_mkt.market_index,
                     &envelope.payload_hash,
                 );
-                let reveal_entry = v4_pipeline::V4RevealEntry {
-                    sequence: v4_seq,
+                let reveal_entry = v5_pipeline::V5RevealEntry {
+                    sequence: v5_seq,
                     payload: request.payload.clone(),
                     payload_hash: envelope.payload_hash,
                     dispatch_accounts: remaining_accounts.clone(),
@@ -6717,31 +6723,33 @@ impl Engine {
                     mango_account,
                     user_sig: Some(user_signature),
                     user_intent_hash: Some(user_intent_msg),
+                    // Bound into the commit_hash at line ~6680 above; the
+                    // on-chain reveal handler recomputes the same hash and
+                    // rejects any mismatch, so these MUST round-trip exactly.
+                    min_execute_slot: envelope.min_execute_slot,
+                    expires_at_slot: envelope.expires_at_slot,
+                    // kind is pinned to 0 (CtmWrapped) in the commit_hash
+                    // computation above; keep in lockstep here. If the
+                    // commit ever takes envelope.kind, update both sites.
+                    kind: 0,
                 };
-                // Durable WAL append MUST land before the commit tx is sent.
-                // If the process dies between tx send and reveal, the WAL is
-                // the only thing that lets the reveal worker reconstruct
-                // payload + accounts + user_sig on restart.
-                if let Some(wal) = self.v4_reveal_wal.as_ref() {
+                if let Some(wal) = self.v5_reveal_wal.as_ref() {
                     if let Err(e) = wal.append_insert(&reveal_entry) {
-                        warn!("v4 reveal WAL append failed for seq {v4_seq}: {e}");
+                        warn!("v5 reveal WAL append failed for seq {v5_seq}: {e}");
                         return Err(Status::internal(format!(
-                            "v4 reveal WAL append failed: {e}"
+                            "v5 reveal WAL append failed: {e}"
                         )));
                     }
                 }
                 {
-                    let mut store = self.v4_reveal_store.lock();
-                    store.insert(v4_seq, reveal_entry);
+                    let mut store = self.v5_reveal_store.lock();
+                    store.insert(v5_seq, reveal_entry);
                 }
-                // Build commit tx inline using engine payer as both payer
-                // and ctm signer (the devnet setup uses admin keypair as
-                // ctm_signer for v4 — matches v4-stress).
-                let commit_tx = v4_pipeline::build_commit_market_tx(
-                    &v4_mkt,
+                let commit_tx = v5_pipeline::build_commit_market_tx(
+                    &v5_mkt,
                     &self.config.ctm,
                     &self.config.payer,
-                    v4_seq,
+                    v5_seq,
                     entry,
                     chain.blockhash,
                 );
@@ -6759,22 +6767,19 @@ impl Engine {
                 {
                     Ok(s) => s,
                     Err(e) => {
-                        // Remove the store entry so reveal worker doesn't try
-                        // to reveal a commit that never landed. Tombstone the
-                        // WAL too so a subsequent replay doesn't resurrect it.
                         {
-                            let mut store = self.v4_reveal_store.lock();
-                            store.remove(&v4_seq);
+                            let mut store = self.v5_reveal_store.lock();
+                            store.remove(&v5_seq);
                         }
-                        if let Some(wal) = self.v4_reveal_wal.as_ref() {
-                            if let Err(werr) = wal.append_remove(v4_seq) {
+                        if let Some(wal) = self.v5_reveal_wal.as_ref() {
+                            if let Err(werr) = wal.append_remove(v5_seq) {
                                 warn!(
-                                    "v4 reveal WAL tombstone failed for seq {v4_seq}: {werr}"
+                                    "v5 reveal WAL tombstone failed for seq {v5_seq}: {werr}"
                                 );
                             }
                         }
                         return Err(Status::internal(format!(
-                            "v4 commit send failed: {e}"
+                            "v5 commit send failed: {e}"
                         )));
                     }
                 };
@@ -6792,7 +6797,7 @@ impl Engine {
                 ))
                 .await;
                 return Ok(SubmitIntentResponse {
-                    sequence: v4_seq,
+                    sequence: v5_seq,
                     tx_signature: sig.to_string(),
                     user_intent_message: user_intent_msg.to_vec(),
                     ctm_envelope_message: ctm_envelope_message.to_vec(),
@@ -12538,12 +12543,12 @@ async fn async_main() -> Result<()> {
         None
     };
 
-    // v4 market state — present when V4_ROUTE_ALL=1 and all pubkeys set.
-    let v4_market = if config.v4_route_all {
+
+    // v5 market state — present when V5_ROUTE_ALL=1. Reuses the V4_* pubkey
+    // env vars (same group/perp/oracle); the queue PDA is derived, not env-configured.
+    let v5_market = if config.v5_route_all {
         let all_set = config.v4_group.is_some()
             && config.v4_authority_state.is_some()
-            && config.v4_queue_root.is_some()
-            && config.v4_queue_page0.is_some()
             && config.v4_perp_market.is_some()
             && config.v4_perp_bids.is_some()
             && config.v4_perp_asks.is_some()
@@ -12553,32 +12558,16 @@ async fn async_main() -> Result<()> {
             && config.v4_usdc_oracle.is_some();
         if !all_set {
             return Err(anyhow!(
-                "V4_ROUTE_ALL=1 but some V4_* pubkey env vars are missing"
+                "V5_ROUTE_ALL=1 but some V4_* pubkey env vars are missing"
             ));
         }
-        // Read queue_root once to pick up page_size / num_pages so the commit
-        // and reveal builders can route to the correct queue_page PDA as the
-        // sequence crosses page boundaries.
-        let queue_root_pk = config.v4_queue_root.unwrap();
-        let (page_size, num_pages) = match rpc.get_account(&queue_root_pk).await {
-            Ok(acct) => match <mango_v4::state::PerpMarketCommitRootV4 as anchor_lang::AccountDeserialize>::try_deserialize(&mut &acct.data[..]) {
-                Ok(root) => (root.page_size, root.num_pages),
-                Err(e) => {
-                    warn!("v4 queue_root decode failed: {}; defaulting to 256/1", e);
-                    (256u16, 1u16)
-                }
-            },
-            Err(e) => {
-                warn!("v4 queue_root fetch failed: {}; defaulting to 256/1", e);
-                (256u16, 1u16)
-            }
-        };
-        let mkt = Arc::new(v4_pipeline::V4MarketState {
+        let group = config.v4_group.unwrap();
+        let (queue, _) = v5_pipeline::derive_queue_v5_pda(&config.program_id, &group);
+        let mkt = Arc::new(v5_pipeline::V5MarketState {
             program_id: config.program_id,
-            group: config.v4_group.unwrap(),
+            group,
             authority_state: config.v4_authority_state.unwrap(),
-            queue_root: queue_root_pk,
-            queue_page0: config.v4_queue_page0.unwrap(),
+            queue,
             perp_market: config.v4_perp_market.unwrap(),
             perp_bids: config.v4_perp_bids.unwrap(),
             perp_asks: config.v4_perp_asks.unwrap(),
@@ -12587,91 +12576,70 @@ async fn async_main() -> Result<()> {
             usdc_bank: config.v4_usdc_bank.unwrap(),
             usdc_oracle: config.v4_usdc_oracle.unwrap(),
             market_index: config.v4_market_index,
-            page_size,
-            num_pages,
             payer: config.payer.pubkey(),
         });
         info!(
-            "v4 route enabled: group={} queue_root={} perp_market={} market_index={} page_size={} num_pages={}",
-            mkt.group, mkt.queue_root, mkt.perp_market, mkt.market_index,
-            mkt.page_size, mkt.num_pages
+            "v5 route enabled: group={} queue={} perp_market={} market_index={}",
+            mkt.group, mkt.queue, mkt.perp_market, mkt.market_index
         );
         Some(mkt)
     } else {
         None
     };
 
-    // Read starting sequences from chain so restarts don't collide:
-    // `next_enqueue_sequence` drives the local atomic counter (for new
-    // commits); `next_sequence_to_execute` (the on-chain head) filters WAL
-    // replay so already-executed entries aren't re-staged.
-    let (v4_start_seq, v4_head_seq): (u64, u64) = if let Some(mkt) = v4_market.as_ref() {
-        match rpc.get_account(&mkt.queue_root).await {
+    let (v5_start_seq, v5_head_seq): (u64, u64) = if let Some(mkt) = v5_market.as_ref() {
+        match rpc.get_account(&mkt.queue).await {
             Ok(acct) => {
-                match <mango_v4::state::PerpMarketCommitRootV4 as anchor_lang::AccountDeserialize>::try_deserialize(
-                    &mut &acct.data[..],
-                ) {
-                    Ok(root) => {
-                        let next = root.next_enqueue_sequence();
-                        let head = root.next_sequence_to_execute;
-                        info!("v4 starting sequence = {} head = {}", next, head);
-                        (next, head)
-                    }
-                    Err(e) => {
-                        warn!("v4 queue_root deserialize failed: {}, starting at 0", e);
-                        (0, 0)
-                    }
-                }
+                let (start, head) =
+                    v5_pipeline::read_starting_sequences(&acct.data, mkt.market_index);
+                info!("v5 starting sequence = {} head = {}", start, head);
+                (start, head)
             }
             Err(e) => {
-                warn!("v4 queue_root fetch failed: {}, starting at 0", e);
+                warn!("v5 queue fetch failed: {e}, starting at 0");
                 (0, 0)
             }
         }
     } else {
         (0, 0)
     };
-    let v4_next_sequence = Arc::new(AtomicU64::new(v4_start_seq));
+    let v5_next_sequence = Arc::new(AtomicU64::new(v5_start_seq));
 
-    // Open the reveal WAL (if configured) and replay live entries at or
-    // above the current on-chain head. This survives relayer restarts: a
-    // commit that landed on-chain but whose process died before reveal can
-    // still be revealed after restart without admin autodrop.
-    let v4_reveal_wal: Option<Arc<v4_reveal_wal::V4RevealWal>> =
-        match config.v4_reveal_wal_path.as_ref() {
+    let v5_reveal_wal: Option<Arc<v4_reveal_wal::V4RevealWal>> =
+        match config.v5_reveal_wal_path.as_ref() {
             Some(path) => match v4_reveal_wal::V4RevealWal::open(path) {
                 Ok(w) => {
-                    info!("v4 reveal WAL opened at {path:?}");
+                    info!("v5 reveal WAL opened at {path:?}");
                     Some(Arc::new(w))
                 }
                 Err(e) => {
-                    warn!("v4 reveal WAL open failed ({path:?}): {e}; persistence disabled");
+                    warn!("v5 reveal WAL open failed ({path:?}): {e}; persistence disabled");
                     None
                 }
             },
             None => None,
         };
-    let mut v4_initial_entries: std::collections::BTreeMap<u64, v4_pipeline::V4RevealEntry> =
+    let mut v5_initial_entries: std::collections::BTreeMap<u64, v4_pipeline::V4RevealEntry> =
         std::collections::BTreeMap::new();
-    if let Some(wal) = v4_reveal_wal.as_ref() {
-        match wal.replay_live(v4_head_seq) {
+    if let Some(wal) = v5_reveal_wal.as_ref() {
+        match wal.replay_live(v5_head_seq) {
             Ok(entries) => {
                 if !entries.is_empty() {
                     info!(
-                        "v4 reveal WAL replay: {} entries restored (head={})",
+                        "v5 reveal WAL replay: {} entries restored (head={})",
                         entries.len(),
-                        v4_head_seq
+                        v5_head_seq
                     );
                 }
-                v4_initial_entries = entries;
+                v5_initial_entries = entries;
             }
             Err(e) => {
-                warn!("v4 reveal WAL replay failed: {e}; starting with empty store");
+                warn!("v5 reveal WAL replay failed: {e}; starting with empty store");
             }
         }
     }
-    let v4_reveal_store: v4_pipeline::V4RevealStore =
-        Arc::new(parking_lot::Mutex::new(v4_initial_entries));
+    let v5_reveal_store: v5_pipeline::V5RevealStore =
+        Arc::new(parking_lot::Mutex::new(v5_initial_entries));
 
     let engine = Arc::new(Engine {
         config: config.clone(),
@@ -12687,10 +12655,10 @@ async fn async_main() -> Result<()> {
         configured_queue_v3: configured_queue_v3.clone(),
         known_v3_pages: Arc::new(StdMutex::new(HashSet::new())),
         execute_nonce: Arc::new(AtomicU64::new(1)),
-        v4_market: v4_market.clone(),
-        v4_reveal_store: v4_reveal_store.clone(),
-        v4_next_sequence: v4_next_sequence.clone(),
-        v4_reveal_wal: v4_reveal_wal.clone(),
+        v5_market: v5_market.clone(),
+        v5_reveal_store: v5_reveal_store.clone(),
+        v5_next_sequence: v5_next_sequence.clone(),
+        v5_reveal_wal: v5_reveal_wal.clone(),
         blocked_mango_accounts: Arc::new(Mutex::new(HashMap::new())),
         unique_addresses: unique_addresses.clone(),
         latency_optimistic_tracker: latency_optimistic_tracker.clone(),
@@ -12706,31 +12674,17 @@ async fn async_main() -> Result<()> {
         ingress_rate_slots: Arc::new(StdMutex::new(HashMap::new())),
     });
 
-    // v4 reveal worker — drains committed intents off-chain by submitting
-    // reveal_execute txs with configurable spacing. Only spawned when v4
-    // route is enabled.
-    //
-    // Plus three companion self-healing workers:
-    //   * page_init_worker  — ensures every page_slot in [0, num_pages) has
-    //                         an on-chain account; eliminates page-boundary
-    //                         commit failures.
-    //   * drift_resync      — periodically aligns the local atomic
-    //                         `v4_next_sequence` with on-chain
-    //                         `next_enqueue_sequence` so silent commit
-    //                         failures don't snowball.
-    //   * autodrop          — when head is unadvanceable for N seconds AND
-    //                         we've attempted reveals at least M times,
-    //                         issues an admin pause+drop+unpause tx.
-    if let Some(mkt) = engine.v4_market.clone() {
+    // v5 reveal worker — single-account ring-buffer queue. No page-init worker.
+    if let Some(mkt) = engine.v5_market.clone() {
         let rpc_c = engine.rpc.clone();
         let payer_c = engine.config.payer.clone();
         let admin_c = engine.config.ctm.clone();
-        let store_c = engine.v4_reveal_store.clone();
+        let store_c = engine.v5_reveal_store.clone();
         let spacing_ms = engine.config.v4_reveal_spacing_ms;
         let pipeline_depth = engine.config.v4_reveal_pipeline_depth;
-        let stall = v4_pipeline::V4HeadStallState::default();
+        let stall = v5_pipeline::V5HeadStallState::default();
 
-        v4_pipeline::spawn_reveal_worker(
+        v5_pipeline::spawn_reveal_worker(
             rpc_c.clone(),
             mkt.clone(),
             payer_c.clone(),
@@ -12738,54 +12692,37 @@ async fn async_main() -> Result<()> {
             spacing_ms,
             pipeline_depth,
             stall.clone(),
-            engine.v4_reveal_wal.clone(),
+            engine.v5_reveal_wal.clone(),
         );
         info!(
-            "v4 reveal worker spawned (spacing_ms={} pipeline_depth={})",
+            "v5 reveal worker spawned (spacing_ms={} pipeline_depth={})",
             spacing_ms, pipeline_depth
         );
 
-        // Page init: refresh every N seconds so a programmatic page bump
-        // gets picked up without a relayer restart. 0 disables periodic
-        // refresh (one-shot at startup only).
-        let page_refresh_secs = engine.config.v4_page_init_refresh_secs;
-        v4_pipeline::spawn_page_init_worker(
-            rpc_c.clone(),
-            mkt.clone(),
-            payer_c.clone(),
-            page_refresh_secs,
-        );
-        info!(
-            "v4 page-init worker spawned (refresh_secs={})",
-            page_refresh_secs
-        );
-
-        // Drift resync.
         let drift_interval_ms = engine.config.v4_drift_resync_interval_ms;
         let drift_max_lookahead = engine.config.v4_drift_max_lookahead;
-        v4_pipeline::spawn_drift_resync_worker(
+        v5_pipeline::spawn_drift_resync_worker(
             rpc_c.clone(),
             mkt.clone(),
-            engine.v4_next_sequence.clone(),
-            engine.v4_reveal_store.clone(),
+            engine.v5_next_sequence.clone(),
+            engine.v5_reveal_store.clone(),
             drift_interval_ms,
             drift_max_lookahead,
         );
         info!(
-            "v4 drift-resync worker spawned (interval_ms={} max_lookahead={})",
+            "v5 drift-resync worker spawned (interval_ms={} max_lookahead={})",
             drift_interval_ms, drift_max_lookahead
         );
 
-        // Autodrop.
         if engine.config.v4_autodrop_enabled {
-            let autodrop_cfg = v4_pipeline::V4AutodropConfig {
+            let autodrop_cfg = v5_pipeline::V5AutodropConfig {
                 stall_threshold_secs: engine.config.v4_autodrop_stall_secs,
                 min_reveal_attempts: engine.config.v4_autodrop_min_attempts,
                 max_drops_per_minute: engine.config.v4_autodrop_max_per_min,
                 drop_count_per_call: engine.config.v4_autodrop_count_per_call,
                 poll_interval_secs: engine.config.v4_autodrop_poll_secs,
             };
-            v4_pipeline::spawn_autodrop_worker(
+            v5_pipeline::spawn_autodrop_worker(
                 rpc_c.clone(),
                 mkt.clone(),
                 admin_c.clone(),
@@ -12794,13 +12731,13 @@ async fn async_main() -> Result<()> {
                 autodrop_cfg,
             );
             info!(
-                "v4 autodrop worker spawned (stall_secs={} min_attempts={} max_per_min={})",
+                "v5 autodrop worker spawned (stall_secs={} min_attempts={} max_per_min={})",
                 engine.config.v4_autodrop_stall_secs,
                 engine.config.v4_autodrop_min_attempts,
                 engine.config.v4_autodrop_max_per_min
             );
         } else {
-            info!("v4 autodrop worker disabled (V4_AUTODROP_ENABLED=false)");
+            info!("v5 autodrop worker disabled (V4_AUTODROP_ENABLED=false)");
         }
     }
 
