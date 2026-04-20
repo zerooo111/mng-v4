@@ -313,3 +313,65 @@ The existing 8-week plan is aggressive. With the delta above the realistic expec
 Fermi DEX is closer than many pre-launch perp DEXes — the on-chain work, formal verification, audit pipeline, and event-sink design are serious. The gaps are in the layers *around* the code: signing isolation, persistence for exactly-once claims, multi-provider RPC, end-to-end tracing, admin governance ceremony, legal posture, runbook muscle memory. Those layers are what separate a system that works on a good day from one that works on the worst day of the year. Close them before rotating the upgrade authority.
 
 **Single highest-leverage item not yet on the list: P0-29 (signing sidecar with allow-list).** Every other recommendation in this memo implicitly assumes the hot keys cannot be stolen; without B1, that assumption is not defensible in a post-incident review.
+
+---
+
+## Addendum — 2026-04-20: per-market queue PDAs + oracle config lockdown
+
+### P0-30. Oracle staleness + confidence lockdown (blocking)
+
+Extends §A3 with concrete pre-launch deploy gates uncovered during the 2026-04-20 per-market-queue migration on devnet:
+
+**Observed (devnet):** SOL/ETH/BTC perp markets in group `BrbJtc8ja8…` were running with `oracle_config.max_staleness_slots = 600` (~240 s at 400 ms/slot) and `conf_filter = 0.1` (10 %). These were tuned to survive the devnet sponsored Pyth feed's multi-minute publish_time gaps — unacceptable on mainnet.
+
+**Pre-launch gate (must pass before upgrade authority rotation):**
+
+1. **Program-side ergonomics** — fix the `max_staleness_slots` inversion in `programs/mango-v4/src/state/oracle.rs::check_staleness`: today `0` = strictest, negative = disabled, which lets an operator reading "0 means no check" brick the system. Either flip the semantics (0 = disabled, positive = max slots) behind a layout-version bump, or refuse `Some(0)` client-side with a confirmation prompt.
+2. **Hard deploy-time caps.** Group admin deploy script MUST:
+   - assert every perp market and every bank oracle has `max_staleness_slots ∈ (0, 25]` (10 s ceiling at 400 ms slot) AND `conf_filter ∈ (0, 0.01]`.
+   - fail closed with a named operator confirmation if any value is outside these bounds.
+3. **`*_unchecked` pruning.** Remove `oracle_state_unchecked` from any public CPI path (see §A3). These exist for internal callers that carry a documented invariant; anything reachable via user input must take the checked path.
+4. **Cross-source deviation band.** Per §A3, reject when `|pyth − clmm| / pyth > band_bps` for any CLMM-oracle token. Fail-closed default 50 bps.
+5. **Runbook: Pyth outage drill.** Rehearse monthly:
+   - feed last publish > `max_staleness_slots` slots ago → `perp_admin_repair_stale_orders` + ingress freeze via emergency pause → 5-min SLA to expiry.
+   - Document who pages, who hits the button, where the logs live.
+
+### P0-31. Execution queue per-market PDA migration (done on devnet, carry forward)
+
+The v5 queue account layout was changed from "one PDA per group with 16 sub-queue slots" to "one PDA per (group, market_index)" specifically to break the cross-market serialization the validator imposes when every reveal/commit writes to the same account. The payload:
+
+- seeds: `[b"execution-queue-v5", group, market_index.to_le_bytes()]`
+- state: `N_MAX_MARKETS = 1`, `PER_MARKET_CAPACITY = 1024` (≈ 99 KB per PDA vs 394 KB shared)
+- executor derives per-market pubkeys from `(program_id, group, market_index)` — no env var needed
+
+**Mainnet deploy order:**
+1. Drain the existing shared queue (pause ingress + autodrop to live_count=0 OR drop authority-close it).
+2. Upgrade the program (new seeds / new state shape).
+3. Bootstrap per-market PDAs: `ts/client/scripts/execution-queue/v5-bootstrap-per-market.ts` with `V5_MARKETS=…`.
+4. Bootstrap ALT covering all new queue pubkeys + per-market dispatch accounts: `v5-bootstrap-alt.ts`.
+5. Restart relayer; it auto-derives per-market queues.
+
+**Mainnet numbers to pick:**
+- `EXECUTION_QUEUE_V5_PER_MARKET_CAPACITY`: keep at 1024 for perp markets. Larger if bots burst > 1024 commits/s (not currently).
+- `V4_AUTODROP_COUNT_PER_CALL`: keep at 50. Bigger values let a bad market block the autodrop worker longer per tick.
+
+### P0-32. Ingress pre-check parity with reveal-side validation
+
+The relayer's `v5_precheck` (`bin/service-mango-execution-engine/src/v5_precheck.rs`) currently runs stages 1, 2, 3 (lite), 4 (lite), 5, 8. Before mainnet, complete:
+
+- **Stage 6** — mango_account state: exists, owner matches, group matches, not frozen, perp slot available.
+- **Stage 7** — oracle freshness client-side: publish_time age ≤ `max_staleness_slots × slot_ms`, conf ratio ≤ `conf_filter`.
+- **Stage 9** — health simulation: fetch banks + oracles, compute pre/post init-health, reject if post < dust-floor.
+- **Stage 10** — payer balance: ≥ N × reveal_fee_lamports.
+
+These are the stages that convert "every committed intent reveals cleanly" from an empirical property into a structural guarantee. Without them a bad oracle or an empty payer silently burns queue slots.
+
+### P0-33. Reveal-handler allocation audit (batch ≥ 3)
+
+During the 2026-04-20 investigation, batch=3 reveals reproducibly panicked with "Access violation in heap section" at a ~1 MB offset even with `ComputeBudgetInstruction::request_heap_frame(128 KB)` set. Root cause not yet nailed down; likely a `Vec` growth inside the reveal loop that allocates per-iteration (decoded_payload + dispatch_accounts slice + health cache) and hits a heap alignment issue when N ≥ 3.
+
+**Gate:** before production-scale throughput rollout, audit `reveal_execute_market` to eliminate per-iteration heap growth. Either pre-allocate arenas up front or serialize to stack-local `[T; MAX_REVEALS]` with an explicit MAX. Current devnet is capped at `V5_REVEAL_BATCH_SIZE=2` as a workaround.
+
+### Stack-wide WARN: devnet oracle config is **not** mainnet-safe
+
+See `exec_q_debugging.md` "⚠️ WARN — Oracle staleness config" for the full list of param values that must be tightened before ANY mainnet deploy. Operator deploy scripts should read this file as a pre-flight checklist.

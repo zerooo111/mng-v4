@@ -214,3 +214,133 @@ Note: `admin-drop-head.ts` requires `pause_execute=true` at the queue level. Set
 | Account | Owner | Issue |
 |---------|-------|-------|
 | `5jDcx19MKSgp3M23JQmaqjRfjKLnSerT8CTyGELyZdaW` | `3bRyWQ5pDQU7cXowskTWZpvp39UuZ6gjYDfq24xPMztJ` | Repeatedly floods queue — thin health → 6007, then OO slots full → ProgramFailedToComplete. Airdropped 10k USDC on 2026-04-07 to stabilize. |
+
+## Failure Mode 6: Empty orderbook despite reveals returning `status=Revealed`
+
+**TL;DR**: If the orderbook is empty, `trade_count_24h = 0`, and head is still advancing, the reveals aren't actually placing orders — they're either (1) terminalizing with a `failure_code` that still emits `status=Revealed` tag in older builds, (2) the intents never reached the queue (bot is using a disabled legacy path), or (3) the harness is optimistically reporting fill/book state that the chain never confirmed.
+
+**Real case (2026-04-20, devnet group `BrbJtc8ja8…`)**: 12 h of empty M2-PERP book with ~3 commits/s and quoter running. Reveals reported `err:None` at the tx level. The failure chain was three-deep:
+
+### Layer 1 — `OracleStale` on `health_region_begin`
+
+The `err:None` at tx level is misleading: the v5 reveal handler catches `OracleStale` inside `queue_health_region_begin`, classifies it as a terminal dispatch failure, increments retry counter, and (on retries-exhausted) calls `clear_head` — the tx returns `Ok` because the terminalize path is a deliberate operation. Look at the program logs, not the tx-level err:
+
+```
+v5 reveal seq=836 market_index=2 health_region_begin failed (terminal=true):
+AnchorError { error_name: "OracleStale",
+  error_msg: "name: USDC, price: 0.9998…, last_update_slot: 456901842,
+              now_slot: 456902531, conf_filter: 0.1" }
+v5 reveal seq=836 terminalizing health-region failure
+  (retries=1/3, terminal=true, code=OracleStale) — clearing head
+```
+
+689 slots lag on USDC oracle vs `max_staleness_slots = 600` → stale by 89 slots. Devnet sponsored Pyth feeds update on a highly variable cadence (observed publish_time gaps of 100–800 slots), so `600` was too tight.
+
+**Fix**: bump `max_staleness_slots` on both USDC bank and perp markets via `tokenEdit` / `perpEditMarket`. Devnet script: `ts/client/scripts/execution-queue/bump-staleness-all.ts` with `ORACLE_MAX_STALENESS_SLOTS=1800`. Verify post-update by reading the raw account bytes (the TS SDK's `group.reloadAll` cache can lag):
+
+```bash
+python3 -c "
+import json, base64, base58, struct, subprocess, os
+rpc = os.environ['CTM_RELAYER_SECONDARY_RPC_URL']
+for pk in ['68MXF7CmVyYUhe1d994BJV1qnLRw9yHgkAFbcz3Rpjgy',  # USDC bank
+           'FuDTET146QJzSpdrUFvSQNxhdk52a9CifctBNNTyvPna']: # SOL perp
+    # ... scan for oracle pubkey, read OracleConfig.max_staleness_slots at offset +32+16 ..."
+```
+
+### Layer 2 — Quoter targeting disabled legacy path
+
+After fixing staleness, reveals stopped terminalizing but the book was still empty. Queue head didn't advance. Relayer logs showed the real issue — quoter txs were failing at **RPC preflight** (so they never land on chain, never show up in `getSignaturesForAddress` for the queue PDA):
+
+```
+bg submitter hard failure sequence=0 sig=jUwNRo…
+  err=RpcError … custom program error: 0x17ee
+  logs: ["Instruction: ExecutionQueueEnqueueCtm",
+         "AnchorError: LegacyQueuesDisabled. Error Number: 6126.
+          legacy execution queue (v3/v4) instructions are disabled
+          in this build."]
+```
+
+The `random-sol-usdc-quoter-bot.ts` was reading `perpMarketIndex: 0` from `.devnet/run/execution-queue-e2e-<group>.json` — market_index 0 is the abandoned v4 SOL-PERP (`E7mxfLL…`), which the relayer routes through the v3/v4 `ExecutionQueueEnqueueCtm` path. Post v5 migration that instruction errors with `LegacyQueuesDisabled (6126)`.
+
+**Fix**: update the config file — `perpMarketIndex: 0` → the actual v5 market index (2 for SOL, 3 for ETH, 4 for BTC). The relayer then routes through `submit_intent_v5` and the quoter gets real sequence numbers (`sequence: "839"` instead of `"0"`).
+
+### Layer 3 — Harness optimistic lie
+
+Even while quoter enqueues were preflight-failing with `LegacyQueuesDisabled`, `.devnet/logs/ctm-relayer.log` contained lines like:
+
+```
+ask on book order_id=1598539501195448614388196 quantity=2632 price=86657
+```
+
+and `GET /state/markets/2?view=optimistic` reported `bids` / `asks` arrays populated. The harness was marking the order as "on book" as soon as the relayer returned `status=submitted` (tx signature assigned) — it did **not** wait for the enqueue tx to actually confirm. Preflight failures at the RPC never fed back into the optimistic view.
+
+This is a **trap for debugging**: if you believe the harness, you'll conclude orders are landing and look for reasons they're not matching. The harness's `view=confirmed` is the source of truth; the `optimistic` view can lie when the ingress path fails before the tx lands.
+
+**Debug checklist — "orderbook empty despite busy reveals"**
+
+1. `getSignaturesForAddress <queue_pda> limit=50` — are there ANY recent txs for the queue? If no, bot isn't reaching the queue. Check relayer log for `bg submitter hard failure`.
+2. For a recent `err:None` tx, read the full `logMessages` — search for `"AnchorError"`, `"terminalizing"`, `"failure_code"`. Don't trust `meta.err == None` alone.
+3. Decode the `Program data:` event after each reveal — `status=3 Failed, failure_code=9 OracleStale` looks like `err:None` at tx level but means the reveal terminalized.
+4. Compare harness `view=confirmed` vs `view=optimistic`. Divergence means ingress is lying.
+5. Verify bot config files match the active v5 market indices. `.devnet/run/execution-queue-e2e-<group>.json: perpMarketIndex` is a common staleness source after a market migration.
+
+## Failure Mode 7: Ingress pre-check rejects every intent with `order price outside oracle band (stable)` and a single frozen `stable_price`
+
+**Observed 2026-04-20.** All SOL-PERP (market 2) intents reject with:
+
+```
+reason: order price outside oracle band (stable):
+  side=Bid price_lots=90168 native_price=901.68 stable_price=852.4843151622147
+```
+
+Key tell: **`stable_price` is byte-for-byte identical across rejections spanning 75+ minutes** (e.g. `852.4843151622147` on every single rejection since relayer startup). The on-chain `PerpMarket.stable_price_model.stable_price` for the same market is fresh (e.g. `859.269` at `last_update_timestamp` a few seconds ago) and the live Pyth feed has clearly moved. So the on-chain band *would* accept the bid — only the relayer's cached copy rejects.
+
+**Root cause:** `ClientService::load_group_static_account_mirror` seeds every `PerpMarket` account into `static_account_cache` once at startup. `fetch_margin_check_account_map` always prefers static-cache hits over the TTL'd `margin_account_cache` (see `static_account_cache` lookup before the TTL check). Because static cache never refreshes, `target_market.stable_price_model.stable_price` used by `inside_price_limit` is frozen at relayer start. After a ~5 % spot move, every bid/ask crosses the stale ±`maint_base_*_weight` band.
+
+**Diagnose in under a minute:**
+```bash
+# 1. Confirm frozen stable_price across time:
+tail -c 20M .devnet/logs/ctm-relayer.log \
+  | grep '"market":"2"' | grep 'stable_price=' \
+  | grep -oE 'stable_price=[0-9.]+' | sort -u
+# Exactly one unique value over a long window → frozen.
+
+# 2. Compare to on-chain stable_price:
+#    Read PerpMarket account, find oracle pubkey offset, then StablePriceModel begins at
+#    oracle + 32 (oracle pk) + 16 (I80F48 conf_filter) + 8 (u64 max_staleness) + 72 (reserved).
+#    First f64 there is stable_price; next u64 is last_update_timestamp.
+```
+
+**Fix (landed):** In `load_group_static_account_mirror`, do NOT push `PerpMarket` into `static_accounts`. Keep the `perps_by_market_index` mirror and `market_metadata` map — those only need pubkeys, not live account bytes. Let `PerpMarket` flow through the TTL'd `margin_account_cache` (`CTM_RELAYER_MARGIN_CACHE_TTL_MS`, default 500 ms, devnet 10000 ms) so `stable_price` refreshes at TTL cadence.
+
+**Mainnet note:** 10 s TTL is devnet-generous. On mainnet with sub-second Pyth cadence and tight `maint_base_*_weight`, this cache is the difference between 5 % of a fast move being rejectable and a full minute. Set `CTM_RELAYER_MARGIN_CACHE_TTL_MS ≤ 500` for mainnet.
+
+**Related:** The same static-cache pattern caches fallback/quote oracles and Banks. Banks have a `stable_price_model` too but aren't read by the current pre-check path, so they don't trip this exact bug. If any future pre-check reads a freshness-sensitive field from Bank, revisit the same carve-out.
+
+---
+
+## ⚠️ WARN — Oracle staleness config (DEVNET HACK, MUST FIX BEFORE MAINNET)
+
+**Context (2026-04-20, investigating empty orderbook with all reveals returning `status=Revealed`):**
+SOL/ETH/BTC perp markets on the devnet group (`BrbJtc8ja8CH75CxbtRMzYqchtEq4XvsQZ6nKvCkQfGG`, program `9rpAcg1jNmUydb4QoeCeJBGf8JfRuxLciRbS7AHGnXEq`) are configured with `oracle_config.max_staleness_slots = 600` (~4 min) to tolerate the devnet sponsored Pyth PriceUpdateV2 feed's real update cadence (observed publish_time lags of 120–180 s are normal there, occasionally up to 240 s).
+
+**Why this is dangerous:**
+- At 400 ms/slot, 600 slots = 240 s of tolerable staleness. On mainnet Pyth feeds update sub-second; 600 slots is an eternity of price drift a liquidator or attacker can exploit.
+- A 240 s stale price lets a trader place orders against a stale mark, exit before the fresh price catches up, and socialize the loss to the insurance fund.
+- `oracle_config.conf_filter = 0.1` (10 %) on these same markets is also lax — a 10 % confidence interval is fine for a vestigial testnet but unacceptable for real collateral.
+
+**Before flipping any of these markets to mainnet:**
+1. Set `max_staleness_slots` to **≤ 25 slots (~10 s)** for every perp and bank oracle (`PerpEditMarket::oracle_config_opt` / `TokenEdit::oracle_config_opt`).
+2. Set `conf_filter` to **≤ 0.01 (1 %)** default; tighter (0.5 %) for BTC/SOL/ETH.
+3. A zero `max_staleness_slots` triggers the program's strict check (`last_update_slot + 0 < now_slot`) which is effectively "always stale" — never ship zero. A sentinel value that means "disabled" should be explicitly negative per mango-v4 semantics, not zero (see `programs/mango-v4/src/state/oracle.rs::check_staleness`).
+4. Drop `oracle_state_unchecked` from any public code path. See `mainnet_plan_17apr.md §A3` for the structural fix.
+
+**Sanity query before every deploy:**
+```
+ts-node ts/client/scripts/execution-queue/bump-oracle-staleness.ts   # dumps current values
+```
+Any market reporting `max_staleness_slots > 25` (or `= 0`) in mainnet deploy logs is a **pre-launch blocker**.
+
+**Related code review items:**
+- `programs/mango-v4/src/state/oracle.rs::check_staleness` at line 190 — semantics of `max_staleness_slots >= 0` mean negative = disabled, zero = strictest. Ergonomically inverted; an operator assuming "0 = disabled" will deploy with strict mode.
+- The `Option<u32>` wrapper on `OracleConfigParams.max_staleness_slots` lets admin-edit pass `None` (no-change) but `Some(0)` = strict. Client-side builders should refuse `Some(0)` unless the operator explicitly typed `--max-stale 0` with a confirmation prompt.

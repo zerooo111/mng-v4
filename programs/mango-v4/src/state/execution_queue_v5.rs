@@ -41,8 +41,17 @@ pub const EXECUTION_QUEUE_V5_DEFAULT_MAX_RETRIES: u8 = 3;
 /// Upper bound on admin-configured max_retries. Bounds the worst-case CU
 /// wasted on a genuinely-undispatchable head item before autodrop takes over.
 pub const EXECUTION_QUEUE_V5_MAX_RETRIES_CAP: u8 = 20;
-pub const EXECUTION_QUEUE_V5_N_MAX_MARKETS: usize = 16;
-pub const EXECUTION_QUEUE_V5_PER_MARKET_CAPACITY: usize = 256;
+/// One queue account per (group, market_index) PDA — each account holds a
+/// single sub-queue. Prior layout packed all markets into one account, which
+/// forced Solana to serialize every reveal across markets on the same
+/// account lock. Splitting to per-market PDAs unlocks true on-chain
+/// parallelism. N=1 reflects that each queue account is single-market.
+pub const EXECUTION_QUEUE_V5_N_MAX_MARKETS: usize = 1;
+/// 1024 ring-buffer slots per market — 4× the prior 256 so the relayer's
+/// admission window is large enough to absorb bursts without tripping
+/// `ExecutionQueueFull` (6076) during reveal stalls / autodrop windows.
+/// 1024 × 96B item + 64B header ≈ 99KB, well under the account-size limit.
+pub const EXECUTION_QUEUE_V5_PER_MARKET_CAPACITY: usize = 1024;
 pub const EXECUTION_QUEUE_V5_TOTAL_CAPACITY: usize =
     EXECUTION_QUEUE_V5_N_MAX_MARKETS * EXECUTION_QUEUE_V5_PER_MARKET_CAPACITY;
 
@@ -449,7 +458,9 @@ mod tests {
         );
         assert_eq!(
             EXECUTION_QUEUE_V5_ITEMS_OFFSET,
-            EXECUTION_QUEUE_V5_SUB_QUEUE_HEADERS_OFFSET + 16 * 64
+            EXECUTION_QUEUE_V5_SUB_QUEUE_HEADERS_OFFSET
+                + EXECUTION_QUEUE_V5_N_MAX_MARKETS
+                    * EXECUTION_QUEUE_V5_SUB_QUEUE_HEADER_STRIDE
         );
     }
 
@@ -497,25 +508,26 @@ mod tests {
         let mut q: Box<ExecutionQueueV5> = unsafe { Box::new(std::mem::zeroed()) };
         q.init(Pubkey::new_unique(), Pubkey::new_unique(), 1);
         let idx = q.allocate_sub_queue(0, 0, 0, 4).unwrap();
-        // Commit and reveal 256 entries.
-        for seq in 0..256u64 {
+        let cap = EXECUTION_QUEUE_V5_PER_MARKET_CAPACITY as u64;
+        // Commit and reveal `cap` entries to fill the ring exactly once.
+        for seq in 0..cap {
             let mut item = CommitItemV5::default();
             item.sequence = seq;
             item.status = CommitStatusV5::Committed as u8;
             q.write_commit(idx, item).unwrap();
         }
-        for _ in 0..256 {
+        for _ in 0..cap {
             q.clear_head(idx).unwrap();
         }
-        // Sequence 256 should land at ring offset 0 again.
+        // Sequence == cap should land at ring offset 0 again.
         let mut item = CommitItemV5::default();
-        item.sequence = 256;
+        item.sequence = cap;
         item.status = CommitStatusV5::Committed as u8;
         q.write_commit(idx, item).unwrap();
         assert_eq!(q.sub_queue_headers[idx].head_ring_offset(), 0);
         assert_eq!(
             q.items[ExecutionQueueV5::physical_index(idx, 0)].sequence,
-            256
+            cap
         );
     }
 
@@ -524,9 +536,10 @@ mod tests {
         let mut q: Box<ExecutionQueueV5> = unsafe { Box::new(std::mem::zeroed()) };
         q.init(Pubkey::new_unique(), Pubkey::new_unique(), 1);
         let idx = q.allocate_sub_queue(0, 0, 0, 4).unwrap();
-        // Sequence = capacity is out of the admission window (head=0, cap=256).
+        let cap = EXECUTION_QUEUE_V5_PER_MARKET_CAPACITY as u64;
+        // Sequence = capacity is out of the admission window (head=0).
         assert!(q.sub_queue_headers[idx]
-            .validate_commit_sequence(256)
+            .validate_commit_sequence(cap)
             .is_err());
         // Sequence below head is rejected once head advances.
         q.sub_queue_headers[idx].next_sequence_to_execute = 10;

@@ -80,6 +80,7 @@ pub mod proto {
 mod v4_pipeline;
 mod v4_reveal_wal;
 mod v5_pipeline;
+mod v5_precheck;
 
 use proto::{
     ctm_sequencer_relayer_server::{CtmSequencerRelayer, CtmSequencerRelayerServer},
@@ -172,6 +173,19 @@ struct Config {
     /// `v4_reveal_spacing_ms=50`, a depth of ~6 was measured optimal in
     /// throughput experiments. 1 collapses to serial.
     v4_reveal_pipeline_depth: u64,
+    /// Number of head-sequential reveals packed into a single reveal tx.
+    /// With the program's in-handler loop each tx advances head N times
+    /// atomically — no cross-tx landing-order race. Legacy tx fits:
+    ///   N=2 with any user mix,
+    ///   N=3 with same-user adjacency (merged ed25519 pre-ix helps),
+    ///   N≥4 requires versioned + ALT.
+    /// Set to 1 to disable batching and fall back to one-reveal-per-tx.
+    v5_reveal_batch_size: u64,
+    /// Address Lookup Table holding shared reveal-path pubkeys. When
+    /// `Some`, reveal txs are built as VersionedTransaction (v0) and gain
+    /// 1-byte-per-shared-address compression — enabling batch≥3 under
+    /// the 1280 B versioned-tx limit. `None` keeps reveal txs on legacy.
+    v5_reveal_alt_address: Option<Pubkey>,
     /// 0 disables periodic refresh (one-shot at startup only).
     v4_page_init_refresh_secs: u64,
     /// How often to compare local atomic counter with on-chain `next_enqueue_sequence`.
@@ -200,6 +214,9 @@ struct Config {
     v5_route_all: bool,
     /// Path to the v5 reveal WAL. Empty disables persistence.
     v5_reveal_wal_path: Option<PathBuf>,
+    /// Strict ingress-time validation so every committed intent reveals
+    /// cleanly. See v5_precheck.rs for stage list.
+    v5_precheck: v5_precheck::PrecheckConfig,
     executor_lane_config_path: Option<PathBuf>,
     executor_lane_cache_path: Option<PathBuf>,
     executor_relay_event_log_path: Option<PathBuf>,
@@ -675,6 +692,12 @@ impl Config {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(50u64),
             v4_reveal_pipeline_depth: parse_u64_env("V4_REVEAL_PIPELINE_DEPTH", 6)?,
+            v5_reveal_batch_size: parse_u64_env("V5_REVEAL_BATCH_SIZE", 2)?,
+            v5_reveal_alt_address: std::env::var("V5_REVEAL_ALT_ADDRESS")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| Pubkey::from_str(s.trim()).context("parse V5_REVEAL_ALT_ADDRESS"))
+                .transpose()?,
             v4_page_init_refresh_secs: parse_u64_env("V4_PAGE_INIT_REFRESH_SECS", 0)?,
             v4_drift_resync_interval_ms: parse_u64_env(
                 "V4_DRIFT_RESYNC_INTERVAL_MS",
@@ -700,6 +723,11 @@ impl Config {
                 .ok()
                 .filter(|s| !s.is_empty())
                 .map(PathBuf::from),
+            v5_precheck: v5_precheck::PrecheckConfig {
+                enabled: parse_bool_env("V5_PRECHECK_ENABLED", true),
+                expire_margin_slots: parse_u64_env("V5_PRECHECK_EXPIRE_MARGIN_SLOTS", 10)?,
+                max_future_slots: parse_u64_env("V5_PRECHECK_MAX_FUTURE_SLOTS", 150)?,
+            },
             executor_lane_config_path,
             executor_lane_cache_path,
             executor_relay_event_log_path,
@@ -3711,7 +3739,12 @@ impl Engine {
                             oracle: perp_market.oracle.to_string(),
                         },
                     );
-                    static_accounts.push(keyed);
+                    // Intentionally NOT pushed into static_accounts. The pre-check reads
+                    // perp_market.stable_price_model.stable_price; a permanently-cached copy
+                    // freezes that value at startup and drift trips the ±weight oracle band
+                    // (devnet incident 2026-04-20, see exec_q_debugging.md Failure Mode 7).
+                    // Instead, PerpMarket flows through the TTL'd margin_account_cache so
+                    // stable_price refreshes every CTM_RELAYER_MARGIN_CACHE_TTL_MS.
                 }
             }
         }
@@ -6690,6 +6723,47 @@ impl Engine {
                 let v5_reveal_store_ref = v5pm.reveal_store.clone();
                 let v5_next_seq_ref = v5pm.next_sequence.clone();
                 let v5_reveal_wal_ref = v5pm.reveal_wal.clone();
+
+                // Ingress-time pre-check: reject intents that would revert at
+                // reveal/execute so we never burn a commit slot on a doomed
+                // reveal. See v5_precheck.rs for the full stage list and the
+                // program reverts each stage guards against.
+                let now_ts_for_precheck: u64 = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                match v5_precheck::precheck_reveal_ready(
+                    &request.payload,
+                    envelope.kind,
+                    envelope.min_execute_slot,
+                    envelope.expires_at_slot,
+                    chain.slot,
+                    now_ts_for_precheck,
+                    &remaining_accounts,
+                    v5_mkt.perp_market,
+                    mango_account,
+                    !request.user_signature.is_empty(),
+                    &self.config.v5_precheck,
+                ) {
+                    Ok(_decoded) => {}
+                    Err(reject) => {
+                        let tag = reject.reason_tag();
+                        warn!(
+                            target: "v5_precheck",
+                            reason = tag,
+                            market_index = v5_mkt.market_index,
+                            "ingress reject: {reject}"
+                        );
+                        self.metrics
+                            .ingress_rejected_total
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return Err(self.reject_submit_request(
+                            &request,
+                            Code::FailedPrecondition,
+                            format!("v5 precheck [{tag}]: {reject}"),
+                        ));
+                    }
+                }
                 // P0.5: single unified user-intent hash. commit_hash and
                 // the message the user's ed25519 pre-ix signs over are now
                 // the same bytes. client_order_id is the 8-byte user
@@ -6733,6 +6807,13 @@ impl Engine {
                 // the user's signature covers the same bytes the program
                 // stores, so we don't derive a separate hash anymore.
                 let user_intent_msg = commit_hash;
+                // The user may have signed either the raw 32-byte hash OR
+                // its hex-utf8 encoding; verify_user_signature above returned
+                // the form it matched. Store those EXACT bytes so the reveal
+                // worker's ed25519 pre-ix contains a message that verifies
+                // against the stored signature (Ed25519SigVerify only checks
+                // exact-byte equality — the program's hex-utf8 fallback does
+                // not help here).
                 let reveal_entry = v5_pipeline::V5RevealEntry {
                     sequence: v5_seq,
                     payload: request.payload.clone(),
@@ -6742,6 +6823,7 @@ impl Engine {
                     mango_account,
                     user_sig: Some(user_signature),
                     user_intent_hash: Some(user_intent_msg),
+                    user_sig_message: Some(user_message_variant.as_bytes().to_vec()),
                     min_execute_slot: envelope.min_execute_slot,
                     expires_at_slot: envelope.expires_at_slot,
                     kind: 0,
@@ -7578,24 +7660,38 @@ impl Engine {
             // sign the cranker is alive and polling.
             self.metrics.tick_event_cranker(unix_timestamp_ms());
 
-            // Re-scan lanes every tick so newly added markets (dynamic lanes)
-            // get picked up. Canonical layout per lane:
-            //   [0] group, [1] mango_account, [2] owner,
-            //   [3] perp_market, [4] bids, [5] asks, [6] event_queue, [7] oracle, ...
-            // Dedupe by perp_market to avoid consuming the same event queue
-            // multiple times per tick when multiple lanes exist for the same
-            // market (different accounts, same perp market).
-            let lanes = executor.lanes_snapshot().await;
+            // Prefer v5_markets for target discovery — that's the source of
+            // truth for active markets post per-market-queue migration. The
+            // v3 lanes config can be stale (points at an old perp_market +
+            // event_queue tuple), which silently breaks event cranking and
+            // eventually panics reveals at `book.rs:102` (OutEvent push on
+            // a full event queue during expired-order cleanup). Fall back
+            // to lanes only when v5_markets is empty (legacy deploys that
+            // haven't migrated to v5).
             let mut markets: Vec<(Pubkey, Pubkey)> = Vec::new();
             let mut seen: HashSet<Pubkey> = HashSet::new();
-            for lane in lanes.iter() {
-                if lane.remaining_accounts.len() < 7 {
-                    continue;
+            if !self.v5_markets.is_empty() {
+                for v5pm in self.v5_markets.values() {
+                    let pm = v5pm.market.perp_market;
+                    let eq = v5pm.market.perp_event_queue;
+                    if seen.insert(pm) {
+                        markets.push((pm, eq));
+                    }
                 }
-                let perp_market = lane.remaining_accounts[3].pubkey;
-                let event_queue = lane.remaining_accounts[6].pubkey;
-                if seen.insert(perp_market) {
-                    markets.push((perp_market, event_queue));
+            } else {
+                // Canonical layout per v3/v4 lane:
+                //   [0] group, [1] mango_account, [2] owner,
+                //   [3] perp_market, [4] bids, [5] asks, [6] event_queue, [7] oracle, ...
+                let lanes = executor.lanes_snapshot().await;
+                for lane in lanes.iter() {
+                    if lane.remaining_accounts.len() < 7 {
+                        continue;
+                    }
+                    let perp_market = lane.remaining_accounts[3].pubkey;
+                    let event_queue = lane.remaining_accounts[6].pubkey;
+                    if seen.insert(perp_market) {
+                        markets.push((perp_market, event_queue));
+                    }
                 }
             }
 
@@ -12636,7 +12732,8 @@ async fn async_main() -> Result<()> {
         let usdc_oracle = config
             .v4_usdc_oracle
             .ok_or_else(|| anyhow!("V5 requires V4_USDC_ORACLE"))?;
-        let (queue, _) = v5_pipeline::derive_queue_v5_pda(&config.program_id, &group);
+        // Per-market queue PDA derivation moved inside the per-market loop;
+        // see `derive_queue_v5_pda(..., market_index)` below.
 
         // Build an ordered list of market indices to configure.
         let market_indices: Vec<u16> = match std::env::var("V5_MARKETS").ok() {
@@ -12716,6 +12813,12 @@ async fn async_main() -> Result<()> {
                     None
                 },
             )?;
+            let (queue, _queue_bump) =
+                v5_pipeline::derive_queue_v5_pda(&config.program_id, &group, idx);
+            info!(
+                "v5 queue PDA for market {idx}: {} (derived from program_id + group + market_index)",
+                queue
+            );
             let mkt = Arc::new(v5_pipeline::V5MarketState {
                 program_id: config.program_id,
                 group,
@@ -12919,6 +13022,51 @@ async fn async_main() -> Result<()> {
         ingress_rate_slots: Arc::new(StdMutex::new(HashMap::new())),
     });
 
+    // Load the reveal-path ALT (if configured) once at startup. The ALT
+    // contents change only via explicit admin extend; we cache a single
+    // snapshot here and reuse it for every reveal tx.
+    let reveal_alts: Arc<Vec<solana_sdk::address_lookup_table_account::AddressLookupTableAccount>> =
+        if let Some(alt_addr) = config.v5_reveal_alt_address {
+            match rpc.get_account(&alt_addr).await {
+                Ok(acct) => {
+                    let state =
+                        solana_address_lookup_table_program::state::AddressLookupTable::deserialize(
+                            &acct.data,
+                        );
+                    match state {
+                        Ok(t) => {
+                            let alt = solana_sdk::address_lookup_table_account::AddressLookupTableAccount {
+                                key: alt_addr,
+                                addresses: t.addresses.to_vec(),
+                            };
+                            info!(
+                                "v5 reveal ALT loaded: {} with {} addresses",
+                                alt_addr,
+                                alt.addresses.len()
+                            );
+                            Arc::new(vec![alt])
+                        }
+                        Err(e) => {
+                            warn!(
+                                "v5 reveal ALT deserialize failed for {}: {e}; disabling ALT",
+                                alt_addr
+                            );
+                            Arc::new(Vec::new())
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "v5 reveal ALT fetch failed for {}: {e}; disabling ALT",
+                        alt_addr
+                    );
+                    Arc::new(Vec::new())
+                }
+            }
+        } else {
+            Arc::new(Vec::new())
+        };
+
     // v5 reveal / drift / autodrop workers — one triplet per configured
     // market_index. No page-init worker in v5 (single-account layout).
     for (idx, v5pm) in engine.v5_markets.iter() {
@@ -12931,6 +13079,7 @@ async fn async_main() -> Result<()> {
         let admin_c = engine.config.ctm.clone();
         let spacing_ms = engine.config.v4_reveal_spacing_ms;
         let pipeline_depth = engine.config.v4_reveal_pipeline_depth;
+        let batch_size = engine.config.v5_reveal_batch_size;
         let stall = v5_pipeline::V5HeadStallState::default();
 
         v5_pipeline::spawn_reveal_worker(
@@ -12941,12 +13090,14 @@ async fn async_main() -> Result<()> {
             reveal_store.clone(),
             spacing_ms,
             pipeline_depth,
+            batch_size,
+            reveal_alts.clone(),
             stall.clone(),
             reveal_wal.clone(),
         );
         info!(
-            "v5 reveal worker spawned: market={} spacing_ms={} pipeline_depth={}",
-            idx, spacing_ms, pipeline_depth
+            "v5 reveal worker spawned: market={} spacing_ms={} pipeline_depth={} batch_size={}",
+            idx, spacing_ms, pipeline_depth, batch_size
         );
 
         let drift_interval_ms = engine.config.v4_drift_resync_interval_ms;

@@ -10,6 +10,7 @@ use anchor_lang::solana_program::sysvar::instructions as tx_instructions;
 // ── Lifecycle (create → resize loop → init) ────────────────────────────
 
 #[derive(Accounts)]
+#[instruction(market_index: u16)]
 pub struct ExecutionQueueV5Create<'info> {
     #[account(
         constraint = group.load()?.admin == admin.key() @ MangoError::SomeError,
@@ -25,7 +26,11 @@ pub struct ExecutionQueueV5Create<'info> {
         init,
         payer = payer,
         space = 8,
-        seeds = [b"execution-queue-v5".as_ref(), group.key().as_ref()],
+        seeds = [
+            b"execution-queue-v5".as_ref(),
+            group.key().as_ref(),
+            &market_index.to_le_bytes(),
+        ],
         bump,
     )]
     /// CHECK: chunked grow target; zero-copy init deferred.
@@ -37,6 +42,7 @@ pub struct ExecutionQueueV5Create<'info> {
 }
 
 #[derive(Accounts)]
+#[instruction(market_index: u16)]
 pub struct ExecutionQueueV5Resize<'info> {
     pub group: AccountLoader<'info, Group>,
     #[account(
@@ -47,7 +53,11 @@ pub struct ExecutionQueueV5Resize<'info> {
     pub authority_state: Account<'info, ExecutionQueueAuthorityState>,
     #[account(
         mut,
-        seeds = [b"execution-queue-v5".as_ref(), group.key().as_ref()],
+        seeds = [
+            b"execution-queue-v5".as_ref(),
+            group.key().as_ref(),
+            &market_index.to_le_bytes(),
+        ],
         bump,
     )]
     /// CHECK: chunked grow target.
@@ -58,6 +68,7 @@ pub struct ExecutionQueueV5Resize<'info> {
 }
 
 #[derive(Accounts)]
+#[instruction(market_index: u16)]
 pub struct ExecutionQueueV5Init<'info> {
     #[account(
         constraint = group.load()?.admin == admin.key() @ MangoError::SomeError,
@@ -71,7 +82,11 @@ pub struct ExecutionQueueV5Init<'info> {
     pub authority_state: Account<'info, ExecutionQueueAuthorityState>,
     #[account(
         zero,
-        seeds = [b"execution-queue-v5".as_ref(), group.key().as_ref()],
+        seeds = [
+            b"execution-queue-v5".as_ref(),
+            group.key().as_ref(),
+            &market_index.to_le_bytes(),
+        ],
         bump,
     )]
     pub queue: AccountLoader<'info, ExecutionQueueV5>,

@@ -86,6 +86,12 @@ struct WalEntry {
     /// via the autodrop path.
     #[serde(default)]
     client_order_id: u64,
+    /// Exact bytes the user ed25519 sig covers (raw 32 or hex-utf8 64). When
+    /// None or absent, reveal falls back to `user_intent_hash`. Added after
+    /// the P0.5 migration to fix a devnet mismatch where bots signing
+    /// hex-utf8 passed commit-time verify but failed reveal-side pre-ix.
+    #[serde(default)]
+    user_sig_message: Option<Vec<u8>>,
 }
 
 impl From<&V4RevealEntry> for WalEntry {
@@ -103,6 +109,7 @@ impl From<&V4RevealEntry> for WalEntry {
             expires_at_slot: e.expires_at_slot,
             kind: e.kind,
             client_order_id: e.client_order_id,
+            user_sig_message: e.user_sig_message.clone(),
         }
     }
 }
@@ -122,6 +129,7 @@ impl From<&WalEntry> for V4RevealEntry {
             expires_at_slot: w.expires_at_slot,
             kind: w.kind,
             client_order_id: w.client_order_id,
+            user_sig_message: w.user_sig_message.clone(),
         }
     }
 }
@@ -280,6 +288,7 @@ mod tests {
             mango_account: Pubkey::new_unique(),
             user_sig: Some([9u8; 64]),
             user_intent_hash: Some([seq as u8; 32]),
+            user_sig_message: None,
             min_execute_slot: 0,
             expires_at_slot: 0,
             kind: 0,

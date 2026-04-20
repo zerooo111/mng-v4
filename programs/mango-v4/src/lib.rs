@@ -2324,21 +2324,30 @@ pub mod mango_v4 {
     /// execution queue v5 (single-account ring buffer, commit/reveal)
     ///
 
-    pub fn execution_queue_v5_create(ctx: Context<ExecutionQueueV5Create>) -> Result<()> {
+    pub fn execution_queue_v5_create(
+        ctx: Context<ExecutionQueueV5Create>,
+        market_index: u16,
+    ) -> Result<()> {
         #[cfg(feature = "enable-gpl")]
-        instructions::execution_queue_v5_create(ctx)?;
+        instructions::execution_queue_v5_create(ctx, market_index)?;
         Ok(())
     }
 
-    pub fn execution_queue_v5_resize(ctx: Context<ExecutionQueueV5Resize>) -> Result<()> {
+    pub fn execution_queue_v5_resize(
+        ctx: Context<ExecutionQueueV5Resize>,
+        market_index: u16,
+    ) -> Result<()> {
         #[cfg(feature = "enable-gpl")]
-        instructions::execution_queue_v5_resize(ctx)?;
+        instructions::execution_queue_v5_resize(ctx, market_index)?;
         Ok(())
     }
 
-    pub fn execution_queue_v5_init(ctx: Context<ExecutionQueueV5Init>) -> Result<()> {
+    pub fn execution_queue_v5_init(
+        ctx: Context<ExecutionQueueV5Init>,
+        market_index: u16,
+    ) -> Result<()> {
         #[cfg(feature = "enable-gpl")]
-        instructions::execution_queue_v5_init(ctx)?;
+        instructions::execution_queue_v5_init(ctx, market_index)?;
         Ok(())
     }
 

@@ -16,13 +16,15 @@ use solana_client::{
 };
 use solana_program::hash::hashv;
 use solana_sdk::{
+    address_lookup_table_account::AddressLookupTableAccount,
     compute_budget::ComputeBudgetInstruction,
     ed25519_program,
     instruction::{AccountMeta, Instruction},
+    message::{v0::Message as MessageV0, VersionedMessage},
     pubkey::Pubkey,
     signature::{Keypair, Signer},
     sysvar::instructions::ID as INSTRUCTIONS_SYSVAR_ID,
-    transaction::Transaction,
+    transaction::{Transaction, VersionedTransaction},
 };
 use std::{
     collections::BTreeMap,
@@ -208,9 +210,22 @@ fn parse_sub_queue_for_market(data: &[u8], market_index: u16) -> Option<SubQueue
 
 /// Derive the queue PDA from group + program_id. Seeds match on-chain
 /// `ExecutionQueueV5Create`.
-pub fn derive_queue_v5_pda(program_id: &Pubkey, group: &Pubkey) -> (Pubkey, u8) {
+/// Per-(group, market_index) queue PDA. Prior layout used a single queue
+/// PDA per group containing all markets' sub-queues, which forced Solana
+/// to serialize every reveal across markets on a shared account lock.
+/// Moving to per-market PDAs unlocks parallel block-time drain across
+/// markets.
+pub fn derive_queue_v5_pda(
+    program_id: &Pubkey,
+    group: &Pubkey,
+    market_index: u16,
+) -> (Pubkey, u8) {
     Pubkey::find_program_address(
-        &[b"execution-queue-v5", group.as_ref()],
+        &[
+            b"execution-queue-v5",
+            group.as_ref(),
+            &market_index.to_le_bytes(),
+        ],
         program_id,
     )
 }
@@ -541,16 +556,27 @@ pub fn build_reveal_execute_tx(
     let mut ixs = vec![cu];
 
     // Under the unified hash, the user signs the SAME bytes that land
-    // on-chain as the commit. user_intent_hash on the reveal entry is
-    // the unified hash; use that if present.
-    if let (Some(user_sig), Some(msg_hash)) =
-        (reveal_entry.user_sig, reveal_entry.user_intent_hash)
-    {
-        ixs.push(build_presigned_ed25519_instruction(
-            reveal_entry.user_owner.to_bytes(),
-            &msg_hash,
-            user_sig,
-        ));
+    // on-chain as the commit. The pre-ix must contain the EXACT bytes the
+    // signature covers — if the user signed utf8-hex(intent_hash) (some
+    // wallet SDKs default to that), putting the raw 32-byte hash in the
+    // pre-ix would fail Ed25519SigVerify even though the program's own
+    // recompute accepts either form. Prefer `user_sig_message` (captured
+    // at commit-time from the verify_user_signature return variant) and
+    // fall back to the raw hash only for legacy WAL entries that
+    // predate the field.
+    if let Some(user_sig) = reveal_entry.user_sig {
+        let msg_bytes: Option<Vec<u8>> = if let Some(m) = reveal_entry.user_sig_message.as_ref() {
+            Some(m.clone())
+        } else {
+            reveal_entry.user_intent_hash.map(|h| h.to_vec())
+        };
+        if let Some(msg_bytes) = msg_bytes {
+            ixs.push(build_presigned_ed25519_instruction(
+                reveal_entry.user_owner.to_bytes(),
+                &msg_bytes,
+                user_sig,
+            ));
+        }
     }
 
     let mut accounts = mango_v4::accounts::ExecutionQueueV5RevealExecuteMarket {
@@ -587,6 +613,203 @@ pub fn build_reveal_execute_tx(
         &[payer],
         blockhash,
     )
+}
+
+/// Pack N head-sequential reveals into a single tx. The program's reveal
+/// handler iterates `for reveal in reveals.iter()` and reloads `head_item`
+/// fresh each iteration, so a batch tx processes head=H, H+1, H+2, …
+/// atomically in one landing. This sidesteps the pipelined-multi-tx
+/// landing-order race that forces single-tx reveals to a ~2/s ceiling on
+/// devnet.
+///
+/// Caller responsibility:
+///   * `entries` must be sorted by sequence, contiguous, and start at the
+///     current on-chain head. A gap or wrong-start invalidates the batch.
+///   * Tx size budget (legacy = 1232 B) is not enforced here. The caller
+///     should size batches based on measured per-reveal marginal cost
+///     (~281 B for mixed users, ~217 B for same-user) and the expected
+///     number of ed25519 pre-ixs.
+///
+/// Note: each reveal that requires a user signature gets its own ed25519
+/// pre-ix in this initial version. Merging multiple sig entries into one
+/// pre-ix (for same-user batches) is a follow-up that saves ~18 B per
+/// reveal after the first — worth it only to squeeze batch=3 into legacy
+/// tx.
+pub fn build_reveal_execute_batch_tx(
+    mkt: &V5MarketState,
+    payer: &Keypair,
+    entries: &[V5RevealEntry],
+    blockhash: solana_sdk::hash::Hash,
+) -> Transaction {
+    assert!(!entries.is_empty(), "batch reveal requires ≥1 entry");
+
+    debug!(
+        target: "v5_reveal_debug",
+        first_seq = entries.first().map(|e| e.sequence).unwrap_or(0),
+        last_seq = entries.last().map(|e| e.sequence).unwrap_or(0),
+        batch_size = entries.len(),
+        "reveal batch dispatch"
+    );
+
+    let cu = ComputeBudgetInstruction::set_compute_unit_limit(1_400_000);
+    let mut ixs = vec![cu];
+
+    // One ed25519 pre-ix per reveal that carries a user signature. The
+    // handler's `verify_user_ed25519_preinstruction` scans ALL pre-ixs and
+    // matches any one with the expected hash, so separate pre-ixs compose
+    // cleanly across distinct users and distinct intent hashes. Same-user
+    // sigs could be merged into one multi-entry pre-ix for a ~18B/reveal
+    // saving; deferred as an optimization.
+    for entry in entries {
+        if let Some(user_sig) = entry.user_sig {
+            let msg_bytes: Option<Vec<u8>> = if let Some(m) = entry.user_sig_message.as_ref() {
+                Some(m.clone())
+            } else {
+                entry.user_intent_hash.map(|h| h.to_vec())
+            };
+            if let Some(msg_bytes) = msg_bytes {
+                ixs.push(build_presigned_ed25519_instruction(
+                    entry.user_owner.to_bytes(),
+                    &msg_bytes,
+                    user_sig,
+                ));
+            }
+        }
+    }
+
+    // remaining_accounts = [fixed accounts][dispatch for reveal_0][dispatch for reveal_1]…[program_id]
+    // The handler slices it by RevealArgsV5.dispatch_accounts_count at a
+    // running cursor, so order must match the reveals vec exactly.
+    let mut accounts = mango_v4::accounts::ExecutionQueueV5RevealExecuteMarket {
+        group: mkt.group,
+        authority_state: mkt.authority_state,
+        queue: mkt.queue,
+        instructions: INSTRUCTIONS_SYSVAR_ID,
+    }
+    .to_account_metas(None);
+    for entry in entries {
+        accounts.extend(entry.dispatch_accounts.clone());
+    }
+    accounts.push(AccountMeta::new_readonly(mkt.program_id, false));
+
+    let reveals: Vec<RevealArgsV5> = entries
+        .iter()
+        .map(|e| RevealArgsV5 {
+            payload: e.payload.clone(),
+            kind: e.kind,
+            dispatch_accounts_count: e.dispatch_accounts.len() as u8,
+            client_order_id: e.client_order_id,
+            mango_account: e.mango_account,
+            user_owner: e.user_owner,
+        })
+        .collect();
+
+    let reveal_ix = Instruction {
+        program_id: mkt.program_id,
+        accounts,
+        data: mango_v4::instruction::ExecutionQueueV5RevealExecuteMarket {
+            market_index: mkt.market_index,
+            reveals,
+        }
+        .data(),
+    };
+    ixs.push(reveal_ix);
+
+    Transaction::new_signed_with_payer(&ixs, Some(&payer.pubkey()), &[payer], blockhash)
+}
+
+/// VersionedTransaction variant of `build_reveal_execute_batch_tx`. Uses
+/// address-lookup-table(s) to compress shared pubkey storage, freeing
+/// budget for more reveals per tx. When `alts` is empty this reduces to
+/// the same legacy shape as the non-v0 builder (just wrapped in a
+/// VersionedMessage::V0) — all addresses stay in the static `accountKeys`.
+///
+/// Returns `Err` if MessageV0 compilation fails (usually: too many
+/// instructions/accounts → would overflow the compact-u16 size limits) or
+/// if signing fails.
+pub fn build_reveal_execute_batch_tx_v0(
+    mkt: &V5MarketState,
+    payer: &Keypair,
+    entries: &[V5RevealEntry],
+    alts: &[AddressLookupTableAccount],
+    blockhash: solana_sdk::hash::Hash,
+) -> anyhow::Result<VersionedTransaction> {
+    if entries.is_empty() {
+        anyhow::bail!("batch reveal requires ≥1 entry");
+    }
+
+    debug!(
+        target: "v5_reveal_debug",
+        first_seq = entries.first().map(|e| e.sequence).unwrap_or(0),
+        last_seq = entries.last().map(|e| e.sequence).unwrap_or(0),
+        batch_size = entries.len(),
+        alts = alts.len(),
+        "reveal batch dispatch (v0)"
+    );
+
+    let cu = ComputeBudgetInstruction::set_compute_unit_limit(1_400_000);
+    // The reveal handler allocates per-reveal scratch in heap (decoded
+    // payload + dispatch-account slices + health cache). Default 32KB heap
+    // is enough for 1-2 reveals; batch=3+ needs extra headroom. Request
+    // 128KB — covers up to ~6 reveals of current shape with margin.
+    let heap = ComputeBudgetInstruction::request_heap_frame(128 * 1024);
+    let mut ixs = vec![cu, heap];
+
+    for entry in entries {
+        if let Some(user_sig) = entry.user_sig {
+            let msg_bytes: Option<Vec<u8>> = if let Some(m) = entry.user_sig_message.as_ref() {
+                Some(m.clone())
+            } else {
+                entry.user_intent_hash.map(|h| h.to_vec())
+            };
+            if let Some(msg_bytes) = msg_bytes {
+                ixs.push(build_presigned_ed25519_instruction(
+                    entry.user_owner.to_bytes(),
+                    &msg_bytes,
+                    user_sig,
+                ));
+            }
+        }
+    }
+
+    let mut accounts = mango_v4::accounts::ExecutionQueueV5RevealExecuteMarket {
+        group: mkt.group,
+        authority_state: mkt.authority_state,
+        queue: mkt.queue,
+        instructions: INSTRUCTIONS_SYSVAR_ID,
+    }
+    .to_account_metas(None);
+    for entry in entries {
+        accounts.extend(entry.dispatch_accounts.clone());
+    }
+    accounts.push(AccountMeta::new_readonly(mkt.program_id, false));
+
+    let reveals: Vec<RevealArgsV5> = entries
+        .iter()
+        .map(|e| RevealArgsV5 {
+            payload: e.payload.clone(),
+            kind: e.kind,
+            dispatch_accounts_count: e.dispatch_accounts.len() as u8,
+            client_order_id: e.client_order_id,
+            mango_account: e.mango_account,
+            user_owner: e.user_owner,
+        })
+        .collect();
+
+    let reveal_ix = Instruction {
+        program_id: mkt.program_id,
+        accounts,
+        data: mango_v4::instruction::ExecutionQueueV5RevealExecuteMarket {
+            market_index: mkt.market_index,
+            reveals,
+        }
+        .data(),
+    };
+    ixs.push(reveal_ix);
+
+    let message = MessageV0::try_compile(&payer.pubkey(), &ixs, alts, blockhash)?;
+    let tx = VersionedTransaction::try_new(VersionedMessage::V0(message), &[payer])?;
+    Ok(tx)
 }
 
 // ---------------------------------------------------------------------------
@@ -644,6 +867,12 @@ pub fn spawn_reveal_worker(
     store: V5RevealStore,
     reveal_spacing_ms: u64,
     reveal_pipeline_depth: u64,
+    reveal_batch_size: u64,
+    // When non-empty, reveal txs are built as VersionedTransaction (v0)
+    // referencing these ALTs — unlocks larger batches under the 1280 B
+    // versioned-tx limit (vs 1232 B legacy) and compresses shared
+    // pubkeys down to 1-byte indices. Empty falls back to legacy txs.
+    alts: Arc<Vec<AddressLookupTableAccount>>,
     stall: V5HeadStallState,
     wal: Option<Arc<crate::v4_reveal_wal::V4RevealWal>>,
 ) -> tokio::task::JoinHandle<()> {
@@ -702,15 +931,28 @@ pub fn spawn_reveal_worker(
             if head > last_fired {
                 last_fired = head;
             }
-            let window_end = max_seen.saturating_add(1).min(head + in_flight);
-            let fire_count = window_end.saturating_sub(last_fired) as usize;
-            if fire_count == 0 {
+            // Total seqs permitted in flight = pipeline_depth * batch_size
+            // (each tx can process batch_size head advances atomically). The
+            // `max_seen + 1` cap prevents firing for a seq that hasn't been
+            // committed on-chain yet — reveals for uncommitted seqs would
+            // hit the gap path (live_count==0 break) and waste slots.
+            let batch_size_u64 = reveal_batch_size.max(1);
+            let in_flight_seqs = in_flight.saturating_mul(batch_size_u64);
+            let window_end = max_seen
+                .saturating_add(1)
+                .min(head.saturating_add(in_flight_seqs));
+            let remaining_seqs = window_end.saturating_sub(last_fired);
+            if remaining_seqs == 0 {
                 if last_fired > head {
                     last_fired = head;
                 }
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 continue;
             }
+            // Fire ceil(remaining_seqs / batch_size) txs, each bundling up
+            // to batch_size sequential reveals.
+            let fire_count =
+                ((remaining_seqs + batch_size_u64 - 1) / batch_size_u64) as usize;
 
             let bh = match rpc.get_latest_blockhash().await {
                 Ok(h) => h,
@@ -721,44 +963,120 @@ pub fn spawn_reveal_worker(
                 }
             };
 
-            for i in 0..fire_count {
-                let seq = last_fired + i as u64;
-                let entry = {
+            // Batch-mode send: pack up to `reveal_batch_size` head-sequential
+            // entries into one tx per outer-loop tick, then fire at most
+            // `fire_count` such txs per tick (each advances last_fired by
+            // its batch_size). This trades the legacy "one reveal per tx,
+            // depth-many in flight" pattern for "batched reveals inside a
+            // serialized tx" — atomic per-tx, no landing-order race, and
+            // each batch tx executes N head advances on the chain in one
+            // slot.
+            let batch_size = reveal_batch_size.max(1) as usize;
+            let mut consumed_so_far: u64 = 0;
+            'pipeline: for _tx_idx in 0..fire_count {
+                // Collect up to `batch_size` consecutive entries starting
+                // at last_fired + consumed_so_far. Stop early if a seq is
+                // missing from the store (orphan slot, will be handled by
+                // autodrop) or if we reach window_end.
+                let batch_start = last_fired + consumed_so_far;
+                let mut batch: Vec<V5RevealEntry> =
+                    Vec::with_capacity(batch_size);
+                let batch_limit = std::cmp::min(
+                    batch_size as u64,
+                    window_end.saturating_sub(batch_start),
+                );
+                {
                     let g = store.lock();
-                    g.get(&seq).cloned()
-                };
-                let Some(entry) = entry else {
-                    debug!(target: "v5_reveal", seq, head, "no reveal material in store; head will need autodrop");
+                    for j in 0..batch_limit {
+                        let seq = batch_start + j;
+                        match g.get(&seq) {
+                            Some(entry) => batch.push(entry.clone()),
+                            None => break,
+                        }
+                    }
+                }
+                if batch.is_empty() {
+                    // Gap at head — bail this tick and let autodrop / next
+                    // loop pass handle it. Advance consumed_so_far by one
+                    // to avoid tight-looping on a missing seq.
+                    debug!(
+                        target: "v5_reveal",
+                        seq = batch_start,
+                        head,
+                        "no reveal material at batch head; autodrop will handle"
+                    );
                     stall.note_reveal_attempt();
+                    consumed_so_far = consumed_so_far.saturating_add(1);
                     tokio::time::sleep(Duration::from_millis(reveal_spacing_ms)).await;
-                    continue;
-                };
-                let tx = build_reveal_execute_tx(&mkt, &payer, &entry, bh);
+                    break 'pipeline;
+                }
+                let batch_len = batch.len() as u64;
+                let first_seq = batch.first().map(|e| e.sequence).unwrap_or(0);
+                let last_seq = batch.last().map(|e| e.sequence).unwrap_or(0);
                 stall.note_reveal_attempt();
-                let res = send_legacy_tx_with_failover(
-                    &rpc,
-                    secondary_rpc.as_deref(),
-                    &tx,
-                    send_cfg,
-                )
-                .await;
+                let res = if alts.is_empty() {
+                    let tx = build_reveal_execute_batch_tx(&mkt, &payer, &batch, bh);
+                    send_legacy_tx_with_failover(
+                        &rpc,
+                        secondary_rpc.as_deref(),
+                        &tx,
+                        send_cfg,
+                    )
+                    .await
+                } else {
+                    match build_reveal_execute_batch_tx_v0(&mkt, &payer, &batch, &alts, bh) {
+                        Ok(tx) => send_tx_with_failover(
+                            &rpc,
+                            secondary_rpc.as_deref(),
+                            &tx,
+                            send_cfg,
+                        )
+                        .await,
+                        Err(e) => {
+                            warn!(
+                                target: "v5_reveal",
+                                first_seq,
+                                last_seq,
+                                batch_len,
+                                error = %e,
+                                "v0 tx build failed — skipping batch"
+                            );
+                            consumed_so_far = consumed_so_far.saturating_add(batch_len);
+                            continue;
+                        }
+                    }
+                };
                 match res {
                     Ok((sig, via_secondary)) => {
                         debug!(
                             target: "v5_reveal",
-                            seq,
+                            first_seq,
+                            last_seq,
+                            batch_len,
                             %sig,
                             via_secondary,
-                            "reveal sent"
+                            "reveal batch sent"
                         );
                     }
                     Err(e) => {
-                        warn!(target: "v5_reveal", seq, head, error = %e, "reveal send failed");
+                        warn!(
+                            target: "v5_reveal",
+                            first_seq,
+                            last_seq,
+                            batch_len,
+                            head,
+                            error = %e,
+                            "reveal batch send failed"
+                        );
                     }
+                }
+                consumed_so_far = consumed_so_far.saturating_add(batch_len);
+                if batch_start + batch_len >= window_end {
+                    break 'pipeline;
                 }
                 tokio::time::sleep(Duration::from_millis(reveal_spacing_ms)).await;
             }
-            last_fired += fire_count as u64;
+            last_fired += consumed_so_far;
 
             let gc_count = {
                 let mut g = store.lock();

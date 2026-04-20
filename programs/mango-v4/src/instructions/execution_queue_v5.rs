@@ -13,8 +13,8 @@ use anchor_lang::solana_program::program::invoke;
 use anchor_lang::solana_program::system_instruction;
 
 use super::execution_queue::{
-    canonical_user_intent_message_v3, decode_queue_payload, dispatch_queue_payload,
-    extract_user_owner_for_ctm_payload, prevalidate_terminal_ctm_payload,
+    canonical_user_intent_message_v2, canonical_user_intent_message_v3, decode_queue_payload,
+    dispatch_queue_payload, extract_user_owner_for_ctm_payload, prevalidate_terminal_ctm_payload,
     queue_health_region_begin, queue_health_region_end, queue_health_region_spec,
     queue_item_kind_for_payload_variant, require_dispatch_market_index, terminal_ctm_failure_msg,
     validate_queue_payload_dispatch_accounts, variant_uses_user_signature,
@@ -106,14 +106,25 @@ fn canonical_commit_batch_message_v5(
 // Lifecycle: create → resize loop → init → configure_market
 // ---------------------------------------------------------------------------
 
-pub fn execution_queue_v5_create(_ctx: Context<ExecutionQueueV5Create>) -> Result<()> {
-    // Account created at 8 bytes by Anchor. The `resize` ix grows it in
-    // MAX_PERMITTED_DATA_INCREASE-sized chunks until it reaches the full
-    // queue size; then `init` finalizes the zero-copy state.
+pub fn execution_queue_v5_create(
+    _ctx: Context<ExecutionQueueV5Create>,
+    _market_index: u16,
+) -> Result<()> {
+    // Account created at 8 bytes by Anchor, per-market PDA seeded by
+    // market_index so every market gets an independent queue account —
+    // which gives us true on-chain parallelism (Solana serializes writes
+    // to the same account, so sharing one queue account across markets
+    // serialized all reveals/commits through a single lock). The `resize`
+    // ix grows it in MAX_PERMITTED_DATA_INCREASE-sized chunks until it
+    // reaches the full queue size; then `init` finalizes the zero-copy
+    // state.
     Ok(())
 }
 
-pub fn execution_queue_v5_resize(ctx: Context<ExecutionQueueV5Resize>) -> Result<()> {
+pub fn execution_queue_v5_resize(
+    ctx: Context<ExecutionQueueV5Resize>,
+    _market_index: u16,
+) -> Result<()> {
     let queue_ai = ctx.accounts.queue.to_account_info();
     let current_len = queue_ai.data_len();
     let target_len = EXECUTION_QUEUE_V5_ACCOUNT_SPACE;
@@ -140,7 +151,10 @@ pub fn execution_queue_v5_resize(ctx: Context<ExecutionQueueV5Resize>) -> Result
     Ok(())
 }
 
-pub fn execution_queue_v5_init(ctx: Context<ExecutionQueueV5Init>) -> Result<()> {
+pub fn execution_queue_v5_init(
+    ctx: Context<ExecutionQueueV5Init>,
+    _market_index: u16,
+) -> Result<()> {
     require!(
         ctx.accounts.queue.to_account_info().data_len() == EXECUTION_QUEUE_V5_ACCOUNT_SPACE,
         MangoError::ExecutionQueueV5LayoutNotReady
@@ -722,10 +736,29 @@ pub fn execution_queue_v5_reveal_execute_market(
                 reveal.user_owner,
                 MangoError::ExecutionQueueV5RevealEnvelopeMismatch
             );
+            // Accept either the unified P0.5 intent hash (v3, what the commit
+            // hash itself IS under the new design) OR the older v2 hash (no
+            // client_order_id) as a valid user signature message. v2
+            // fallback exists so bots that have not yet upgraded to the
+            // unified scheme can still place orders; the relayer's own
+            // verify_user_signature at ingress already confirmed the sig
+            // matches one of these forms, so the pre-ix content is trusted
+            // to be one of these two by the time we arrive here. Payload
+            // and commit-hash integrity are enforced independently via the
+            // `expected_commit_hash != head_item.commit_hash` check above.
+            let legacy_v2_hash = canonical_user_intent_message_v2(
+                group_key,
+                reveal.mango_account,
+                reveal.user_owner,
+                reveal.kind,
+                UserIntentTargetKind::PerpMarket,
+                market_index,
+                &payload_hash,
+            );
             verify_user_ed25519_preinstruction(
                 ctx.accounts.instructions.as_ref(),
                 user_owner,
-                &[expected_commit_hash],
+                &[expected_commit_hash, legacy_v2_hash],
             )?;
         }
 

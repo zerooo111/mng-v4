@@ -187,9 +187,9 @@ pub(crate) struct QueueHealthRegionSpec {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct DecodedQueuePayload {
-    pub(crate) variant: QueuePayloadVariant,
-    pub(crate) flags: u16,
+pub struct DecodedQueuePayload {
+    pub variant: QueuePayloadVariant,
+    pub flags: u16,
     pub(crate) body: QueuePayloadBody,
 }
 
@@ -204,7 +204,7 @@ struct ExecutableCandidate {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TerminalCtmFailureReason {
+pub enum TerminalCtmFailureReason {
     Expired,
     InvalidNumericInput,
 }
@@ -411,7 +411,7 @@ fn queue_payload_variant_from_u8(value: u8) -> Result<QueuePayloadVariant> {
     }
 }
 
-pub(crate) fn queue_item_kind_for_payload_variant(variant: QueuePayloadVariant) -> u8 {
+pub fn queue_item_kind_for_payload_variant(variant: QueuePayloadVariant) -> u8 {
     match variant {
         QueuePayloadVariant::PerpPlaceOrderV2
         | QueuePayloadVariant::PerpCancelOrder
@@ -436,7 +436,7 @@ pub(crate) fn queue_health_region_spec(
     }
 }
 
-pub(crate) fn variant_uses_user_signature(variant: QueuePayloadVariant) -> bool {
+pub fn variant_uses_user_signature(variant: QueuePayloadVariant) -> bool {
     matches!(
         variant,
         QueuePayloadVariant::PerpPlaceOrderV2
@@ -489,7 +489,7 @@ fn decode_payload_body(variant: QueuePayloadVariant, body: &[u8]) -> Result<Queu
     Ok(decoded)
 }
 
-pub(crate) fn decode_queue_payload(payload: &[u8]) -> Result<DecodedQueuePayload> {
+pub fn decode_queue_payload(payload: &[u8]) -> Result<DecodedQueuePayload> {
     require!(
         payload.len() >= QUEUE_PAYLOAD_HEADER_LEN,
         MangoError::ExecutionQueuePayloadDecodeFailed
@@ -655,7 +655,7 @@ fn dispatch_perp_place_order_v2<'info>(
     Ok(())
 }
 
-pub(crate) fn prevalidate_terminal_ctm_payload(
+pub fn prevalidate_terminal_ctm_payload(
     payload: &DecodedQueuePayload,
     now_ts: u64,
 ) -> Option<TerminalCtmFailureReason> {
@@ -895,7 +895,7 @@ fn validate_perp_place_order_health_accounts(
     Ok(())
 }
 
-pub(crate) fn validate_queue_payload_dispatch_accounts(
+pub fn validate_queue_payload_dispatch_accounts(
     group_key: Pubkey,
     payload: &DecodedQueuePayload,
     dispatch_accounts: &[AccountInfo],
@@ -915,7 +915,7 @@ pub(crate) fn validate_queue_payload_dispatch_accounts(
 /// for market A into market B's sub-queue. Liquidity payloads have no perp
 /// market in the dispatch accounts and bypass this check (they go to the
 /// global liquidity ring).
-pub(crate) fn require_dispatch_market_index(
+pub fn require_dispatch_market_index(
     dispatch_accounts: &[AccountInfo],
     expected_market_index: u16,
 ) -> Result<()> {
@@ -935,7 +935,7 @@ pub(crate) fn require_dispatch_market_index(
     Ok(())
 }
 
-pub(crate) fn extract_user_owner_for_ctm_payload(
+pub fn extract_user_owner_for_ctm_payload(
     group_key: Pubkey,
     remaining_accounts: &[AccountInfo],
 ) -> Result<(Pubkey, Pubkey)> {

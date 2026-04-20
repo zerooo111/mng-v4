@@ -29,6 +29,13 @@ pub struct V4RevealEntry {
     pub mango_account: Pubkey,
     pub user_sig: Option<[u8; 64]>,
     pub user_intent_hash: Option<[u8; 32]>,
+    /// Exact bytes the user's ed25519 signature covers. The program accepts
+    /// either the raw 32-byte intent hash or its utf8-hex (64-byte) form;
+    /// storing the chosen variant here lets the reveal worker build a pre-ix
+    /// whose message matches the sig byte-for-byte. Legacy WAL entries
+    /// without this field deserialize to None and the reveal path falls back
+    /// to the raw `user_intent_hash`.
+    pub user_sig_message: Option<Vec<u8>>,
     pub min_execute_slot: u64,
     pub expires_at_slot: u64,
     pub kind: u8,

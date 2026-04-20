@@ -22,6 +22,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 solana-client = { workspace = true }
 solana-sdk = { workspace = true, default-features = false }
 solana-program = { workspace = true }
+solana-address-lookup-table-program = "=1.16.14"
 reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
 base64 = "0.22"
 
