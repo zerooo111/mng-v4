@@ -30,6 +30,10 @@ const PUBLISH_ENABLED =
 const EVENTS_STREAM_MAXLEN = 50_000;
 // Trades stream is smaller — 1000 is the minimum window the frontend shows.
 const TRADES_STREAM_MAXLEN = 1_000;
+// Per-wallet tail. Smaller than the market-wide stream — wallets rarely look
+// deeper than a few hundred prior trades, and one stream per owner adds up
+// in aggregate. 500 × Redis-stream-entry (~200B) ~ 100KB per active trader.
+const WALLET_TRADES_MAXLEN = 500;
 
 // Hard cap: if any single XADD takes longer than this, we give up on it. The
 // harness hot path never blocks on Redis; the pipeline call is `.exec()` but
@@ -162,6 +166,10 @@ class IORedisPublisher implements Publisher {
         if (v === undefined || v === null) return;
         fields.push(k, String(v));
       };
+      // Always carry `market` on the per-wallet tail so readers can dedupe
+      // across markets without a second lookup. Cheap on the market-wide
+      // stream too — keeps field layout consistent.
+      push('market', market);
       push('maker', t.maker);
       push('taker', t.taker);
       push('price', t.price);
@@ -170,10 +178,23 @@ class IORedisPublisher implements Publisher {
       push('ts_ms', t.ts_ms ?? event.ts_ms);
       push('sequence', t.sequence ?? event.sequence);
       if (fields.length === 0) continue;
+      // Fan-out: one XADD to the market-wide stream, plus one XADD per
+      // participating wallet so /v2/trades/wallet/:owner is a single XREVRANGE.
       this.client
         .xadd(streamKey, 'MAXLEN', '~', TRADES_STREAM_MAXLEN, '*', ...fields)
         .then(() => this.metrics.writesTotal?.inc({ stream: streamKey }))
         .catch(() => this.metrics.writeErrorsTotal?.inc({ kind: 'xadd' }));
+
+      const participants = new Set<string>();
+      if (typeof t.maker === 'string' && t.maker) participants.add(t.maker);
+      if (typeof t.taker === 'string' && t.taker && t.taker !== t.maker) participants.add(t.taker);
+      for (const owner of participants) {
+        const walletKey = `v1:wallet_trades:${owner}`;
+        this.client
+          .xadd(walletKey, 'MAXLEN', '~', WALLET_TRADES_MAXLEN, '*', ...fields)
+          .then(() => this.metrics.writesTotal?.inc({ stream: walletKey }))
+          .catch(() => this.metrics.writeErrorsTotal?.inc({ kind: 'xadd_wallet' }));
+      }
     }
   }
 }
