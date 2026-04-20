@@ -32,6 +32,13 @@ pub struct V4RevealEntry {
     pub min_execute_slot: u64,
     pub expires_at_slot: u64,
     pub kind: u8,
+    /// User-supplied 8-byte randomizer bound into the unified v3 user-intent
+    /// hash. Present from the P0.5 migration onward; pre-migration WAL
+    /// entries deserialize with `client_order_id = 0`, which the reveal
+    /// handler will reject on-chain (hash mismatch) — forcing those stale
+    /// entries onto the autodrop path rather than silently succeeding with
+    /// the wrong randomizer.
+    pub client_order_id: u64,
 }
 
 pub type V4RevealStore = Arc<Mutex<BTreeMap<u64, V4RevealEntry>>>;

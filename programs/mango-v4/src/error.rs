@@ -255,6 +255,12 @@ pub enum MangoError {
     ExecutionQueueV5LayoutNotReady,
     #[msg("execution queue v5 sub-queue is not configured for this market")]
     ExecutionQueueV5SubQueueNotConfigured,
+    #[msg("execution queue v5 max_retries must be between 1 and 20")]
+    ExecutionQueueV5InvalidMaxRetries,
+    #[msg("legacy execution queue (v3/v4) instructions are disabled in this build")]
+    LegacyQueuesDisabled,
+    #[msg("execution queue v5 reveal mango_account / user_owner disagree with stored commit")]
+    ExecutionQueueV5RevealEnvelopeMismatch,
 }
 
 impl MangoError {

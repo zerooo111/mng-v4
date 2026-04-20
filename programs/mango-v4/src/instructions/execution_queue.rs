@@ -343,6 +343,48 @@ pub(crate) fn canonical_user_intent_message_v2(
     .to_bytes()
 }
 
+/// v3 of the canonical user-intent hash, used by the v5 commit-reveal path.
+///
+/// Adds an 8-byte `client_order_id`, supplied randomly by the user per intent.
+/// Purpose: payload space for common intents (cancels, standard-size places)
+/// is small enough that an observer with a commit_hash could brute-force the
+/// pre-image. Mixing in 2^64 random bits per intent makes brute force
+/// infeasible, restoring commit-time privacy.
+///
+/// This hash also replaces the separate relayer-side `commit_hash` used in v4
+/// and early v5 — the commit stored on-chain IS this hash, and the user's
+/// ed25519 pre-ix signs this same hash. One hash binds user consent, replay
+/// resistance (via client_order_id), and the reveal-time integrity check.
+///
+/// NOT included in the hash (by design):
+///   * sequence — assigned by the relayer at commit time; replay protection
+///     is provided by client_order_id uniqueness enforced downstream.
+///   * min_execute_slot / expires_at_slot — treated as relayer policy, not
+///     user-signed. A future v4 may bind these for stricter user control.
+pub(crate) fn canonical_user_intent_message_v3(
+    group: Pubkey,
+    mango_account: Pubkey,
+    user_owner: Pubkey,
+    kind: u8,
+    target_kind: UserIntentTargetKind,
+    target_index: u16,
+    payload_hash: &[u8; 32],
+    client_order_id: u64,
+) -> [u8; 32] {
+    hashv(&[
+        b"mango-v5-user-intent-v1",
+        group.as_ref(),
+        mango_account.as_ref(),
+        user_owner.as_ref(),
+        &[kind],
+        &[target_kind as u8],
+        &target_index.to_le_bytes(),
+        payload_hash,
+        &client_order_id.to_le_bytes(),
+    ])
+    .to_bytes()
+}
+
 fn canonical_user_intent_message_hex_utf8(msg_hash: [u8; 32]) -> [u8; 64] {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = [0u8; 64];

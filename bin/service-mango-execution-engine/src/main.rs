@@ -3091,6 +3091,18 @@ impl SequenceStore {
     }
 }
 
+/// Per-market v5 state. One entry per configured market_index; the
+/// commit-path looks these up by `request.target_index` so ETH/BTC
+/// intents land in their own sub-queues rather than being funneled
+/// into whichever market_index the relayer was started with.
+#[derive(Clone)]
+struct V5PerMarket {
+    market: Arc<v5_pipeline::V5MarketState>,
+    reveal_store: v5_pipeline::V5RevealStore,
+    next_sequence: v5_pipeline::V5NextSequence,
+    reveal_wal: Option<Arc<v4_reveal_wal::V4RevealWal>>,
+}
+
 #[derive(Clone)]
 struct Engine {
     config: Arc<Config>,
@@ -3109,10 +3121,11 @@ struct Engine {
     known_v3_pages: Arc<StdMutex<HashSet<Pubkey>>>,
     execute_nonce: Arc<AtomicU64>,
     // v5 commit-reveal route state ----------------------------------------
-    v5_market: Option<Arc<v5_pipeline::V5MarketState>>,
-    v5_reveal_store: v5_pipeline::V5RevealStore,
-    v5_next_sequence: v5_pipeline::V5NextSequence,
-    v5_reveal_wal: Option<Arc<v4_reveal_wal::V4RevealWal>>,
+    /// Per-market v5 state, keyed by `market_index`. Empty when v5 is off.
+    /// Intent routing is `self.v5_markets.get(&request.target_index)`, so
+    /// markets that aren't configured here simply return an error instead of
+    /// being silently routed through some other market's sub-queue.
+    v5_markets: Arc<std::collections::BTreeMap<u16, V5PerMarket>>,
     /// Mango accounts whose perp order slots are full. Keyed by account
     /// pubkey, value is the wall-clock ms when the block expires.  New
     /// intents targeting a blocked account are rejected immediately with
@@ -6667,34 +6680,43 @@ impl Engine {
             let mut instructions = vec![ComputeBudgetInstruction::set_compute_unit_limit(1_400_000)];
             // v5 commit-reveal route — single-account ring-buffer queue.
             // Identical commit/reveal semantics to v4, no page PDAs.
-            if let Some(v5_mkt) = self.v5_market.clone() {
-                let accounts_hash =
-                    v5_pipeline::hash_dispatch_accounts_for_reveal(&v5_mkt, &remaining_accounts);
-                let v5_seq = self
-                    .v5_next_sequence
+            // Route by `request.target_index` so ETH/BTC intents land in
+            // their own sub-queues rather than being funneled into whichever
+            // market the relayer was configured with at startup.
+            let v5_route_target = request.target_index as u16;
+            let v5_route_entry = self.v5_markets.get(&v5_route_target);
+            if let Some(v5pm) = v5_route_entry {
+                let v5_mkt = v5pm.market.clone();
+                let v5_reveal_store_ref = v5pm.reveal_store.clone();
+                let v5_next_seq_ref = v5pm.next_sequence.clone();
+                let v5_reveal_wal_ref = v5pm.reveal_wal.clone();
+                // P0.5: single unified user-intent hash. commit_hash and
+                // the message the user's ed25519 pre-ix signs over are now
+                // the same bytes. client_order_id is the 8-byte user
+                // randomizer that makes the pre-image unguessable.
+                let v5_seq = v5_next_seq_ref
                     .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                let commit_hash = v5_pipeline::canonical_commit_hash(
+                let client_order_id = request.client_order_id;
+                let commit_hash = v5_pipeline::canonical_user_intent_v3(
                     v5_mkt.group,
+                    mango_account,
+                    user_owner,
+                    0, // kind = CtmWrapped
+                    0, // target_kind = PerpMarket
                     v5_mkt.market_index,
-                    v5_seq,
-                    0, // CtmWrapped
                     &envelope.payload_hash,
-                    &accounts_hash,
-                    envelope.min_execute_slot,
-                    envelope.expires_at_slot,
+                    client_order_id,
                 );
                 debug!(
                     target: "v5_commit_debug",
                     seq = v5_seq,
                     n_remaining = remaining_accounts.len(),
+                    client_order_id,
                     payload_hash_hex = format!("{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
                         envelope.payload_hash[0], envelope.payload_hash[1],
                         envelope.payload_hash[2], envelope.payload_hash[3],
                         envelope.payload_hash[4], envelope.payload_hash[5],
                         envelope.payload_hash[6], envelope.payload_hash[7]),
-                    accounts_hash_hex = format!("{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-                        accounts_hash[0], accounts_hash[1], accounts_hash[2], accounts_hash[3],
-                        accounts_hash[4], accounts_hash[5], accounts_hash[6], accounts_hash[7]),
                     commit_hash_hex = format!("{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
                         commit_hash[0], commit_hash[1], commit_hash[2], commit_hash[3],
                         commit_hash[4], commit_hash[5], commit_hash[6], commit_hash[7]),
@@ -6707,13 +6729,10 @@ impl Engine {
                     min_execute_slot: envelope.min_execute_slot,
                     expires_at_slot: envelope.expires_at_slot,
                 };
-                let user_intent_msg = v5_pipeline::canonical_user_intent_v2(
-                    v5_mkt.group,
-                    mango_account,
-                    user_owner,
-                    v5_mkt.market_index,
-                    &envelope.payload_hash,
-                );
+                // user_intent_msg == commit_hash under the unified scheme —
+                // the user's signature covers the same bytes the program
+                // stores, so we don't derive a separate hash anymore.
+                let user_intent_msg = commit_hash;
                 let reveal_entry = v5_pipeline::V5RevealEntry {
                     sequence: v5_seq,
                     payload: request.payload.clone(),
@@ -6723,17 +6742,41 @@ impl Engine {
                     mango_account,
                     user_sig: Some(user_signature),
                     user_intent_hash: Some(user_intent_msg),
-                    // Bound into the commit_hash at line ~6680 above; the
-                    // on-chain reveal handler recomputes the same hash and
-                    // rejects any mismatch, so these MUST round-trip exactly.
                     min_execute_slot: envelope.min_execute_slot,
                     expires_at_slot: envelope.expires_at_slot,
-                    // kind is pinned to 0 (CtmWrapped) in the commit_hash
-                    // computation above; keep in lockstep here. If the
-                    // commit ever takes envelope.kind, update both sites.
                     kind: 0,
+                    client_order_id,
                 };
-                if let Some(wal) = self.v5_reveal_wal.as_ref() {
+                // Commit-time dedup: before inserting into reveal_store,
+                // check that seq isn't already occupied by a different
+                // pending commit. This can happen when drift-resync rewinds
+                // the local counter to a seq whose on-chain commit_hash is
+                // still in play but whose reveal_store entry was purged
+                // (e.g., by the aggressive stale-in-flight purge). Without
+                // this check, a later commit at the same seq would silently
+                // overwrite the reveal material and every reveal attempt
+                // would fail 6122 (stored hash is from commit #1, payload
+                // in reveal_store is from commit #2). Explicit reject
+                // here lets the bot retry and get a fresh seq from the
+                // drift-resync'd counter.
+                {
+                    let store = v5_reveal_store_ref.lock();
+                    if store.contains_key(&v5_seq) {
+                        drop(store);
+                        warn!(
+                            seq = v5_seq,
+                            market_index = v5_mkt.market_index,
+                            "v5 commit reject: seq collision — reveal_store already has an entry at this seq from a prior (un-revealed) commit"
+                        );
+                        self.metrics
+                            .ingress_rejected_total
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return Err(Status::resource_exhausted(format!(
+                            "v5 sequence {v5_seq} collision — retry"
+                        )));
+                    }
+                }
+                if let Some(wal) = v5_reveal_wal_ref.as_ref() {
                     if let Err(e) = wal.append_insert(&reveal_entry) {
                         warn!("v5 reveal WAL append failed for seq {v5_seq}: {e}");
                         return Err(Status::internal(format!(
@@ -6742,7 +6785,23 @@ impl Engine {
                     }
                 }
                 {
-                    let mut store = self.v5_reveal_store.lock();
+                    let mut store = v5_reveal_store_ref.lock();
+                    // Race guard: re-check after acquiring the write lock.
+                    if store.contains_key(&v5_seq) {
+                        drop(store);
+                        // Undo the WAL insert we just appended.
+                        if let Some(wal) = v5_reveal_wal_ref.as_ref() {
+                            let _ = wal.append_remove(v5_seq);
+                        }
+                        warn!(
+                            seq = v5_seq,
+                            market_index = v5_mkt.market_index,
+                            "v5 commit reject: seq collision detected under write lock (concurrent submits)"
+                        );
+                        return Err(Status::resource_exhausted(format!(
+                            "v5 sequence {v5_seq} collision — retry"
+                        )));
+                    }
                     store.insert(v5_seq, reveal_entry);
                 }
                 let commit_tx = v5_pipeline::build_commit_market_tx(
@@ -6753,25 +6812,26 @@ impl Engine {
                     entry,
                     chain.blockhash,
                 );
-                let sig = match self
-                    .rpc
-                    .send_transaction_with_config(
-                        &commit_tx,
-                        solana_client::rpc_config::RpcSendTransactionConfig {
-                            skip_preflight: true,
-                            max_retries: Some(0),
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                {
-                    Ok(s) => s,
+                let commit_cfg = solana_client::rpc_config::RpcSendTransactionConfig {
+                    skip_preflight: true,
+                    max_retries: Some(0),
+                    ..Default::default()
+                };
+                let commit_res = v5_pipeline::send_legacy_tx_with_failover(
+                    &self.rpc,
+                    self.secondary_rpc.as_deref(),
+                    &commit_tx,
+                    commit_cfg,
+                )
+                .await;
+                let sig = match commit_res {
+                    Ok((s, _via_secondary)) => s,
                     Err(e) => {
                         {
-                            let mut store = self.v5_reveal_store.lock();
+                            let mut store = v5_reveal_store_ref.lock();
                             store.remove(&v5_seq);
                         }
-                        if let Some(wal) = self.v5_reveal_wal.as_ref() {
+                        if let Some(wal) = v5_reveal_wal_ref.as_ref() {
                             if let Err(werr) = wal.append_remove(v5_seq) {
                                 warn!(
                                     "v5 reveal WAL tombstone failed for seq {v5_seq}: {werr}"
@@ -12544,102 +12604,290 @@ async fn async_main() -> Result<()> {
     };
 
 
-    // v5 market state — present when V5_ROUTE_ALL=1. Reuses the V4_* pubkey
-    // env vars (same group/perp/oracle); the queue PDA is derived, not env-configured.
-    let v5_market = if config.v5_route_all {
-        let all_set = config.v4_group.is_some()
-            && config.v4_authority_state.is_some()
-            && config.v4_perp_market.is_some()
-            && config.v4_perp_bids.is_some()
-            && config.v4_perp_asks.is_some()
-            && config.v4_perp_event_queue.is_some()
-            && config.v4_perp_oracle.is_some()
-            && config.v4_usdc_bank.is_some()
-            && config.v4_usdc_oracle.is_some();
-        if !all_set {
-            return Err(anyhow!(
-                "V5_ROUTE_ALL=1 but some V4_* pubkey env vars are missing"
-            ));
-        }
-        let group = config.v4_group.unwrap();
-        let (queue, _) = v5_pipeline::derive_queue_v5_pda(&config.program_id, &group);
-        let mkt = Arc::new(v5_pipeline::V5MarketState {
-            program_id: config.program_id,
-            group,
-            authority_state: config.v4_authority_state.unwrap(),
-            queue,
-            perp_market: config.v4_perp_market.unwrap(),
-            perp_bids: config.v4_perp_bids.unwrap(),
-            perp_asks: config.v4_perp_asks.unwrap(),
-            perp_event_queue: config.v4_perp_event_queue.unwrap(),
-            perp_oracle: config.v4_perp_oracle.unwrap(),
-            usdc_bank: config.v4_usdc_bank.unwrap(),
-            usdc_oracle: config.v4_usdc_oracle.unwrap(),
-            market_index: config.v4_market_index,
-            payer: config.payer.pubkey(),
-        });
-        info!(
-            "v5 route enabled: group={} queue={} perp_market={} market_index={}",
-            mkt.group, mkt.queue, mkt.perp_market, mkt.market_index
-        );
-        Some(mkt)
-    } else {
-        None
-    };
-
-    let (v5_start_seq, v5_head_seq): (u64, u64) = if let Some(mkt) = v5_market.as_ref() {
-        match rpc.get_account(&mkt.queue).await {
-            Ok(acct) => {
-                let (start, head) =
-                    v5_pipeline::read_starting_sequences(&acct.data, mkt.market_index);
-                info!("v5 starting sequence = {} head = {}", start, head);
-                (start, head)
-            }
-            Err(e) => {
-                warn!("v5 queue fetch failed: {e}, starting at 0");
-                (0, 0)
-            }
-        }
-    } else {
-        (0, 0)
-    };
-    let v5_next_sequence = Arc::new(AtomicU64::new(v5_start_seq));
-
-    let v5_reveal_wal: Option<Arc<v4_reveal_wal::V4RevealWal>> =
-        match config.v5_reveal_wal_path.as_ref() {
-            Some(path) => match v4_reveal_wal::V4RevealWal::open(path) {
-                Ok(w) => {
-                    info!("v5 reveal WAL opened at {path:?}");
-                    Some(Arc::new(w))
-                }
-                Err(e) => {
-                    warn!("v5 reveal WAL open failed ({path:?}): {e}; persistence disabled");
-                    None
-                }
-            },
-            None => None,
-        };
-    let mut v5_initial_entries: std::collections::BTreeMap<u64, v4_pipeline::V4RevealEntry> =
+    // v5 markets — one V5PerMarket per configured market_index.
+    //
+    // Config source (env):
+    //   V5_MARKETS=<csv of market indices>     # e.g. "2,3,4"
+    //   V5_M<idx>_PERP_MARKET=<pubkey>
+    //   V5_M<idx>_PERP_BIDS=<pubkey>
+    //   V5_M<idx>_PERP_ASKS=<pubkey>
+    //   V5_M<idx>_PERP_EVENT_QUEUE=<pubkey>
+    //   V5_M<idx>_PERP_ORACLE=<pubkey>
+    //
+    // Shared across all markets (reuses V4_* for continuity with existing
+    // deploys; the queue PDA is derived, not env-configured):
+    //   V4_GROUP, V4_AUTHORITY_STATE, V4_USDC_BANK, V4_USDC_ORACLE
+    //
+    // Legacy single-market fallback: if V5_MARKETS is unset but V5_ROUTE_ALL
+    // and V4_PERP_* are present, register one market at V4_MARKET_INDEX.
+    let mut v5_markets_map: std::collections::BTreeMap<u16, V5PerMarket> =
         std::collections::BTreeMap::new();
-    if let Some(wal) = v5_reveal_wal.as_ref() {
-        match wal.replay_live(v5_head_seq) {
-            Ok(entries) => {
-                if !entries.is_empty() {
-                    info!(
-                        "v5 reveal WAL replay: {} entries restored (head={})",
-                        entries.len(),
-                        v5_head_seq
-                    );
+
+    if config.v5_route_all {
+        let group = config
+            .v4_group
+            .ok_or_else(|| anyhow!("V5 requires V4_GROUP"))?;
+        let authority_state = config
+            .v4_authority_state
+            .ok_or_else(|| anyhow!("V5 requires V4_AUTHORITY_STATE"))?;
+        let usdc_bank = config
+            .v4_usdc_bank
+            .ok_or_else(|| anyhow!("V5 requires V4_USDC_BANK"))?;
+        let usdc_oracle = config
+            .v4_usdc_oracle
+            .ok_or_else(|| anyhow!("V5 requires V4_USDC_ORACLE"))?;
+        let (queue, _) = v5_pipeline::derive_queue_v5_pda(&config.program_id, &group);
+
+        // Build an ordered list of market indices to configure.
+        let market_indices: Vec<u16> = match std::env::var("V5_MARKETS").ok() {
+            Some(csv) if !csv.trim().is_empty() => csv
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.parse::<u16>())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| anyhow!("V5_MARKETS parse: {e}"))?,
+            _ => {
+                // Legacy single-market fallback.
+                if config.v4_perp_market.is_some() {
+                    vec![config.v4_market_index]
+                } else {
+                    return Err(anyhow!(
+                        "V5_ROUTE_ALL=true but V5_MARKETS is unset and V4_PERP_MARKET is missing — \
+                         configure at least one market"
+                    ));
                 }
-                v5_initial_entries = entries;
             }
-            Err(e) => {
-                warn!("v5 reveal WAL replay failed: {e}; starting with empty store");
+        };
+
+        for idx in market_indices {
+            // Prefer V5_M<idx>_*; fall back to V4_PERP_* if idx matches the
+            // legacy V4_MARKET_INDEX (keeps one-market deploys working without
+            // touching env).
+            let key = |suffix: &str| format!("V5_M{}_{}", idx, suffix);
+            let env_or = |name: &str, fallback: Option<Pubkey>| -> Result<Pubkey> {
+                match std::env::var(name).ok().filter(|s| !s.is_empty()) {
+                    Some(s) => s
+                        .parse()
+                        .map_err(|e| anyhow!("{name}: parse pubkey: {e}")),
+                    None => fallback.ok_or_else(|| {
+                        anyhow!("{name} is unset and no fallback available for market_index={idx}")
+                    }),
+                }
+            };
+            let use_v4_fallback = idx == config.v4_market_index;
+            let perp_market = env_or(
+                &key("PERP_MARKET"),
+                if use_v4_fallback {
+                    config.v4_perp_market
+                } else {
+                    None
+                },
+            )?;
+            let perp_bids = env_or(
+                &key("PERP_BIDS"),
+                if use_v4_fallback {
+                    config.v4_perp_bids
+                } else {
+                    None
+                },
+            )?;
+            let perp_asks = env_or(
+                &key("PERP_ASKS"),
+                if use_v4_fallback {
+                    config.v4_perp_asks
+                } else {
+                    None
+                },
+            )?;
+            let perp_event_queue = env_or(
+                &key("PERP_EVENT_QUEUE"),
+                if use_v4_fallback {
+                    config.v4_perp_event_queue
+                } else {
+                    None
+                },
+            )?;
+            let perp_oracle = env_or(
+                &key("PERP_ORACLE"),
+                if use_v4_fallback {
+                    config.v4_perp_oracle
+                } else {
+                    None
+                },
+            )?;
+            let mkt = Arc::new(v5_pipeline::V5MarketState {
+                program_id: config.program_id,
+                group,
+                authority_state,
+                queue,
+                perp_market,
+                perp_bids,
+                perp_asks,
+                perp_event_queue,
+                perp_oracle,
+                usdc_bank,
+                usdc_oracle,
+                market_index: idx,
+                payer: config.payer.pubkey(),
+            });
+
+            // Per-market starting sequence (read from on-chain sub-queue).
+            let (start_seq, head_seq, on_chain_max_seen, on_chain_live_count) =
+                match rpc.get_account(&mkt.queue).await {
+                    Ok(acct) => {
+                        let (start, head) =
+                            v5_pipeline::read_starting_sequences(&acct.data, mkt.market_index);
+                        let snap = v5_pipeline::read_sub_queue_snapshot(
+                            &acct.data,
+                            mkt.market_index,
+                        );
+                        let (max_seen, live) = snap.unwrap_or((0, 0));
+                        (start, head, max_seen, live)
+                    }
+                    Err(e) => {
+                        warn!("v5 queue fetch failed for market {idx}: {e}; starting at 0");
+                        (0, 0, 0, 0)
+                    }
+                };
+
+            // Per-market WAL file. Derive from v5_reveal_wal_path by inserting
+            // `-<idx>` before the extension: /x/v5-reveal-wal.jsonl ->
+            // /x/v5-reveal-wal-2.jsonl. Separate files prevent cross-market
+            // sequence collisions on replay.
+            let reveal_wal: Option<Arc<v4_reveal_wal::V4RevealWal>> =
+                match config.v5_reveal_wal_path.as_ref() {
+                    Some(base) => {
+                        let stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or("v5-reveal-wal");
+                        let ext = base.extension().and_then(|s| s.to_str()).unwrap_or("jsonl");
+                        let per_market = base.with_file_name(format!("{}-{}.{}", stem, idx, ext));
+                        match v4_reveal_wal::V4RevealWal::open(&per_market) {
+                            Ok(w) => {
+                                info!("v5 reveal WAL for market {idx} opened at {per_market:?}");
+                                Some(Arc::new(w))
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "v5 reveal WAL open failed for market {idx} at {per_market:?}: {e}; \
+                                     persistence disabled for this market"
+                                );
+                                None
+                            }
+                        }
+                    }
+                    None => None,
+                };
+
+            let mut initial_entries: std::collections::BTreeMap<u64, v4_pipeline::V4RevealEntry> =
+                std::collections::BTreeMap::new();
+            if let Some(wal) = reveal_wal.as_ref() {
+                match wal.replay_live(head_seq) {
+                    Ok(entries) => {
+                        if !entries.is_empty() {
+                            info!(
+                                "v5 reveal WAL replay (market {idx}): {} entries restored (head={})",
+                                entries.len(),
+                                head_seq
+                            );
+                        }
+                        initial_entries = entries;
+                    }
+                    Err(e) => warn!(
+                        "v5 reveal WAL replay (market {idx}) failed: {e}; starting empty"
+                    ),
+                }
             }
+
+            // Reconcile restored WAL entries against the on-chain queue. Any
+            // restored entry that can't map to a pending on-chain commit is
+            // an orphan (pre-restart commit-send error, aggressive drift
+            // purge, or pre-dedup overwrite) and will burn forever as a
+            // 6122 mismatch if left in the store — the reveal worker would
+            // keep re-sending its stale payload against whatever hash the
+            // chain actually holds at that seq slot.
+            //
+            // Two cases:
+            //   live_count == 0:  no commits pending on chain → every
+            //                     restored entry is an orphan, drop all.
+            //   live_count  > 0:  pending range is [head_seq, max_seen].
+            //                     Entries above max_seen never landed on
+            //                     chain (commit failed or was dropped).
+            let orphans: Vec<u64> = if on_chain_live_count == 0 {
+                initial_entries.keys().copied().collect()
+            } else {
+                initial_entries
+                    .range(on_chain_max_seen.saturating_add(1)..)
+                    .map(|(k, _)| *k)
+                    .collect()
+            };
+            if !orphans.is_empty() {
+                warn!(
+                    "v5 WAL reconcile (market {idx}): dropping {} orphan entries \
+                     (on_chain_head={}, on_chain_max_seen={}, live_count={}); \
+                     first={} last={}",
+                    orphans.len(),
+                    head_seq,
+                    on_chain_max_seen,
+                    on_chain_live_count,
+                    orphans.first().copied().unwrap_or(0),
+                    orphans.last().copied().unwrap_or(0),
+                );
+                for seq in &orphans {
+                    initial_entries.remove(seq);
+                    if let Some(wal) = reveal_wal.as_ref() {
+                        if let Err(e) = wal.append_remove(*seq) {
+                            warn!(
+                                "v5 WAL reconcile (market {idx}): tombstone append for seq {} failed: {e}",
+                                seq
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Seed the atomic counter past any restored entry so the first
+            // fetch_add after startup doesn't collide with a WAL-restored
+            // seq (the dedup check would reject it and the commit would
+            // fail with resource_exhausted). Normally the chain's
+            // max_seen+1 already covers this; we take the max as a belt
+            // against WAL files that are somehow ahead of on-chain state.
+            let max_restored_seq = initial_entries
+                .keys()
+                .next_back()
+                .copied()
+                .unwrap_or(0);
+            let seed_seq = start_seq.max(max_restored_seq.saturating_add(1));
+            let next_sequence = Arc::new(AtomicU64::new(seed_seq));
+
+            let reveal_store: v5_pipeline::V5RevealStore =
+                Arc::new(parking_lot::Mutex::new(initial_entries));
+
+            info!(
+                "v5 market configured: idx={} perp_market={} oracle={} \
+                 start_seq={} head_seq={} on_chain_max_seen={} live_count={} \
+                 wal_restored={} seed_seq={}",
+                idx,
+                perp_market,
+                perp_oracle,
+                start_seq,
+                head_seq,
+                on_chain_max_seen,
+                on_chain_live_count,
+                reveal_store.lock().len(),
+                seed_seq,
+            );
+            v5_markets_map.insert(
+                idx,
+                V5PerMarket {
+                    market: mkt,
+                    reveal_store,
+                    next_sequence,
+                    reveal_wal,
+                },
+            );
         }
     }
-    let v5_reveal_store: v5_pipeline::V5RevealStore =
-        Arc::new(parking_lot::Mutex::new(v5_initial_entries));
+    let v5_markets = Arc::new(v5_markets_map);
 
     let engine = Arc::new(Engine {
         config: config.clone(),
@@ -12655,10 +12903,7 @@ async fn async_main() -> Result<()> {
         configured_queue_v3: configured_queue_v3.clone(),
         known_v3_pages: Arc::new(StdMutex::new(HashSet::new())),
         execute_nonce: Arc::new(AtomicU64::new(1)),
-        v5_market: v5_market.clone(),
-        v5_reveal_store: v5_reveal_store.clone(),
-        v5_next_sequence: v5_next_sequence.clone(),
-        v5_reveal_wal: v5_reveal_wal.clone(),
+        v5_markets: v5_markets.clone(),
         blocked_mango_accounts: Arc::new(Mutex::new(HashMap::new())),
         unique_addresses: unique_addresses.clone(),
         latency_optimistic_tracker: latency_optimistic_tracker.clone(),
@@ -12674,29 +12919,34 @@ async fn async_main() -> Result<()> {
         ingress_rate_slots: Arc::new(StdMutex::new(HashMap::new())),
     });
 
-    // v5 reveal worker — single-account ring-buffer queue. No page-init worker.
-    if let Some(mkt) = engine.v5_market.clone() {
+    // v5 reveal / drift / autodrop workers — one triplet per configured
+    // market_index. No page-init worker in v5 (single-account layout).
+    for (idx, v5pm) in engine.v5_markets.iter() {
+        let mkt = v5pm.market.clone();
+        let reveal_store = v5pm.reveal_store.clone();
+        let next_sequence = v5pm.next_sequence.clone();
+        let reveal_wal = v5pm.reveal_wal.clone();
         let rpc_c = engine.rpc.clone();
         let payer_c = engine.config.payer.clone();
         let admin_c = engine.config.ctm.clone();
-        let store_c = engine.v5_reveal_store.clone();
         let spacing_ms = engine.config.v4_reveal_spacing_ms;
         let pipeline_depth = engine.config.v4_reveal_pipeline_depth;
         let stall = v5_pipeline::V5HeadStallState::default();
 
         v5_pipeline::spawn_reveal_worker(
             rpc_c.clone(),
+            engine.secondary_rpc.clone(),
             mkt.clone(),
             payer_c.clone(),
-            store_c,
+            reveal_store.clone(),
             spacing_ms,
             pipeline_depth,
             stall.clone(),
-            engine.v5_reveal_wal.clone(),
+            reveal_wal.clone(),
         );
         info!(
-            "v5 reveal worker spawned (spacing_ms={} pipeline_depth={})",
-            spacing_ms, pipeline_depth
+            "v5 reveal worker spawned: market={} spacing_ms={} pipeline_depth={}",
+            idx, spacing_ms, pipeline_depth
         );
 
         let drift_interval_ms = engine.config.v4_drift_resync_interval_ms;
@@ -12704,14 +12954,14 @@ async fn async_main() -> Result<()> {
         v5_pipeline::spawn_drift_resync_worker(
             rpc_c.clone(),
             mkt.clone(),
-            engine.v5_next_sequence.clone(),
-            engine.v5_reveal_store.clone(),
+            next_sequence.clone(),
+            reveal_store.clone(),
             drift_interval_ms,
             drift_max_lookahead,
         );
         info!(
-            "v5 drift-resync worker spawned (interval_ms={} max_lookahead={})",
-            drift_interval_ms, drift_max_lookahead
+            "v5 drift-resync worker spawned: market={} interval_ms={} max_lookahead={}",
+            idx, drift_interval_ms, drift_max_lookahead
         );
 
         if engine.config.v4_autodrop_enabled {
@@ -12724,6 +12974,7 @@ async fn async_main() -> Result<()> {
             };
             v5_pipeline::spawn_autodrop_worker(
                 rpc_c.clone(),
+                engine.secondary_rpc.clone(),
                 mkt.clone(),
                 admin_c.clone(),
                 payer_c.clone(),
@@ -12731,7 +12982,8 @@ async fn async_main() -> Result<()> {
                 autodrop_cfg,
             );
             info!(
-                "v5 autodrop worker spawned (stall_secs={} min_attempts={} max_per_min={})",
+                "v5 autodrop worker spawned: market={} stall_secs={} min_attempts={} max_per_min={}",
+                idx,
                 engine.config.v4_autodrop_stall_secs,
                 engine.config.v4_autodrop_min_attempts,
                 engine.config.v4_autodrop_max_per_min
@@ -12739,6 +12991,9 @@ async fn async_main() -> Result<()> {
         } else {
             info!("v5 autodrop worker disabled (V4_AUTODROP_ENABLED=false)");
         }
+    }
+    if engine.v5_markets.is_empty() {
+        info!("v5 disabled — no markets configured");
     }
 
     // Spawn the bg submitter worker pool. Each worker shares the receiver

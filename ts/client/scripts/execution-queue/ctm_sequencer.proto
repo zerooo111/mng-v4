@@ -23,6 +23,12 @@ message SubmitIntentRequest {
   uint32 intent_version = 12;
   uint32 target_kind = 13;
   uint32 target_index = 14;
+  // P0.5 single-hash migration: 8-byte random randomizer the user
+  // generated when signing the intent. Bound into
+  // canonical_user_intent_v3 on-chain. 0 is a valid placeholder for
+  // non-user-signed intents (relayer-originated sweeps, admin ops);
+  // user-signed intents MUST set a random value per intent.
+  uint64 client_order_id = 15;
 }
 
 message SubmitIntentResponse {

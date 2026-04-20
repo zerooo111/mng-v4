@@ -13,7 +13,7 @@ use anchor_lang::solana_program::program::invoke;
 use anchor_lang::solana_program::system_instruction;
 
 use super::execution_queue::{
-    canonical_user_intent_message_v2, decode_queue_payload, dispatch_queue_payload,
+    canonical_user_intent_message_v3, decode_queue_payload, dispatch_queue_payload,
     extract_user_owner_for_ctm_payload, prevalidate_terminal_ctm_payload,
     queue_health_region_begin, queue_health_region_end, queue_health_region_spec,
     queue_item_kind_for_payload_variant, require_dispatch_market_index, terminal_ctm_failure_msg,
@@ -60,49 +60,24 @@ pub struct CommitEntryV5 {
 }
 
 /// Reveal args: relayer presents the real intent data; program
-/// recomputes the commit_hash and rejects any mismatch.
+/// recomputes the single unified user-intent hash and rejects any
+/// mismatch. `client_order_id` is the user-supplied 8-byte randomizer
+/// that the user signed over — passing it unchanged is what proves
+/// the reveal is authorized.
+///
+/// `mango_account` and `user_owner` must be supplied here too because
+/// the unified hash binds both. They're present as named accounts on
+/// the reveal ix, but we carry them as explicit args so the hash
+/// recomputation doesn't need to guess which remaining-account slots
+/// are the user binding.
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
 pub struct RevealArgsV5 {
     pub payload: Vec<u8>,
     pub kind: u8,
     pub dispatch_accounts_count: u8,
-}
-
-fn canonical_commit_message_v5(
-    group: Pubkey,
-    market_index: u16,
-    sequence: u64,
-    kind: u8,
-    payload_hash: &[u8; 32],
-    min_execute_slot: u64,
-    expires_at_slot: u64,
-) -> [u8; 32] {
-    // Wire version bumped to v5 because we dropped `accounts_hash` from the
-    // binding. Rationale: including accounts_hash let an observer with a
-    // candidate list of mango_accounts fingerprint which account committed
-    // *before* reveal, since they could replay the hash computation. Removing
-    // accounts_hash gives proper commit-time privacy.
-    //
-    // The mango_account → payload binding is still enforced at reveal via the
-    // user's ed25519 signature over `canonical_user_intent_v2`, which covers
-    // (group, mango_account, user_owner, kind, target_kind, target_index,
-    // payload_hash). A malicious relayer cannot substitute a different
-    // mango_account without failing that signature check.
-    //
-    // Changing the wire prefix means stored v4 commits can't be revealed
-    // against v5 reveals — callers must drain any in-flight queue before
-    // upgrade (we do this via WAL truncate in the relayer restart flow).
-    hashv(&[
-        b"mango-v5-commit-v1",
-        group.as_ref(),
-        &market_index.to_le_bytes(),
-        &sequence.to_le_bytes(),
-        &[kind],
-        payload_hash,
-        &min_execute_slot.to_le_bytes(),
-        &expires_at_slot.to_le_bytes(),
-    ])
-    .to_bytes()
+    pub client_order_id: u64,
+    pub mango_account: Pubkey,
+    pub user_owner: Pubkey,
 }
 
 fn canonical_commit_batch_message_v5(
@@ -581,24 +556,25 @@ pub fn execution_queue_v5_reveal_execute_market(
         let dispatch_accounts = &ctx.remaining_accounts[cursor..cursor + count];
         cursor += count;
 
-        // Recompute commit_hash and compare to stored. accounts_hash is NOT
-        // part of the v5 commit binding (privacy — dropped in the v5 wire).
-        // The mango_account binding is enforced below via the user ed25519
-        // signature over `canonical_user_intent_v2`, which covers
-        // (group, mango_account, user_owner, kind, target_kind, target_index,
-        // payload_hash). A relayer substituting dispatch_accounts would fail
-        // that signature check for user-signed variants; non-user-signed
-        // variants rely on perp_market / bank constraints enforced by
-        // `validate_queue_payload_dispatch_accounts` below.
+        // Recompute the single unified user-intent hash and compare to the
+        // stored commit_hash. This replaces the earlier two-hash scheme
+        // (relayer-signed commit_hash + user-signed user_intent_v2).
+        // `client_order_id` randomizes the pre-image so the commit stays
+        // private even when payload shapes are small / predictable.
+        //
+        // mango_account + user_owner arrive as explicit RevealArgsV5 fields
+        // rather than inferred from dispatch_accounts: this keeps the hash
+        // computation purely argument-driven, independent of recipe layout.
         let payload_hash = hashv(&[&reveal.payload]).to_bytes();
-        let expected_commit_hash = canonical_commit_message_v5(
+        let expected_commit_hash = canonical_user_intent_message_v3(
             group_key,
-            market_index,
-            head_item.sequence,
+            reveal.mango_account,
+            reveal.user_owner,
             reveal.kind,
+            UserIntentTargetKind::PerpMarket,
+            market_index,
             &payload_hash,
-            head_item.min_execute_slot,
-            head_item.expires_at_slot,
+            reveal.client_order_id,
         );
         if expected_commit_hash != head_item.commit_hash {
             // Surface diverging inputs so 6122 is diagnosable from tx logs
@@ -638,7 +614,7 @@ pub fn execution_queue_v5_reveal_execute_market(
                 "v5 reveal commit_hash mismatch: seq={} market={} kind={} \
                  expected_prefix={:#x} stored_prefix={:#x} \
                  payload_prefix={:#x} payload_len={} \
-                 min_exec={} exp={}",
+                 client_order_id={} mango_account={} user_owner={}",
                 head_item.sequence,
                 market_index,
                 reveal.kind,
@@ -646,8 +622,9 @@ pub fn execution_queue_v5_reveal_execute_market(
                 stored_prefix,
                 payload_prefix,
                 reveal.payload.len(),
-                head_item.min_execute_slot,
-                head_item.expires_at_slot,
+                reveal.client_order_id,
+                reveal.mango_account,
+                reveal.user_owner,
             );
             return err!(MangoError::ExecutionQueueV5CommitRevealMismatch);
         }
@@ -723,23 +700,32 @@ pub fn execution_queue_v5_reveal_execute_market(
         require_dispatch_market_index(dispatch_accounts, market_index)?;
         validate_queue_payload_dispatch_accounts(group_key, &decoded_payload, dispatch_accounts)?;
 
-        // User-signature for variants that require it.
+        // User-signature for variants that require it. The unified hash
+        // (already computed and matched against the stored commit above)
+        // IS what the user signs, so we verify the ed25519 pre-ix against
+        // `expected_commit_hash` directly — no second hash computation.
+        //
+        // Also cross-check that the mango_account / user_owner carried in
+        // RevealArgsV5 match the accounts named in dispatch_accounts; the
+        // hash binding already catches substitution, but the explicit
+        // equality gives cleaner error messages.
         if variant_uses_user_signature(decoded_payload.variant) {
             let (mango_account_key, user_owner) =
                 extract_user_owner_for_ctm_payload(group_key, dispatch_accounts)?;
-            let user_intent_hash_v2 = canonical_user_intent_message_v2(
-                group_key,
+            require_keys_eq!(
                 mango_account_key,
+                reveal.mango_account,
+                MangoError::ExecutionQueueV5RevealEnvelopeMismatch
+            );
+            require_keys_eq!(
                 user_owner,
-                reveal.kind,
-                UserIntentTargetKind::PerpMarket,
-                market_index,
-                &payload_hash,
+                reveal.user_owner,
+                MangoError::ExecutionQueueV5RevealEnvelopeMismatch
             );
             verify_user_ed25519_preinstruction(
                 ctx.accounts.instructions.as_ref(),
                 user_owner,
-                &[user_intent_hash_v2],
+                &[expected_commit_hash],
             )?;
         }
 

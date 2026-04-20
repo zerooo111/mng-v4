@@ -80,6 +80,12 @@ struct WalEntry {
     expires_at_slot: u64,
     #[serde(default)]
     kind: u8,
+    /// P0.5 single-hash migration: user-supplied 8-byte randomizer bound
+    /// into canonical_user_intent_v3. Pre-migration entries deserialize
+    /// as 0; the reveal will then fail commit-hash match and get handled
+    /// via the autodrop path.
+    #[serde(default)]
+    client_order_id: u64,
 }
 
 impl From<&V4RevealEntry> for WalEntry {
@@ -96,6 +102,7 @@ impl From<&V4RevealEntry> for WalEntry {
             min_execute_slot: e.min_execute_slot,
             expires_at_slot: e.expires_at_slot,
             kind: e.kind,
+            client_order_id: e.client_order_id,
         }
     }
 }
@@ -114,6 +121,7 @@ impl From<&WalEntry> for V4RevealEntry {
             min_execute_slot: w.min_execute_slot,
             expires_at_slot: w.expires_at_slot,
             kind: w.kind,
+            client_order_id: w.client_order_id,
         }
     }
 }
@@ -275,6 +283,7 @@ mod tests {
             min_execute_slot: 0,
             expires_at_slot: 0,
             kind: 0,
+            client_order_id: seq.wrapping_mul(0xDEAD_BEEF),
         }
     }
 

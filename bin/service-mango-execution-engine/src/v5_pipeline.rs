@@ -6,9 +6,10 @@ use anchor_lang::{InstructionData, ToAccountMetas};
 use anyhow::{anyhow, Result};
 use mango_v4::instructions::{CommitEntryV5, ExecutionQueueV5GlobalPauseParams, RevealArgsV5};
 use mango_v4::state::{
-    EXECUTION_QUEUE_V5_N_MAX_MARKETS, EXECUTION_QUEUE_V5_SUB_QUEUE_HEADERS_OFFSET,
-    EXECUTION_QUEUE_V5_SUB_QUEUE_HEADER_STRIDE, SQH_V5_ACTIVE_OFFSET, SQH_V5_LIVE_COUNT_OFFSET,
-    SQH_V5_MARKET_INDEX_OFFSET, SQH_V5_MAX_SEEN_SEQ_OFFSET, SQH_V5_NEXT_SEQ_OFFSET,
+    EXECUTION_QUEUE_V5_N_MAX_MARKETS, EXECUTION_QUEUE_V5_PER_MARKET_CAPACITY,
+    EXECUTION_QUEUE_V5_SUB_QUEUE_HEADERS_OFFSET, EXECUTION_QUEUE_V5_SUB_QUEUE_HEADER_STRIDE,
+    SQH_V5_ACTIVE_OFFSET, SQH_V5_LIVE_COUNT_OFFSET, SQH_V5_MARKET_INDEX_OFFSET,
+    SQH_V5_MAX_SEEN_SEQ_OFFSET, SQH_V5_NEXT_SEQ_OFFSET,
 };
 use solana_client::{
     nonblocking::rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig,
@@ -41,6 +42,85 @@ fn hex_short(h: &[u8; 32]) -> String {
         let _ = write!(s, "{:02x}", b);
     }
     s
+}
+
+// ---------------------------------------------------------------------------
+// RPC failover — Helius → Triton on throttle-class errors
+// ---------------------------------------------------------------------------
+
+/// Helius periodically returns a cluster of throttle-class errors when the
+/// pooled HTTP/2 connection hits its internal reset limit. Solana's
+/// reqwest-based RpcClient surfaces these as nested strings that don't map
+/// cleanly to a specific variant — match on the message instead.
+pub fn is_rpc_throttle_error(err: &solana_client::client_error::ClientError) -> bool {
+    let s = err.to_string();
+    s.contains("too_many_internal_resets")
+        || s.contains("detected excessive load generating behavior")
+        || s.contains("http2 error: connection error detected")
+        || s.contains("connection error detected")
+        || s.contains("connection closed before message completed")
+}
+
+/// Send a versioned transaction via `primary`; on throttle-class errors,
+/// fall back to `secondary` when configured. Returns the landed signature
+/// and a bool indicating whether the secondary handled the send.
+pub async fn send_tx_with_failover(
+    primary: &RpcClient,
+    secondary: Option<&RpcClient>,
+    tx: &solana_sdk::transaction::VersionedTransaction,
+    cfg: RpcSendTransactionConfig,
+) -> std::result::Result<(solana_sdk::signature::Signature, bool), solana_client::client_error::ClientError>
+{
+    match primary.send_transaction_with_config(tx, cfg).await {
+        Ok(sig) => Ok((sig, false)),
+        Err(e) if is_rpc_throttle_error(&e) => {
+            if let Some(sec) = secondary {
+                warn!(
+                    target: "rpc_failover",
+                    error = %e,
+                    "primary RPC throttled; failing over to secondary"
+                );
+                match sec.send_transaction_with_config(tx, cfg).await {
+                    Ok(sig) => Ok((sig, true)),
+                    Err(e2) => Err(e2),
+                }
+            } else {
+                Err(e)
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Legacy-transaction variant of `send_tx_with_failover`. The reveal and
+/// autodrop paths build `solana_sdk::transaction::Transaction` (not
+/// VersionedTransaction), so they need a separate entry point.
+pub async fn send_legacy_tx_with_failover(
+    primary: &RpcClient,
+    secondary: Option<&RpcClient>,
+    tx: &solana_sdk::transaction::Transaction,
+    cfg: RpcSendTransactionConfig,
+) -> std::result::Result<(solana_sdk::signature::Signature, bool), solana_client::client_error::ClientError>
+{
+    match primary.send_transaction_with_config(tx, cfg).await {
+        Ok(sig) => Ok((sig, false)),
+        Err(e) if is_rpc_throttle_error(&e) => {
+            if let Some(sec) = secondary {
+                warn!(
+                    target: "rpc_failover",
+                    error = %e,
+                    "primary RPC throttled; failing over to secondary"
+                );
+                match sec.send_transaction_with_config(tx, cfg).await {
+                    Ok(sig) => Ok((sig, true)),
+                    Err(e2) => Err(e2),
+                }
+            } else {
+                Err(e)
+            }
+        }
+        Err(e) => Err(e),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -153,6 +233,15 @@ pub fn read_starting_sequences(data: &[u8], market_index: u16) -> (u64, u64) {
     }
 }
 
+/// Snapshot of (max_seen_sequence, live_count) for a specific market's
+/// sub-queue. Returned separately from `read_starting_sequences` so the
+/// startup reconciliation can classify restored WAL entries as pending
+/// vs orphaned.
+pub fn read_sub_queue_snapshot(data: &[u8], market_index: u16) -> Option<(u64, u32)> {
+    parse_sub_queue_for_market(data, market_index)
+        .map(|sqh| (sqh.max_seen_sequence, sqh.live_count))
+}
+
 // ---------------------------------------------------------------------------
 // hashing (must match on-chain exactly)
 // ---------------------------------------------------------------------------
@@ -210,27 +299,36 @@ pub fn hash_dispatch_accounts_for_reveal(
     hash_metas_with_flag_map(dispatch_accounts, &flags)
 }
 
+/// P0.5: the single unified user-intent hash used by v5 commit-reveal.
+/// Must match `programs/mango-v4/src/instructions/execution_queue.rs
+/// canonical_user_intent_message_v3` byte-for-byte. Commit stores this
+/// hash as `commit_hash`; reveal recomputes and matches; the ed25519
+/// pre-ix signs this same hash.
+///
+/// `client_order_id` is the 8-byte user-supplied randomizer that makes
+/// brute-forcing the commit pre-image infeasible even for small payload
+/// spaces (cancels, standard-size places).
 #[allow(clippy::too_many_arguments)]
-pub fn canonical_commit_hash(
+pub fn canonical_user_intent_v3(
     group: Pubkey,
-    market_index: u16,
-    sequence: u64,
+    mango_account: Pubkey,
+    user_owner: Pubkey,
     kind: u8,
+    target_kind: u8,
+    target_index: u16,
     payload_hash: &[u8; 32],
-    accounts_hash: &[u8; 32],
-    min_execute_slot: u64,
-    expires_at_slot: u64,
+    client_order_id: u64,
 ) -> [u8; 32] {
     hashv(&[
-        b"mango-v4-commit-v1",
+        b"mango-v5-user-intent-v1",
         group.as_ref(),
-        &market_index.to_le_bytes(),
-        &sequence.to_le_bytes(),
+        mango_account.as_ref(),
+        user_owner.as_ref(),
         &[kind],
+        &[target_kind],
+        &target_index.to_le_bytes(),
         payload_hash,
-        accounts_hash,
-        &min_execute_slot.to_le_bytes(),
-        &expires_at_slot.to_le_bytes(),
+        &client_order_id.to_le_bytes(),
     ])
     .to_bytes()
 }
@@ -401,33 +499,30 @@ pub fn build_reveal_execute_tx(
     reveal_entry: &V5RevealEntry,
     blockhash: solana_sdk::hash::Hash,
 ) -> Transaction {
-    // The on-chain reveal handler recomputes commit_hash from (group,
-    // market_index, sequence, kind, payload_hash, accounts_hash,
-    // min_execute_slot, expires_at_slot) and fails the reveal if it
-    // doesn't match the stored commit. All four of these must come from
-    // the same envelope the relayer used at commit time — they're carried
-    // through the reveal_store (and WAL) on V5RevealEntry.
-    let computed_accounts_hash =
-        hash_dispatch_accounts_for_reveal(mkt, &reveal_entry.dispatch_accounts);
-    let recomputed_commit = canonical_commit_hash(
+    // P0.5: the on-chain reveal handler recomputes ONE unified hash
+    // (canonical_user_intent_v3 over group, mango_account, user_owner,
+    // kind, target_kind, market_index, payload_hash, client_order_id)
+    // and fails the reveal if it does not match the stored commit. Every
+    // argument that feeds that hash must round-trip through the WAL
+    // unchanged — the reveal_entry carries mango_account, user_owner,
+    // kind, and client_order_id exactly as they were at commit time.
+    let recomputed_commit = canonical_user_intent_v3(
         mkt.group,
-        mkt.market_index,
-        reveal_entry.sequence,
+        reveal_entry.mango_account,
+        reveal_entry.user_owner,
         reveal_entry.kind,
+        /* target_kind = PerpMarket */ 0,
+        mkt.market_index,
         &reveal_entry.payload_hash,
-        &computed_accounts_hash,
-        reveal_entry.min_execute_slot,
-        reveal_entry.expires_at_slot,
+        reveal_entry.client_order_id,
     );
     debug!(
         target: "v5_reveal_debug",
         seq = reveal_entry.sequence,
         n_dispatch = reveal_entry.dispatch_accounts.len(),
         kind = reveal_entry.kind,
-        min_execute_slot = reveal_entry.min_execute_slot,
-        expires_at_slot = reveal_entry.expires_at_slot,
+        client_order_id = reveal_entry.client_order_id,
         payload_hash = hex_short(&reveal_entry.payload_hash),
-        accounts_hash = hex_short(&computed_accounts_hash),
         commit_hash = hex_short(&recomputed_commit),
         "reveal dispatch"
     );
@@ -445,6 +540,9 @@ pub fn build_reveal_execute_tx(
     let cu = ComputeBudgetInstruction::set_compute_unit_limit(1_400_000);
     let mut ixs = vec![cu];
 
+    // Under the unified hash, the user signs the SAME bytes that land
+    // on-chain as the commit. user_intent_hash on the reveal entry is
+    // the unified hash; use that if present.
     if let (Some(user_sig), Some(msg_hash)) =
         (reveal_entry.user_sig, reveal_entry.user_intent_hash)
     {
@@ -474,6 +572,9 @@ pub fn build_reveal_execute_tx(
                 payload: reveal_entry.payload.clone(),
                 kind: reveal_entry.kind,
                 dispatch_accounts_count: reveal_entry.dispatch_accounts.len() as u8,
+                client_order_id: reveal_entry.client_order_id,
+                mango_account: reveal_entry.mango_account,
+                user_owner: reveal_entry.user_owner,
             }],
         }
         .data(),
@@ -537,6 +638,7 @@ impl V5HeadStallState {
 
 pub fn spawn_reveal_worker(
     rpc: Arc<RpcClient>,
+    secondary_rpc: Option<Arc<RpcClient>>,
     mkt: Arc<V5MarketState>,
     payer: Arc<Keypair>,
     store: V5RevealStore,
@@ -633,9 +735,22 @@ pub fn spawn_reveal_worker(
                 };
                 let tx = build_reveal_execute_tx(&mkt, &payer, &entry, bh);
                 stall.note_reveal_attempt();
-                match rpc.send_transaction_with_config(&tx, send_cfg).await {
-                    Ok(sig) => {
-                        debug!(target: "v5_reveal", seq, %sig, "reveal sent");
+                let res = send_legacy_tx_with_failover(
+                    &rpc,
+                    secondary_rpc.as_deref(),
+                    &tx,
+                    send_cfg,
+                )
+                .await;
+                match res {
+                    Ok((sig, via_secondary)) => {
+                        debug!(
+                            target: "v5_reveal",
+                            seq,
+                            %sig,
+                            via_secondary,
+                            "reveal sent"
+                        );
                     }
                     Err(e) => {
                         warn!(target: "v5_reveal", seq, head, error = %e, "reveal send failed");
@@ -802,11 +917,106 @@ pub fn spawn_drift_resync_worker(
             } else {
                 sqh.max_seen_sequence.saturating_add(1)
             };
-            let max_stored_seq: u64 = {
-                let store = reveal_store.lock();
-                store.keys().next_back().copied().unwrap_or(0)
+
+            // On-chain `validate_commit_sequence` admits commits only in
+            // the half-open interval [next_sequence_to_execute,
+            // next_sequence_to_execute + admission_limit). `admission_limit
+            // <= per-market capacity (256)`, so:
+            //
+            //   admission_ceiling = on_chain_next + capacity        // first INVALID seq
+            //   max_valid_seq     = admission_ceiling - 1            // last valid seq
+            //
+            // Three invariants to enforce against a drifted local counter:
+            //
+            //  (1) Purge reveal-store entries at seq >= admission_ceiling.
+            //      They can never land and poison rewind targets.
+            //
+            //  (2) When the system is WEDGED (local already past ceiling
+            //      even after (1)) the entries between max_seen+1 and
+            //      ceiling-1 are almost certainly orphans from
+            //      commits-that-sent-but-errored-on-chain: max_seen only
+            //      advances via successful commits, so anything above it
+            //      for long is suspect. Purge these aggressively.
+            //
+            //  (3) Rewind target must itself be a VALID seq — capped at
+            //      max_valid_seq, not admission_ceiling. The old code
+            //      targeted `max(on_chain_next, max_stored+1)` which
+            //      equals admission_ceiling when max_stored = ceiling-1,
+            //      and every subsequent commit immediately fails 6076.
+            const IN_FLIGHT_TOLERANCE: u64 = 32;
+            let capacity = EXECUTION_QUEUE_V5_PER_MARKET_CAPACITY as u64;
+            let admission_ceiling = on_chain_next.saturating_add(capacity);
+            let max_valid_seq = admission_ceiling.saturating_sub(1);
+            let stale_below_cutoff = sqh.next_sequence_to_execute;
+
+            let local_pre = next_seq.load(Ordering::Acquire);
+            let system_wedged = local_pre >= admission_ceiling;
+            let aggressive_floor = sqh
+                .max_seen_sequence
+                .saturating_add(IN_FLIGHT_TOLERANCE.saturating_add(1));
+
+            let (purged_orphan, purged_aggressive, max_stored_seq) = {
+                let mut store = reveal_store.lock();
+                // (a) stale-below-head (already-consumed entries).
+                let stale: Vec<u64> =
+                    store.range(..stale_below_cutoff).map(|(k, _)| *k).collect();
+                for k in &stale {
+                    store.remove(k);
+                }
+                // (b) entries at or beyond admission_ceiling — unreachable.
+                let orphan: Vec<u64> =
+                    store.range(admission_ceiling..).map(|(k, _)| *k).collect();
+                for k in &orphan {
+                    store.remove(k);
+                }
+                // (c) aggressive purge when system is wedged: entries far
+                //     above max_seen are assumed orphaned (stale in-flight
+                //     from commits that errored on-chain).
+                let aggressive: Vec<u64> = if system_wedged {
+                    let v: Vec<u64> =
+                        store.range(aggressive_floor..).map(|(k, _)| *k).collect();
+                    for k in &v {
+                        store.remove(k);
+                    }
+                    v
+                } else {
+                    Vec::new()
+                };
+                let max = store.keys().next_back().copied().unwrap_or(0);
+                (orphan, aggressive, max)
             };
-            let safe_rewind_target = on_chain_next.max(max_stored_seq.saturating_add(1));
+            if !purged_orphan.is_empty() {
+                warn!(
+                    target: "v5_drift",
+                    count = purged_orphan.len(),
+                    first = purged_orphan.first().copied().unwrap_or(0),
+                    last = purged_orphan.last().copied().unwrap_or(0),
+                    on_chain_next,
+                    admission_ceiling,
+                    "purged unreachable reveal-store entries (>= admission_ceiling)"
+                );
+            }
+            if !purged_aggressive.is_empty() {
+                warn!(
+                    target: "v5_drift",
+                    count = purged_aggressive.len(),
+                    first = purged_aggressive.first().copied().unwrap_or(0),
+                    last = purged_aggressive.last().copied().unwrap_or(0),
+                    max_seen = sqh.max_seen_sequence,
+                    aggressive_floor,
+                    "purged stale in-flight reveal-store entries (system wedged, in-range entries suspected orphans)"
+                );
+            }
+
+            // Rewind target:
+            //   - at least on_chain_next (don't rewind into already-processed seqs)
+            //   - at least max_stored + 1 (don't duplicate existing entries)
+            //   - at most max_valid_seq (next fetch_add must return a valid seq)
+            let mut safe_rewind_target =
+                on_chain_next.max(max_stored_seq.saturating_add(1));
+            if safe_rewind_target > max_valid_seq {
+                safe_rewind_target = max_valid_seq;
+            }
 
             let local = next_seq.load(Ordering::Acquire);
             if local > on_chain_next.saturating_add(max_lookahead) {
@@ -816,8 +1026,9 @@ pub fn spawn_drift_resync_worker(
                     on_chain_next,
                     max_stored_seq,
                     rewind_to = safe_rewind_target,
+                    admission_ceiling,
                     drift = local - on_chain_next,
-                    "local counter drifted; rewinding past in-flight reveal-store entries"
+                    "local counter drifted; rewinding"
                 );
                 if local > safe_rewind_target {
                     next_seq.store(safe_rewind_target, Ordering::Release);
@@ -830,15 +1041,6 @@ pub fn spawn_drift_resync_worker(
                     "local counter behind on-chain; advancing"
                 );
                 next_seq.store(on_chain_next, Ordering::Release);
-            }
-
-            {
-                let mut store = reveal_store.lock();
-                let cutoff = sqh.next_sequence_to_execute;
-                let stale: Vec<u64> = store.range(..cutoff).map(|(k, _)| *k).collect();
-                for k in stale {
-                    store.remove(&k);
-                }
             }
         }
     })
@@ -871,6 +1073,7 @@ impl V5AutodropConfig {
 
 pub fn spawn_autodrop_worker(
     rpc: Arc<RpcClient>,
+    secondary_rpc: Option<Arc<RpcClient>>,
     mkt: Arc<V5MarketState>,
     admin: Arc<Keypair>,
     payer: Arc<Keypair>,
@@ -964,19 +1167,27 @@ pub fn spawn_autodrop_worker(
                 live_count,
                 "head unadvanceable — issuing admin pause+drop+unpause"
             );
-            match rpc
-                .send_transaction_with_config(
-                    &tx,
-                    RpcSendTransactionConfig {
-                        skip_preflight: true,
-                        max_retries: Some(5),
-                        ..Default::default()
-                    },
-                )
-                .await
-            {
-                Ok(sig) => {
-                    info!(target: "v5_autodrop", head, %sig, "admin drop sent");
+            let ad_cfg = RpcSendTransactionConfig {
+                skip_preflight: true,
+                max_retries: Some(5),
+                ..Default::default()
+            };
+            let ad_res = send_legacy_tx_with_failover(
+                &rpc,
+                secondary_rpc.as_deref(),
+                &tx,
+                ad_cfg,
+            )
+            .await;
+            match ad_res {
+                Ok((sig, via_secondary)) => {
+                    info!(
+                        target: "v5_autodrop",
+                        head,
+                        %sig,
+                        via_secondary,
+                        "admin drop sent"
+                    );
                     match wait_for_signature_confirmation(&rpc, &sig, Duration::from_secs(30)).await
                     {
                         Ok(true) => info!(
