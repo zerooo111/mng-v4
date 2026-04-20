@@ -35,15 +35,6 @@ const MIRROR_DEBOUNCE_MS = 100;
 // books bloating Redis.
 const MIRROR_MAX_ORDERS_PER_MARKET = 500;
 
-// Rich-metadata refresh. The harness's `/state/markets` handler builds
-// `{name, base_mint, base_decimals, perp_market PDA, ...}` from internal
-// state that isn't exposed on the EngineSnapshot. We fetch that handler on
-// a slow cadence and merge the result into `v1:meta:market:<id>` so the
-// gateway's /v2/markets becomes a full replacement.
-const META_REFRESH_MS = 60_000;
-const META_SELF_FETCH_URL =
-  process.env.CONTINUUM_HARNESS_SELF_URL ?? 'http://127.0.0.1:9091';
-
 // ── Types (structural subset of EngineSnapshot) ─────────────────────
 
 type ViewTag = 'opt' | 'conf';
@@ -147,7 +138,6 @@ class IORedisMirror implements Mirror {
   private timer: NodeJS.Timeout | null = null;
   private inFlight = false;
   private pendingWhileInFlight = false;
-  private metaRefreshTimer: NodeJS.Timeout | null = null;
 
   constructor(
     url: string,
@@ -164,70 +154,6 @@ class IORedisMirror implements Mirror {
       // eslint-disable-next-line no-console
       console.warn('[state-mirror] redis error:', err.message);
     });
-    // Kick an immediate refresh and then keep it on a slow timer.
-    this.refreshRichMetadata().catch(() => {});
-    this.metaRefreshTimer = setInterval(
-      () => this.refreshRichMetadata().catch(() => {}),
-      META_REFRESH_MS,
-    );
-    this.metaRefreshTimer.unref();
-  }
-
-  /**
-   * Pull rich market identity (name, symbols, mints, decimals, PDA pubkeys,
-   * open_interest) from the harness's own /state/markets endpoint and merge
-   * into v1:meta:market:<id>. This fills the gap between what the engine
-   * snapshot exposes (dynamic pricing) and what the v1 metadata handler
-   * exposes (static identity from group config + mint account loads).
-   *
-   * Errors are swallowed: a transient failure just means the rich fields
-   * stay stale until the next refresh. Dynamic fields are unaffected.
-   */
-  private async refreshRichMetadata(): Promise<void> {
-    try {
-      const res = await fetch(`${META_SELF_FETCH_URL}/state/markets?view=optimistic`);
-      if (!res.ok) return;
-      const body = (await res.json()) as {
-        items?: Array<{ market?: string; metadata?: Record<string, unknown> }>;
-      };
-      const items = Array.isArray(body?.items) ? body.items : [];
-      if (items.length === 0) return;
-      const pipeline = this.client.pipeline();
-      const fieldsOfInterest = [
-        'name',
-        'base_symbol',
-        'quote_symbol',
-        'base_mint',
-        'quote_mint',
-        'perp_market',
-        'oracle',
-        'bids',
-        'asks',
-        'event_queue',
-        'base_decimals',
-        'quote_decimals',
-        'base_lot_size',
-        'quote_lot_size',
-        'open_interest',
-      ] as const;
-      for (const item of items) {
-        const md = item.metadata ?? {};
-        const id = String(md.market_index ?? item.market ?? '');
-        if (!id) continue;
-        const merged: Record<string, string> = {};
-        for (const k of fieldsOfInterest) {
-          const v = md[k];
-          if (v !== undefined && v !== null) merged[k] = String(v);
-        }
-        if (Object.keys(merged).length > 0) {
-          pipeline.hset(`v1:meta:market:${id}`, merged);
-        }
-      }
-      await pipeline.exec();
-    } catch (err) {
-      // eslint-disable-next-line no-console
-      console.warn('[state-mirror] rich-metadata refresh failed:', (err as Error).message);
-    }
   }
 
   onEvent(): void {
@@ -473,10 +399,6 @@ class IORedisMirror implements Mirror {
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
-    }
-    if (this.metaRefreshTimer) {
-      clearInterval(this.metaRefreshTimer);
-      this.metaRefreshTimer = null;
     }
     try {
       await this.client.quit();
