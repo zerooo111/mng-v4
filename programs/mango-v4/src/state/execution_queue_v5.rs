@@ -30,7 +30,17 @@ use anchor_lang::prelude::*;
 use static_assertions::const_assert_eq;
 use std::mem::size_of;
 
-pub const EXECUTION_QUEUE_V5_LAYOUT_VERSION: u8 = 5;
+pub const EXECUTION_QUEUE_V5_LAYOUT_VERSION: u8 = 6;
+
+/// Default per-commit retry budget used when `ExecutionQueueV5Header.max_retries`
+/// is 0 (fresh init, or a queue that pre-dates the layout-v6 field). Effective
+/// value is also what `execution_queue_v5_set_max_retries` resets to when
+/// called with 0.
+pub const EXECUTION_QUEUE_V5_DEFAULT_MAX_RETRIES: u8 = 3;
+
+/// Upper bound on admin-configured max_retries. Bounds the worst-case CU
+/// wasted on a genuinely-undispatchable head item before autodrop takes over.
+pub const EXECUTION_QUEUE_V5_MAX_RETRIES_CAP: u8 = 20;
 pub const EXECUTION_QUEUE_V5_N_MAX_MARKETS: usize = 16;
 pub const EXECUTION_QUEUE_V5_PER_MARKET_CAPACITY: usize = 256;
 pub const EXECUTION_QUEUE_V5_TOTAL_CAPACITY: usize =
@@ -208,11 +218,28 @@ pub struct ExecutionQueueV5Header {
     pub paused_ingress: u8,
     pub paused_execute: u8,
     pub layout_version: u8,
-    pub _padding0: [u8; 4],
+    /// Per-commit retry budget inside `reveal_execute_market`. 0 means
+    /// "use default" so queues created under layout_version < 6 keep working
+    /// without migration. Configure via `execution_queue_v5_set_max_retries`.
+    pub max_retries: u8,
+    pub _padding0: [u8; 3],
     pub total_count: u64,
     pub reserved: [u8; 64],
 }
 const_assert_eq!(size_of::<ExecutionQueueV5Header>() % 8, 0);
+
+impl ExecutionQueueV5Header {
+    /// Retry budget actually used by the reveal handler. Falls back to the
+    /// default when the admin hasn't set a value (or the queue pre-dates
+    /// the max_retries field).
+    pub fn max_retries_effective(&self) -> u8 {
+        if self.max_retries == 0 {
+            EXECUTION_QUEUE_V5_DEFAULT_MAX_RETRIES
+        } else {
+            self.max_retries
+        }
+    }
+}
 
 #[account(zero_copy)]
 #[derive(Debug)]
@@ -231,7 +258,8 @@ impl ExecutionQueueV5 {
         self.header.paused_ingress = 0;
         self.header.paused_execute = 0;
         self.header.layout_version = EXECUTION_QUEUE_V5_LAYOUT_VERSION;
-        self.header._padding0 = [0; 4];
+        self.header.max_retries = EXECUTION_QUEUE_V5_DEFAULT_MAX_RETRIES;
+        self.header._padding0 = [0; 3];
         self.header.total_count = 0;
         self.header.reserved = [0; 64];
         for sqh in self.sub_queue_headers.iter_mut() {
@@ -446,7 +474,9 @@ mod tests {
         q.init(Pubkey::new_unique(), Pubkey::new_unique(), 1);
         let idx = q.allocate_sub_queue(2, 0, 0, 4).unwrap();
         for seq in 0..5u64 {
-            q.sub_queue_headers[idx].validate_commit_sequence(seq).unwrap();
+            q.sub_queue_headers[idx]
+                .validate_commit_sequence(seq)
+                .unwrap();
             let mut item = CommitItemV5::default();
             item.sequence = seq;
             item.status = CommitStatusV5::Committed as u8;
@@ -495,9 +525,13 @@ mod tests {
         q.init(Pubkey::new_unique(), Pubkey::new_unique(), 1);
         let idx = q.allocate_sub_queue(0, 0, 0, 4).unwrap();
         // Sequence = capacity is out of the admission window (head=0, cap=256).
-        assert!(q.sub_queue_headers[idx].validate_commit_sequence(256).is_err());
+        assert!(q.sub_queue_headers[idx]
+            .validate_commit_sequence(256)
+            .is_err());
         // Sequence below head is rejected once head advances.
         q.sub_queue_headers[idx].next_sequence_to_execute = 10;
-        assert!(q.sub_queue_headers[idx].validate_commit_sequence(5).is_err());
+        assert!(q.sub_queue_headers[idx]
+            .validate_commit_sequence(5)
+            .is_err());
     }
 }

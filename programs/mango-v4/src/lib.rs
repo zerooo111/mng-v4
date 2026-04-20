@@ -37,6 +37,13 @@ use instructions::{
     ExecutionQueueV5SubQueueConfigParams, RevealArgsV5,
 };
 
+/// Compile-time toggle for legacy (v3/v4) execution-queue instructions.
+/// When the `legacy-queues` cargo feature is off, every legacy entry point
+/// short-circuits with `MangoError::LegacyQueuesDisabled`. Keeps the IDL
+/// and account contexts intact so existing clients still get a clean error
+/// rather than `InstructionFallbackNotFound`.
+const LEGACY_QUEUES_ENABLED: bool = cfg!(feature = "legacy-queues");
+
 #[cfg(all(not(feature = "no-entrypoint"), not(feature = "enable-gpl")))]
 
 compile_error!("compiling the program entrypoint without 'enable-gpl' makes no sense, enable it or use the 'cpi' or 'client' features");
@@ -564,18 +571,21 @@ pub mod mango_v4 {
         ctx: Context<ExecutionQueueInit>,
         ctm_signer: Pubkey,
     ) -> Result<()> {
+        require!(LEGACY_QUEUES_ENABLED, MangoError::LegacyQueuesDisabled);
         #[cfg(feature = "enable-gpl")]
         instructions::execution_queue_init(ctx, ctm_signer)?;
         Ok(())
     }
 
     pub fn execution_queue_create(ctx: Context<ExecutionQueueCreate>) -> Result<()> {
+        require!(LEGACY_QUEUES_ENABLED, MangoError::LegacyQueuesDisabled);
         #[cfg(feature = "enable-gpl")]
         instructions::execution_queue_create(ctx)?;
         Ok(())
     }
 
     pub fn execution_queue_resize(ctx: Context<ExecutionQueueResize>) -> Result<()> {
+        require!(LEGACY_QUEUES_ENABLED, MangoError::LegacyQueuesDisabled);
         #[cfg(feature = "enable-gpl")]
         instructions::execution_queue_resize(ctx)?;
         Ok(())
@@ -585,6 +595,7 @@ pub mod mango_v4 {
         ctx: Context<ExecutionQueueAdmin>,
         params: ExecutionQueueConfigParams,
     ) -> Result<()> {
+        require!(LEGACY_QUEUES_ENABLED, MangoError::LegacyQueuesDisabled);
         #[cfg(feature = "enable-gpl")]
         instructions::execution_queue_configure(ctx, params)?;
         Ok(())
@@ -595,6 +606,7 @@ pub mod mango_v4 {
         pending_ctm_signer: Pubkey,
         activate_at_slot: u64,
     ) -> Result<()> {
+        require!(LEGACY_QUEUES_ENABLED, MangoError::LegacyQueuesDisabled);
         #[cfg(feature = "enable-gpl")]
         instructions::execution_queue_set_ctm_pending(ctx, pending_ctm_signer, activate_at_slot)?;
         Ok(())
@@ -605,6 +617,7 @@ pub mod mango_v4 {
         market_index: u16,
         sequence: u64,
     ) -> Result<()> {
+        require!(LEGACY_QUEUES_ENABLED, MangoError::LegacyQueuesDisabled);
         #[cfg(feature = "enable-gpl")]
         instructions::execution_queue_drop_ctm(ctx, market_index, sequence)?;
         Ok(())
@@ -616,6 +629,7 @@ pub mod mango_v4 {
         envelope: CtmEnvelope,
         payload: Vec<u8>,
     ) -> Result<()> {
+        require!(LEGACY_QUEUES_ENABLED, MangoError::LegacyQueuesDisabled);
         #[cfg(feature = "enable-gpl")]
         instructions::execution_queue_enqueue_ctm(ctx, market_index, envelope, payload)?;
         Ok(())
@@ -629,6 +643,7 @@ pub mod mango_v4 {
         envelope: CtmEnvelope,
         payload: Vec<u8>,
     ) -> Result<()> {
+        require!(LEGACY_QUEUES_ENABLED, MangoError::LegacyQueuesDisabled);
         #[cfg(feature = "enable-gpl")]
         instructions::execution_queue_enqueue_direct(ctx, market_index, envelope, payload)?;
         Ok(())
@@ -639,6 +654,7 @@ pub mod mango_v4 {
         kind: u8,
         payload: Vec<u8>,
     ) -> Result<()> {
+        require!(LEGACY_QUEUES_ENABLED, MangoError::LegacyQueuesDisabled);
         #[cfg(feature = "enable-gpl")]
         instructions::execution_queue_enqueue_liquidity(ctx, kind, payload)?;
         Ok(())
@@ -649,6 +665,7 @@ pub mod mango_v4 {
         market_index: u16,
         max_items: u16,
     ) -> Result<()> {
+        require!(LEGACY_QUEUES_ENABLED, MangoError::LegacyQueuesDisabled);
         #[cfg(feature = "enable-gpl")]
         instructions::execution_queue_execute(ctx, market_index, max_items)?;
         Ok(())
@@ -662,6 +679,7 @@ pub mod mango_v4 {
         accounts_per_lane: u16,
         lane_hashes: Vec<[u8; 32]>,
     ) -> Result<()> {
+        require!(LEGACY_QUEUES_ENABLED, MangoError::LegacyQueuesDisabled);
         #[cfg(feature = "enable-gpl")]
         instructions::execution_queue_execute_multi(
             ctx,
@@ -681,6 +699,7 @@ pub mod mango_v4 {
     /// layout_version = 2. The first market to enqueue post-migration will
     /// claim sub-queue slot 0.
     pub fn execution_queue_migrate_v1_to_v2(ctx: Context<ExecutionQueueAdmin>) -> Result<()> {
+        require!(LEGACY_QUEUES_ENABLED, MangoError::LegacyQueuesDisabled);
         #[cfg(feature = "enable-gpl")]
         instructions::execution_queue_migrate_v1_to_v2(ctx)?;
         Ok(())
@@ -690,6 +709,7 @@ pub mod mango_v4 {
         ctx: Context<ExecutionQueueV3InitAuthorityState>,
         ctm_signer: Pubkey,
     ) -> Result<()> {
+        require!(LEGACY_QUEUES_ENABLED, MangoError::LegacyQueuesDisabled);
         #[cfg(feature = "enable-gpl")]
         instructions::execution_queue_v3_init_authority_state(ctx, ctm_signer)?;
         Ok(())
@@ -700,6 +720,7 @@ pub mod mango_v4 {
         pending_ctm_signer: Pubkey,
         activate_at_slot: u64,
     ) -> Result<()> {
+        require!(LEGACY_QUEUES_ENABLED, MangoError::LegacyQueuesDisabled);
         #[cfg(feature = "enable-gpl")]
         instructions::execution_queue_v3_set_ctm_pending(
             ctx,
@@ -715,6 +736,7 @@ pub mod mango_v4 {
         shard_id: u8,
         params: ExecutionQueueV3MarketRootCreateParams,
     ) -> Result<()> {
+        require!(LEGACY_QUEUES_ENABLED, MangoError::LegacyQueuesDisabled);
         #[cfg(feature = "enable-gpl")]
         instructions::execution_queue_v3_init_market_root(ctx, market_index, shard_id, params)?;
         Ok(())
@@ -724,6 +746,7 @@ pub mod mango_v4 {
         ctx: Context<ExecutionQueueV3MarketRootAdmin>,
         params: ExecutionQueueV3MarketRootConfigParams,
     ) -> Result<()> {
+        require!(LEGACY_QUEUES_ENABLED, MangoError::LegacyQueuesDisabled);
         #[cfg(feature = "enable-gpl")]
         instructions::execution_queue_v3_configure_market_root(ctx, params)?;
         Ok(())
@@ -733,6 +756,7 @@ pub mod mango_v4 {
         ctx: Context<ExecutionQueueV3InitLiquidityRoot>,
         params: ExecutionQueueV3LiquidityRootCreateParams,
     ) -> Result<()> {
+        require!(LEGACY_QUEUES_ENABLED, MangoError::LegacyQueuesDisabled);
         #[cfg(feature = "enable-gpl")]
         instructions::execution_queue_v3_init_liquidity_root(ctx, params)?;
         Ok(())
@@ -742,6 +766,7 @@ pub mod mango_v4 {
         ctx: Context<ExecutionQueueV3LiquidityRootAdmin>,
         params: ExecutionQueueV3LiquidityRootConfigParams,
     ) -> Result<()> {
+        require!(LEGACY_QUEUES_ENABLED, MangoError::LegacyQueuesDisabled);
         #[cfg(feature = "enable-gpl")]
         instructions::execution_queue_v3_configure_liquidity_root(ctx, params)?;
         Ok(())
@@ -751,6 +776,7 @@ pub mod mango_v4 {
         ctx: Context<ExecutionQueueV3CreateMarketPage>,
         page_slot: u16,
     ) -> Result<()> {
+        require!(LEGACY_QUEUES_ENABLED, MangoError::LegacyQueuesDisabled);
         #[cfg(feature = "enable-gpl")]
         instructions::execution_queue_v3_create_market_page(ctx, page_slot)?;
         Ok(())
@@ -760,6 +786,7 @@ pub mod mango_v4 {
         ctx: Context<ExecutionQueueV3ResizeMarketPage>,
         page_slot: u16,
     ) -> Result<()> {
+        require!(LEGACY_QUEUES_ENABLED, MangoError::LegacyQueuesDisabled);
         #[cfg(feature = "enable-gpl")]
         instructions::execution_queue_v3_resize_market_page(ctx, page_slot)?;
         Ok(())
@@ -770,6 +797,7 @@ pub mod mango_v4 {
         page_slot: u16,
         assigned_abs_page_no: u64,
     ) -> Result<()> {
+        require!(LEGACY_QUEUES_ENABLED, MangoError::LegacyQueuesDisabled);
         #[cfg(feature = "enable-gpl")]
         instructions::execution_queue_v3_init_market_page(ctx, page_slot, assigned_abs_page_no)?;
         Ok(())
@@ -779,6 +807,7 @@ pub mod mango_v4 {
         ctx: Context<ExecutionQueueV3CreateLiquidityPage>,
         page_slot: u16,
     ) -> Result<()> {
+        require!(LEGACY_QUEUES_ENABLED, MangoError::LegacyQueuesDisabled);
         #[cfg(feature = "enable-gpl")]
         instructions::execution_queue_v3_create_liquidity_page(ctx, page_slot)?;
         Ok(())
@@ -788,6 +817,7 @@ pub mod mango_v4 {
         ctx: Context<ExecutionQueueV3ResizeLiquidityPage>,
         page_slot: u16,
     ) -> Result<()> {
+        require!(LEGACY_QUEUES_ENABLED, MangoError::LegacyQueuesDisabled);
         #[cfg(feature = "enable-gpl")]
         instructions::execution_queue_v3_resize_liquidity_page(ctx, page_slot)?;
         Ok(())
@@ -798,18 +828,16 @@ pub mod mango_v4 {
         page_slot: u16,
         assigned_abs_page_no: u64,
     ) -> Result<()> {
+        require!(LEGACY_QUEUES_ENABLED, MangoError::LegacyQueuesDisabled);
         #[cfg(feature = "enable-gpl")]
-        instructions::execution_queue_v3_init_liquidity_page(
-            ctx,
-            page_slot,
-            assigned_abs_page_no,
-        )?;
+        instructions::execution_queue_v3_init_liquidity_page(ctx, page_slot, assigned_abs_page_no)?;
         Ok(())
     }
 
     pub fn execution_queue_v3_close_market_page(
         ctx: Context<ExecutionQueueV3CloseMarketPage>,
     ) -> Result<()> {
+        require!(LEGACY_QUEUES_ENABLED, MangoError::LegacyQueuesDisabled);
         #[cfg(feature = "enable-gpl")]
         instructions::execution_queue_v3_close_market_page(ctx)?;
         Ok(())
@@ -818,6 +846,7 @@ pub mod mango_v4 {
     pub fn execution_queue_v3_close_liquidity_page(
         ctx: Context<ExecutionQueueV3CloseLiquidityPage>,
     ) -> Result<()> {
+        require!(LEGACY_QUEUES_ENABLED, MangoError::LegacyQueuesDisabled);
         #[cfg(feature = "enable-gpl")]
         instructions::execution_queue_v3_close_liquidity_page(ctx)?;
         Ok(())
@@ -829,6 +858,7 @@ pub mod mango_v4 {
         envelope: CtmEnvelope,
         payload: Vec<u8>,
     ) -> Result<()> {
+        require!(LEGACY_QUEUES_ENABLED, MangoError::LegacyQueuesDisabled);
         #[cfg(feature = "enable-gpl")]
         instructions::execution_queue_v3_enqueue_market(ctx, market_index, envelope, payload)?;
         Ok(())
@@ -839,6 +869,7 @@ pub mod mango_v4 {
         envelope: CtmEnvelope,
         payload: Vec<u8>,
     ) -> Result<()> {
+        require!(LEGACY_QUEUES_ENABLED, MangoError::LegacyQueuesDisabled);
         #[cfg(feature = "enable-gpl")]
         instructions::execution_queue_v3_enqueue_market_direct(ctx, envelope, payload)?;
         Ok(())
@@ -849,6 +880,7 @@ pub mod mango_v4 {
         kind: u8,
         payload: Vec<u8>,
     ) -> Result<()> {
+        require!(LEGACY_QUEUES_ENABLED, MangoError::LegacyQueuesDisabled);
         #[cfg(feature = "enable-gpl")]
         instructions::execution_queue_v3_enqueue_liquidity(ctx, kind, payload)?;
         Ok(())
@@ -858,6 +890,7 @@ pub mod mango_v4 {
         ctx: Context<ExecutionQueueV3ExecuteMarket>,
         max_items: u16,
     ) -> Result<()> {
+        require!(LEGACY_QUEUES_ENABLED, MangoError::LegacyQueuesDisabled);
         #[cfg(feature = "enable-gpl")]
         instructions::execution_queue_v3_execute_market(ctx, max_items)?;
         Ok(())
@@ -870,6 +903,7 @@ pub mod mango_v4 {
         accounts_per_lane: u16,
         lane_hashes: Vec<[u8; 32]>,
     ) -> Result<()> {
+        require!(LEGACY_QUEUES_ENABLED, MangoError::LegacyQueuesDisabled);
         #[cfg(feature = "enable-gpl")]
         instructions::execution_queue_v3_execute_market_multi(
             ctx,
@@ -885,6 +919,7 @@ pub mod mango_v4 {
         ctx: Context<ExecutionQueueV3MarketPageAdmin>,
         sequence: u64,
     ) -> Result<()> {
+        require!(LEGACY_QUEUES_ENABLED, MangoError::LegacyQueuesDisabled);
         #[cfg(feature = "enable-gpl")]
         instructions::execution_queue_v3_drop_market(ctx, sequence)?;
         Ok(())
@@ -894,6 +929,7 @@ pub mod mango_v4 {
         ctx: Context<ExecutionQueueV3ExecuteLiquidity>,
         max_items: u16,
     ) -> Result<()> {
+        require!(LEGACY_QUEUES_ENABLED, MangoError::LegacyQueuesDisabled);
         #[cfg(feature = "enable-gpl")]
         instructions::execution_queue_v3_execute_liquidity(ctx, max_items)?;
         Ok(())
@@ -1459,9 +1495,7 @@ pub mod mango_v4 {
         Ok(())
     }
 
-    pub fn perp_admin_repair_stale_orders(
-        ctx: Context<PerpAdminRepairStaleOrders>,
-    ) -> Result<()> {
+    pub fn perp_admin_repair_stale_orders(ctx: Context<PerpAdminRepairStaleOrders>) -> Result<()> {
         #[cfg(feature = "enable-gpl")]
         instructions::perp_admin_repair_stale_orders(ctx)?;
         Ok(())
@@ -2335,6 +2369,15 @@ pub mod mango_v4 {
         Ok(())
     }
 
+    pub fn execution_queue_v5_set_max_retries(
+        ctx: Context<ExecutionQueueV5Admin>,
+        max_retries: u8,
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        instructions::execution_queue_v5_set_max_retries(ctx, max_retries)?;
+        Ok(())
+    }
+
     pub fn execution_queue_v5_drop_head_market(
         ctx: Context<ExecutionQueueV5Admin>,
         market_index: u16,
@@ -2358,12 +2401,7 @@ pub mod mango_v4 {
         entries: Vec<CommitEntryV5>,
     ) -> Result<()> {
         #[cfg(feature = "enable-gpl")]
-        instructions::execution_queue_v5_commit_market(
-            ctx,
-            market_index,
-            first_sequence,
-            entries,
-        )?;
+        instructions::execution_queue_v5_commit_market(ctx, market_index, first_sequence, entries)?;
         Ok(())
     }
 

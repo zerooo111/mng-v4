@@ -280,7 +280,7 @@ fn decode_pyth_v2(data: &[u8]) -> Result<PythV2PriceFields> {
     );
     let tag = data[PYTH_V2_VERIFICATION_TAG_OFFSET];
     let mut off = match tag {
-        1 => PYTH_V2_VERIFICATION_TAG_OFFSET + 1,     // Full: 1-byte tag only
+        1 => PYTH_V2_VERIFICATION_TAG_OFFSET + 1, // Full: 1-byte tag only
         0 => PYTH_V2_VERIFICATION_TAG_OFFSET + 1 + 1, // Partial: tag + num_signatures
         _ => return Err(MangoError::UnknownOracleType.into()),
     };

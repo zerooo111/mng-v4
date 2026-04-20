@@ -24,7 +24,10 @@ pub fn perp_close_market(ctx: Context<PerpCloseMarket>) -> Result<()> {
     require_msg!(book_is_empty(&asks), "perp market asks are not empty");
 
     let event_queue = ctx.accounts.event_queue.load()?;
-    require_msg!(event_queue.is_empty(), "perp market event queue is not empty");
+    require_msg!(
+        event_queue.is_empty(),
+        "perp market event queue is not empty"
+    );
 
     Ok(())
 }

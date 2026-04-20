@@ -14,18 +14,20 @@ fn book_has_orders_for_owner(book: &BookSide, owner: Pubkey) -> bool {
 }
 
 fn event_queue_has_activity_for_account(event_queue: &EventQueue, account: Pubkey) -> bool {
-    event_queue.iter().any(|event| match EventType::try_from(event.event_type) {
-        Ok(EventType::Fill) => {
-            let fill: &FillEvent = cast_ref(event);
-            fill.maker == account || fill.taker == account
-        }
-        Ok(EventType::Out) => {
-            let out: &OutEvent = cast_ref(event);
-            out.owner == account
-        }
-        Ok(EventType::Liquidate) => false,
-        Err(_) => true,
-    })
+    event_queue
+        .iter()
+        .any(|event| match EventType::try_from(event.event_type) {
+            Ok(EventType::Fill) => {
+                let fill: &FillEvent = cast_ref(event);
+                fill.maker == account || fill.taker == account
+            }
+            Ok(EventType::Out) => {
+                let out: &OutEvent = cast_ref(event);
+                out.owner == account
+            }
+            Ok(EventType::Liquidate) => false,
+            Err(_) => true,
+        })
 }
 
 pub fn perp_admin_repair_stale_orders(ctx: Context<PerpAdminRepairStaleOrders>) -> Result<()> {
@@ -103,24 +105,26 @@ mod tests {
         let owner = Pubkey::new_unique();
         let mut event_queue = EventQueue::zeroed();
         event_queue
-            .push_back(FillEvent::new(
-                Side::Bid,
-                false,
-                0,
-                0,
-                1,
-                owner,
-                11,
-                22,
-                I80F48::ZERO,
-                0,
-                Pubkey::new_unique(),
-                33,
-                I80F48::ZERO,
-                44,
-                55,
+            .push_back(
+                FillEvent::new(
+                    Side::Bid,
+                    false,
+                    0,
+                    0,
+                    1,
+                    owner,
+                    11,
+                    22,
+                    I80F48::ZERO,
+                    0,
+                    Pubkey::new_unique(),
+                    33,
+                    I80F48::ZERO,
+                    44,
+                    55,
+                )
+                .into(),
             )
-            .into())
             .unwrap();
 
         assert!(event_queue_has_activity_for_account(&event_queue, owner));

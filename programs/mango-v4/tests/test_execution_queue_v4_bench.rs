@@ -23,9 +23,11 @@ use anchor_lang::AnchorSerialize;
 use anchor_lang::{InstructionData, ToAccountMetas};
 use fixed::types::I80F48;
 use mango_v4::instructions::{CommitEntryV4, RevealArgsV4};
-use mango_v4::state::{PerpMarket, Side, PlaceOrderType, SelfTradeBehavior};
-use program_test::mango_setup::{Token, GroupWithTokens, GroupWithTokensConfig, create_funded_account};
+use mango_v4::state::{PerpMarket, PlaceOrderType, SelfTradeBehavior, Side};
 use program_test::mango_client::*;
+use program_test::mango_setup::{
+    create_funded_account, GroupWithTokens, GroupWithTokensConfig, Token,
+};
 use program_test::solana::SolanaCookie;
 use program_test::*;
 use solana_program_test::*;
@@ -275,12 +277,22 @@ async fn setup_v4_queue(
             .to_account_metas(None),
             data: mango_v4::instruction::ExecutionQueueV4CreateMarketPage { page_slot }.data(),
         };
-        solana.process_transaction(&[create_ix], Some(&[payer])).await.unwrap();
+        solana
+            .process_transaction(&[create_ix], Some(&[payer]))
+            .await
+            .unwrap();
 
         // resize loop — each resize grows ~10 KB; page is ~24 KB
         const TARGET: usize = 8 + std::mem::size_of::<mango_v4::state::CommitPageV4>();
         loop {
-            let acct = solana.context.borrow_mut().banks_client.get_account(queue_page).await.unwrap().unwrap();
+            let acct = solana
+                .context
+                .borrow_mut()
+                .banks_client
+                .get_account(queue_page)
+                .await
+                .unwrap()
+                .unwrap();
             if acct.data.len() >= TARGET {
                 break;
             }
@@ -297,7 +309,10 @@ async fn setup_v4_queue(
                 .to_account_metas(None),
                 data: mango_v4::instruction::ExecutionQueueV4ResizeMarketPage { page_slot }.data(),
             };
-            solana.process_transaction(&[resize_ix], Some(&[payer])).await.unwrap();
+            solana
+                .process_transaction(&[resize_ix], Some(&[payer]))
+                .await
+                .unwrap();
         }
 
         let init_ix = Instruction {
@@ -315,7 +330,10 @@ async fn setup_v4_queue(
             }
             .data(),
         };
-        solana.process_transaction(&[init_ix], Some(&[payer])).await.unwrap();
+        solana
+            .process_transaction(&[init_ix], Some(&[payer]))
+            .await
+            .unwrap();
     }
 
     queue_root
@@ -382,7 +400,11 @@ fn prepare_intents(
             let sequence = start_seq + i as u64;
             let payload = encode_perp_place_order_v2_payload(
                 if i % 2 == 0 { Side::Bid } else { Side::Ask },
-                if i % 2 == 0 { price_lots - 10 } else { price_lots + 10 },
+                if i % 2 == 0 {
+                    price_lots - 10
+                } else {
+                    price_lots + 10
+                },
                 1,
                 10_000 + sequence,
             );
@@ -453,7 +475,8 @@ async fn commit_batch(
         .as_ref()
         .try_into()
         .unwrap();
-    let preix = build_presigned_ed25519_instruction(ctm_signer.pubkey().to_bytes(), &batch_msg, sig);
+    let preix =
+        build_presigned_ed25519_instruction(ctm_signer.pubkey().to_bytes(), &batch_msg, sig);
 
     let commit_ix = Instruction {
         program_id: mango_v4::id(),
@@ -522,9 +545,8 @@ async fn reveal_execute_batch(
         ));
     }
 
-    let cu_limit_ix = solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(
-        1_400_000,
-    );
+    let cu_limit_ix =
+        solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(1_400_000);
 
     let mut accounts = mango_v4::accounts::ExecutionQueueV4RevealExecuteMarket {
         group,
@@ -556,7 +578,10 @@ async fn reveal_execute_batch(
         .simulate_transaction(r.transaction.clone())
         .await
         .unwrap();
-    let cu = sim.simulation_details.map(|d| d.units_consumed).unwrap_or(0);
+    let cu = sim
+        .simulation_details
+        .map(|d| d.units_consumed)
+        .unwrap_or(0);
     r.result?;
     Ok(cu)
 }
@@ -648,7 +673,16 @@ async fn test_v4_bench_e2e_place_cancel_10_users() -> Result<(), TransportError>
     // v4 queue setup.
     let ctm_signer = TestKeypair::new();
     let market_index = 0u16;
-    let queue_root = setup_v4_queue(solana, group, admin, payer, ctm_signer.pubkey(), market_index, 1).await;
+    let queue_root = setup_v4_queue(
+        solana,
+        group,
+        admin,
+        payer,
+        ctm_signer.pubkey(),
+        market_index,
+        1,
+    )
+    .await;
     let authority_state = find_authority_state_pda(group);
     let queue_page0 = find_commit_queue_page_pda(queue_root, 0);
 
@@ -735,7 +769,13 @@ async fn test_v4_bench_e2e_place_cancel_10_users() -> Result<(), TransportError>
                 );
             }
             Err(e) => {
-                println!("reveal batch={} seqs [{}, {}) failed: {:?}", batch.len(), head, end, e);
+                println!(
+                    "reveal batch={} seqs [{}, {}) failed: {:?}",
+                    batch.len(),
+                    head,
+                    end,
+                    e
+                );
                 break;
             }
         }

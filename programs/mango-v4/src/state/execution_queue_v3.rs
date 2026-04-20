@@ -17,10 +17,8 @@ pub const EXECUTION_QUEUE_V3_CANONICAL_PERP_ACCOUNT_RECIPE_V1_LEN: u8 = 8;
 
 pub const EXECUTION_QUEUE_AUTHORITY_STATE_SPACE: usize =
     8 + size_of::<ExecutionQueueAuthorityState>();
-pub const EXECUTION_QUEUE_PERP_MARKET_ROOT_V3_SPACE: usize =
-    8 + size_of::<PerpMarketQueueRootV3>();
-pub const EXECUTION_QUEUE_LIQUIDITY_ROOT_V3_SPACE: usize =
-    8 + size_of::<LiquidityQueueRootV3>();
+pub const EXECUTION_QUEUE_PERP_MARKET_ROOT_V3_SPACE: usize = 8 + size_of::<PerpMarketQueueRootV3>();
+pub const EXECUTION_QUEUE_LIQUIDITY_ROOT_V3_SPACE: usize = 8 + size_of::<LiquidityQueueRootV3>();
 pub const EXECUTION_QUEUE_PAGE_V3_SPACE: usize = 8 + size_of::<ExecutionQueuePageV3>();
 
 #[repr(u8)]
@@ -317,7 +315,10 @@ impl PerpMarketQueueRootV3 {
             MangoError::InvalidSequenceNumber
         );
         require!(
-            sequence < self.next_sequence_to_execute.saturating_add(self.admission_limit()),
+            sequence
+                < self
+                    .next_sequence_to_execute
+                    .saturating_add(self.admission_limit()),
             MangoError::ExecutionQueueFull
         );
         Ok(())
@@ -610,7 +611,8 @@ impl ExecutionQueuePageV3 {
         );
         let existing = &self.items[offset as usize];
         require!(
-            existing.status != QueueItemStatusV3::Pending as u8 || existing.sequence != item.sequence,
+            existing.status != QueueItemStatusV3::Pending as u8
+                || existing.sequence != item.sequence,
             MangoError::ExecutionQueueDuplicateSequence
         );
         require!(
@@ -859,7 +861,8 @@ mod tests {
         let queue_root = Pubkey::new_unique();
         page.init(queue_root, 0, 0, 64, 1);
 
-        page.prepare_for_write_target(queue_root, 0, 16, 64).unwrap();
+        page.prepare_for_write_target(queue_root, 0, 16, 64)
+            .unwrap();
 
         assert_eq!(page.assigned_abs_page_no, 16);
         assert_eq!(page.first_pending_offset, 64);
