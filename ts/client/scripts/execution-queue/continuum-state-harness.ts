@@ -19,6 +19,13 @@ import * as dotenv from 'dotenv';
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 import fs from 'fs';
+// [redis-phase1a] redis event mirror (Phase 1a)
+import { createPublisher, type Publisher, type HarnessEventLike } from './redis-publisher';
+// [redis-phase1b] state mirror (book/position/balance)
+import { createMirror, type Mirror } from './state-mirror';
+// [redis-phase6] prom metrics listener + hooks
+import { startMetricsServer, publisherMetricsHooks } from './metrics';
+startMetricsServer();
 import http, { IncomingMessage, ServerResponse } from 'http';
 import path from 'path';
 import { monitorEventLoopDelay, performance } from 'perf_hooks';
@@ -61,6 +68,10 @@ import {
   decodeExecutionQueueHeader,
   decodeExecutionQueuePendingItems,
 } from '../../src/executionQueueLayout';
+import {
+  decodeExecutionQueueV3MarketRoot,
+  executionQueueV3NextEnqueueSequence,
+} from '../../src/executionQueue';
 import { I80F48, ZERO_I80F48 } from '../../src/numbers/I80F48';
 
 dotenv.config();
@@ -120,6 +131,12 @@ const HARNESS_GROUP_PK =
   process.env.CONTINUUM_HARNESS_GROUP_PK ||
   process.env.EXECUTION_QUEUE_GROUP_PK ||
   '';
+const HARNESS_EXECUTION_QUEUE_TOPOLOGY = (
+  process.env.CONTINUUM_HARNESS_EXECUTION_QUEUE_TOPOLOGY ||
+  process.env.EXECUTION_QUEUE_TOPOLOGY ||
+  'v2'
+).toLowerCase();
+const HARNESS_USES_V3_QUEUE = HARNESS_EXECUTION_QUEUE_TOPOLOGY.startsWith('v3');
 const HARNESS_AIRDROP_DEPOSIT_UI_AMOUNT = Number(
   process.env.CONTINUUM_HARNESS_AIRDROP_DEPOSIT_UI_AMOUNT || '1000',
 );
@@ -3575,7 +3592,17 @@ function writeSseEvent(
   );
 }
 
+// [redis-phase1a] module-level publisher
+const redisPublisher: Publisher = createPublisher(publisherMetricsHooks); // [redis-phase6]
+// [redis-phase1b] Closure captures the module-level `engine` lazily, so this is safe
+// even though `engine` is assigned asynchronously during boot.
+const stateMirror: Mirror = createMirror((view) => engine?.getSnapshot(view));
+
 function broadcastEvent(event: HarnessEvent): void {
+  // [redis-phase1a] fire-and-forget mirror; never blocks, never throws
+  redisPublisher.publishEvent(event as unknown as HarnessEventLike);
+  // [redis-phase1b] debounced snapshot mirror; never blocks, never throws
+  stateMirror.onEvent();
   measureSync(
     'broadcast_event',
     () => {
@@ -5682,6 +5709,9 @@ async function resolveExecutionQueuePk(
   if (onchain.executionQueuePk) {
     return onchain.executionQueuePk;
   }
+  if (HARNESS_USES_V3_QUEUE) {
+    return null;
+  }
   const group = await getFreshGroup(onchain);
   if (!group) {
     return null;
@@ -5698,8 +5728,14 @@ async function buildOnchainQueueSnapshot(
   onchain: OnchainContext | null,
 ): Promise<OnchainQueueSnapshot | null> {
   return await withOnchainRead(onchain, 'build_onchain_queue_snapshot', async () => {
+    if (!onchain) {
+      return null;
+    }
     const executionQueuePk = await resolveExecutionQueuePk(onchain);
-    if (!executionQueuePk || !onchain?.groupPk) {
+    if (!executionQueuePk) {
+      return null;
+    }
+    if (!HARNESS_USES_V3_QUEUE && !onchain.groupPk) {
       return null;
     }
 
@@ -5712,8 +5748,22 @@ async function buildOnchainQueueSnapshot(
     }
 
     const data = Buffer.from(queueAccount.value.data);
+    if (HARNESS_USES_V3_QUEUE) {
+      const root = decodeExecutionQueueV3MarketRoot(data);
+      return {
+        generated_ts_ms: Date.now(),
+        observed_slot: queueAccount.context.slot,
+        next_sequence: executionQueueV3NextEnqueueSequence(root).toString(),
+        max_seen_sequence: root.maxSeenSequence.toString(),
+        total_count: root.liveCount,
+        // The harness only needs authoritative queue depth and sequence
+        // watermarks here. Decoding per-page pending items for v3/v4 routes
+        // is separate from the legacy flat-queue layout.
+        items: [],
+      };
+    }
     const header = decodeExecutionQueueHeader(data);
-    const group = onchain.groupPk.toBase58();
+    const group = onchain.groupPk!.toBase58();
     const items = decodeExecutionQueuePendingItems(data).map((item) => {
       // v2 sub-queue: items decoded from a per-market window carry the
       // market_index of their owning sub-queue. Pass it through to the engine
@@ -6408,10 +6458,12 @@ async function buildOnchainContext(
     : null;
   let executionQueuePk: PublicKey | null =
     process.env.CONTINUUM_HARNESS_EXECUTION_QUEUE_PK ||
-    process.env.EXECUTION_QUEUE_PK
+    process.env.EXECUTION_QUEUE_PK ||
+    process.env.V4_QUEUE_ROOT
       ? new PublicKey(
           process.env.CONTINUUM_HARNESS_EXECUTION_QUEUE_PK ||
             process.env.EXECUTION_QUEUE_PK ||
+            process.env.V4_QUEUE_ROOT ||
             '',
         )
       : null;
@@ -6431,7 +6483,7 @@ async function buildOnchainContext(
       if (!usdcMint) {
         usdcMint = cachedGroup.getFirstBankForPerpSettlement().mint;
       }
-      if (!executionQueuePk) {
+      if (!executionQueuePk && !HARNESS_USES_V3_QUEUE) {
         [executionQueuePk] = PublicKey.findProgramAddressSync(
           [Buffer.from('ExecutionQueue'), cachedGroup.publicKey.toBuffer()],
           programId,
