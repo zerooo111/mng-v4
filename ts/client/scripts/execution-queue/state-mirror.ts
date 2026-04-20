@@ -25,8 +25,10 @@ const MIRROR_ENABLED =
   (process.env.REDIS_MIRROR_ENABLED ?? 'false').toLowerCase() === 'true';
 
 // Trailing-debounce window. Bigger = fewer Redis writes but staler snapshots.
-// 50ms = ~20 writes/s max per process, well under the Redis budget.
-const MIRROR_DEBOUNCE_MS = 50;
+// 100ms = ~10 writes/s max per process. Halves mirror CPU vs 50ms; users
+// dont notice 100ms of snapshot staleness on the read path. Trade latency
+// is protected by keeping the hot path fire-and-forget regardless.
+const MIRROR_DEBOUNCE_MS = 100;
 
 // Safety cap on orders mirrored per market per view. Book depth > this is
 // truncated from the tail (lowest-priority side). Protects against runaway
