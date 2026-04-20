@@ -26,7 +26,7 @@ const MIRROR_ENABLED =
 
 // Trailing-debounce window. Bigger = fewer Redis writes but staler snapshots.
 // 100ms = ~10 writes/s max per process. Halves mirror CPU vs 50ms; users
-// dont notice 100ms of snapshot staleness on the read path. Trade latency
+// don't notice 100ms of snapshot staleness on the read path. Trade latency
 // is protected by keeping the hot path fire-and-forget regardless.
 const MIRROR_DEBOUNCE_MS = 100;
 
@@ -49,9 +49,34 @@ interface OpenOrderLike {
   readonly client_order_id?: string;
 }
 
+/**
+ * Rich, slow-changing identity fields carried on the harness's own Market
+ * record (mirrors the shape returned by `GET /state/markets/:id.metadata`).
+ * Every field optional so the mirror stays resilient to harness upgrades.
+ */
+interface MarketMetadataLike {
+  readonly market_index?: number | string;
+  readonly name?: string;
+  readonly base_symbol?: string;
+  readonly quote_symbol?: string;
+  readonly base_mint?: string;
+  readonly quote_mint?: string;
+  readonly perp_market?: string;
+  readonly oracle?: string;
+  readonly bids?: string;
+  readonly asks?: string;
+  readonly event_queue?: string;
+  readonly base_decimals?: number | string;
+  readonly quote_decimals?: number | string;
+  readonly base_lot_size?: number | string;
+  readonly quote_lot_size?: number | string;
+  readonly open_interest?: number | string;
+}
+
 interface MarketLike {
   readonly market: string;
   readonly open_orders?: OpenOrderLike[];
+  readonly metadata?: MarketMetadataLike;
 }
 
 interface PerMarketStateLike {
@@ -277,37 +302,85 @@ class IORedisMirror implements Mirror {
       }
     }
 
-    // ── Market metadata (Phase 1c) ──
-    // Single-view: perp_markets is view-agnostic. We still write under both
-    // view tags so the gateway's /v2/snapshot/market/:id can be queried
-    // without a view parameter.
+    // ── Market metadata (Phase 1c + 5) ──
+    // Single-view: market metadata is view-agnostic. We still write under the
+    // `opt` tag only because the data is identical across views and the
+    // gateway reads this without a view parameter.
+    //
+    // Payload merges two sources:
+    //   - `perp_markets[id]` — fast-changing: oracle/stable prices, funding,
+    //     fees. Mirrored every tick.
+    //   - `markets[id].metadata` — slow-changing identity: name, symbols,
+    //     mints, PDA pubkeys, decimals, open_interest. Frontend needs these
+    //     once at boot but the values rarely change; re-writing each tick is
+    //     cheap (a single HSET per market).
+    //
+    // Together, `v1:meta:market:<id>` becomes a complete replacement for the
+    // v1 `/state/markets/:id` payload's `metadata` + `metrics` subobjects.
     if (snap.perp_markets && tag === 'opt') {
-      // Registry of all known markets. Frontend uses this in place of
-      // /state/full to enumerate markets without round-tripping the harness.
-      pipeline.sadd(
-        'v1:meta:markets',
-        ...Object.entries(snap.perp_markets).map(([k, pm]) => String(pm.market_index ?? k))
-      );
+      const collect: Record<string, Record<string, string>> = {};
+
+      const addField = (id: string, k: string, v: unknown) => {
+        if (v === undefined || v === null) return;
+        (collect[id] ??= {})[k] = String(v);
+      };
+
+      // 1. Dynamic pricing / funding / fees from perp_markets.
       for (const [key, pm] of Object.entries(snap.perp_markets)) {
-        const marketId = pm.market_index ?? key;
-        const metaKey = `v1:meta:market:${marketId}`;
-        const fields: Record<string, string> = { ts_ms: tsMs };
-        const copy = (k: keyof PerpMarketSyncLike) => {
-          const v = pm[k];
-          if (v !== undefined && v !== null) fields[k as string] = String(v);
-        };
-        copy('oracle_price');
-        copy('stable_price');
-        copy('base_lot_size');
-        copy('quote_lot_size');
-        copy('long_funding');
-        copy('short_funding');
-        copy('maker_fee');
-        copy('taker_fee');
-        copy('settle_token_index');
-        copy('market');
-        pipeline.del(metaKey);
-        pipeline.hset(metaKey, fields);
+        const id = String(pm.market_index ?? key);
+        addField(id, 'ts_ms', tsMs);
+        for (const k of [
+          'oracle_price',
+          'stable_price',
+          'base_lot_size',
+          'quote_lot_size',
+          'long_funding',
+          'short_funding',
+          'maker_fee',
+          'taker_fee',
+          'settle_token_index',
+          'market',
+        ] as const) {
+          addField(id, k, pm[k]);
+        }
+      }
+
+      // 2. Static identity from markets[id].metadata (if present).
+      if (snap.markets) {
+        for (const [key, m] of Object.entries(snap.markets)) {
+          const md = m.metadata;
+          if (!md) continue;
+          const id = String(md.market_index ?? m.market ?? key);
+          for (const k of [
+            'name',
+            'base_symbol',
+            'quote_symbol',
+            'base_mint',
+            'quote_mint',
+            'perp_market',
+            'oracle',
+            'bids',
+            'asks',
+            'event_queue',
+            'base_decimals',
+            'quote_decimals',
+            'base_lot_size',
+            'quote_lot_size',
+            'open_interest',
+          ] as const) {
+            addField(id, k, md[k]);
+          }
+        }
+      }
+
+      const ids = Object.keys(collect);
+      if (ids.length > 0) {
+        pipeline.sadd('v1:meta:markets', ...ids);
+        for (const id of ids) {
+          const key = `v1:meta:market:${id}`;
+          pipeline.del(key);
+          pipeline.hset(key, collect[id]);
+        }
       }
     }
 
