@@ -36,6 +36,18 @@ const writeErrorsTotal = new Counter({
   labelNames: ['kind'],
 });
 
+// Counts publishes that the pipeline intentionally skipped because the
+// source event carried nothing to publish (e.g. queue_item_processed with
+// no fills attached by enrichProcessedWithFills). Distinct from
+// write_errors — nothing failed; there was simply nothing to write. A
+// sustained rate here with `reason="no_fills"` means the enrichment path
+// is broken even though Redis itself is healthy.
+const publishSkippedTotal = new Counter({
+  name: 'harness_redis_publish_skipped_total',
+  help: 'Publishes skipped because the source event had no data to emit.',
+  labelNames: ['stream', 'reason'],
+});
+
 const writeDurationSeconds = new Histogram({
   name: 'harness_redis_write_duration_seconds',
   help: 'XADD round-trip duration from issue to resolution.',
@@ -73,6 +85,11 @@ export const publisherMetricsHooks = {
   writeErrorsTotal: {
     inc(labels: Record<string, string> = {}, value = 1) {
       writeErrorsTotal.inc(labels, value);
+    },
+  },
+  publishSkippedTotal: {
+    inc(labels: Record<string, string> = {}, value = 1) {
+      publishSkippedTotal.inc(labels, value);
     },
   },
   writeDurationSeconds: {

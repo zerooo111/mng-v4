@@ -41,6 +41,11 @@ const WALLET_TRADES_MAXLEN = 500;
 // watchdog and the metrics recorder.
 const REDIS_WRITE_TIMEOUT_MS = 50;
 
+// Throttle for the per-market "queue_item_processed carried no fills" warn
+// log. The counter still increments on every occurrence — the log is only
+// rate-limited because a stuck pipeline can fire dozens of these per second.
+const NO_FILLS_WARN_INTERVAL_MS = 60_000;
+
 // ── Minimal event shape we need ─────────────────────────────────────
 // Keep this narrow on purpose — anything more specific belongs in the
 // harness's own types. The publisher only cares about routing and payload.
@@ -66,6 +71,11 @@ interface MetricsHooks {
   writesTotal?: PrometheusCounter;
   writeErrorsTotal?: PrometheusCounter;
   writeDurationSeconds?: PrometheusHistogram;
+  // Skipped publishes for expected-but-empty sources (e.g. a
+  // queue_item_processed event that carries no fill payload). Lets us see
+  // the "pipeline up, data absent" failure mode that otherwise reads as
+  // "Redis is fine" because no XADD ever fails.
+  publishSkippedTotal?: PrometheusCounter;
 }
 
 // ── Publisher ───────────────────────────────────────────────────────
@@ -148,6 +158,12 @@ class IORedisPublisher implements Publisher {
 
   isEnabled(): boolean { return true; }
 
+  // Per-market last-warned timestamp for the "no fills attached" skip path.
+  // Throttles the warn log to at most once per NO_FILLS_WARN_INTERVAL_MS so
+  // a persistent outage (enrichment broken, engine empty, deploy drift)
+  // stays visible without flooding logs.
+  private lastNoFillsWarnMs: Map<number, number> = new Map();
+
   /**
    * Extract trade records from a processed-queue event's payload and XADD
    * them to `v1:trades:<market>`. Defensive: unrecognized payload shapes
@@ -158,7 +174,27 @@ class IORedisPublisher implements Publisher {
     const market = extractMarket(event);
     if (market === null) return;
     const trades = extractTrades(event);
-    if (trades.length === 0) return;
+    if (trades.length === 0) {
+      // Silent drop used to be invisible: XADD never fired, no counter moved,
+      // no log. We now record it explicitly so dashboards can alert on
+      // `harness_redis_publish_skipped_total{stream="v1:trades",reason="no_fills"}`
+      // when enrichment is broken (missing trades[] field, engine state
+      // empty, sequence-namespace drift, etc.).
+      this.metrics.publishSkippedTotal?.inc({
+        stream: 'v1:trades',
+        reason: 'no_fills',
+      });
+      const now = Date.now();
+      const prev = this.lastNoFillsWarnMs.get(market) ?? 0;
+      if (now - prev >= NO_FILLS_WARN_INTERVAL_MS) {
+        this.lastNoFillsWarnMs.set(market, now);
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[redis-publisher] queue_item_processed market=${market} seq=${String(event.sequence ?? '')} carried no trades/fills payload — v1:trades:${market} will not receive this entry. Upstream enrichment (enrichProcessedWithFills) or engine fill tracking is likely the cause.`,
+        );
+      }
+      return;
+    }
     const streamKey = `v1:trades:${market}`;
     for (const t of trades) {
       const fields: string[] = [];
