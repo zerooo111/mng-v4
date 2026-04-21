@@ -7598,6 +7598,21 @@ impl Engine {
                         "v5 sequence {v5_seq} collision after send — retry"
                     )));
                 }
+                // v5 now uses the same optimistic accepted-intent flow as the
+                // legacy path: once the commit send has cleared all local
+                // hard-fail points, apply it to the in-process replay engine
+                // before returning so user-visible reads pick it up
+                // immediately. We intentionally do this only after the final
+                // post-send collision guard, because any failure before this
+                // point is still a reject rather than an accepted optimistic
+                // state that would need rollback.
+                let undo_token =
+                    self.apply_relay_intent_to_local_state(&resolved_request, &envelope, &sig);
+                if undo_token.is_some() {
+                    self.metrics
+                        .local_optimistic_latency
+                        .record(parse_started.elapsed().as_millis() as u64);
+                }
                 self.metrics
                     .ingress_accepted_total
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -7610,6 +7625,16 @@ impl Engine {
                     None,
                     None,
                 ))
+                .await;
+                if target.target_kind == UserIntentTargetKind::PerpMarket {
+                    self.note_mango_account_target_market(mango_account, target.target_index);
+                }
+                self.maybe_emit_event(
+                    &resolved_request,
+                    &envelope,
+                    &sig,
+                    &status_ctx.request_id,
+                )
                 .await;
                 return Ok(SubmitIntentResponse {
                     sequence: v5_seq,

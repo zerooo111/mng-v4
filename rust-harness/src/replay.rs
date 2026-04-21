@@ -1886,20 +1886,22 @@ impl ContinuumStateEngine {
         projection: &mut Projection,
         simulation_now_ts: u64,
     ) -> Result<()> {
-        let mut pending_by_group = BTreeMap::<String, BTreeMap<u64, &CanonicalIntent>>::new();
+        let mut pending_by_group_market =
+            BTreeMap::<(String, String), BTreeMap<u64, &CanonicalIntent>>::new();
         for intent in intents
             .iter()
             .copied()
             .filter(|intent| intent.kind == QUEUE_ITEM_KIND_CTM_WRAPPED)
         {
-            pending_by_group
-                .entry(intent.group.clone())
+            pending_by_group_market
+                .entry((intent.group.clone(), intent.market.clone()))
                 .or_default()
                 .insert(intent.sequence, intent);
         }
 
-        for (_group, intents_by_sequence) in pending_by_group {
-            let Some(mut next_sequence) = self.optimistic_ctm_start_sequence(&intents_by_sequence)
+        for ((_group, market), intents_by_sequence) in pending_by_group_market {
+            let Some(mut next_sequence) =
+                self.optimistic_ctm_start_sequence(&market, &intents_by_sequence)
             else {
                 continue;
             };
@@ -3058,12 +3060,19 @@ impl ContinuumStateEngine {
             .max(1)
     }
 
+    fn baseline_next_ctm_sequence_for_market(&self, market: &str) -> u64 {
+        self.baseline_seq_for_market(market)
+            .saturating_add(1)
+            .max(1)
+    }
+
     fn optimistic_ctm_start_sequence(
         &self,
+        market: &str,
         intents_by_sequence: &BTreeMap<u64, &CanonicalIntent>,
     ) -> Option<u64> {
         if self.baseline_bootstrapped {
-            Some(self.baseline_next_ctm_sequence())
+            Some(self.baseline_next_ctm_sequence_for_market(market))
         } else {
             intents_by_sequence.keys().next().copied()
         }
@@ -3611,7 +3620,8 @@ fn order_intents_by_queue_semantics(a: &&CanonicalIntent, b: &&CanonicalIntent) 
         .then_with(|| a.kind.cmp(&b.kind))
         .then_with(|| {
             if a.kind == QUEUE_ITEM_KIND_CTM_WRAPPED && b.kind == QUEUE_ITEM_KIND_CTM_WRAPPED {
-                a.sequence.cmp(&b.sequence)
+                compare_market_strings(&a.market, &b.market)
+                    .then_with(|| a.sequence.cmp(&b.sequence))
             } else {
                 Ordering::Equal
             }
@@ -3803,6 +3813,11 @@ mod tests {
                 group: group.to_string(),
                 execution_queue: execution_queue.to_string(),
                 market: market.to_string(),
+                intent_version: None,
+                target_kind: None,
+                target_index: None,
+                accounts_hash: None,
+                remaining_accounts_source: None,
                 sequence: sequence.to_string(),
                 kind: 0,
                 payload_b64: place_order_payload(
@@ -3932,6 +3947,11 @@ mod tests {
                     group: group.clone(),
                     execution_queue: execution_queue.clone(),
                     market: market.clone(),
+                    intent_version: None,
+                    target_kind: None,
+                    target_index: None,
+                    accounts_hash: None,
+                    remaining_accounts_source: None,
                     sequence: "1".to_string(),
                     kind: 0,
                     payload_b64: place_order_payload(
@@ -4002,6 +4022,11 @@ mod tests {
                     group: group.clone(),
                     execution_queue,
                     market: market.clone(),
+                    intent_version: None,
+                    target_kind: None,
+                    target_index: None,
+                    accounts_hash: None,
+                    remaining_accounts_source: None,
                     sequence: "2".to_string(),
                     kind: 0,
                     payload_b64: cancel_all_payload(20),
@@ -4069,6 +4094,11 @@ mod tests {
                     group: group.clone(),
                     execution_queue: execution_queue.clone(),
                     market: market.clone(),
+                    intent_version: None,
+                    target_kind: None,
+                    target_index: None,
+                    accounts_hash: None,
+                    remaining_accounts_source: None,
                     sequence: "1".to_string(),
                     kind: 0,
                     payload_b64: place_payload.clone(),
@@ -4085,6 +4115,11 @@ mod tests {
                     group: group.clone(),
                     execution_queue: execution_queue.clone(),
                     market: market.clone(),
+                    intent_version: None,
+                    target_kind: None,
+                    target_index: None,
+                    accounts_hash: None,
+                    remaining_accounts_source: None,
                     sequence: "2".to_string(),
                     kind: 0,
                     payload_b64: cancel_payload.clone(),
@@ -4135,6 +4170,11 @@ mod tests {
                     group: group.clone(),
                     execution_queue,
                     market: market.clone(),
+                    intent_version: None,
+                    target_kind: None,
+                    target_index: None,
+                    accounts_hash: None,
+                    remaining_accounts_source: None,
                     sequence: "2".to_string(),
                     kind: 0,
                     payload_b64: cancel_payload,
@@ -4167,6 +4207,11 @@ mod tests {
                     group: group.clone(),
                     execution_queue: key(),
                     market: market.clone(),
+                    intent_version: None,
+                    target_kind: None,
+                    target_index: None,
+                    accounts_hash: None,
+                    remaining_accounts_source: None,
                     sequence: "1".to_string(),
                     kind: 0,
                     payload_b64: place_payload,
@@ -4257,6 +4302,11 @@ mod tests {
                     group: group.clone(),
                     execution_queue: execution_queue.clone(),
                     market: market.clone(),
+                    intent_version: None,
+                    target_kind: None,
+                    target_index: None,
+                    accounts_hash: None,
+                    remaining_accounts_source: None,
                     sequence: "1".to_string(),
                     kind: 0,
                     payload_b64: place_order_payload(
@@ -4286,6 +4336,11 @@ mod tests {
                     group: group.clone(),
                     execution_queue,
                     market: market.clone(),
+                    intent_version: None,
+                    target_kind: None,
+                    target_index: None,
+                    accounts_hash: None,
+                    remaining_accounts_source: None,
                     sequence: "2".to_string(),
                     kind: 0,
                     payload_b64: place_order_payload(
@@ -4377,6 +4432,11 @@ mod tests {
                     group: group.clone(),
                     execution_queue,
                     market: market.clone(),
+                    intent_version: None,
+                    target_kind: None,
+                    target_index: None,
+                    accounts_hash: None,
+                    remaining_accounts_source: None,
                     sequence: "5".to_string(),
                     kind: 0,
                     payload_b64: place_order_payload(
@@ -4445,6 +4505,11 @@ mod tests {
                     group: group.clone(),
                     execution_queue,
                     market: market.clone(),
+                    intent_version: None,
+                    target_kind: None,
+                    target_index: None,
+                    accounts_hash: None,
+                    remaining_accounts_source: None,
                     sequence: "9".to_string(),
                     kind: 0,
                     payload_b64: place_order_payload(
@@ -4526,6 +4591,11 @@ mod tests {
                     group: group.clone(),
                     execution_queue,
                     market,
+                    intent_version: None,
+                    target_kind: None,
+                    target_index: None,
+                    accounts_hash: None,
+                    remaining_accounts_source: None,
                     sequence: "8".to_string(),
                     kind: 0,
                     payload_b64: cancel_all_payload(10),
@@ -4648,6 +4718,11 @@ mod tests {
                     group: group.clone(),
                     execution_queue,
                     market: market.clone(),
+                    intent_version: None,
+                    target_kind: None,
+                    target_index: None,
+                    accounts_hash: None,
+                    remaining_accounts_source: None,
                     sequence: "1".to_string(),
                     kind: 0,
                     payload_b64: place_order_payload(
@@ -4715,6 +4790,11 @@ mod tests {
                     group,
                     execution_queue,
                     market: market.clone(),
+                    intent_version: None,
+                    target_kind: None,
+                    target_index: None,
+                    accounts_hash: None,
+                    remaining_accounts_source: None,
                     sequence: "1".to_string(),
                     kind: 0,
                     payload_b64: place_order_payload(
@@ -4773,6 +4853,11 @@ mod tests {
                     group,
                     execution_queue,
                     market: market.clone(),
+                    intent_version: None,
+                    target_kind: None,
+                    target_index: None,
+                    accounts_hash: None,
+                    remaining_accounts_source: None,
                     sequence: "2".to_string(),
                     kind: 0,
                     payload_b64: place_order_payload(
@@ -4823,6 +4908,11 @@ mod tests {
                     group: group.clone(),
                     execution_queue,
                     market: market.clone(),
+                    intent_version: None,
+                    target_kind: None,
+                    target_index: None,
+                    accounts_hash: None,
+                    remaining_accounts_source: None,
                     sequence: "2".to_string(),
                     kind: 0,
                     payload_b64: place_order_payload(
@@ -4887,6 +4977,11 @@ mod tests {
                     group: group.clone(),
                     execution_queue,
                     market: market.clone(),
+                    intent_version: None,
+                    target_kind: None,
+                    target_index: None,
+                    accounts_hash: None,
+                    remaining_accounts_source: None,
                     sequence: "1".to_string(),
                     kind: 0,
                     payload_b64: place_order_payload(
@@ -4955,6 +5050,11 @@ mod tests {
                     group,
                     execution_queue,
                     market: market.clone(),
+                    intent_version: None,
+                    target_kind: None,
+                    target_index: None,
+                    accounts_hash: None,
+                    remaining_accounts_source: None,
                     sequence: "1".to_string(),
                     kind: 0,
                     payload_b64: BASE64_STANDARD.encode([0xff, 0xff]),
@@ -4975,6 +5075,158 @@ mod tests {
                 .unwrap()
                 .open_orders
                 .is_empty());
+        });
+    }
+
+    #[test]
+    fn optimistic_pending_ctm_keeps_same_sequence_on_different_markets() {
+        run_with_large_stack(|| {
+            let mut engine = ContinuumStateEngine::new();
+            let group = key();
+            let execution_queue = key();
+            let owner = key();
+            let mango_account = key();
+            let market_a = "25".to_string();
+            let market_b = "26".to_string();
+
+            bootstrap_market(&mut engine, &market_a, 100);
+            bootstrap_market(&mut engine, &market_b, 100);
+
+            for (market, side, price, client_order_id, tx_signature) in [
+                (
+                    market_a.clone(),
+                    Side::Bid,
+                    91,
+                    125,
+                    "tx-market-a-seq-1".to_string(),
+                ),
+                (
+                    market_b.clone(),
+                    Side::Ask,
+                    109,
+                    126,
+                    "tx-market-b-seq-1".to_string(),
+                ),
+            ] {
+                engine
+                    .ingest_relay_intent(RelayIntentAcceptedEvent {
+                        event_type: "relay_intent_accepted".to_string(),
+                        ts_ms: 1,
+                        group: group.clone(),
+                        execution_queue: execution_queue.clone(),
+                        market,
+                        intent_version: None,
+                        target_kind: None,
+                        target_index: None,
+                        accounts_hash: None,
+                        remaining_accounts_source: None,
+                        sequence: "1".to_string(),
+                        kind: 0,
+                        payload_b64: place_order_payload(
+                            side,
+                            price,
+                            2,
+                            250,
+                            client_order_id,
+                            PlaceOrderType::Limit,
+                            SelfTradeBehavior::DecrementTake,
+                            false,
+                            0,
+                            10,
+                        ),
+                        remaining_accounts: Vec::new(),
+                        min_execute_slot: "1".to_string(),
+                        expires_at_slot: "0".to_string(),
+                        user_owner: owner.clone(),
+                        mango_account: mango_account.clone(),
+                        enqueue_tx_signature: tx_signature,
+                    })
+                    .unwrap();
+            }
+
+            let optimistic_a = engine
+                .get_market_state(&market_a, QueueView::Optimistic)
+                .unwrap();
+            assert_eq!(optimistic_a.open_orders.len(), 1);
+            assert_eq!(optimistic_a.open_orders[0].client_order_id, "125");
+
+            let optimistic_b = engine
+                .get_market_state(&market_b, QueueView::Optimistic)
+                .unwrap();
+            assert_eq!(optimistic_b.open_orders.len(), 1);
+            assert_eq!(optimistic_b.open_orders[0].client_order_id, "126");
+        });
+    }
+
+    #[test]
+    fn optimistic_pending_ctm_uses_per_market_baseline_sequence() {
+        run_with_large_stack(|| {
+            let mut engine = ContinuumStateEngine::new();
+            let group = key();
+            let execution_queue = key();
+            let owner = key();
+            let mango_account = key();
+            let market_a = "27".to_string();
+            let market_b = "28".to_string();
+
+            let mut markets = HashMap::new();
+            let mut market_a_state = empty_market_state(&market_a, 100);
+            market_a_state.watermarks.confirmed_seq = "5".to_string();
+            markets.insert(market_a.clone(), market_a_state);
+            markets.insert(market_b.clone(), empty_market_state(&market_b, 100));
+            engine
+                .bootstrap_from_onchain_snapshot(EngineSnapshot {
+                    view: QueueView::Confirmed,
+                    markets,
+                    users: HashMap::new(),
+                    queue: HashMap::new(),
+                    accounts: HashMap::new(),
+                    perp_markets: HashMap::new(),
+                    token_banks: HashMap::new(),
+                    generated_ts_ms: 0,
+                })
+                .unwrap();
+
+            engine
+                .ingest_relay_intent(RelayIntentAcceptedEvent {
+                    event_type: "relay_intent_accepted".to_string(),
+                    ts_ms: 1,
+                    group,
+                    execution_queue,
+                    market: market_b.clone(),
+                    intent_version: None,
+                    target_kind: None,
+                    target_index: None,
+                    accounts_hash: None,
+                    remaining_accounts_source: None,
+                    sequence: "1".to_string(),
+                    kind: 0,
+                    payload_b64: place_order_payload(
+                        Side::Bid,
+                        77,
+                        3,
+                        231,
+                        7001,
+                        PlaceOrderType::Limit,
+                        SelfTradeBehavior::DecrementTake,
+                        false,
+                        0,
+                        10,
+                    ),
+                    remaining_accounts: Vec::new(),
+                    min_execute_slot: "1".to_string(),
+                    expires_at_slot: "0".to_string(),
+                    user_owner: owner,
+                    mango_account,
+                    enqueue_tx_signature: "tx-market-b-seq-1".to_string(),
+                })
+                .unwrap();
+
+            let optimistic = engine
+                .get_market_state(&market_b, QueueView::Optimistic)
+                .unwrap();
+            assert_eq!(optimistic.open_orders.len(), 1);
+            assert_eq!(optimistic.open_orders[0].client_order_id, "7001");
         });
     }
 
@@ -5234,6 +5486,11 @@ mod tests {
                         group: group.clone(),
                         execution_queue: execution_queue.clone(),
                         market: market.clone(),
+                        intent_version: None,
+                        target_kind: None,
+                        target_index: None,
+                        accounts_hash: None,
+                        remaining_accounts_source: None,
                         sequence: sequence.to_string(),
                         kind: 0,
                         payload_b64: place_order_payload(
@@ -5551,6 +5808,11 @@ mod tests {
                     group,
                     execution_queue,
                     market: market.clone(),
+                    intent_version: None,
+                    target_kind: None,
+                    target_index: None,
+                    accounts_hash: None,
+                    remaining_accounts_source: None,
                     sequence: "2".to_string(),
                     kind: 0,
                     payload_b64: place_order_payload(
@@ -5721,6 +5983,11 @@ mod tests {
                     group,
                     execution_queue,
                     market: market.clone(),
+                    intent_version: None,
+                    target_kind: None,
+                    target_index: None,
+                    accounts_hash: None,
+                    remaining_accounts_source: None,
                     sequence: "65".to_string(),
                     kind: 0,
                     payload_b64: place_order_payload(
