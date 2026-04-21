@@ -23,6 +23,7 @@ import fs from 'fs';
 import { createPublisher, type Publisher, type HarnessEventLike } from './redis-publisher';
 // [redis-phase1b] state mirror (book/position/balance)
 import { createMirror, type Mirror } from './state-mirror';
+import IORedis, { type Redis as RedisClientType } from 'ioredis';
 // [redis-phase6] prom metrics listener + hooks
 import { startMetricsServer, publisherMetricsHooks } from './metrics';
 startMetricsServer();
@@ -961,6 +962,39 @@ const marketRuntimeMetricsCache = new Map<
 // state-mirror snapshot provider can attach rich identity fields without a
 // dependency on a specific OnchainContext reference or on any HTTP call.
 let harnessMarketMetadataSnapshot: Record<string, HarnessMarketMetadata> = {};
+
+// [redis-phase6] Per-owner optimistic collateral cache. The engine snapshot
+// doesn't carry `optimistic_collateral` on user records — that field is
+// built on-demand by /state/balances via enrichOwnerStateWithOnchain (an
+// async onchain RPC path). For the Redis mirror to write tokens into
+// v1:balance:<owner> without the gateway or frontend needing a second
+// round-trip, the state-mirror's snapshot provider must see this data
+// ambiently.
+//
+// Mirrors the harnessMarketMetadataSnapshot pattern: a module-level cache
+// populated by a bounded-concurrency background task (`refreshOwnerCollateralCache`),
+// read synchronously by the snapshot-provider closure. Interval tuned via
+// CONTINUUM_HARNESS_COLLATERAL_REFRESH_MS.
+type OwnerCollateralEntry = {
+  /** `optimistic_collateral` payload from enrichOwnerStateWithOnchain. */
+  readonly payload: unknown;
+  readonly fetchedAtMs: number;
+};
+const ownerCollateralCache = new Map<string, OwnerCollateralEntry>();
+
+const OWNER_COLLATERAL_REFRESH_INTERVAL_MS = Math.max(
+  2_000,
+  Number(process.env.CONTINUUM_HARNESS_COLLATERAL_REFRESH_MS ?? '10000'),
+);
+const OWNER_COLLATERAL_MAX_CONCURRENCY = Math.max(
+  1,
+  Number(process.env.CONTINUUM_HARNESS_COLLATERAL_MAX_CONCURRENCY ?? '5'),
+);
+const OWNER_COLLATERAL_STALE_MS = Math.max(
+  OWNER_COLLATERAL_REFRESH_INTERVAL_MS * 6,
+  Number(process.env.CONTINUUM_HARNESS_COLLATERAL_STALE_MS ?? '60000'),
+);
+
 // ── Market stats state ───────────────────────────────────────────────────────
 let marketStatsStore: MarketStatsStore = {
   version: 1,
@@ -3843,10 +3877,44 @@ const stateMirror: Mirror = createMirror((view) => {
       open_interest: metrics?.open_interest_base_lots ?? null,
     };
   }
+  // [redis-phase6] Enrich user records with cached optimistic_collateral
+  // (refreshed out-of-band by refreshOwnerCollateralCache) and synthesize
+  // `totals` — the aggregate-reserves object /state/balances composes from
+  // per_market entries. Both consumed by the gateway's /v2/snapshot/account
+  // and the composite stream's `account` event, which let the frontend
+  // retire the last /state/balances call sites.
+  const users = (snap as { users?: Record<string, { per_market?: Array<{
+    open_order_base_lots_bid?: string;
+    open_order_base_lots_ask?: string;
+    quote_reserved_lots?: string;
+  }> }> }).users ?? {};
+  const enrichedUsers: Record<string, unknown> = {};
+  for (const [owner, user] of Object.entries(users)) {
+    let bid = 0n;
+    let ask = 0n;
+    let reserved = 0n;
+    for (const pm of user.per_market ?? []) {
+      try { bid += BigInt(pm.open_order_base_lots_bid ?? '0'); } catch { /* ignore */ }
+      try { ask += BigInt(pm.open_order_base_lots_ask ?? '0'); } catch { /* ignore */ }
+      try { reserved += BigInt(pm.quote_reserved_lots ?? '0'); } catch { /* ignore */ }
+    }
+    const cached = ownerCollateralCache.get(owner);
+    enrichedUsers[owner] = {
+      ...user,
+      ...(cached?.payload !== undefined ? { optimistic_collateral: cached.payload } : {}),
+      totals: {
+        total_open_order_base_lots_bid: bid.toString(),
+        total_open_order_base_lots_ask: ask.toString(),
+        total_quote_reserved_lots: reserved.toString(),
+      },
+    };
+  }
+
   return {
     ...snap,
     markets: enrichedMarkets,
     perp_markets: enrichedPerp,
+    users: enrichedUsers,
   } as unknown as ReturnType<NonNullable<typeof engine>['getSnapshot']>;
 });
 
@@ -6542,6 +6610,137 @@ async function buildOnchainConfirmedSnapshot(
     queue: onchainQueue,
   };
   });
+}
+
+/**
+ * [redis-phase6] Refresh `ownerCollateralCache` for every owner the engine
+ * is currently tracking. One RPC per owner (via enrichOwnerStateWithOnchain)
+ * with bounded concurrency so we don't fan out thousands of requests at
+ * once. Errors are swallowed per owner — a transient RPC failure leaves
+ * the prior cache entry in place so the mirror keeps writing the last
+ * known good data.
+ *
+ * Stale entries (> OWNER_COLLATERAL_STALE_MS) are evicted: this keeps the
+ * cache from growing unbounded for owners that have left the engine.
+ */
+/**
+ * Owner set seed: scan `v1:balance:<tag>:*` in Redis and return the bare
+ * owner strings. Lets the refresh task source its work from the mirror's
+ * prior writes instead of relying on `engine.getSnapshot().users`, which
+ * is empty after every harness restart until new intents flow.
+ *
+ * Uses a dedicated short-lived ioredis connection — not the state-mirror's
+ * long-lived connection (which lives inside state-mirror.ts and isn't
+ * exported). A SCAN at the default ioredis match count is ~ms cheap for
+ * devnet key counts; we keep the client alive for the whole scan so the
+ * TCP handshake amortises across the cursor walk.
+ */
+async function listOwnersFromBalanceKeys(): Promise<string[]> {
+  const url = process.env.REDIS_URL ?? '';
+  if (!url) return [];
+  let client: RedisClientType | null = null;
+  try {
+    client = new IORedis(url, {
+      lazyConnect: false,
+      enableOfflineQueue: false,
+      maxRetriesPerRequest: 1,
+      connectTimeout: 2000,
+    });
+    const owners = new Set<string>();
+    let cursor = '0';
+    do {
+      const [next, batch] = (await client.scan(
+        cursor,
+        'MATCH',
+        'v1:balance:opt:*',
+        'COUNT',
+        500,
+      )) as [string, string[]];
+      cursor = next;
+      for (const key of batch) {
+        // key shape: `v1:balance:opt:<owner>`
+        const owner = key.slice('v1:balance:opt:'.length);
+        if (owner) owners.add(owner);
+      }
+    } while (cursor !== '0');
+    return Array.from(owners);
+  } catch {
+    return [];
+  } finally {
+    try {
+      await client?.quit();
+    } catch {
+      client?.disconnect();
+    }
+  }
+}
+
+async function refreshOwnerCollateralCache(
+  onchain: OnchainContext | null,
+): Promise<void> {
+  if (!onchain?.groupPk || !onchain?.mangoClient) return;
+  if (!engine) return;
+
+  // Source owners from the union of two canonical sources:
+  //   1. The engine snapshot (users the current harness process has
+  //      observed intents for this lifetime).
+  //   2. The Redis mirror key set (every owner the mirror has ever
+  //      touched, including prior harness sessions).
+  // Covers both the fresh-restart case (engine empty, Redis holds prior
+  // state) and steady state. The Redis scan runs at most once per
+  // refresh tick and SCAN is O(keys) with small constant cost on
+  // devnet-scale key counts (<10k).
+  const snap = engine.getSnapshot('optimistic');
+  const engineOwners = snap?.users ? Object.keys(snap.users) : [];
+  const redisOwners = await listOwnersFromBalanceKeys();
+  const ownerSet = new Set<string>([...engineOwners, ...redisOwners]);
+  if (ownerSet.size === 0) {
+    // Nothing to refresh; opportunistically evict stale entries.
+    const cutoffMs = Date.now() - OWNER_COLLATERAL_STALE_MS;
+    for (const [key, entry] of ownerCollateralCache.entries()) {
+      if (entry.fetchedAtMs < cutoffMs) ownerCollateralCache.delete(key);
+    }
+    return;
+  }
+
+  const queue = Array.from(ownerSet);
+  const seen = ownerSet;
+  const workers = Array.from(
+    { length: Math.min(OWNER_COLLATERAL_MAX_CONCURRENCY, queue.length) },
+    async () => {
+      while (queue.length > 0) {
+        const owner = queue.shift();
+        if (!owner) return;
+        try {
+          const enriched = await enrichOwnerStateWithOnchain(
+            owner,
+            { owner, mango_accounts: [], per_market: [] } as unknown as never,
+            onchain,
+            'optimistic',
+          );
+          const payload = (enriched as { optimistic_collateral?: unknown })
+            .optimistic_collateral;
+          if (payload !== undefined && payload !== null) {
+            ownerCollateralCache.set(owner, {
+              payload,
+              fetchedAtMs: Date.now(),
+            });
+          }
+        } catch {
+          // Per-owner error; prior cache entry (if any) stays.
+        }
+      }
+    },
+  );
+  await Promise.all(workers);
+
+  // Evict entries for owners the engine no longer tracks AND are stale.
+  const cutoffMs = Date.now() - OWNER_COLLATERAL_STALE_MS;
+  for (const [key, entry] of ownerCollateralCache.entries()) {
+    if (!seen.has(key) && entry.fetchedAtMs < cutoffMs) {
+      ownerCollateralCache.delete(key);
+    }
+  }
 }
 
 async function runOnchainReconciliation(
@@ -10389,6 +10588,22 @@ async function main(): Promise<void> {
       await pollMarketStats(onchain);
     },
   );
+
+  // [redis-phase6] Refresh the per-owner collateral cache on a background
+  // loop so the state-mirror can write v1:balance:<owner>.tokens without
+  // any consumer (frontend, gateway) doing on-demand /state/balances RPCs.
+  // Same onchain-read path as /state/balances; uses bounded concurrency
+  // (OWNER_COLLATERAL_MAX_CONCURRENCY) so we don't saturate Solana RPC.
+  if (onchain) {
+    startPeriodicTask(
+      'owner_collateral_refresh',
+      OWNER_COLLATERAL_REFRESH_INTERVAL_MS,
+      async () => {
+        await refreshOwnerCollateralCache(onchain);
+      },
+      { runImmediately: true },
+    );
+  }
 
   startPeriodicTask(
     'onchain_reconciliation',
