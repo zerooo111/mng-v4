@@ -154,10 +154,22 @@ class IORedisPublisher implements Publisher {
    * simply no-op rather than throw.
    */
   private maybePublishTrades(event: HarnessEventLike): void {
-    if (event.event_type !== 'queue_item_processed') return;
+    if (
+      event.event_type !== 'queue_item_processed' &&
+      event.event_type !== 'perp_fill'
+    ) {
+      return;
+    }
     const market = extractMarket(event);
     if (market === null) return;
-    const trades = extractTrades(event);
+    // For `perp_fill` the event itself is the trade record — the relayer
+    // extracts one `PerpTakerTradeLog` per taker execution and publishes
+    // each as its own event. We synthesize a single-element TradeLike so
+    // the rest of the fan-out (market + wallet streams) works unchanged.
+    const trades =
+      event.event_type === 'perp_fill'
+        ? perpFillToTradeLike(event)
+        : extractTrades(event);
     if (trades.length === 0) return;
     const streamKey = `v1:trades:${market}`;
     for (const t of trades) {
@@ -257,6 +269,52 @@ function extractMarket(event: HarnessEventLike): number | null {
     if (typeof cand === 'string' && /^-?\d+$/.test(cand)) return Number(cand);
   }
   return null;
+}
+
+/**
+ * Convert a `perp_fill` event (emitted by the engine's `ingestPerpFill`
+ * path, originally sourced from the relayer's `PerpTakerTradeLog`
+ * extractor) into a single-element TradeLike the publisher can fan out
+ * to `v1:trades:<market>` and per-wallet streams.
+ *
+ * Field mapping: `price`/`size`/`side` are the shorthand the downstream
+ * stream expects; `price_lots`/`base_lots`/`quote_lots`/`taker_side`/
+ * `maker_owner`/`taker_owner` are the legacy aliases the TimescaleDB
+ * ingester and /wallet/:pubkey/trades already read. We populate both so
+ * consumers don't need a translation layer.
+ */
+function perpFillToTradeLike(event: HarnessEventLike): TradeLike[] {
+  const e = event as unknown as Record<string, unknown>;
+  const takerSide = e['taker_side'];
+  const side =
+    takerSide === 0 || takerSide === '0' || takerSide === 'bid'
+      ? 'bid'
+      : 'ask';
+  const trade: TradeLike = {
+    maker: e['maker'],
+    taker: e['taker'],
+    price: e['price_lots'],
+    size: e['base_lots'],
+    side,
+    ts_ms: e['ts_ms'],
+    // `taker_sequence` is the on-chain `seq_num` field from
+    // PerpTakerTradeLog; older consumers may reference `sequence` so we
+    // mirror it there too.
+    sequence: e['seq_num'],
+    price_lots: e['price_lots'],
+    base_lots: e['base_lots'],
+    quote_lots: e['quote_lots'],
+    taker_side: side,
+    maker_owner: e['maker'],
+    taker_owner: e['taker'],
+    maker_order_id: e['maker_client_order_id'],
+    taker_sequence: e['seq_num'],
+    // `tx_signature` uniquely identifies the reveal tx that produced
+    // this fill — makes the stream row idempotent-checkable against
+    // chain data.
+    trade_id: e['tx_signature'],
+  };
+  return [trade];
 }
 
 /**

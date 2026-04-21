@@ -20,6 +20,7 @@ export type ContinuumHarnessBackend = Pick<
   | 'getUserState'
   | 'ingestQueueEnqueued'
   | 'ingestQueueProcessed'
+  | 'ingestPerpFill'
   | 'ingestRelayIntent'
   | 'ingestRelayIntentStatus'
   | 'listDivergences'

@@ -6123,6 +6123,7 @@ dependencies = [
  "solana-client",
  "solana-program",
  "solana-sdk",
+ "solana-transaction-status",
  "tokio",
  "tonic 0.11.0",
  "tonic-build 0.11.0",

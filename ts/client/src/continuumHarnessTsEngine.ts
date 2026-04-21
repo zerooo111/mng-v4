@@ -781,6 +781,47 @@ type InternalOrder = {
   expiry_timestamp: bigint;
 };
 
+/**
+ * Relayer-emitted fill event. See
+ * `bin/service-mango-execution-engine/src/v5_fill_extractor.rs` for the
+ * producing side. Fields are optional to tolerate older/legacy shapes.
+ */
+export type PerpFillEvent = {
+  event_type?: string;
+  ts_ms?: number | string;
+  market?: string | number;
+  market_index?: number | string;
+  group?: string;
+  taker_side?: number | string;
+  price_lots?: number | string;
+  base_lots?: number | string;
+  quote_lots?: string | number;
+  maker?: string;
+  taker?: string;
+  maker_client_order_id?: number | string;
+  taker_client_order_id?: number | string;
+  maker_out?: boolean;
+  taker_fees_paid?: string | number;
+  timestamp?: number | string;
+  seq_num?: number | string;
+  tx_signature?: string;
+};
+
+function toBigIntSafe(value: unknown): bigint {
+  if (typeof value === 'bigint') return value;
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return BigInt(Math.trunc(value));
+  }
+  if (typeof value === 'string' && value.length > 0) {
+    try {
+      return BigInt(value);
+    } catch {
+      return 0n;
+    }
+  }
+  return 0n;
+}
+
 type InternalTrade = {
   trade_id: string;
   market: string;
@@ -861,6 +902,23 @@ export class ContinuumStateEngine {
   private readonly baselineOrders = new Map<string, InternalOrder>();
   private baselineConfirmedSeq = new Map<string, bigint>();
   private baselineBootstrapped = false;
+
+  /**
+   * Authoritative fills parsed from on-chain `PerpTakerTradeLog` events by
+   * the relayer and tailed from the event log. Keyed by market (same
+   * string id the rest of the engine uses). The simulator's in-process
+   * matcher doesn't cross orders reliably under v5 (orderbook state
+   * diverges from chain once the queue has any drift), so chain fills
+   * are the ground truth surfaced through `/state/trades`.
+   */
+  private readonly chainFillsByMarket = new Map<string, InternalTrade[]>();
+  /**
+   * Dedup set for chain fills keyed by `tx_signature:marketIndex:idx` —
+   * the (sig, market, emit-order) tuple is unique per reveal tx. Prevents
+   * double-ingestion when the startup replay overlaps the tail follower.
+   */
+  private readonly chainFillSeenKeys = new Set<string>();
+  private static readonly CHAIN_FILL_MAX_PER_MARKET = 10000;
 
   /**
    * Bootstrap the engine from an on-chain confirmed snapshot.
@@ -1025,6 +1083,80 @@ export class ContinuumStateEngine {
   ingestRelayIntentStatus(event: RelayIntentStatusEvent): void {
     this.revision += 1;
     this.emitEvent(event);
+  }
+
+  /**
+   * Ingest a `perp_fill` event emitted by the relayer's v5 fill extractor
+   * (one per `PerpTakerTradeLog` observed in a reveal tx). These are the
+   * chain-authoritative fills surfaced through `/state/trades`.
+   */
+  ingestPerpFill(event: PerpFillEvent): void {
+    const marketIdStr =
+      event.market != null
+        ? String(event.market)
+        : event.market_index != null
+          ? String(event.market_index)
+          : null;
+    if (marketIdStr === null) return;
+
+    const txSig = String(event.tx_signature ?? '');
+    // Without a tx_signature we can't safely dedup, so fall back to
+    // (ts_ms, taker, price_lots, base_lots) which is unique enough in
+    // practice for hand-fed or legacy events.
+    const dedupKey = txSig
+      ? `${txSig}:${marketIdStr}:${event.taker ?? ''}:${event.price_lots ?? 0}:${event.base_lots ?? 0}:${event.ts_ms ?? 0}`
+      : `nosig:${marketIdStr}:${event.ts_ms ?? 0}:${event.taker ?? ''}:${event.price_lots ?? 0}:${event.base_lots ?? 0}`;
+    if (this.chainFillSeenKeys.has(dedupKey)) return;
+    this.chainFillSeenKeys.add(dedupKey);
+
+    const priceLots = toBigIntSafe(event.price_lots);
+    const baseLots = toBigIntSafe(event.base_lots);
+    // Prefer the pre-computed quote_lots if the relayer supplied it as
+    // a string (i128 is serialized as a decimal string to dodge JS
+    // number precision); otherwise derive price * base.
+    const quoteLots =
+      typeof event.quote_lots === 'string' || typeof event.quote_lots === 'number'
+        ? toBigIntSafe(event.quote_lots)
+        : priceLots * baseLots;
+
+    const takerSide: 'bid' | 'ask' =
+      Number(event.taker_side ?? 0) === 0 ? 'bid' : 'ask';
+
+    const bucket = this.chainFillsByMarket.get(marketIdStr) || [];
+    const trade: InternalTrade = {
+      trade_id: txSig
+        ? `${txSig}:${marketIdStr}:${bucket.length}`
+        : `${marketIdStr}:${event.ts_ms ?? Date.now()}:${bucket.length}`,
+      market: marketIdStr,
+      price_lots: priceLots,
+      base_lots: baseLots,
+      quote_lots: quoteLots,
+      taker_side: takerSide,
+      maker_owner: String(event.maker ?? ''),
+      taker_owner: String(event.taker ?? ''),
+      maker_order_id: String(event.maker_client_order_id ?? ''),
+      taker_sequence: toBigIntSafe(event.seq_num ?? 0),
+      ts_ms: Number(event.ts_ms ?? Date.now()),
+    };
+    bucket.push(trade);
+    // Cap retention so a long-running harness doesn't grow unboundedly;
+    // `/state/trades` callers typically page with `limit`.
+    if (bucket.length > ContinuumStateEngine.CHAIN_FILL_MAX_PER_MARKET) {
+      bucket.splice(
+        0,
+        bucket.length - ContinuumStateEngine.CHAIN_FILL_MAX_PER_MARKET,
+      );
+    }
+    this.chainFillsByMarket.set(marketIdStr, bucket);
+    this.revision += 1;
+    // Fan out to subscribers so downstream mirrors (Redis publisher,
+    // state-mirror snapshot debouncer) see the new fill.
+    this.emitEvent({
+      ...event,
+      event_type: 'perp_fill',
+      market: marketIdStr,
+      market_index: Number(marketIdStr),
+    } as unknown as HarnessEvent);
   }
 
   ingestRelayIntent(event: RelayIntentAcceptedEvent): void {
@@ -1468,8 +1600,23 @@ export class ContinuumStateEngine {
     const tradesByOwner = new Map<string, MarketTrade[]>();
     const allTrades: MarketTrade[] = [];
 
+    // Seed market entries for every market we've seen chain fills for,
+    // even if the projection's intent-replay loop didn't materialize one
+    // (e.g. bots only take, never rest, so no place-order intents land
+    // in the projection but fills still exist on chain).
+    for (const chainMarket of this.chainFillsByMarket.keys()) {
+      this.getOrCreateMarket(projection, chainMarket);
+    }
+
     for (const market of projection.markets.values()) {
-      const marketTrades = market.trades
+      const chainFills = this.chainFillsByMarket.get(market.market) || [];
+      // Chain-authoritative fills take priority. The simulator's trades
+      // are retained as a fallback only when we have no chain fills for
+      // the market — useful for local unit-test scenarios where nothing
+      // is writing perp_fill events.
+      const source: InternalTrade[] =
+        chainFills.length > 0 ? chainFills : market.trades;
+      const marketTrades = source
         .map((trade) => ({
           trade_id: trade.trade_id,
           market: trade.market,

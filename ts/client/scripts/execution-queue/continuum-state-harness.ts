@@ -50,6 +50,7 @@ import {
   decodeQueueAnchorEvent,
   parseProgramDataLogLine,
 } from '../../src/continuumHarness';
+import type { PerpFillEvent } from '../../src/continuumHarnessTsEngine';
 import {
   ContinuumHarnessBackend,
   HarnessBackendKind,
@@ -4017,6 +4018,14 @@ function appendEventLog(event: HarnessEvent): void {
   if (!HARNESS_REPLAY_LOG) {
     return;
   }
+  // `perp_fill` events are produced by the relayer directly into the
+  // same log file we're appending to — our `startPerpFillLogFollower`
+  // tails that log and re-emits them through the engine. If we also
+  // re-write them here we'd create a harmless but wasteful duplicate on
+  // every fill (dedup'd on next read, but still churn). Skip.
+  if (event.event_type === 'perp_fill') {
+    return;
+  }
   measureSync(
     'append_event_log',
     () => {
@@ -5755,6 +5764,8 @@ function replayEventLogIfPresent(): void {
               source: 'replay_event_log',
             });
             engine.ingestQueueProcessed(event);
+          } else if (event.event_type === 'perp_fill') {
+            engine.ingestPerpFill(event as unknown as PerpFillEvent);
           }
         } catch (err) {
           recordRuntimeError('replay_event_log_line', err, {
@@ -5771,6 +5782,92 @@ function replayEventLogIfPresent(): void {
       },
     },
   );
+}
+
+/**
+ * Tails the harness event log for `perp_fill` events emitted by the
+ * relayer's v5 fill extractor. These are the on-chain-authoritative
+ * fills that `/state/trades/*` surfaces.
+ *
+ * Why a pollable tail instead of a streaming subscription: the relayer
+ * writes the event log as O_APPEND jsonl and does not expose a live fill
+ * feed over gRPC. Polling stat().size and reading incrementally is
+ * simple, handles multi-writer append atomicity, and matches the
+ * pattern already used by the startup replay.
+ *
+ * File rotation / truncation safety: if the file shrinks between polls
+ * (truncation or a fresh log), we reset our offset and leave dedup to
+ * the engine's `chainFillSeenKeys`. Missed lines from a rotation are
+ * replayed on next harness restart anyway.
+ */
+function startPerpFillLogFollower(): void {
+  if (!HARNESS_REPLAY_LOG) {
+    return;
+  }
+  const logPath = path.resolve(HARNESS_EVENT_LOG_PATH);
+  let offset = (() => {
+    try {
+      return fs.statSync(logPath).size;
+    } catch {
+      return 0;
+    }
+  })();
+  let pending = '';
+  const pollMs = 500;
+
+  const tick = (): void => {
+    let size = 0;
+    try {
+      size = fs.statSync(logPath).size;
+    } catch {
+      return;
+    }
+    if (size < offset) {
+      offset = 0;
+      pending = '';
+    }
+    if (size === offset) return;
+    let fd: number | null = null;
+    try {
+      fd = fs.openSync(logPath, 'r');
+      const toRead = size - offset;
+      const buf = Buffer.alloc(toRead);
+      fs.readSync(fd, buf, 0, toRead, offset);
+      offset = size;
+      pending += buf.toString('utf8');
+      const newlineIdx = pending.lastIndexOf('\n');
+      if (newlineIdx < 0) return;
+      const ready = pending.slice(0, newlineIdx);
+      pending = pending.slice(newlineIdx + 1);
+      for (const line of ready.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed.length) continue;
+        if (!trimmed.includes('"perp_fill"')) continue;
+        try {
+          const obj = JSON.parse(trimmed);
+          if (obj && obj.event_type === 'perp_fill') {
+            engine.ingestPerpFill(obj as PerpFillEvent);
+          }
+        } catch {
+          // skip malformed line
+        }
+      }
+    } catch {
+      // fs error — try again next tick
+    } finally {
+      if (fd !== null) {
+        try {
+          fs.closeSync(fd);
+        } catch {
+          // ignore
+        }
+      }
+    }
+  };
+
+  const interval = setInterval(tick, pollMs);
+  // Don't let this poller keep the process alive on shutdown.
+  interval.unref?.();
 }
 
 function readBoundedTextFile(filePath: string, maxBytes: number): string {
@@ -11061,6 +11158,7 @@ async function main(): Promise<void> {
 
   loadMarketStats();
   replayEventLogIfPresent();
+  startPerpFillLogFollower();
   await measureAsync('startup.backfill_program_logs', async () => {
     await maybeBackfillProgramLogs(connection, programId);
   });

@@ -944,6 +944,12 @@ pub fn spawn_reveal_worker(
     alts: Arc<Vec<AddressLookupTableAccount>>,
     stall: V5HeadStallState,
     wal: Option<Arc<crate::v4_reveal_wal::V4RevealWal>>,
+    // Path to the relay event log; when `Some`, after every landed reveal
+    // we spawn a background task that fetches the tx, parses any
+    // FillLogV3 / FillLogV2 / FillLog anchor events from its logs, and
+    // appends `perp_fill` lines to this file. The harness's trade-store
+    // engine consumes those events to populate `/state/trades/*`.
+    event_log_path: Option<Arc<std::path::PathBuf>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let send_cfg = RpcSendTransactionConfig {
@@ -1126,6 +1132,24 @@ pub fn spawn_reveal_worker(
                             via_secondary,
                             "reveal batch sent"
                         );
+                        // Background task: fetch tx logs and emit any
+                        // FillLog* anchor events as `perp_fill` event-log
+                        // lines. Independent of the reveal hot path, with
+                        // its own retries, so a slow tx-index lookup
+                        // never blocks the next batch.
+                        if let Some(log_path) = event_log_path.clone() {
+                            let rpc_c = rpc.clone();
+                            let mi = mkt.market_index;
+                            tokio::spawn(async move {
+                                crate::v5_fill_extractor::extract_and_emit_fills(
+                                    rpc_c,
+                                    sig,
+                                    mi,
+                                    Some(log_path),
+                                )
+                                .await;
+                            });
+                        }
                     }
                     Err(e) => {
                         warn!(

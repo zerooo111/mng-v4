@@ -79,6 +79,7 @@ pub mod proto {
 // commit_reveal_throughput.md in the repo root for design notes.
 mod v4_pipeline;
 mod v4_reveal_wal;
+mod v5_fill_extractor;
 mod v5_pipeline;
 mod v5_precheck;
 
@@ -913,6 +914,17 @@ struct Metrics {
     /// Lifetime count of submit_intent calls where the final (post-harness)
     /// verify_user_signature failed and a failure memo entry was recorded.
     ingress_sig_fail_total: AtomicU64,
+    /// Total rejects caused by structural account-shape problems before the
+    /// tx was ever submitted.
+    ingress_account_shape_rejected_total: AtomicU64,
+    /// Rejects caused by stale or foreign group/bank metadata in the request
+    /// account set.
+    ingress_stale_group_rejected_total: AtomicU64,
+    /// Rejects caused by a mango account having no spare perp-position slot
+    /// for the target market.
+    ingress_no_free_perp_position_total: AtomicU64,
+    /// Rejects caused by the target on-chain queue being ingress-paused.
+    ingress_queue_paused_rejected_total: AtomicU64,
 
     // ---- Sampler-published rate / windowed values. Only the sampler task
     // writes these; the /metrics renderer only reads them.
@@ -942,6 +954,12 @@ struct Metrics {
     /// sampler simply pins this to 1 each tick. External monitors that scrape
     /// /metrics get an implicit liveness signal regardless.
     relayer_healthy: AtomicU64,
+    /// 1 when the legacy executor loop is configured on.
+    executor_enabled: AtomicU64,
+    /// 1 when the legacy perp event consumer is configured on.
+    event_cranker_enabled: AtomicU64,
+    /// 1 when routing is using the v5 per-market on-chain queues.
+    v5_route_all_enabled: AtomicU64,
     /// 1 when the bridge /healthz probe last succeeded; 0 otherwise.
     bridge_healthy: AtomicU64,
     /// 1 when the executor heartbeat is fresher than the configured stale
@@ -953,6 +971,13 @@ struct Metrics {
     /// Last reported relayer payer balance, in lamports. 0 until the first
     /// poll succeeds.
     relayer_balance_lamports: AtomicU64,
+    /// Composite execution-path health:
+    ///   * legacy mode: executor heartbeat is fresh
+    ///   * v5 mode: queue probes are still updating
+    execution_healthy: AtomicU64,
+    /// Wall-clock ms when any v5 queue prober last completed a successful
+    /// on-chain queue read via the harness.
+    v5_queue_probe_last_ms: AtomicU64,
     /// Wall-clock ms when the balance was last refreshed.
     relayer_balance_last_ms: AtomicU64,
     /// Wall-clock ms when the executor loop last completed an iteration.
@@ -1019,6 +1044,15 @@ struct Metrics {
     /// Wall-clock ms when the processed prober last successfully read the
     /// processed watermark.
     latency_processed_prober_last_ms: AtomicU64,
+    /// Market-index keyed optimistic watermarks. Written by the per-market
+    /// v5 optimistic probers or the legacy single-market prober.
+    market_optimistic_watermarks: StdMutex<BTreeMap<u16, u64>>,
+    /// Market-index keyed processed watermarks. Written by the per-market v5
+    /// queue probers or the legacy single-market processed prober.
+    market_processed_watermarks: StdMutex<BTreeMap<u16, u64>>,
+    /// Latest per-market v5 queue telemetry observed from the harness live
+    /// queue endpoint.
+    market_v5_queue_state: StdMutex<BTreeMap<u16, V5QueueTelemetrySnapshot>>,
 
     // ---- Hot-path-owned latency histograms.
     // Each LatencyHistogram is a fixed-size sample ring + a write counter.
@@ -1090,6 +1124,80 @@ impl Metrics {
         }
     }
 
+    #[inline(always)]
+    fn record_submit_rejection_classification(&self, class: SubmitRejectClass) {
+        match class {
+            SubmitRejectClass::AccountShape => {
+                self.ingress_account_shape_rejected_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            SubmitRejectClass::StaleGroupMetadata => {
+                self.ingress_account_shape_rejected_total
+                    .fetch_add(1, Ordering::Relaxed);
+                self.ingress_stale_group_rejected_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            SubmitRejectClass::NoFreePerpPosition => {
+                self.ingress_account_shape_rejected_total
+                    .fetch_add(1, Ordering::Relaxed);
+                self.ingress_no_free_perp_position_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            SubmitRejectClass::QueueIngressPaused => {
+                self.ingress_queue_paused_rejected_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn update_market_watermark(
+        &self,
+        kind: MarketWatermarkKind,
+        market_index: u16,
+        watermark: u64,
+        observed_at_ms: u64,
+    ) {
+        let target = match kind {
+            MarketWatermarkKind::Optimistic => &self.market_optimistic_watermarks,
+            MarketWatermarkKind::Processed => &self.market_processed_watermarks,
+        };
+        let aggregate = match kind {
+            MarketWatermarkKind::Optimistic => &self.harness_optimistic_watermark_seq,
+            MarketWatermarkKind::Processed => &self.harness_processed_watermark_seq,
+        };
+        if let Ok(mut guard) = target.lock() {
+            guard.insert(market_index, watermark);
+            let max_watermark = guard.values().copied().max().unwrap_or(0);
+            aggregate.store(max_watermark, Ordering::Relaxed);
+        } else {
+            aggregate.store(watermark, Ordering::Relaxed);
+        }
+        match kind {
+            MarketWatermarkKind::Optimistic => self
+                .latency_optimistic_prober_last_ms
+                .store(observed_at_ms, Ordering::Relaxed),
+            MarketWatermarkKind::Processed => self
+                .latency_processed_prober_last_ms
+                .store(observed_at_ms, Ordering::Relaxed),
+        }
+    }
+
+    fn update_v5_queue_state(&self, market_index: u16, snapshot: V5QueueTelemetrySnapshot) {
+        if let Ok(mut guard) = self.market_v5_queue_state.lock() {
+            guard.insert(market_index, snapshot);
+            let total_depth = guard
+                .values()
+                .fold(0u64, |acc, item| acc.saturating_add(item.live_count));
+            self.execution_queue_depth
+                .store(total_depth, Ordering::Relaxed);
+        } else {
+            self.execution_queue_depth
+                .store(snapshot.live_count, Ordering::Relaxed);
+        }
+        self.v5_queue_probe_last_ms
+            .store(snapshot.generated_ts_ms, Ordering::Relaxed);
+    }
+
     /// Bumped from the executor when the on-chain queue head advances by
     /// `delta` items.
     #[inline(always)]
@@ -1159,7 +1267,7 @@ impl Metrics {
         let parse_avg = avg_ms(self.submit_parse_total_ms.load(Ordering::Relaxed), count);
         let prepare_avg = avg_ms(self.submit_prepare_total_ms.load(Ordering::Relaxed), count);
         let send_avg = avg_ms(self.submit_send_total_ms.load(Ordering::Relaxed), count);
-        [
+        let mut lines = vec![
             "# TYPE execution_engine_requests_total counter".to_string(),
             format!(
                 "execution_engine_requests_total {}",
@@ -1276,6 +1384,21 @@ impl Metrics {
                 "execution_engine_relayer_healthy {}",
                 self.relayer_healthy.load(Ordering::Relaxed)
             ),
+            "# TYPE execution_engine_executor_enabled gauge".to_string(),
+            format!(
+                "execution_engine_executor_enabled {}",
+                self.executor_enabled.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_event_cranker_enabled gauge".to_string(),
+            format!(
+                "execution_engine_event_cranker_enabled {}",
+                self.event_cranker_enabled.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_v5_route_all_enabled gauge".to_string(),
+            format!(
+                "execution_engine_v5_route_all_enabled {}",
+                self.v5_route_all_enabled.load(Ordering::Relaxed)
+            ),
             "# HELP execution_engine_bridge_healthy 1 if the last HTTP-to-gRPC bridge healthz probe succeeded".to_string(),
             "# TYPE execution_engine_bridge_healthy gauge".to_string(),
             format!(
@@ -1299,6 +1422,17 @@ impl Metrics {
             format!(
                 "execution_engine_relayer_balance_lamports {}",
                 self.relayer_balance_lamports.load(Ordering::Relaxed)
+            ),
+            "# HELP execution_engine_execution_healthy 1 if the active execution path is alive (executor heartbeat in legacy mode, v5 queue probe freshness in v5 mode)".to_string(),
+            "# TYPE execution_engine_execution_healthy gauge".to_string(),
+            format!(
+                "execution_engine_execution_healthy {}",
+                self.execution_healthy.load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_v5_queue_probe_last_ms gauge".to_string(),
+            format!(
+                "execution_engine_v5_queue_probe_last_ms {}",
+                self.v5_queue_probe_last_ms.load(Ordering::Relaxed)
             ),
             "# TYPE execution_engine_relayer_balance_last_ms gauge".to_string(),
             format!(
@@ -1424,6 +1558,31 @@ impl Metrics {
             format!(
                 "execution_engine_ingress_sig_fail_total {}",
                 self.ingress_sig_fail_total.load(Ordering::Relaxed)
+            ),
+            "# HELP execution_engine_ingress_account_shape_rejected_total Requests rejected before submit because the account set or account shape is invalid".to_string(),
+            "# TYPE execution_engine_ingress_account_shape_rejected_total counter".to_string(),
+            format!(
+                "execution_engine_ingress_account_shape_rejected_total {}",
+                self.ingress_account_shape_rejected_total
+                    .load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_ingress_stale_group_rejected_total counter".to_string(),
+            format!(
+                "execution_engine_ingress_stale_group_rejected_total {}",
+                self.ingress_stale_group_rejected_total
+                    .load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_ingress_no_free_perp_position_total counter".to_string(),
+            format!(
+                "execution_engine_ingress_no_free_perp_position_total {}",
+                self.ingress_no_free_perp_position_total
+                    .load(Ordering::Relaxed)
+            ),
+            "# TYPE execution_engine_ingress_queue_paused_rejected_total counter".to_string(),
+            format!(
+                "execution_engine_ingress_queue_paused_rejected_total {}",
+                self.ingress_queue_paused_rejected_total
+                    .load(Ordering::Relaxed)
             ),
 
             "# HELP execution_engine_ingress_tps_10s Ingress txns per second sampled over last 10s".to_string(),
@@ -1681,8 +1840,52 @@ impl Metrics {
                 "execution_engine_latency_processed_prober_last_ms {}",
                 self.latency_processed_prober_last_ms.load(Ordering::Relaxed)
             ),
-        ]
-        .join("\n")
+        ];
+
+        if let Ok(guard) = self.market_optimistic_watermarks.lock() {
+            for (market_index, watermark) in guard.iter() {
+                lines.push(format!(
+                    "execution_engine_harness_optimistic_watermark_seq_by_market{{market_index=\"{}\"}} {}",
+                    market_index, watermark
+                ));
+            }
+        }
+        if let Ok(guard) = self.market_processed_watermarks.lock() {
+            for (market_index, watermark) in guard.iter() {
+                lines.push(format!(
+                    "execution_engine_harness_processed_watermark_seq_by_market{{market_index=\"{}\"}} {}",
+                    market_index, watermark
+                ));
+            }
+        }
+        if let Ok(guard) = self.market_v5_queue_state.lock() {
+            for (market_index, snapshot) in guard.iter() {
+                lines.push(format!(
+                    "execution_engine_execution_queue_market_depth{{market_index=\"{}\"}} {}",
+                    market_index, snapshot.live_count
+                ));
+                lines.push(format!(
+                    "execution_engine_execution_queue_market_next_sequence_to_execute{{market_index=\"{}\"}} {}",
+                    market_index, snapshot.next_sequence_to_execute
+                ));
+                lines.push(format!(
+                    "execution_engine_execution_queue_market_max_seen_sequence{{market_index=\"{}\"}} {}",
+                    market_index, snapshot.max_seen_sequence
+                ));
+                lines.push(format!(
+                    "execution_engine_execution_queue_market_paused_ingress{{market_index=\"{}\"}} {}",
+                    market_index,
+                    if snapshot.paused_ingress { 1 } else { 0 }
+                ));
+                lines.push(format!(
+                    "execution_engine_execution_queue_market_paused_execute{{market_index=\"{}\"}} {}",
+                    market_index,
+                    if snapshot.paused_execute { 1 } else { 0 }
+                ));
+            }
+        }
+
+        lines.join("\n")
     }
 }
 
@@ -1695,6 +1898,30 @@ struct LatencySummary {
     p50_ms: u64,
     p95_ms: u64,
     max_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct V5QueueTelemetrySnapshot {
+    live_count: u64,
+    next_sequence_to_execute: u64,
+    max_seen_sequence: u64,
+    paused_ingress: bool,
+    paused_execute: bool,
+    generated_ts_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MarketWatermarkKind {
+    Optimistic,
+    Processed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SubmitRejectClass {
+    AccountShape,
+    StaleGroupMetadata,
+    NoFreePerpPosition,
+    QueueIngressPaused,
 }
 
 /// One unit of work for the background submitter pool. Carries the
@@ -1836,9 +2063,10 @@ impl LatencyHistogram {
 /// into a ring of recent samples. The metrics sampler computes percentiles
 /// from that ring once per second and publishes them as gauges.
 struct LatencyTracker {
-    /// sequence -> ingress wall-clock ms. BTreeMap so the prober can drain a
-    /// prefix in O(k) when the watermark advances.
-    pending: StdMutex<BTreeMap<u64, u64>>,
+    /// market_index -> (sequence -> ingress wall-clock ms). The v5 queue uses
+    /// per-market sequence spaces, so pending entries must be partitioned by
+    /// market before a watermark can safely complete them.
+    pending: StdMutex<HashMap<u16, BTreeMap<u64, u64>>>,
     /// Ring of completed latency samples (oldest at the front, newest at the
     /// back). Bounded by samples_capacity.
     samples: StdMutex<VecDeque<u64>>,
@@ -1858,7 +2086,7 @@ struct LatencyTracker {
 impl LatencyTracker {
     fn new(samples_capacity: usize, pending_max_size: usize, pending_max_age_ms: u64) -> Self {
         Self {
-            pending: StdMutex::new(BTreeMap::new()),
+            pending: StdMutex::new(HashMap::new()),
             samples: StdMutex::new(VecDeque::with_capacity(samples_capacity)),
             samples_capacity,
             pending_max_size,
@@ -1872,18 +2100,19 @@ impl LatencyTracker {
     /// BTreeMap insert. Lock never held across an `.await`. Failures are
     /// silently ignored — metrics must never affect intent flow.
     #[inline]
-    fn note_ingress(&self, sequence: u64, ingress_ts_ms: u64) {
+    fn note_ingress(&self, market_index: u16, sequence: u64, ingress_ts_ms: u64) {
         if let Ok(mut guard) = self.pending.lock() {
-            guard.insert(sequence, ingress_ts_ms);
+            let market_pending = guard.entry(market_index).or_insert_with(BTreeMap::new);
+            market_pending.insert(sequence, ingress_ts_ms);
             // Bound the map. The smallest sequence is the oldest entry under
             // the per-market monotonic-sequence assumption, so popping from
             // the front evicts the oldest in flight.
-            while guard.len() > self.pending_max_size {
-                let first_seq = match guard.iter().next() {
+            while market_pending.len() > self.pending_max_size {
+                let first_seq = match market_pending.iter().next() {
                     Some((&seq, _)) => seq,
                     None => break,
                 };
-                guard.remove(&first_seq);
+                market_pending.remove(&first_seq);
                 self.expired_total.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -1893,28 +2122,34 @@ impl LatencyTracker {
     /// computing latency for each. Also evicts pending entries older than
     /// pending_max_age_ms regardless of watermark, to bound the map when
     /// reconciliation stalls.
-    fn complete_up_to(&self, watermark: u64, now_ms: u64) -> usize {
+    fn complete_up_to(&self, market_index: u16, watermark: u64, now_ms: u64) -> usize {
         let drained: Vec<u64> = {
             let Ok(mut guard) = self.pending.lock() else {
                 return 0;
             };
+            let Some(market_pending) = guard.get_mut(&market_index) else {
+                return 0;
+            };
             // Drain matched-by-watermark prefix.
-            let to_complete: Vec<u64> = guard.range(..=watermark).map(|(&seq, _)| seq).collect();
+            let to_complete: Vec<u64> = market_pending
+                .range(..=watermark)
+                .map(|(&seq, _)| seq)
+                .collect();
             let mut latencies = Vec::with_capacity(to_complete.len());
             for seq in to_complete {
-                if let Some(ingress_ts) = guard.remove(&seq) {
+                if let Some(ingress_ts) = market_pending.remove(&seq) {
                     latencies.push(now_ms.saturating_sub(ingress_ts));
                 }
             }
             // Sweep stale entries that the watermark hasn't caught up to.
             let stale_cutoff = now_ms.saturating_sub(self.pending_max_age_ms);
-            let stale: Vec<u64> = guard
+            let stale: Vec<u64> = market_pending
                 .iter()
                 .filter(|(_, &ts)| ts < stale_cutoff)
                 .map(|(&seq, _)| seq)
                 .collect();
             for seq in stale {
-                guard.remove(&seq);
+                market_pending.remove(&seq);
                 self.expired_total.fetch_add(1, Ordering::Relaxed);
             }
             latencies
@@ -1962,7 +2197,10 @@ impl LatencyTracker {
     }
 
     fn pending_len(&self) -> usize {
-        self.pending.lock().map(|g| g.len()).unwrap_or(0)
+        self.pending
+            .lock()
+            .map(|g| g.values().map(|pending| pending.len()).sum())
+            .unwrap_or(0)
     }
 }
 
@@ -3465,6 +3703,39 @@ fn is_transaction_too_large_error(err: &anyhow::Error) -> bool {
         || msg.contains("packet too large")
 }
 
+fn classify_submit_rejection(message: &str) -> Option<SubmitRejectClass> {
+    if message.contains("RequireKeysEqViolated") {
+        return Some(SubmitRejectClass::StaleGroupMetadata);
+    }
+    if message.contains("NoFreePerpPositionIndex") {
+        return Some(SubmitRejectClass::NoFreePerpPosition);
+    }
+    if message.contains("ExecutionQueueIngressPaused")
+        || message.contains("custom program error: 0x17bd")
+    {
+        return Some(SubmitRejectClass::QueueIngressPaused);
+    }
+    if message.contains("account-shape mismatch") {
+        return Some(SubmitRejectClass::AccountShape);
+    }
+    None
+}
+
+fn format_margin_health_cache_error(err: &str) -> String {
+    if err.contains("RequireKeysEqViolated") {
+        return format!(
+            "margin precheck account-shape mismatch: bank/group metadata does not match the request group; refresh remaining accounts or lane config ({err})"
+        );
+    }
+    format!("failed to build health cache for margin precheck: {err}")
+}
+
+fn format_no_free_perp_position_error(target_market_index: PerpMarketIndex, err: &str) -> String {
+    format!(
+        "mango account has no free perp position slot for market={target_market_index}; free an inactive perp slot or expand the account ({err})"
+    )
+}
+
 impl Engine {
     /// Hot-path: stamps `user_owner.to_bytes()` with the current wall-clock
     /// time in the unique-address tracker. Single std Mutex acquisition +
@@ -3574,6 +3845,9 @@ impl Engine {
         message: impl Into<String>,
     ) -> Status {
         let message = message.into();
+        if let Some(class) = classify_submit_rejection(&message) {
+            self.metrics.record_submit_rejection_classification(class);
+        }
         warn!(
             reason = %message,
             group = %request.group,
@@ -4802,13 +5076,18 @@ impl Engine {
         optimistic_account
             .ensure_perp_position(target_market_index, target_settle_token_index)
             .map_err(|err| {
+                let err_text = err.to_string();
                 self.reject_submit_request(
                     request,
                     Code::FailedPrecondition,
-                    format!(
-                        "failed to ensure target perp position for margin precheck market={}: {err}",
-                        target_market_index
-                    ),
+                    if err_text.contains("NoFreePerpPositionIndex") {
+                        format_no_free_perp_position_error(target_market_index, &err_text)
+                    } else {
+                        format!(
+                            "failed to ensure target perp position for margin precheck market={}: {}",
+                            target_market_index, err_text
+                        )
+                    },
                 )
             })?;
 
@@ -4858,10 +5137,11 @@ impl Engine {
             .as_secs();
         let mut health_cache = new_health_cache(&optimistic_account.borrow(), &retriever, now_ts)
             .map_err(|err| {
+            let err_text = err.to_string();
             self.reject_submit_request(
                 request,
                 Code::FailedPrecondition,
-                format!("failed to build health cache for margin precheck: {err}"),
+                format_margin_health_cache_error(&err_text),
             )
         })?;
         let pre_init_health =
@@ -6476,6 +6756,14 @@ impl Engine {
         // unix_timestamp_ms is one syscall; not held across an await beyond
         // what submit_intent already does.
         let request_arrived_ms = unix_timestamp_ms();
+        let request_market_index = request
+            .market
+            .parse::<u16>()
+            .ok()
+            .or_else(|| {
+                (request.target_index <= u16::MAX as u32)
+                    .then_some(request.target_index as u16)
+            });
         let started = Instant::now();
         let permit = match self.acquire_permit().await {
             Ok(permit) => permit,
@@ -6506,12 +6794,25 @@ impl Engine {
                 .record_submit_latency(elapsed.as_millis() as u64);
             // (2) Optimistic latency: ingress -> harness applies the
             // relay-intent event into its optimistic state.
-            self.latency_optimistic_tracker
-                .note_ingress(response.sequence, request_arrived_ms);
-            // (3) Processed latency: ingress -> harness has reconciled past
-            // the sequence from on-chain state.
-            self.latency_processed_tracker
-                .note_ingress(response.sequence, request_arrived_ms);
+            let latency_market_index = if self.config.v5_route_all {
+                request_market_index
+            } else {
+                Some(0)
+            };
+            if let Some(market_index) = latency_market_index {
+                self.latency_optimistic_tracker.note_ingress(
+                    market_index,
+                    response.sequence,
+                    request_arrived_ms,
+                );
+                // (3) Processed latency: ingress -> harness has reconciled past
+                // the sequence from on-chain state.
+                self.latency_processed_tracker.note_ingress(
+                    market_index,
+                    response.sequence,
+                    request_arrived_ms,
+                );
+            }
         }
 
         result
@@ -12305,9 +12606,11 @@ async fn run_metrics_sampler(
     unique_addresses: Arc<StdMutex<HashMap<[u8; 32], u64>>>,
     latency_optimistic: Arc<LatencyTracker>,
     latency_processed: Arc<LatencyTracker>,
+    v5_route_all: bool,
     executor_stale_ms: u64,
     event_cranker_stale_ms: u64,
     event_cranker_enabled: bool,
+    v5_queue_probe_stale_ms: u64,
 ) {
     // Tick once per second; ring of 70 ticks gives us a 70s window which
     // comfortably covers the 60s rolling counts.
@@ -12404,10 +12707,18 @@ async fn run_metrics_sampler(
         // Heartbeat-derived health gauges. The sampler is the single writer
         // for these so /metrics renderer just reads.
         metrics.relayer_healthy.store(1, Ordering::Relaxed);
+        metrics
+            .executor_enabled
+            .store(executor.is_some() as u64, Ordering::Relaxed);
+        metrics
+            .event_cranker_enabled
+            .store(event_cranker_enabled as u64, Ordering::Relaxed);
+        metrics
+            .v5_route_all_enabled
+            .store(v5_route_all as u64, Ordering::Relaxed);
         let executor_last = metrics.executor_last_tick_ms.load(Ordering::Relaxed);
         let executor_healthy = if executor.is_none() {
-            // Executor disabled — report 1 so the gauge isn't a false alarm.
-            1
+            0
         } else if executor_last == 0 {
             0
         } else {
@@ -12419,7 +12730,7 @@ async fn run_metrics_sampler(
 
         let cranker_last = metrics.event_cranker_last_tick_ms.load(Ordering::Relaxed);
         let cranker_healthy = if !event_cranker_enabled {
-            1
+            0
         } else if cranker_last == 0 {
             0
         } else {
@@ -12428,6 +12739,19 @@ async fn run_metrics_sampler(
         metrics
             .event_cranker_healthy
             .store(cranker_healthy, Ordering::Relaxed);
+        let execution_healthy = if v5_route_all {
+            let last_probe = metrics.v5_queue_probe_last_ms.load(Ordering::Relaxed);
+            if last_probe == 0 {
+                0
+            } else {
+                (now_ms.saturating_sub(last_probe) <= v5_queue_probe_stale_ms) as u64
+            }
+        } else {
+            executor_healthy
+        };
+        metrics
+            .execution_healthy
+            .store(execution_healthy, Ordering::Relaxed);
 
         // Latency: snapshot each tracker, sort, and publish percentile
         // gauges. Each call holds its own short critical section under that
@@ -12786,30 +13110,98 @@ async fn bootstrap_local_state(url: &str, timeout_ms: u64) -> anyhow::Result<Con
 /// endpoint). Accepts both string-encoded and numeric sequence values
 /// because the harness stringifies large integers to avoid JS precision
 /// loss.
-fn parse_harness_watermark(body: &str, json_path: &str) -> Option<u64> {
-    let v: serde_json::Value = serde_json::from_str(body).ok()?;
-    let mut cursor = &v;
+fn parse_json_path<'a>(
+    value: &'a serde_json::Value,
+    json_path: &str,
+) -> Option<&'a serde_json::Value> {
+    let mut cursor = value;
     for segment in json_path.split('.') {
         cursor = cursor.get(segment)?;
     }
-    if let Some(s) = cursor.as_str() {
+    Some(cursor)
+}
+
+fn parse_u64_json_value(value: &serde_json::Value) -> Option<u64> {
+    if let Some(s) = value.as_str() {
         s.parse::<u64>().ok()
-    } else if let Some(n) = cursor.as_u64() {
-        Some(n)
     } else {
-        None
+        value.as_u64()
     }
+}
+
+fn parse_bool_json_value(value: &serde_json::Value) -> Option<bool> {
+    value.as_bool()
+}
+
+fn parse_harness_watermark(body: &str, json_path: &str) -> Option<u64> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let cursor = parse_json_path(&value, json_path)?;
+    parse_u64_json_value(cursor)
+}
+
+fn parse_v5_queue_telemetry(body: &str) -> Option<V5QueueTelemetrySnapshot> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let live_count = parse_json_path(&value, "data.sub_queue.live_count")
+        .and_then(parse_u64_json_value)
+        .unwrap_or(0);
+    let next_sequence_to_execute =
+        parse_json_path(&value, "data.sub_queue.next_sequence_to_execute")
+            .and_then(parse_u64_json_value)
+            .unwrap_or(0);
+    let max_seen_sequence = parse_json_path(&value, "data.sub_queue.max_seen_sequence")
+        .and_then(parse_u64_json_value)
+        .unwrap_or(0);
+    let paused_ingress = parse_json_path(&value, "data.sub_queue.paused_ingress")
+        .and_then(parse_bool_json_value)
+        .or_else(|| {
+            parse_json_path(&value, "data.paused_ingress").and_then(parse_bool_json_value)
+        })
+        .unwrap_or(false);
+    let paused_execute = parse_json_path(&value, "data.sub_queue.paused_execute")
+        .and_then(parse_bool_json_value)
+        .or_else(|| {
+            parse_json_path(&value, "data.paused_execute").and_then(parse_bool_json_value)
+        })
+        .unwrap_or(false);
+    let generated_ts_ms = parse_json_path(&value, "data.generated_ts_ms")
+        .and_then(parse_u64_json_value)
+        .unwrap_or_else(unix_timestamp_ms);
+    Some(V5QueueTelemetrySnapshot {
+        live_count,
+        next_sequence_to_execute,
+        max_seen_sequence,
+        paused_ingress,
+        paused_execute,
+        generated_ts_ms,
+    })
+}
+
+fn build_prober_client(label: &str, timeout_ms: u64) -> Option<reqwest::Client> {
+    match reqwest::Client::builder()
+        .timeout(Duration::from_millis(timeout_ms))
+        .build()
+    {
+        Ok(client) => Some(client),
+        Err(err) => {
+            warn!("{label}: failed to build client: {err:?}");
+            None
+        }
+    }
+}
+
+fn update_legacy_market_watermark(
+    metrics: &Metrics,
+    kind: MarketWatermarkKind,
+    watermark: u64,
+    observed_at_ms: u64,
+) {
+    metrics.update_market_watermark(kind, 0, watermark, observed_at_ms);
 }
 
 /// Background task that polls a harness watermark URL, parses out a
 /// sequence number along the configured JSON path, and advances the
-/// associated LatencyTracker. The `watermark_atomic` and `last_ms_atomic`
-/// arguments let one prober update the optimistic gauges and another the
-/// processed gauges without sharing fields.
-///
-/// Hits the harness on its own dedicated reqwest client with a hard
-/// timeout so a stalled or hung harness can never wedge this loop or
-/// back-pressure the hot path.
+/// associated LatencyTracker. This legacy variant is used only for the
+/// single-market topology; v5 routes use the market-aware probers below.
 async fn run_latency_prober(
     label: &'static str,
     metrics: Arc<Metrics>,
@@ -12821,29 +13213,29 @@ async fn run_latency_prober(
     interval_ms: u64,
     timeout_ms: u64,
 ) {
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_millis(timeout_ms))
-        .build()
-    {
-        Ok(c) => c,
-        Err(err) => {
-            warn!("latency prober [{label}]: failed to build client: {err:?}");
-            return;
-        }
+    let prober_label = format!("latency prober [{label}]");
+    let Some(client) = build_prober_client(&prober_label, timeout_ms) else {
+        return;
     };
     info!(
         "latency prober [{}] enabled url={} field={} interval_ms={} timeout_ms={}",
         label, harness_url, watermark_field, interval_ms, timeout_ms
     );
+    let kind = if label == "processed" {
+        MarketWatermarkKind::Processed
+    } else {
+        MarketWatermarkKind::Optimistic
+    };
     loop {
         match client.get(&harness_url).send().await {
             Ok(resp) if resp.status().is_success() => match resp.text().await {
                 Ok(body) => {
                     if let Some(wm) = parse_harness_watermark(&body, &watermark_field) {
                         let now_ms = unix_timestamp_ms();
-                        tracker.complete_up_to(wm, now_ms);
+                        tracker.complete_up_to(0, wm, now_ms);
                         watermark_atomic(&metrics).store(wm, Ordering::Relaxed);
                         last_ms_atomic(&metrics).store(now_ms, Ordering::Relaxed);
+                        update_legacy_market_watermark(&metrics, kind, wm, now_ms);
                     } else {
                         debug!(
                             "latency prober [{label}]: failed to parse watermark at {}",
@@ -12855,6 +13247,97 @@ async fn run_latency_prober(
             },
             Ok(resp) => debug!("latency prober [{label}] non-2xx: {}", resp.status()),
             Err(err) => debug!("latency prober [{label}] error: {err:?}"),
+        }
+        tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+    }
+}
+
+async fn run_market_optimistic_prober(
+    metrics: Arc<Metrics>,
+    tracker: Arc<LatencyTracker>,
+    market_index: u16,
+    harness_url: String,
+    watermark_field: String,
+    interval_ms: u64,
+    timeout_ms: u64,
+) {
+    let label = format!("optimistic market={market_index}");
+    let Some(client) = build_prober_client(&label, timeout_ms) else {
+        return;
+    };
+    info!(
+        "latency prober [{}] enabled url={} field={} interval_ms={} timeout_ms={}",
+        label, harness_url, watermark_field, interval_ms, timeout_ms
+    );
+    loop {
+        match client.get(&harness_url).send().await {
+            Ok(resp) if resp.status().is_success() => match resp.text().await {
+                Ok(body) => {
+                    if let Some(wm) = parse_harness_watermark(&body, &watermark_field) {
+                        let now_ms = unix_timestamp_ms();
+                        tracker.complete_up_to(market_index, wm, now_ms);
+                        metrics.update_market_watermark(
+                            MarketWatermarkKind::Optimistic,
+                            market_index,
+                            wm,
+                            now_ms,
+                        );
+                    } else {
+                        debug!(
+                            "latency prober [{}]: failed to parse watermark at {}",
+                            label, watermark_field
+                        );
+                    }
+                }
+                Err(err) => debug!("latency prober [{}] body read failed: {err:?}", label),
+            },
+            Ok(resp) => debug!("latency prober [{}] non-2xx: {}", label, resp.status()),
+            Err(err) => debug!("latency prober [{}] error: {err:?}", label),
+        }
+        tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+    }
+}
+
+async fn run_v5_queue_prober(
+    metrics: Arc<Metrics>,
+    tracker: Arc<LatencyTracker>,
+    market_index: u16,
+    harness_url: String,
+    interval_ms: u64,
+    timeout_ms: u64,
+) {
+    let label = format!("v5 queue market={market_index}");
+    let Some(client) = build_prober_client(&label, timeout_ms) else {
+        return;
+    };
+    info!(
+        "v5 queue prober [{}] enabled url={} interval_ms={} timeout_ms={}",
+        label, harness_url, interval_ms, timeout_ms
+    );
+    loop {
+        match client.get(&harness_url).send().await {
+            Ok(resp) if resp.status().is_success() => match resp.text().await {
+                Ok(body) => {
+                    if let Some(snapshot) = parse_v5_queue_telemetry(&body) {
+                        let now_ms = unix_timestamp_ms();
+                        let processed_watermark =
+                            snapshot.next_sequence_to_execute.saturating_sub(1);
+                        tracker.complete_up_to(market_index, processed_watermark, now_ms);
+                        metrics.update_market_watermark(
+                            MarketWatermarkKind::Processed,
+                            market_index,
+                            processed_watermark,
+                            now_ms,
+                        );
+                        metrics.update_v5_queue_state(market_index, snapshot);
+                    } else {
+                        debug!("v5 queue prober [{}]: failed to parse queue snapshot", label);
+                    }
+                }
+                Err(err) => debug!("v5 queue prober [{}] body read failed: {err:?}", label),
+            },
+            Ok(resp) => debug!("v5 queue prober [{}] non-2xx: {}", label, resp.status()),
+            Err(err) => debug!("v5 queue prober [{}] error: {err:?}", label),
         }
         tokio::time::sleep(Duration::from_millis(interval_ms)).await;
     }
@@ -13549,6 +14032,11 @@ async fn async_main() -> Result<()> {
         let batch_size = engine.config.v5_reveal_batch_size;
         let stall = v5_pipeline::V5HeadStallState::default();
 
+        let fill_event_log_path: Option<Arc<std::path::PathBuf>> = engine
+            .config
+            .executor_relay_event_log_path
+            .as_ref()
+            .map(|p| Arc::new(p.clone()));
         v5_pipeline::spawn_reveal_worker(
             rpc_c.clone(),
             engine.secondary_rpc.clone(),
@@ -13561,6 +14049,7 @@ async fn async_main() -> Result<()> {
             reveal_alts.clone(),
             stall.clone(),
             reveal_wal.clone(),
+            fill_event_log_path,
         );
         info!(
             "v5 reveal worker spawned: market={} spacing_ms={} pipeline_depth={} batch_size={}",
@@ -13705,9 +14194,14 @@ async fn async_main() -> Result<()> {
         unique_addresses.clone(),
         latency_optimistic_tracker.clone(),
         latency_processed_tracker.clone(),
+        config.v5_route_all,
         config.executor_stale_threshold_ms,
         config.event_cranker_stale_threshold_ms,
         event_cranker_enabled,
+        config
+            .latency_probe_interval_ms
+            .saturating_mul(10)
+            .max(5_000),
     ));
 
     // Optional bridge health prober — only runs if a URL is configured.
@@ -13720,36 +14214,72 @@ async fn async_main() -> Result<()> {
         ));
     }
 
-    // Optimistic latency prober — drains the optimistic tracker. Each
-    // prober is the sole writer for its own pair of (watermark_seq,
-    // last_ms) gauges, so they never contend with each other or the hot
-    // path.
-    if let Some(latency_url) = config.latency_optimistic_url.clone() {
-        tokio::spawn(run_latency_prober(
-            "optimistic",
-            metrics.clone(),
-            latency_optimistic_tracker.clone(),
-            |m| &m.harness_optimistic_watermark_seq,
-            |m| &m.latency_optimistic_prober_last_ms,
-            latency_url,
-            config.latency_optimistic_field.clone(),
-            config.latency_probe_interval_ms,
-            config.latency_probe_timeout_ms,
-        ));
-    }
-    // Processed latency prober — drains the processed tracker.
-    if let Some(latency_url) = config.latency_processed_url.clone() {
-        tokio::spawn(run_latency_prober(
-            "processed",
-            metrics.clone(),
-            latency_processed_tracker.clone(),
-            |m| &m.harness_processed_watermark_seq,
-            |m| &m.latency_processed_prober_last_ms,
-            latency_url,
-            config.latency_processed_field.clone(),
-            config.latency_probe_interval_ms,
-            config.latency_probe_timeout_ms,
-        ));
+    // Latency and queue telemetry probers. The v5 route uses per-market
+    // sequence spaces, so each market gets its own optimistic and queue
+    // prober. Legacy mode keeps the prior single-market probers.
+    if config.v5_route_all && !engine.v5_markets.is_empty() {
+        if let Some(harness_base_url) = config.harness_base_url.as_deref() {
+            let harness_base_url = harness_base_url.trim_end_matches('/').to_string();
+            for market_index in engine.v5_markets.keys().copied() {
+                tokio::spawn(run_market_optimistic_prober(
+                    metrics.clone(),
+                    latency_optimistic_tracker.clone(),
+                    market_index,
+                    format!(
+                        "{}/state/markets/{}?view=optimistic",
+                        harness_base_url, market_index
+                    ),
+                    config.latency_optimistic_field.clone(),
+                    config.latency_probe_interval_ms,
+                    config.latency_probe_timeout_ms,
+                ));
+                tokio::spawn(run_v5_queue_prober(
+                    metrics.clone(),
+                    latency_processed_tracker.clone(),
+                    market_index,
+                    format!(
+                        "{}/state/queue/{}?source=onchain_v5",
+                        harness_base_url, market_index
+                    ),
+                    config.latency_probe_interval_ms,
+                    config.latency_probe_timeout_ms,
+                ));
+            }
+        } else {
+            warn!("v5 route enabled but harness_base_url is missing; latency/queue telemetry probers disabled");
+        }
+    } else {
+        // Optimistic latency prober — drains the optimistic tracker. Each
+        // prober is the sole writer for its own pair of (watermark_seq,
+        // last_ms) gauges, so they never contend with each other or the hot
+        // path.
+        if let Some(latency_url) = config.latency_optimistic_url.clone() {
+            tokio::spawn(run_latency_prober(
+                "optimistic",
+                metrics.clone(),
+                latency_optimistic_tracker.clone(),
+                |m| &m.harness_optimistic_watermark_seq,
+                |m| &m.latency_optimistic_prober_last_ms,
+                latency_url,
+                config.latency_optimistic_field.clone(),
+                config.latency_probe_interval_ms,
+                config.latency_probe_timeout_ms,
+            ));
+        }
+        // Processed latency prober — drains the processed tracker.
+        if let Some(latency_url) = config.latency_processed_url.clone() {
+            tokio::spawn(run_latency_prober(
+                "processed",
+                metrics.clone(),
+                latency_processed_tracker.clone(),
+                |m| &m.harness_processed_watermark_seq,
+                |m| &m.latency_processed_prober_last_ms,
+                latency_url,
+                config.latency_processed_field.clone(),
+                config.latency_probe_interval_ms,
+                config.latency_probe_timeout_ms,
+            ));
+        }
     }
 
     // Background balance poller — non-blocking, low cadence.
