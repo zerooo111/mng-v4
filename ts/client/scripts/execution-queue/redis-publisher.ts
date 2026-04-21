@@ -197,9 +197,27 @@ class IORedisPublisher implements Publisher {
         .then(() => this.metrics.writesTotal?.inc({ stream: streamKey }))
         .catch(() => this.metrics.writeErrorsTotal?.inc({ kind: 'xadd' }));
 
+      // Fan-out keys: accept either shorthand (maker/taker) or legacy-alias
+      // (maker_owner/taker_owner) field names. If a future producer emits
+      // only one shape, we still index every participant into the per-wallet
+      // stream — staying consistent with the market-wide stream.
       const participants = new Set<string>();
-      if (typeof t.maker === 'string' && t.maker) participants.add(t.maker);
-      if (typeof t.taker === 'string' && t.taker && t.taker !== t.maker) participants.add(t.taker);
+      const asPubkey = (...candidates: unknown[]): string | null => {
+        for (const c of candidates) {
+          if (typeof c === 'string' && c.length > 0) return c;
+        }
+        return null;
+      };
+      const makerKey = asPubkey(
+        t.maker,
+        (t as Record<string, unknown>).maker_owner,
+      );
+      const takerKey = asPubkey(
+        t.taker,
+        (t as Record<string, unknown>).taker_owner,
+      );
+      if (makerKey) participants.add(makerKey);
+      if (takerKey && takerKey !== makerKey) participants.add(takerKey);
       for (const owner of participants) {
         const walletKey = `v1:wallet_trades:${owner}`;
         this.client

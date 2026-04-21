@@ -355,6 +355,10 @@ class IORedisMirror implements Mirror {
       }
 
       // 2. Static identity from markets[id].metadata (if present).
+      // NOTE: base_lot_size and quote_lot_size are deliberately NOT copied
+      // here — they are already written from perp_markets above. Writing
+      // them from both sources would silently overwrite one with the other
+      // on drift; perp_markets is the canonical source.
       if (snap.markets) {
         for (const [key, m] of Object.entries(snap.markets)) {
           const md = m.metadata;
@@ -373,8 +377,6 @@ class IORedisMirror implements Mirror {
             'event_queue',
             'base_decimals',
             'quote_decimals',
-            'base_lot_size',
-            'quote_lot_size',
             'open_interest',
           ] as const) {
             addField(id, k, md[k]);
