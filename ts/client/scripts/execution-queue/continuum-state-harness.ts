@@ -137,6 +137,12 @@ const HARNESS_EXECUTION_QUEUE_TOPOLOGY = (
   'v2'
 ).toLowerCase();
 const HARNESS_USES_V3_QUEUE = HARNESS_EXECUTION_QUEUE_TOPOLOGY.startsWith('v3');
+// v5 = per-market PDAs. No single shared queue to snapshot; per-market live
+// reads go through fetchV5QueueLiveState for /state/queue/{m}?source=onchain_v5.
+// Legacy single-queue replay is disabled in v5 mode — without this gate the
+// harness keeps polling a stale shared-queue PDA whose writes were closed by
+// the v5 migration.
+const HARNESS_USES_V5_QUEUE = HARNESS_EXECUTION_QUEUE_TOPOLOGY.startsWith('v5');
 const HARNESS_AIRDROP_DEPOSIT_UI_AMOUNT = Number(
   process.env.CONTINUUM_HARNESS_AIRDROP_DEPOSIT_UI_AMOUNT || '1000',
 );
@@ -6010,6 +6016,11 @@ async function resolveExecutionQueuePk(
   if (!onchain) {
     return null;
   }
+  if (HARNESS_USES_V5_QUEUE) {
+    // v5: per-market PDAs only; legacy single-queue pointer is meaningless
+    // and if left set would resolve to a stale/closed account.
+    return null;
+  }
   if (onchain.executionQueuePk) {
     return onchain.executionQueuePk;
   }
@@ -6151,6 +6162,22 @@ async function buildOnchainConfirmedSnapshot(
     >
   >();
   const tokenBanks = {} as NonNullable<EngineSnapshot['token_banks']>;
+  // Lookup: PerpOo.id (on-chain 128-bit order_id, stringified) -> clientId.
+  // Bookside slab doesn't store client_id; it's on mango_account.perpOpenOrders.
+  // Without this, every recorded open-order summary gets client_order_id='0'
+  // and downstream bots can't target cancel_order_by_client_order_id correctly
+  // (surfaces as on-chain `Custom(6044) PerpOrderIdNotFound`).
+  const perpClientIdByOrderId = new Map<string, string>();
+  for (const account of allAccounts) {
+    const mangoAccountKey = account.publicKey.toBase58();
+    for (const oo of account.perpOrdersActive()) {
+      const id = oo.id.toString();
+      const cid = oo.clientId.toString();
+      if (id !== '0') {
+        perpClientIdByOrderId.set(`${mangoAccountKey}:${id}`, cid);
+      }
+    }
+  }
 
   for (const [tokenIndex, banks] of group.banksMapByTokenIndex.entries()) {
     const bank = banks[0];
@@ -6338,6 +6365,7 @@ async function buildOnchainConfirmedSnapshot(
       sequence: string,
       expiryTimestamp: string,
       orderId: string,
+      rawOrderId: string,
     ) => {
       const depth = side === 'bid' ? bids : asks;
       depth.set(priceLotsStr, (depth.get(priceLotsStr) || 0n) + baseLots);
@@ -6345,6 +6373,11 @@ async function buildOnchainConfirmedSnapshot(
       if (!user.mango_accounts.includes(mangoAccount)) {
         user.mango_accounts.push(mangoAccount);
       }
+      // Client-id lookup built at the top of this function from each mango
+      // account's perpOpenOrders (bookside doesn't carry client_id). Falls
+      // back to '0' only if the account truly placed without a client_id.
+      const clientOrderId =
+        perpClientIdByOrderId.get(`${mangoAccount}:${rawOrderId}`) ?? '0';
       const orderSummary = {
         order_id: orderId,
         owner,
@@ -6354,7 +6387,7 @@ async function buildOnchainConfirmedSnapshot(
         price_lots: priceLotsStr,
         base_lots: baseLots.toString(),
         quote_lots: quoteLots.toString(),
-        client_order_id: '0',
+        client_order_id: clientOrderId,
         sequence,
         expiry_timestamp: expiryTimestamp,
         status: 'open',
@@ -6377,6 +6410,7 @@ async function buildOnchainConfirmedSnapshot(
       const baseLots = BigInt(order.sizeLots.toString());
       const priceLotsStr = order.priceLots.toString();
       const quoteLots = BigInt(order.priceLots.toString()) * baseLots;
+      const rawOrderId = order.orderId.toString();
       recordOrder(
         'bid',
         priceLotsStr,
@@ -6386,7 +6420,8 @@ async function buildOnchainConfirmedSnapshot(
         owner,
         order.seqNum.toString(),
         order.expiryTimestamp.toString(),
-        `${group.publicKey.toBase58()}:${market}:${order.orderId.toString()}`,
+        `${group.publicKey.toBase58()}:${market}:${rawOrderId}`,
+        rawOrderId,
       );
     }
 
@@ -6396,6 +6431,7 @@ async function buildOnchainConfirmedSnapshot(
       const baseLots = BigInt(order.sizeLots.toString());
       const priceLotsStr = order.priceLots.toString();
       const quoteLots = BigInt(order.priceLots.toString()) * baseLots;
+      const rawOrderId = order.orderId.toString();
       recordOrder(
         'ask',
         priceLotsStr,
@@ -6405,7 +6441,8 @@ async function buildOnchainConfirmedSnapshot(
         owner,
         order.seqNum.toString(),
         order.expiryTimestamp.toString(),
-        `${group.publicKey.toBase58()}:${market}:${order.orderId.toString()}`,
+        `${group.publicKey.toBase58()}:${market}:${rawOrderId}`,
+        rawOrderId,
       );
     }
 
@@ -6787,7 +6824,7 @@ async function buildOnchainContext(
       if (!usdcMint) {
         usdcMint = cachedGroup.getFirstBankForPerpSettlement().mint;
       }
-      if (!executionQueuePk && !HARNESS_USES_V3_QUEUE) {
+      if (!executionQueuePk && !HARNESS_USES_V3_QUEUE && !HARNESS_USES_V5_QUEUE) {
         [executionQueuePk] = PublicKey.findProgramAddressSync(
           [Buffer.from('ExecutionQueue'), cachedGroup.publicKey.toBuffer()],
           programId,
@@ -9704,6 +9741,265 @@ function buildHttpServer(
           });
           return;
         }
+      }
+
+      // /trace?market=M&sequence=S | /trace?client_order_id=C | /trace?tx_signature=T
+      //
+      // Pipeline audit trail. Returns every event in continuum-harness-2.jsonl
+      // that matches the filter, plus on-chain enrichment (queue-slot status
+      // for sequence lookups, tx meta for signatures), plus a terminal
+      // classification (landed / failed / in_flight / dropped / unknown).
+      //
+      // Backs the rule: no transaction gets silently dropped anywhere in the
+      // ingress→accepted→committed→executed→head_advanced→state pipeline. If
+      // /trace returns nothing matching a known intent, the relevant emission
+      // site in the relayer/harness is missing a status event — treat it as
+      // a bug.
+      if (method === 'GET' && url.pathname === '/trace') {
+        const market = url.searchParams.get('market');
+        const sequence = url.searchParams.get('sequence');
+        const clientOrderId = url.searchParams.get('client_order_id');
+        const txSignature = url.searchParams.get('tx_signature');
+        const limit = parseNonNegativeInteger(
+          url.searchParams.get('limit'),
+          500,
+          { min: 1, max: 5000 },
+        );
+        if (!sequence && !clientOrderId && !txSignature) {
+          writeJson(res, 400, {
+            error: 'missing_filter',
+            message:
+              'provide one of: ?market=M&sequence=S | ?client_order_id=C | ?tx_signature=T',
+          });
+          return;
+        }
+        const matchFilter = (obj: Record<string, unknown>): boolean => {
+          if (sequence != null) {
+            const seqField = obj['sequence'];
+            if (String(seqField ?? '') !== sequence) return false;
+            if (market != null) {
+              const mk = obj['market'];
+              if (String(mk ?? '') !== market) return false;
+            }
+            return true;
+          }
+          if (clientOrderId != null) {
+            const cid = obj['client_order_id'];
+            return String(cid ?? '') === clientOrderId;
+          }
+          if (txSignature != null) {
+            const sig = obj['tx_signature'] ?? obj['enqueue_tx_signature'];
+            return String(sig ?? '') === txSignature;
+          }
+          return false;
+        };
+        const events: Array<Record<string, unknown>> = [];
+        try {
+          const stream = fs.createReadStream(HARNESS_EVENT_LOG_PATH, {
+            encoding: 'utf8',
+            highWaterMark: 1 << 20,
+          });
+          const rl = require('readline').createInterface({
+            input: stream,
+            crlfDelay: Infinity,
+          });
+          for await (const line of rl) {
+            if (!line.trim()) continue;
+            let obj: Record<string, unknown>;
+            try {
+              obj = JSON.parse(line);
+            } catch {
+              continue;
+            }
+            if (matchFilter(obj)) {
+              events.push(obj);
+              if (events.length > limit) events.shift();
+            }
+          }
+          stream.destroy?.();
+        } catch (err) {
+          writeJson(res, 500, {
+            error: 'event_log_scan_failed',
+            message: normalizeError(err).message,
+          });
+          return;
+        }
+
+        // Stage reached tracking. Each stage is implied by at least one event
+        // type — if the set is empty for a stage, the intent never reached
+        // that stage (either legitimately not-yet-there, or silently dropped).
+        const stagesReached = new Set<string>();
+        let signatureFromEvents: string | null = null;
+        let enqueueSignature: string | null = null;
+        let latestRejectReason: string | null = null;
+        for (const e of events) {
+          const et = String(e['event_type'] ?? '');
+          if (et === 'relay_intent_status') {
+            const label = String(e['status_label'] ?? '');
+            if (label === 'accepted') stagesReached.add('accepted');
+            if (label === 'submitted') stagesReached.add('submitted');
+            if (label === 'rejected') {
+              stagesReached.add('rejected');
+              latestRejectReason = String(e['reason'] ?? '');
+            }
+            const sig = e['tx_signature'];
+            if (typeof sig === 'string' && sig.length > 0) {
+              signatureFromEvents = sig;
+            }
+          } else if (et === 'relay_intent_accepted') {
+            stagesReached.add('accepted');
+            const sig = e['enqueue_tx_signature'];
+            if (typeof sig === 'string' && sig.length > 0) {
+              enqueueSignature = sig;
+            }
+          } else if (et === 'queue_item_enqueued') {
+            stagesReached.add('enqueued');
+          } else if (et === 'queue_item_processed') {
+            stagesReached.add('executed');
+          }
+        }
+
+        // On-chain enrichment: queue-slot status if we have (market, sequence)
+        // and an OnchainContext.
+        let queueSlot: Record<string, unknown> | null = null;
+        if (sequence && market && onchain?.groupPk && onchain?.programId) {
+          const mi = Number(market);
+          const seqNum = BigInt(sequence);
+          if (Number.isFinite(mi) && seqNum >= 0n) {
+            try {
+              const live = await fetchV5QueueLiveState(
+                onchain.connection,
+                onchain.programId,
+                onchain.groupPk,
+                mi,
+                HARNESS_COMMITMENT,
+              );
+              if (live?.sub_queue) {
+                const sq = live.sub_queue;
+                const nextExec = BigInt(sq.next_sequence_to_execute);
+                const maxSeen = BigInt(sq.max_seen_sequence);
+                let slotClass: string;
+                if (seqNum < nextExec) slotClass = 'head_advanced_past';
+                else if (seqNum <= maxSeen) slotClass = 'pending_in_ring';
+                else slotClass = 'not_yet_committed_on_chain';
+                queueSlot = {
+                  pda: live.pda,
+                  market_index: sq.market_index,
+                  head: sq.next_sequence_to_execute,
+                  max_seen: sq.max_seen_sequence,
+                  live_count: sq.live_count,
+                  ring_offset: Number(seqNum % 1024n),
+                  classification: slotClass,
+                };
+                if (slotClass === 'head_advanced_past') {
+                  stagesReached.add('head_advanced');
+                }
+              }
+            } catch {
+              // RPC failure — leave queueSlot null, don't fail the trace.
+            }
+          }
+        }
+
+        // If we have a tx signature (from events or direct query), fetch its
+        // on-chain outcome for visibility.
+        const sigToCheck = txSignature || signatureFromEvents || enqueueSignature;
+        let onchainTx: Record<string, unknown> | null = null;
+        if (sigToCheck && onchain?.connection) {
+          try {
+            const tx = await onchain.connection.getTransaction(sigToCheck, {
+              maxSupportedTransactionVersion: 0,
+              commitment:
+                HARNESS_COMMITMENT === 'confirmed' ||
+                HARNESS_COMMITMENT === 'finalized'
+                  ? HARNESS_COMMITMENT
+                  : 'confirmed',
+            });
+            if (tx) {
+              stagesReached.add('committed');
+              const err = tx.meta?.err;
+              onchainTx = {
+                signature: sigToCheck,
+                slot: tx.slot,
+                block_time: tx.blockTime ?? null,
+                err: err ?? null,
+                log_summary: (tx.meta?.logMessages || [])
+                  .filter(
+                    (l) =>
+                      l.startsWith('Program log: Instruction:') ||
+                      l.includes('dispatch failed') ||
+                      l.includes('commit_hash mismatch') ||
+                      l.includes('head advanced') ||
+                      l.includes('AnchorError'),
+                  )
+                  .slice(0, 20),
+              };
+              if (!err) stagesReached.add('executed');
+            } else {
+              onchainTx = {
+                signature: sigToCheck,
+                status: 'not_found_on_chain',
+              };
+            }
+          } catch (rpcErr) {
+            onchainTx = {
+              signature: sigToCheck,
+              fetch_error: normalizeError(rpcErr).message,
+            };
+          }
+        }
+
+        // Classification. If no events + no on-chain match, the tx never hit
+        // any observable pipeline stage — this is the "silent drop" red flag
+        // the audit-trail rule is designed to catch. Operator should look at
+        // the client's send path.
+        //
+        // Order matters: check on-chain tx err before head_advanced so we
+        // don't mis-classify a tx that failed 6076 as "landed_and_head_
+        // advanced" just because unrelated successful txs later advanced
+        // head past its seq.
+        let classification: string;
+        if (events.length === 0 && !onchainTx) {
+          classification = 'no_record_found — check client send path';
+        } else if (onchainTx && (onchainTx as { err?: unknown }).err) {
+          classification = 'landed_with_program_error';
+        } else if (stagesReached.has('head_advanced') && onchainTx) {
+          classification = 'executed_and_head_advanced';
+        } else if (stagesReached.has('head_advanced')) {
+          // Head moved past this seq but we have no on-chain tx for it —
+          // this seq was likely admin-dropped (autodrop) or never committed
+          // successfully. Either way the intent did NOT make it to the book.
+          classification = 'head_advanced_past_seq_but_no_landed_tx_for_it';
+        } else if (stagesReached.has('executed')) {
+          classification = 'executed';
+        } else if (stagesReached.has('committed')) {
+          classification = 'committed_awaiting_reveal';
+        } else if (stagesReached.has('submitted')) {
+          classification = 'submitted_awaiting_onchain';
+        } else if (stagesReached.has('rejected')) {
+          classification = 'rejected_at_ingress';
+        } else if (stagesReached.has('accepted')) {
+          classification = 'accepted_but_no_submit_status';
+        } else {
+          classification = 'unknown';
+        }
+
+        writeJson(res, 200, {
+          query: {
+            market: market ?? null,
+            sequence: sequence ?? null,
+            client_order_id: clientOrderId ?? null,
+            tx_signature: txSignature ?? null,
+          },
+          classification,
+          stages_reached: Array.from(stagesReached).sort(),
+          latest_reject_reason: latestRejectReason,
+          queue_slot: queueSlot,
+          onchain_tx: onchainTx,
+          event_count: events.length,
+          events,
+        });
+        return;
       }
 
       if (method === 'GET' && url.pathname === '/state/full') {

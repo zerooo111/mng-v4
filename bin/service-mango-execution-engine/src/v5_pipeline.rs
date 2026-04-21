@@ -155,6 +155,10 @@ pub struct V5MarketState {
 /// (`append_insert`, `replay_live`) work without conversion.
 pub use crate::v4_pipeline::V4RevealEntry as V5RevealEntry;
 
+/// Re-export for `main.rs` to size the admission-ceiling atomic without
+/// adding another use-line.
+pub const PER_MARKET_CAPACITY: u64 = EXECUTION_QUEUE_V5_PER_MARKET_CAPACITY as u64;
+
 /// Shared map of sequence → reveal material. Reveal worker drains this
 /// as head advances. Populated by the submit_intent handler.
 pub type V5RevealStore = crate::v4_pipeline::V4RevealStore;
@@ -237,11 +241,21 @@ pub fn derive_queue_v5_pda(
 pub fn read_starting_sequences(data: &[u8], market_index: u16) -> (u64, u64) {
     match parse_sub_queue_for_market(data, market_index) {
         Some(sqh) => {
-            let start = if sqh.live_count == 0 {
-                sqh.next_sequence_to_execute
-            } else {
-                sqh.max_seen_sequence.saturating_add(1)
-            };
+            // Seed the allocator past the larger of the two candidates:
+            //   - next_sequence_to_execute (the head)
+            //   - max_seen_sequence + 1 (next seq that has never been committed)
+            // The max() is load-bearing. On a healthy queue the two collapse
+            // to the same value, but after an admin drop_range / reset path
+            // the state can land at live_count=0 while max_seen > next
+            // (slots in (next, max_seen] still carry status=Committed from
+            // the prior cycle). If we seed at `next` in that case, the next
+            // ~(max_seen - next) commit attempts hit write_commit's
+            // ExecutionQueueFull check on every stuck slot and get rejected
+            // at preflight. Seeding past max_seen+1 wraps around the ring
+            // buffer into fresh slot territory.
+            let start = sqh
+                .next_sequence_to_execute
+                .max(sqh.max_seen_sequence.saturating_add(1));
             (start, sqh.next_sequence_to_execute)
         }
         None => (0, 0),
@@ -609,6 +623,61 @@ pub fn build_reveal_execute_tx(
 
     Transaction::new_signed_with_payer(
         &ixs,
+        Some(&payer.pubkey()),
+        &[payer],
+        blockhash,
+    )
+}
+
+/// Build a no-op `reveal_execute_market` tx purely to trigger the
+/// program's pre-loop orphan-tail sweep. The sweep (deployed 2026-04-21)
+/// runs unconditionally at the top of the ix handler, advances
+/// `next_sequence_to_execute` over any stale Committed/Empty slots in
+/// `[next, max_seen]` when `live_count == 0`, then the reveal loop sees
+/// `live_count == 0` and breaks with `Ok(())`.
+///
+/// Used by the drift-resync worker when it detects the wedge pattern
+/// (live_count == 0 && max_seen >= next). Without this trigger the
+/// ix never fires on a wedged market (relayer's reveal_store is empty
+/// so the normal reveal dispatch never generates a tx), and the
+/// sweep — despite being on-chain — stays dormant.
+///
+/// The tx carries one dummy `RevealArgsV5` with `dispatch_accounts_count=0`
+/// because the program requires `reveals.is_empty() == false`. Post-sweep
+/// the reveal loop exits before touching the dummy entry.
+pub fn build_sweep_trigger_tx(
+    mkt: &V5MarketState,
+    payer: &Keypair,
+    blockhash: solana_sdk::hash::Hash,
+) -> Transaction {
+    let cu = ComputeBudgetInstruction::set_compute_unit_limit(400_000);
+    let mut accounts = mango_v4::accounts::ExecutionQueueV5RevealExecuteMarket {
+        group: mkt.group,
+        authority_state: mkt.authority_state,
+        queue: mkt.queue,
+        instructions: INSTRUCTIONS_SYSVAR_ID,
+    }
+    .to_account_metas(None);
+    accounts.push(AccountMeta::new_readonly(mkt.program_id, false));
+
+    let reveal_ix = Instruction {
+        program_id: mkt.program_id,
+        accounts,
+        data: mango_v4::instruction::ExecutionQueueV5RevealExecuteMarket {
+            market_index: mkt.market_index,
+            reveals: vec![RevealArgsV5 {
+                payload: Vec::new(),
+                kind: 0,
+                dispatch_accounts_count: 0,
+                client_order_id: 0,
+                mango_account: Pubkey::default(),
+                user_owner: Pubkey::default(),
+            }],
+        }
+        .data(),
+    };
+    Transaction::new_signed_with_payer(
+        &[cu, reveal_ix],
         Some(&payer.pubkey()),
         &[payer],
         blockhash,
@@ -1203,11 +1272,14 @@ pub async fn wait_for_signature_confirmation(
 
 pub fn spawn_drift_resync_worker(
     rpc: Arc<RpcClient>,
+    secondary_rpc: Option<Arc<RpcClient>>,
     mkt: Arc<V5MarketState>,
     next_seq: V5NextSequence,
     reveal_store: V5RevealStore,
+    admission_ceiling_atomic: Arc<AtomicU64>,
     interval_ms: u64,
     max_lookahead: u64,
+    sweep_trigger_payer: Arc<Keypair>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -1230,42 +1302,41 @@ pub fn spawn_drift_resync_worker(
                     continue;
                 }
             };
-            let on_chain_next = if sqh.live_count == 0 {
-                sqh.next_sequence_to_execute
-            } else {
-                sqh.max_seen_sequence.saturating_add(1)
-            };
 
-            // On-chain `validate_commit_sequence` admits commits only in
-            // the half-open interval [next_sequence_to_execute,
-            // next_sequence_to_execute + admission_limit). `admission_limit
-            // <= per-market capacity (256)`, so:
+            // On-chain `validate_commit_sequence` admits commits in the
+            // half-open interval [next_sequence_to_execute,
+            // next_sequence_to_execute + admission_limit). The ceiling is
+            // derived from the ACTUAL head (next_sequence_to_execute),
+            // NOT `max_seen_sequence+1`. Those two collapse on a healthy
+            // queue, but when a gap-tail wedges the head below max_seen
+            // (live_count=0 && max_seen > next_seq, or live=N with the
+            // head stuck at a failing reveal) the distinction is
+            // load-bearing: picking `max_seen+1 + capacity` over-estimates
+            // the ceiling and the next rewind target lands in a window
+            // the program rejects with ExecutionQueueFull (6076). Mirror
+            // the program verbatim.
             //
-            //   admission_ceiling = on_chain_next + capacity        // first INVALID seq
-            //   max_valid_seq     = admission_ceiling - 1            // last valid seq
-            //
-            // Three invariants to enforce against a drifted local counter:
-            //
-            //  (1) Purge reveal-store entries at seq >= admission_ceiling.
-            //      They can never land and poison rewind targets.
-            //
-            //  (2) When the system is WEDGED (local already past ceiling
-            //      even after (1)) the entries between max_seen+1 and
-            //      ceiling-1 are almost certainly orphans from
-            //      commits-that-sent-but-errored-on-chain: max_seen only
-            //      advances via successful commits, so anything above it
-            //      for long is suspect. Purge these aggressively.
-            //
-            //  (3) Rewind target must itself be a VALID seq — capped at
-            //      max_valid_seq, not admission_ceiling. The old code
-            //      targeted `max(on_chain_next, max_stored+1)` which
-            //      equals admission_ceiling when max_stored = ceiling-1,
-            //      and every subsequent commit immediately fails 6076.
+            // `on_chain_next_floor` tracks the lowest seq that's safe to
+            // rewind to — still max(next_seq, max_seen+1) so rewinds
+            // don't collide with ring slots that are still in
+            // status=Committed from the prior generation.
             const IN_FLIGHT_TOLERANCE: u64 = 32;
             let capacity = EXECUTION_QUEUE_V5_PER_MARKET_CAPACITY as u64;
-            let admission_ceiling = on_chain_next.saturating_add(capacity);
+            let admission_ceiling = sqh.next_sequence_to_execute.saturating_add(capacity);
+            let on_chain_next_floor = sqh
+                .next_sequence_to_execute
+                .max(sqh.max_seen_sequence.saturating_add(1));
+            let on_chain_next = on_chain_next_floor; // kept for the existing
+                                                     // drift-detection log field
             let max_valid_seq = admission_ceiling.saturating_sub(1);
             let stale_below_cutoff = sqh.next_sequence_to_execute;
+
+            // Publish the ceiling so ingress can back-pressure instead
+            // of letting the allocator race past it. Store unconditionally
+            // — the relaxed read on the ingress side tolerates a slightly
+            // stale value; the worst case is one extra sim before the
+            // next refresh catches up.
+            admission_ceiling_atomic.store(admission_ceiling, Ordering::Release);
 
             let local_pre = next_seq.load(Ordering::Acquire);
             let system_wedged = local_pre >= admission_ceiling;
@@ -1327,25 +1398,126 @@ pub fn spawn_drift_resync_worker(
             }
 
             // Rewind target:
-            //   - at least on_chain_next (don't rewind into already-processed seqs)
+            //   - at least on_chain_next_floor (don't rewind into
+            //     already-processed seqs OR into ring slots still in
+            //     status=Committed from the prior cycle)
             //   - at least max_stored + 1 (don't duplicate existing entries)
             //   - at most max_valid_seq (next fetch_add must return a valid seq)
+            //
+            // When `on_chain_next_floor >= admission_ceiling` the queue is
+            // GENUINELY WEDGED: head stuck low enough that every safe seq
+            // is also out-of-window. We clamp the target to max_valid_seq
+            // to avoid panicking, and rely on the ingress-side admission
+            // guard to start rejecting new intents until autodrop / head
+            // advance opens up room.
+            let wedged_no_headroom = on_chain_next_floor >= admission_ceiling;
             let mut safe_rewind_target =
-                on_chain_next.max(max_stored_seq.saturating_add(1));
+                on_chain_next_floor.max(max_stored_seq.saturating_add(1));
             if safe_rewind_target > max_valid_seq {
                 safe_rewind_target = max_valid_seq;
             }
 
             let local = next_seq.load(Ordering::Acquire);
+            // Send a sweep-trigger tx when the wedge pattern is live.
+            // Program fix (deployed 2026-04-21) runs an unconditional
+            // orphan-tail sweep at the top of reveal_execute_market
+            // that advances next_seq past max_seen when live_count==0.
+            // But the ix fires only when the relayer actually sends a
+            // reveal tx — and on a wedged market the reveal_store is
+            // empty, so the normal reveal dispatch never generates one.
+            // Drive the sweep explicitly here with a dummy reveal tx
+            // (see build_sweep_trigger_tx). Guarded on both (a)
+            // live_count==0 (otherwise normal reveal flow is already
+            // advancing head and the sweep is a no-op), and (b)
+            // max_seen >= next (a strictly-empty queue has nothing to
+            // sweep).
+            let wedge_live_zero =
+                sqh.live_count == 0 && sqh.max_seen_sequence >= sqh.next_sequence_to_execute;
+            if wedge_live_zero {
+                match rpc.get_latest_blockhash().await {
+                    Ok(bh) => {
+                        let tx = build_sweep_trigger_tx(&mkt, &sweep_trigger_payer, bh);
+                        let cfg = solana_client::rpc_config::RpcSendTransactionConfig {
+                            skip_preflight: false,
+                            preflight_commitment: Some(
+                                solana_sdk::commitment_config::CommitmentLevel::Processed,
+                            ),
+                            max_retries: Some(0),
+                            ..Default::default()
+                        };
+                        match send_legacy_tx_with_failover(
+                            &rpc,
+                            secondary_rpc.as_deref(),
+                            &tx,
+                            cfg,
+                        )
+                        .await
+                        {
+                            Ok((sig, via_sec)) => info!(
+                                target: "v5_drift",
+                                event = "sweep_trigger_sent",
+                                market_index = mkt.market_index,
+                                next = sqh.next_sequence_to_execute,
+                                max_seen = sqh.max_seen_sequence,
+                                %sig,
+                                via_secondary = via_sec,
+                                "dispatched on-chain sweep trigger for wedged sub-queue"
+                            ),
+                            Err(e) => warn!(
+                                target: "v5_drift",
+                                event = "sweep_trigger_failed",
+                                market_index = mkt.market_index,
+                                error = %e,
+                                "sweep trigger send failed; will retry next tick"
+                            ),
+                        }
+                    }
+                    Err(e) => warn!(
+                        target: "v5_drift",
+                        event = "sweep_trigger_blockhash_failed",
+                        error = %e,
+                        "blockhash fetch for sweep trigger failed"
+                    ),
+                }
+            }
+            if wedged_no_headroom {
+                // Observability: every tick while wedged emits a structured
+                // event tied to (market, next_seq_to_execute, max_seen,
+                // admission_ceiling) so the trace endpoint can explain why
+                // ingress is rejecting intents. Per CLAUDE.md "No silent
+                // drops" rule — saturation MUST be visible, not silent.
+                warn!(
+                    target: "v5_drift",
+                    event = "admission_saturated",
+                    market_index = mkt.market_index,
+                    local,
+                    on_chain_head = sqh.next_sequence_to_execute,
+                    max_seen = sqh.max_seen_sequence,
+                    live_count = sqh.live_count,
+                    admission_ceiling,
+                    max_valid_seq,
+                    safe_rewind_target,
+                    "admission window saturated (head wedged below max_seen+1 — \
+                     new commits will fail with ExecutionQueueFull until autodrop \
+                     or reveal advances the head)"
+                );
+            }
             if local > on_chain_next.saturating_add(max_lookahead) {
                 warn!(
                     target: "v5_drift",
+                    event = "rewind",
+                    market_index = mkt.market_index,
                     local,
                     on_chain_next,
+                    on_chain_head = sqh.next_sequence_to_execute,
+                    max_seen = sqh.max_seen_sequence,
+                    live_count = sqh.live_count,
                     max_stored_seq,
                     rewind_to = safe_rewind_target,
                     admission_ceiling,
+                    max_valid_seq,
                     drift = local - on_chain_next,
+                    wedged_no_headroom,
                     "local counter drifted; rewinding"
                 );
                 if local > safe_rewind_target {
@@ -1354,8 +1526,13 @@ pub fn spawn_drift_resync_worker(
             } else if local + 16 < on_chain_next {
                 info!(
                     target: "v5_drift",
+                    event = "advance",
+                    market_index = mkt.market_index,
                     local,
                     on_chain_next,
+                    on_chain_head = sqh.next_sequence_to_execute,
+                    max_seen = sqh.max_seen_sequence,
+                    admission_ceiling,
                     "local counter behind on-chain; advancing"
                 );
                 next_seq.store(on_chain_next, Ordering::Release);

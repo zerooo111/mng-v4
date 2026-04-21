@@ -727,6 +727,10 @@ impl Config {
                 enabled: parse_bool_env("V5_PRECHECK_ENABLED", true),
                 expire_margin_slots: parse_u64_env("V5_PRECHECK_EXPIRE_MARGIN_SLOTS", 10)?,
                 max_future_slots: parse_u64_env("V5_PRECHECK_MAX_FUTURE_SLOTS", 150)?,
+                payload_expiry_min_margin_secs: parse_u64_env(
+                    "V5_PRECHECK_PAYLOAD_EXPIRY_MIN_MARGIN_SECS",
+                    2,
+                )?,
             },
             executor_lane_config_path,
             executor_lane_cache_path,
@@ -3129,6 +3133,13 @@ struct V5PerMarket {
     reveal_store: v5_pipeline::V5RevealStore,
     next_sequence: v5_pipeline::V5NextSequence,
     reveal_wal: Option<Arc<v4_reveal_wal::V4RevealWal>>,
+    /// First sequence the on-chain program will reject with
+    /// `ExecutionQueueFull` (6076). Computed by the drift-resync worker
+    /// exactly as the program does: `sqh.next_sequence_to_execute +
+    /// admission_limit`. Ingress compares its pre-allocation counter to
+    /// this value and back-pressures instead of minting a seq the chain
+    /// will reject at preflight.
+    admission_ceiling: Arc<AtomicU64>,
 }
 
 #[derive(Clone)]
@@ -6764,6 +6775,59 @@ impl Engine {
                         ));
                     }
                 }
+                // Admission guard: peek the local counter against the
+                // on-chain admission ceiling before allocating a seq. The
+                // on-chain `validate_commit_sequence` rejects any seq
+                // `>= next_sequence_to_execute + admission_limit` with
+                // `ExecutionQueueFull` (6076). Without this guard the
+                // allocator happily mints seqs past the ceiling, every
+                // resulting commit dies at preflight with `0x17bc`, and
+                // the client sees it land as "submitted" in the status
+                // feed — a silent drop under CLAUDE.md's "no silent
+                // drops" rule. Back-pressure at ingress instead: emit a
+                // structured `relay_intent_status status=rejected
+                // reason=admission_saturated` and return
+                // `Code::ResourceExhausted` so the client retries or
+                // surfaces the saturation to the operator.
+                //
+                // The ceiling atomic is refreshed by the drift-resync
+                // worker every `V4_DRIFT_RESYNC_INTERVAL_MS` (default 3s)
+                // — stale by at most one interval, which is fine: the
+                // safety margin covers the handful of ingresses that
+                // could race a stale ceiling check.
+                const V5_ADMISSION_SAFETY_MARGIN: u64 = 8;
+                let admission_ceiling = v5pm
+                    .admission_ceiling
+                    .load(std::sync::atomic::Ordering::Acquire);
+                let local_pre = v5_next_seq_ref
+                    .load(std::sync::atomic::Ordering::Acquire);
+                if admission_ceiling > 0
+                    && local_pre.saturating_add(V5_ADMISSION_SAFETY_MARGIN) >= admission_ceiling
+                {
+                    warn!(
+                        target: "v5_precheck",
+                        event = "admission_saturated",
+                        market_index = v5_mkt.market_index,
+                        local_pre,
+                        admission_ceiling,
+                        safety_margin = V5_ADMISSION_SAFETY_MARGIN,
+                        "ingress reject: admission window saturated"
+                    );
+                    self.metrics
+                        .ingress_rejected_total
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Err(self.reject_submit_request(
+                        &request,
+                        Code::ResourceExhausted,
+                        format!(
+                            "v5 admission window saturated: local={local_pre} \
+                             ceiling={admission_ceiling} market={} \
+                             (head wedged — retry shortly)",
+                            v5_mkt.market_index
+                        ),
+                    ));
+                }
+
                 // P0.5: single unified user-intent hash. commit_hash and
                 // the message the user's ed25519 pre-ix signs over are now
                 // the same bytes. client_order_id is the 8-byte user
@@ -6829,18 +6893,13 @@ impl Engine {
                     kind: 0,
                     client_order_id,
                 };
-                // Commit-time dedup: before inserting into reveal_store,
-                // check that seq isn't already occupied by a different
-                // pending commit. This can happen when drift-resync rewinds
-                // the local counter to a seq whose on-chain commit_hash is
-                // still in play but whose reveal_store entry was purged
-                // (e.g., by the aggressive stale-in-flight purge). Without
-                // this check, a later commit at the same seq would silently
-                // overwrite the reveal material and every reveal attempt
-                // would fail 6122 (stored hash is from commit #1, payload
-                // in reveal_store is from commit #2). Explicit reject
-                // here lets the bot retry and get a fresh seq from the
-                // drift-resync'd counter.
+                // Commit-time dedup: reject if seq is already occupied by a
+                // prior pending commit whose reveal hasn't fired. This
+                // happens when drift-resync rewinds the local counter onto
+                // a seq still live in reveal_store. The race-guard under
+                // the write lock below catches the concurrent-submit
+                // variant; this early check just avoids building & sending
+                // a commit tx we'd have to roll back.
                 {
                     let store = v5_reveal_store_ref.lock();
                     if store.contains_key(&v5_seq) {
@@ -6858,34 +6917,24 @@ impl Engine {
                         )));
                     }
                 }
-                if let Some(wal) = v5_reveal_wal_ref.as_ref() {
-                    if let Err(e) = wal.append_insert(&reveal_entry) {
-                        warn!("v5 reveal WAL append failed for seq {v5_seq}: {e}");
-                        return Err(Status::internal(format!(
-                            "v5 reveal WAL append failed: {e}"
-                        )));
-                    }
-                }
-                {
-                    let mut store = v5_reveal_store_ref.lock();
-                    // Race guard: re-check after acquiring the write lock.
-                    if store.contains_key(&v5_seq) {
-                        drop(store);
-                        // Undo the WAL insert we just appended.
-                        if let Some(wal) = v5_reveal_wal_ref.as_ref() {
-                            let _ = wal.append_remove(v5_seq);
-                        }
-                        warn!(
-                            seq = v5_seq,
-                            market_index = v5_mkt.market_index,
-                            "v5 commit reject: seq collision detected under write lock (concurrent submits)"
-                        );
-                        return Err(Status::resource_exhausted(format!(
-                            "v5 sequence {v5_seq} collision — retry"
-                        )));
-                    }
-                    store.insert(v5_seq, reveal_entry);
-                }
+                // Build and send the commit tx WITH preflight enabled BEFORE
+                // touching reveal_store or the WAL. Rationale (devnet
+                // incident 2026-04-21): the old order inserted reveal
+                // material speculatively, then sent the commit tx with
+                // `skip_preflight: true`. If the send failed for any reason
+                // (blockhash expired, RPC rate-limit, ix build error) the
+                // cleanup path sometimes missed tombstoning — e.g. if the
+                // relayer restarted between WAL insert and tx send, or if
+                // the remove fsync raced. Every restart then replayed the
+                // phantom entry and every future commit at that seq
+                // collided. Fix: only mutate reveal_store / WAL once the
+                // RPC has accepted the tx (preflight passed → the tx is
+                // guaranteed to have been valid at send time; even if
+                // confirmation later fails, a stuck entry can be reaped by
+                // autodrop just like any other on-chain stall). Preflight
+                // also surfaces program-level errors (e.g. ExecutionQueueFull)
+                // cleanly as a send failure instead of silently landing a
+                // doomed tx.
                 let commit_tx = v5_pipeline::build_commit_market_tx(
                     &v5_mkt,
                     &self.config.ctm,
@@ -6895,7 +6944,16 @@ impl Engine {
                     chain.blockhash,
                 );
                 let commit_cfg = solana_client::rpc_config::RpcSendTransactionConfig {
-                    skip_preflight: true,
+                    skip_preflight: false,
+                    // Preflight commitment MUST match the commitment the
+                    // blockhash was fetched at (BlockhashManager uses
+                    // `processed`). Default would be `finalized`, which
+                    // doesn't yet contain a processed-level blockhash →
+                    // spurious `Blockhash not found` for every tx. Pair
+                    // them explicitly.
+                    preflight_commitment: Some(
+                        solana_sdk::commitment_config::CommitmentLevel::Processed,
+                    ),
                     max_retries: Some(0),
                     ..Default::default()
                 };
@@ -6909,22 +6967,58 @@ impl Engine {
                 let sig = match commit_res {
                     Ok((s, _via_secondary)) => s,
                     Err(e) => {
-                        {
-                            let mut store = v5_reveal_store_ref.lock();
-                            store.remove(&v5_seq);
-                        }
-                        if let Some(wal) = v5_reveal_wal_ref.as_ref() {
-                            if let Err(werr) = wal.append_remove(v5_seq) {
-                                warn!(
-                                    "v5 reveal WAL tombstone failed for seq {v5_seq}: {werr}"
-                                );
-                            }
-                        }
+                        // Nothing was inserted into reveal_store or WAL yet —
+                        // no cleanup needed. Seq is released back to the
+                        // allocator (caller will re-fetch on next attempt).
                         return Err(Status::internal(format!(
                             "v5 commit send failed: {e}"
                         )));
                     }
                 };
+                // Commit tx was accepted by the RPC (preflight passed + send
+                // ok). Persist to WAL first, then install into the in-memory
+                // reveal_store under a second collision check. If the WAL
+                // append fails, tombstone the entry and surface internal
+                // error — the on-chain tx has the commit_hash, so the
+                // reveal handler will 6122 forever for this seq and the
+                // autodrop worker will clear it at the stall timeout.
+                if let Some(wal) = v5_reveal_wal_ref.as_ref() {
+                    if let Err(e) = wal.append_insert(&reveal_entry) {
+                        warn!(
+                            seq = v5_seq,
+                            "v5 reveal WAL append failed after commit tx sent: {e} (autodrop will clear)"
+                        );
+                        return Err(Status::internal(format!(
+                            "v5 reveal WAL append failed post-commit: {e}"
+                        )));
+                    }
+                }
+                {
+                    let mut store = v5_reveal_store_ref.lock();
+                    // Race guard: if a concurrent submit for the same seq
+                    // won the lock first, tombstone the WAL entry we just
+                    // appended and fail. The commit tx for this racer is
+                    // already in flight — it'll either land (and 6122
+                    // until autodrop because reveal_store has the other
+                    // payload) or fail. Either way the honest path for the
+                    // losing submitter is to retry with a fresh seq.
+                    if store.contains_key(&v5_seq) {
+                        drop(store);
+                        if let Some(wal) = v5_reveal_wal_ref.as_ref() {
+                            let _ = wal.append_remove(v5_seq);
+                        }
+                        warn!(
+                            seq = v5_seq,
+                            market_index = v5_mkt.market_index,
+                            sig = %sig,
+                            "v5 commit reject: seq collision detected under write lock after send — autodrop will reconcile the stuck on-chain commit"
+                        );
+                        return Err(Status::resource_exhausted(format!(
+                            "v5 sequence {v5_seq} collision after send — retry"
+                        )));
+                    }
+                    store.insert(v5_seq, reveal_entry);
+                }
                 self.metrics
                     .ingress_accepted_total
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -12962,6 +13056,15 @@ async fn async_main() -> Result<()> {
             let seed_seq = start_seq.max(max_restored_seq.saturating_add(1));
             let next_sequence = Arc::new(AtomicU64::new(seed_seq));
 
+            // Seed the admission ceiling to the program's view
+            // (`head_seq + per-market capacity`). Drift worker refreshes
+            // this every tick. Until the first refresh runs, ingress sees
+            // a correct ceiling rather than 0 (which would block every
+            // intent as "saturated").
+            let admission_ceiling = Arc::new(AtomicU64::new(
+                head_seq.saturating_add(v5_pipeline::PER_MARKET_CAPACITY),
+            ));
+
             let reveal_store: v5_pipeline::V5RevealStore =
                 Arc::new(parking_lot::Mutex::new(initial_entries));
 
@@ -12986,6 +13089,7 @@ async fn async_main() -> Result<()> {
                     reveal_store,
                     next_sequence,
                     reveal_wal,
+                    admission_ceiling,
                 },
             );
         }
@@ -13074,6 +13178,7 @@ async fn async_main() -> Result<()> {
         let reveal_store = v5pm.reveal_store.clone();
         let next_sequence = v5pm.next_sequence.clone();
         let reveal_wal = v5pm.reveal_wal.clone();
+        let admission_ceiling_c = v5pm.admission_ceiling.clone();
         let rpc_c = engine.rpc.clone();
         let payer_c = engine.config.payer.clone();
         let admin_c = engine.config.ctm.clone();
@@ -13104,16 +13209,74 @@ async fn async_main() -> Result<()> {
         let drift_max_lookahead = engine.config.v4_drift_max_lookahead;
         v5_pipeline::spawn_drift_resync_worker(
             rpc_c.clone(),
+            engine.secondary_rpc.clone(),
             mkt.clone(),
             next_sequence.clone(),
             reveal_store.clone(),
+            admission_ceiling_c.clone(),
             drift_interval_ms,
             drift_max_lookahead,
+            payer_c.clone(),
         );
         info!(
             "v5 drift-resync worker spawned: market={} interval_ms={} max_lookahead={}",
             idx, drift_interval_ms, drift_max_lookahead
         );
+
+        // Spawn WAL compaction worker for this market. Runs every 5min,
+        // drops entries whose sequence is already below the on-chain head
+        // (reveal-path already done or doomed) AND entries older than 60min
+        // regardless of seq state. 60min retention bounds worst-case file
+        // size to roughly (ingress rate * 60min * bytes_per_record) — on
+        // devnet at ~2 commits/sec with ~5KB/record, that's ~36MB ceiling
+        // per market. Legacy records with ts_ms=0 (pre-retention migration)
+        // are kept until the seq cutoff catches them, matching prior
+        // behavior.
+        if let Some(wal) = reveal_wal.clone() {
+            let rpc_wal = rpc_c.clone();
+            let queue_pk = mkt.queue;
+            let mkt_idx: u16 = *idx;
+            tokio::spawn(async move {
+                const COMPACT_INTERVAL_SECS: u64 = 300; // 5 min
+                const MAX_AGE_MS: u64 = 60 * 60 * 1000; // 60 min
+                loop {
+                    tokio::time::sleep(Duration::from_secs(COMPACT_INTERVAL_SECS)).await;
+                    // Cutoff = on-chain next_sequence_to_execute. Everything
+                    // below that sequence is already executed (or admin-dropped)
+                    // and its reveal material is dead weight.
+                    let min_sequence = match rpc_wal.get_account(&queue_pk).await {
+                        Ok(acct) => {
+                            let (_start, head) =
+                                v5_pipeline::read_starting_sequences(&acct.data, mkt_idx);
+                            head
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "v5 WAL compact (market {mkt_idx}): queue fetch failed: {e}; skipping this tick"
+                            );
+                            continue;
+                        }
+                    };
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    match wal.compact_with_retention(min_sequence, now_ms, MAX_AGE_MS) {
+                        Ok(()) => {
+                            info!(
+                                "v5 WAL compact (market {mkt_idx}): ok min_sequence={min_sequence} max_age_ms={MAX_AGE_MS}"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "v5 WAL compact (market {mkt_idx}) failed: {e}"
+                            );
+                        }
+                    }
+                }
+            });
+            info!("v5 WAL compaction worker spawned: market={idx} interval_secs=300 max_age_min=60");
+        }
 
         if engine.config.v4_autodrop_enabled {
             let autodrop_cfg = v5_pipeline::V5AutodropConfig {

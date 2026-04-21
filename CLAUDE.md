@@ -1,5 +1,29 @@
 # Project rules
 
+## No silent drops: every transaction MUST have an auditable trace
+
+**Rule:** Across the full ingress → accepted → enqueued → committed → executed → head-advanced → state-updated pipeline, every sequence number / transaction must leave a structured, queryable trail. Given a `(market, sequence)` or `client_order_id` or `tx_signature`, it must be possible to determine within seconds: current status, every stage reached, every stage NOT reached, and the exact reason if anything failed. If a code path can cause a transaction to disappear without a recorded cause, that is a bug — fix the code path, don't mask it.
+
+**Forbidden patterns:**
+- Catching an error and returning early without emitting a status event / log line that ties back to the seq.
+- Mutating reveal_store / queue state without a matching WAL or log record.
+- Treating preflight / send failures as "retry later" without recording the attempt with timestamp, blockhash, and error text.
+- `dispatch failed (terminal=false)` paths that silently autodrop — those MUST surface in both the relayer log AND the harness trace endpoint so the operator can see "seq X was admin-dropped at slot Y because <reason>".
+- Any branch that drops an intent before a `relay_intent_status` event is emitted.
+
+**Required emission points per seq:**
+1. Ingress receive → `relay_intent_status status=accepted|rejected` (with `reason` if rejected)
+2. Commit tx build → `v5_commit_debug seq=... commit_hash_hex=...`
+3. Commit send outcome → `relay_intent_status status=submitted` with `tx_signature`, or `status=rejected` with `reason` including the preflight error code
+4. Reveal dispatch → `v5_reveal_debug first_seq=... last_seq=...`
+5. Reveal tx outcome (program-level) → parseable from on-chain logs (`dispatch failed` / `dispatch_ok` / `head advanced`)
+6. Autodrop → `v5_autodrop admin drop sent seq=...`
+7. Head advance → `v5_reveal queue state head=... last_fired=...`
+
+**How to apply:** before merging any relayer/harness change that touches the submit / commit / reveal / drop paths, run `GET /trace/sequence/<market>/<seq>` against a recent live seq and confirm every stage emits at least one matching record. If a path can be exercised where the trace shows nothing for some stage, that path is broken — add the missing emission.
+
+**Reason:** 2026-04-21 devnet incident — bot's cancel_all "failed" with no visible error anywhere. On investigation, no relay_intent_status with `kind=cancel` existed; no on-chain cancel_all tx; no harness log. The failure was invisible at every observability point because whatever path the bot was taking never emitted a status event. Cost ~1 hour of orthogonal debugging before we figured out the cancel wasn't actually being submitted. A trace endpoint that answered "no record for that order id, probably never sent" would have closed the case in 10 seconds.
+
 ## Keypair management
 
 - **Always store every keypair you generate in `/home/hetalkenaudekar/secure/keypairs/`** (mode 700).

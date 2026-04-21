@@ -434,11 +434,42 @@ fn skip_sub_queue_head_gaps_v5(
         if skipped >= EXECUTION_QUEUE_GAP_SKIP_LIMIT_PER_EXECUTE {
             break;
         }
-        if sqh.live_count == 0 || sqh.max_seen_sequence < sqh.next_sequence_to_execute {
+        // Fix (2026-04-21 wedge, TODO.md §gap-tail): advance over gaps
+        // even when `live_count == 0`. The prior gate required
+        // `live_count > 0`, which left the queue structurally wedged
+        // whenever all live commits revealed/failed but `max_seen` had
+        // been pushed ahead by later commits whose own reveals never
+        // landed. With live=0 the admin autodrop and skip-gap paths
+        // both refused to advance, so `next_sequence_to_execute`
+        // permanently trailed `max_seen`, new commits allocated into
+        // still-Committed ring slots, and the sub-queue rejected every
+        // one with 6076 ExecutionQueueFull. The only recoverable
+        // invariant is max_seen >= next_seq; live_count is not load-
+        // bearing here.
+        if sqh.max_seen_sequence < sqh.next_sequence_to_execute {
             break;
         }
         let next_seq = sqh.next_sequence_to_execute;
-        if queue.get_item(idx, next_seq).is_some() {
+        let live_count = sqh.live_count;
+        // `get_item` returns Some only when status != Empty AND the
+        // stored sequence matches. Two cases where we should still
+        // advance:
+        //   (a) slot is Empty (a true gap — original behaviour).
+        //   (b) live_count == 0 AND the slot still looks Committed/
+        //       Revealed/etc — this is an ORPHAN left by an earlier
+        //       cycle (e.g. a reveal that succeeded on the commit
+        //       hash check but failed in the inner perp_place_order
+        //       and never got clear_head'd, or an admin path that
+        //       decremented live without clearing). With live==0 the
+        //       sub-queue is authoritatively empty; any non-Empty
+        //       slot in [next, max_seen] is stale state, and
+        //       reusing its ring offset for a new commit would fail
+        //       6076 forever. Treat it as a gap: zero the slot,
+        //       advance next. Without this branch the 2026-04-21
+        //       SOL market accumulated 357 orphan-Committed slots
+        //       and every new commit failed at preflight.
+        let item_present = queue.get_item(idx, next_seq).is_some();
+        if item_present && live_count > 0 {
             break;
         }
         emit!(QueueItemProcessed {
@@ -449,8 +480,12 @@ fn skip_sub_queue_head_gaps_v5(
             status: CommitStatusV5::Failed as u8,
             failure_code: QueueFailureCode::GapSkipped as u8,
         });
-        // Gap: no committed item at head. Advance over it without touching
-        // live_count (it wasn't counted). `gap_observed_slot` reset is below.
+        // Zero the ring slot: handles both true gaps (already Empty,
+        // default() is a no-op mutation) and orphan-Committed slots
+        // (default() resets status=Empty + commit_hash=[0;32]).
+        let ring_offset = SubQueueHeaderV5::ring_offset_for_sequence(next_seq);
+        let phys = ExecutionQueueV5::physical_index(idx, ring_offset);
+        queue.items[phys] = CommitItemV5::default();
         queue.sub_queue_headers[idx].next_sequence_to_execute = next_seq.saturating_add(1);
         queue.sub_queue_headers[idx].gap_observed_slot = 0;
         skipped = skipped.saturating_add(1);
@@ -490,6 +525,34 @@ pub fn execution_queue_v5_reveal_execute_market(
 
     let mut cursor: usize = 0;
     let total_accounts = ctx.remaining_accounts.len();
+
+    // Sweep any pre-existing orphan-tail BEFORE the reveal loop. An orphan
+    // tail is a non-empty stretch [next, max_seen] left over from a prior
+    // cycle when live_count dropped to 0 without clearing every slot —
+    // e.g. a reveal that passed the commit_hash check but failed in the
+    // inner perp ix and didn't clear_head, or an admin path that
+    // decremented live without zeroing. Without this up-front sweep, the
+    // per-iter `live_count == 0` break (below) exits the reveal loop
+    // before `skip_sub_queue_head_gaps_v5` ever runs, so the orphan
+    // slots stay Committed forever and `write_commit` fails every new
+    // commit with 6076 ExecutionQueueFull. Covers the 2026-04-21 SOL
+    // wedge where all 357 slots [28853..29209] needed reclaiming.
+    {
+        let mut queue = ctx.accounts.queue.load_mut()?;
+        let needs_sweep = {
+            let sqh = &queue.sub_queue_headers[sub_queue_idx];
+            sqh.live_count == 0
+                && sqh.max_seen_sequence >= sqh.next_sequence_to_execute
+        };
+        if needs_sweep {
+            skip_sub_queue_head_gaps_v5(
+                &mut queue,
+                sub_queue_idx,
+                group_key,
+                market_index,
+            );
+        }
+    }
 
     for reveal in reveals.iter() {
         // Snapshot per-iteration head state.

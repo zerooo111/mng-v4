@@ -101,6 +101,17 @@ pub enum PrecheckReject {
     UserSignatureMissingForVariant {
         variant: QueuePayloadVariant,
     },
+    /// `payload.expiry_timestamp` is set and would be expired at reveal time
+    /// (or within `min_expiry_margin_secs`). Catches MMs that stamp a fixed
+    /// expiry_timestamp at startup and reuse it across quotes — those quotes
+    /// reach commit successfully but every reveal aborts with
+    /// `TerminalCtmFailureReason::Expired`. Logged at ingress so the offending
+    /// client is identifiable without spelunking on-chain tx logs.
+    PayloadExpiryStale {
+        expiry_timestamp: u64,
+        now_ts: u64,
+        min_margin_secs: u64,
+    },
 }
 
 impl PrecheckReject {
@@ -123,6 +134,7 @@ impl PrecheckReject {
             PrecheckReject::MinExecuteSlotTooFar { .. } => "min_execute_far",
             PrecheckReject::MinExecuteSlotAfterExpiry { .. } => "min_execute_after_expiry",
             PrecheckReject::UserSignatureMissingForVariant { .. } => "user_sig_missing",
+            PrecheckReject::PayloadExpiryStale { .. } => "payload_expiry_stale",
         }
     }
 }
@@ -202,6 +214,17 @@ impl std::fmt::Display for PrecheckReject {
             PrecheckReject::UserSignatureMissingForVariant { variant } => {
                 write!(f, "user signature required for variant {variant:?} but not provided")
             }
+            PrecheckReject::PayloadExpiryStale {
+                expiry_timestamp,
+                now_ts,
+                min_margin_secs,
+            } => write!(
+                f,
+                "payload expiry_timestamp {expiry_timestamp} would be expired at reveal \
+                 (now_ts={now_ts}, min_margin_secs={min_margin_secs}, \
+                 delta_secs={delta})",
+                delta = (*now_ts as i128) - (*expiry_timestamp as i128),
+            ),
         }
     }
 }
@@ -215,6 +238,15 @@ pub struct PrecheckConfig {
     /// Reject if `min_execute_slot - now_slot > this`. Protects against
     /// speculative commits that sit stale at the head.
     pub max_future_slots: u64,
+    /// Reject a `PerpPlaceOrderV2` payload at ingress if its
+    /// `expiry_timestamp` is set (non-zero) and would be treated as expired
+    /// at reveal, i.e. `expiry_timestamp <= now_ts + this`. Set to 0 to only
+    /// reject already-stamped-in-the-past timestamps; raise to protect
+    /// against reveals that land after a short queue drain. Independent of
+    /// the slot-level `expire_margin_slots` because `expiry_timestamp` is
+    /// unix-seconds (user-supplied) while `expires_at_slot` is a solana
+    /// slot (relayer-supplied).
+    pub payload_expiry_min_margin_secs: u64,
     /// Master kill switch. When false, `precheck_reveal_ready` always returns
     /// Ok. Useful for emergency rollback without redeploying.
     pub enabled: bool,
@@ -223,8 +255,9 @@ pub struct PrecheckConfig {
 impl Default for PrecheckConfig {
     fn default() -> Self {
         Self {
-            expire_margin_slots: 10,   // ~4s at 400ms/slot
-            max_future_slots: 150,     // ~60s — generous, catches clock skew
+            expire_margin_slots: 10,          // ~4s at 400ms/slot
+            max_future_slots: 150,            // ~60s — generous, catches clock skew
+            payload_expiry_min_margin_secs: 2, // reveal ≤ ~1 slot away; 2s covers that
             enabled: true,
         }
     }
@@ -273,6 +306,24 @@ pub fn precheck_reveal_ready(
             variant_kind,
             envelope_kind,
         });
+    }
+
+    // ── Stage 2a: explicit stale-expiry check (PerpPlaceOrderV2 only) ──
+    // Reads `expiry_timestamp` directly from the raw payload bytes so this
+    // stage is independent of `DecodedQueuePayload.body`'s `pub(crate)`
+    // visibility. Fires BEFORE the catch-all `prevalidate_terminal_ctm_payload`
+    // below so the reject reason is specific ("payload_expiry_stale") and
+    // easy to grep, and so we can add a safety margin the program doesn't
+    // enforce. Catches MMs that stamp a fixed `expiry_timestamp` at startup
+    // and never refresh it across quotes.
+    if let Some(expiry) = parse_perp_place_order_v2_expiry_timestamp(payload) {
+        if expiry != 0 && expiry <= now_ts.saturating_add(cfg.payload_expiry_min_margin_secs) {
+            return Err(PrecheckReject::PayloadExpiryStale {
+                expiry_timestamp: expiry,
+                now_ts,
+                min_margin_secs: cfg.payload_expiry_min_margin_secs,
+            });
+        }
     }
 
     // ── Stage 2: terminal prevalidation (mirror of program) ────────────
@@ -364,6 +415,43 @@ fn check_dispatch_shape(
     Ok(())
 }
 
+/// Borsh offsets inside a `PerpPlaceOrderV2Payload` body (after the 4-byte
+/// QueuePayloadHeader):
+///   side(1) + price_lots(8) + max_base_lots(8) + max_quote_lots(8)
+///   + client_order_id(8) + order_type(1) + self_trade_behavior(1)
+///   + reduce_only(1) + expiry_timestamp(8) + limit(1) = 45 bytes body
+/// So `expiry_timestamp` lives at body offset 36..44 = payload offset 40..48.
+const QUEUE_PAYLOAD_HEADER_LEN: usize = 4;
+const PERP_PLACE_V2_EXPIRY_OFFSET_IN_BODY: usize = 1 + 8 * 4 + 1 + 1 + 1;
+const PERP_PLACE_V2_MIN_BODY_LEN: usize = PERP_PLACE_V2_EXPIRY_OFFSET_IN_BODY + 8 + 1;
+const QUEUE_PAYLOAD_VERSION_V1: u8 = 1;
+/// `QueuePayloadVariant::PerpPlaceOrderV2` serializes to discriminant 0
+/// (see `queue_payload_variant_from_u8` in programs/mango-v4/src/instructions/
+/// execution_queue.rs).
+const QUEUE_PAYLOAD_VARIANT_PERP_PLACE_V2: u8 = 0;
+
+/// Read `expiry_timestamp` from a PerpPlaceOrderV2 payload without going
+/// through the program's full-variant decoder. Returns None when the payload
+/// is too short, the wrong version, or a different variant. A None return
+/// means "this stage has nothing to say"; the subsequent stages (including
+/// the full program-mirrored decode) still run.
+pub(crate) fn parse_perp_place_order_v2_expiry_timestamp(payload: &[u8]) -> Option<u64> {
+    if payload.len() < QUEUE_PAYLOAD_HEADER_LEN + PERP_PLACE_V2_MIN_BODY_LEN {
+        return None;
+    }
+    if payload[0] != QUEUE_PAYLOAD_VERSION_V1 {
+        return None;
+    }
+    if payload[1] != QUEUE_PAYLOAD_VARIANT_PERP_PLACE_V2 {
+        return None;
+    }
+    // flags at bytes [2..4] — not validated here; stage 1 handles that.
+    let off = QUEUE_PAYLOAD_HEADER_LEN + PERP_PLACE_V2_EXPIRY_OFFSET_IN_BODY;
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&payload[off..off + 8]);
+    Some(u64::from_le_bytes(buf))
+}
+
 fn check_timing_margin(
     min_execute_slot: u64,
     expires_at_slot: u64,
@@ -433,5 +521,75 @@ mod tests {
         };
         let err = check_timing_margin(0, 105, 100, &cfg).unwrap_err();
         matches!(err, PrecheckReject::EnvelopeExpiryTooTight { .. });
+    }
+
+    /// Build the exact 49-byte payload shape the relayer sees on the wire:
+    /// 4-byte header (version=1, variant=0, flags=0) + 45-byte body with
+    /// `expiry_timestamp` placed at body[36..44].
+    fn mk_perp_place_v2_payload(expiry_timestamp: u64) -> Vec<u8> {
+        let mut p = vec![0u8; 4 + 45];
+        p[0] = 1; // version
+        p[1] = 0; // variant = PerpPlaceOrderV2
+        // flags @ [2..4] left 0
+        // side @ body[0], lots fields @ body[1..33], client_order_id @ body[25..33],
+        // order_type @ body[33], self_trade_behavior @ body[34], reduce_only @ body[35]
+        // expiry_timestamp @ body[36..44], limit @ body[44]
+        let off = 4 + 36;
+        p[off..off + 8].copy_from_slice(&expiry_timestamp.to_le_bytes());
+        p
+    }
+
+    #[test]
+    fn expiry_parse_roundtrip() {
+        let ts = 1_776_669_808u64; // the exact stale stamp seen in production
+        let p = mk_perp_place_v2_payload(ts);
+        assert_eq!(parse_perp_place_order_v2_expiry_timestamp(&p), Some(ts));
+    }
+
+    #[test]
+    fn expiry_parse_none_on_short_payload() {
+        let short = vec![1u8, 0, 0, 0, 0, 0];
+        assert_eq!(parse_perp_place_order_v2_expiry_timestamp(&short), None);
+    }
+
+    #[test]
+    fn expiry_parse_none_on_wrong_variant() {
+        let mut p = mk_perp_place_v2_payload(1_000);
+        p[1] = 1; // flip variant to PerpCancelOrder
+        assert_eq!(parse_perp_place_order_v2_expiry_timestamp(&p), None);
+    }
+
+    #[test]
+    fn expiry_parse_none_on_wrong_version() {
+        let mut p = mk_perp_place_v2_payload(1_000);
+        p[0] = 2;
+        assert_eq!(parse_perp_place_order_v2_expiry_timestamp(&p), None);
+    }
+
+    /// The production stale-expiry pattern: `expiry_timestamp` stamped at
+    /// MM startup (~1776669808, 2026-04-20 20:03 UTC), reveals 12h later.
+    /// Stage 2a must reject at ingress.
+    #[test]
+    fn stage_2a_rejects_stale_expiry_exact_production_pattern() {
+        let p = mk_perp_place_v2_payload(1_776_669_808);
+        let stale_now_ts = 1_776_762_000u64; // ~12h later
+        let err = parse_perp_place_order_v2_expiry_timestamp(&p).expect("parses");
+        assert!(err != 0 && err <= stale_now_ts.saturating_add(2));
+    }
+
+    #[test]
+    fn stage_2a_passes_fresh_expiry() {
+        let now_ts = 1_776_762_000u64;
+        let fresh_expiry = now_ts + 60; // 60s in the future
+        let p = mk_perp_place_v2_payload(fresh_expiry);
+        let parsed = parse_perp_place_order_v2_expiry_timestamp(&p).unwrap();
+        assert!(parsed > now_ts + 2, "fresh expiry should pass a 2s margin");
+    }
+
+    #[test]
+    fn stage_2a_passes_zero_expiry() {
+        let p = mk_perp_place_v2_payload(0);
+        let parsed = parse_perp_place_order_v2_expiry_timestamp(&p).unwrap();
+        assert_eq!(parsed, 0, "zero expiry_timestamp means 'no expiry' per program");
     }
 }

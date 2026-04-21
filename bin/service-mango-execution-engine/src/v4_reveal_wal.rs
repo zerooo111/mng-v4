@@ -92,10 +92,24 @@ struct WalEntry {
     /// hex-utf8 passed commit-time verify but failed reveal-side pre-ix.
     #[serde(default)]
     user_sig_message: Option<Vec<u8>>,
+    /// Wall-clock insert time (ms since epoch). Stamped at append; used by
+    /// `compact_with_max_age` to evict entries that have aged past the
+    /// retention window even if their sequence isn't yet below on-chain
+    /// head (belt-and-braces against the class of bugs where on-chain head
+    /// doesn't advance, e.g. a stuck autodrop or an admin reset that keeps
+    /// `max_seen` ahead of a small `next`). Defaults to 0 for pre-migration
+    /// records; compact treats 0 as "unknown age" and keeps until the seq
+    /// cutoff does its work.
+    #[serde(default)]
+    ts_ms: u64,
 }
 
 impl From<&V4RevealEntry> for WalEntry {
     fn from(e: &V4RevealEntry) -> Self {
+        let ts_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
         Self {
             sequence: e.sequence,
             payload: e.payload.clone(),
@@ -110,6 +124,7 @@ impl From<&V4RevealEntry> for WalEntry {
             kind: e.kind,
             client_order_id: e.client_order_id,
             user_sig_message: e.user_sig_message.clone(),
+            ts_ms,
         }
     }
 }
@@ -238,9 +253,97 @@ impl V4RevealWal {
         Ok(live)
     }
 
+    /// Rewrite the WAL retaining only `Insert` records that pass BOTH
+    /// - `sequence >= min_sequence`  (head cutoff; pre-head entries are
+    ///   executed so their reveal material is useless)
+    /// - age cutoff: if `max_age_ms > 0`, drop entries with
+    ///   `ts_ms != 0 && now_ms - ts_ms > max_age_ms`
+    ///
+    /// The age cutoff is the primary defense against unbounded WAL growth
+    /// when on-chain head doesn't advance (autodrop stall, admin reset, etc.).
+    /// Legacy records with `ts_ms=0` are kept regardless — they pre-date the
+    /// migration and the seq cutoff is the only signal available.
+    ///
+    /// This preserves original `ts_ms` values in the rewritten file instead
+    /// of re-stamping to now; that matters so successive compactions don't
+    /// defeat the age cutoff by giving every surviving entry a fresh clock.
+    pub fn compact_with_retention(
+        &self,
+        min_sequence: u64,
+        now_ms: u64,
+        max_age_ms: u64,
+    ) -> Result<()> {
+        // Read the raw WAL preserving WalEntry (not downcasting to
+        // V4RevealEntry) so ts_ms is retained through the rewrite.
+        let mut file = self.file.lock().expect("WAL mutex poisoned");
+        file.seek(SeekFrom::Start(0))?;
+        let mut buf = String::new();
+        {
+            let mut reader = BufReader::new(&mut *file);
+            reader.read_to_string(&mut buf)?;
+        }
+        file.seek(SeekFrom::End(0))?;
+
+        let mut live: BTreeMap<u64, WalEntry> = BTreeMap::new();
+        for line in buf.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<WalRecord>(line) {
+                Ok(WalRecord::Insert(entry)) => {
+                    if entry.sequence < min_sequence {
+                        continue;
+                    }
+                    if max_age_ms > 0
+                        && entry.ts_ms != 0
+                        && now_ms.saturating_sub(entry.ts_ms) > max_age_ms
+                    {
+                        continue;
+                    }
+                    live.insert(entry.sequence, entry);
+                }
+                Ok(WalRecord::Remove { sequence }) => {
+                    live.remove(&sequence);
+                }
+                Err(_) => {
+                    // malformed line — skip silently during compaction
+                }
+            }
+        }
+
+        drop(file); // release lock before blocking FS ops on tmp file
+
+        let tmp_path = self.path.with_extension("wal.compact.tmp");
+        {
+            let mut tmp = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp_path)
+                .with_context(|| format!("open WAL compact tmp {tmp_path:?}"))?;
+            for entry in live.into_values() {
+                let rec = WalRecord::Insert(entry);
+                let line = serde_json::to_string(&rec).context("serialize WAL record")?;
+                tmp.write_all(line.as_bytes())?;
+                tmp.write_all(b"\n")?;
+            }
+            tmp.sync_data()?;
+        }
+        let mut file = self.file.lock().expect("WAL mutex poisoned");
+        std::fs::rename(&tmp_path, &self.path)
+            .with_context(|| format!("rename {tmp_path:?} -> {:?}", self.path))?;
+        *file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&self.path)
+            .with_context(|| format!("reopen WAL after compact at {:?}", self.path))?;
+        Ok(())
+    }
+
     /// Rewrite the WAL file retaining only inserts with
-    /// `sequence >= min_sequence`. Called periodically from the reveal GC
-    /// loop to bound file size.
+    /// `sequence >= min_sequence`. Legacy entry point — new code should
+    /// call `compact_with_retention` to also enforce the age cutoff.
     pub fn compact(&self, min_sequence: u64) -> Result<()> {
         let live = self.replay_live(min_sequence)?;
         let tmp_path = self.path.with_extension("wal.compact.tmp");
