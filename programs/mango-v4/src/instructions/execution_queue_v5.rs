@@ -1036,6 +1036,15 @@ fn classify_dispatch_failure(err: &anchor_lang::error::Error) -> (bool, QueueFai
             Some(QueueFailureCode::GroupDepositLimit)
         }
         Some(c) if c == MangoError::WouldSelfTrade as u32 => Some(QueueFailureCode::WouldSelfTrade),
+        // `PerpOrderIdNotFound` is deterministic: the target order isn't
+        // on the book, and a retry-same-payload will re-verify absence.
+        // Terminalize on first failure so bursts of
+        // `perp_cancel_order_by_client_order_id` intents for already-gone
+        // orders don't eat 3× retry budget per item and pin live_count
+        // high enough to stall new ingress.
+        Some(c) if c == MangoError::PerpOrderIdNotFound as u32 => {
+            Some(QueueFailureCode::PerpOrderIdNotFound)
+        }
         _ => None,
     };
     match mapped {

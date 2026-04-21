@@ -112,6 +112,17 @@ pub enum PrecheckReject {
         now_ts: u64,
         min_margin_secs: u64,
     },
+    /// A `PerpCancelOrder` / `PerpCancelOrderByClientOrderId` intent whose
+    /// target order id (or client-order-id) isn't in the mango account's
+    /// current `perp_open_orders`. Without this check every phantom cancel
+    /// burns a commit slot and reveal-fails with `PerpOrderIdNotFound`
+    /// (6044), inflating `live_count` on the queue until autodrop catches
+    /// up. Rejected at ingress so the bot sees the feedback immediately.
+    PhantomCancelOrder {
+        market_index: u16,
+        is_client_id: bool,
+        target: String,
+    },
 }
 
 impl PrecheckReject {
@@ -135,6 +146,7 @@ impl PrecheckReject {
             PrecheckReject::MinExecuteSlotAfterExpiry { .. } => "min_execute_after_expiry",
             PrecheckReject::UserSignatureMissingForVariant { .. } => "user_sig_missing",
             PrecheckReject::PayloadExpiryStale { .. } => "payload_expiry_stale",
+            PrecheckReject::PhantomCancelOrder { .. } => "phantom_cancel",
         }
     }
 }
@@ -224,6 +236,16 @@ impl std::fmt::Display for PrecheckReject {
                  (now_ts={now_ts}, min_margin_secs={min_margin_secs}, \
                  delta_secs={delta})",
                 delta = (*now_ts as i128) - (*expiry_timestamp as i128),
+            ),
+            PrecheckReject::PhantomCancelOrder {
+                market_index,
+                is_client_id,
+                target,
+            } => write!(
+                f,
+                "phantom cancel: no {kind} order {target} resting on mango \
+                 account for market_index={market_index}",
+                kind = if *is_client_id { "client-id" } else { "order-id" },
             ),
         }
     }

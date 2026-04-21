@@ -39,6 +39,9 @@ async function main() {
   const group = await client.getGroup(GROUP_PK);
 
   // Derive mango account PDA: seeds = ["MangoAccount", group, owner, account_num_le_u32]
+  console.log('env ACCOUNT_NUM=', process.env.ACCOUNT_NUM, '-> ACCOUNT_NUM_OVERRIDE=', ACCOUNT_NUM_OVERRIDE);
+  console.log('env V4_GROUP=', process.env.V4_GROUP, 'GROUP_PK=', GROUP_PK.toBase58());
+  console.log('env CTM_RELAYER_PROGRAM_ID=', process.env.CTM_RELAYER_PROGRAM_ID, 'PROGRAM_ID=', PROGRAM_ID.toBase58());
   const ACCOUNT_NUM = ACCOUNT_NUM_OVERRIDE;
   const accountNumBuf = Buffer.alloc(4);
   accountNumBuf.writeUInt32LE(ACCOUNT_NUM, 0);
@@ -52,7 +55,12 @@ async function main() {
   const existing = await connection.getAccountInfo(mangoAccountPk);
   if (!existing) {
     console.log('creating mango account...');
-    const sig = await client.createMangoAccount(group, ACCOUNT_NUM, 'taker', 8, 4, 4, 32);
+    // Perp-only taker: 8 perp slots for 5 markets + headroom; 4 token
+    // slots is enough for USDC collateral + 1 or 2 settlement tokens;
+    // serum3=0 because we don't touch spot markets. The program
+    // enforces 2*token + serum3 + 2*perp <= max_health_accounts (=28),
+    // so we have 8 + 0 + 16 = 24 ≤ 28.
+    const sig = await client.createMangoAccount(group, ACCOUNT_NUM, 'taker', 4, 0, 8, 32);
     console.log('create tx:', sig);
     // wait for confirmation
     await new Promise(r => setTimeout(r, 4000));

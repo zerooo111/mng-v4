@@ -86,6 +86,14 @@ pub enum QueueFailureCode {
     WouldSelfTrade = 21,
     RetriesExhausted = 22,
     GapSkipped = 23,
+    /// `perp_cancel_order_by_client_order_id` couldn't find the target
+    /// order on the book. Deterministic: a retry with the same payload
+    /// finds the same absence, so we terminalize immediately instead of
+    /// burning 3× reveal ticks per bad cancel. Added 2026-04-21 after
+    /// an ETH/BTC backlog of ~1000 cancel-for-nothing intents pinned
+    /// those markets' live_count high enough that new orders couldn't
+    /// land.
+    PerpOrderIdNotFound = 24,
     Other = 255,
 }
 

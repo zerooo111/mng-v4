@@ -64,7 +64,7 @@ use tokio::{
     time::{sleep, timeout},
 };
 use tonic::{transport::Server, Code, Request, Response, Status};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use warp::Filter;
 
 use parking_lot::Mutex as PlMutex;
@@ -3241,6 +3241,18 @@ struct Engine {
     /// Per-user_owner token-bucket rate-limiter slots. Keyed by the 32-byte
     /// pubkey bytes. Only active when `ingress_rate_limit_enabled=true`.
     ingress_rate_slots: Arc<StdMutex<HashMap<[u8; 32], IngressRateSlot>>>,
+    /// Authoritative append-only log for `relay_intent_accepted` and
+    /// `relay_intent_status` events. Written synchronously BEFORE the
+    /// HTTP sink POST so the event is durable locally even if the POST
+    /// fails (harness down, network reset, rate-limited etc.). The
+    /// harness's `/trace` endpoint reads this file and dedups against
+    /// the harness's own event log, giving a hard guarantee that every
+    /// accepted seq appears in /trace regardless of HTTP sink health.
+    /// Populated from `config.executor_relay_event_log_path` at startup.
+    /// Writes use O_APPEND so per-line writes under PIPE_BUF (4 KiB on
+    /// Linux) are atomic across concurrent writers (relayer direct,
+    /// harness HTTP handler).
+    relay_event_log: Option<Arc<PlMutex<std::fs::File>>>,
 }
 
 /// Per-user_owner failure tracking. Populated when `verify_user_signature`
@@ -3863,30 +3875,27 @@ impl Engine {
     }
 
     async fn load_mango_account_mirror(&self, mango_account: Pubkey) -> Result<MangoAccountMirror> {
-        if let Ok(cache) = self.mango_account_mirrors.lock() {
-            if let Some(mirror) = cache.get(&mango_account) {
-                return Ok(mirror.clone());
-            }
-        }
-
-        let keyed_account = if let Some(account) = self.cached_static_account(&mango_account) {
-            account
-        } else {
-            let account = self.rpc.get_account(&mango_account).await.map_err(|err| {
-                anyhow!("mango account mirror bootstrap failed for {mango_account}: {err}")
-            })?;
-            let keyed = KeyedAccountSharedData::new(mango_account, account.into());
-            self.seed_static_account_cache(std::iter::once(keyed.clone()));
-            keyed
-        };
-
-        let mirror = build_mango_account_mirror_from_keyed_account(mango_account, &keyed_account)
-            .map_err(|err| {
-            anyhow!("failed to build mango account mirror for {mango_account}: {err}")
+        // Always re-fetch from chain. Caching was causing stale
+        // `perp_market_indices` on accounts that opened new positions after
+        // the relayer first saw them — the program then rejects reveals
+        // with 6101 `PerpHealthAccountsInvalid`: "missing perp market/oracle
+        // for active perp position N". A per-submit RPC is cheap compared
+        // to a whole-queue wedge, and we already do a fresh read in the
+        // phantom_cancel check.
+        let account = self.rpc.get_account(&mango_account).await.map_err(|err| {
+            anyhow!("mango account mirror bootstrap failed for {mango_account}: {err}")
         })?;
+        let keyed = KeyedAccountSharedData::new(mango_account, account.into());
+        self.seed_static_account_cache(std::iter::once(keyed.clone()));
+        let mirror =
+            build_mango_account_mirror_from_keyed_account(mango_account, &keyed).map_err(|err| {
+                anyhow!("failed to build mango account mirror for {mango_account}: {err}")
+            })?;
+        // Update the cache with the freshly-read mirror so callers that hit
+        // the map directly (see line ~3688 bulk-insert path) don't regress
+        // to the stale entry they had before.
         if let Ok(mut cache) = self.mango_account_mirrors.lock() {
-            let entry = cache.entry(mango_account).or_insert_with(|| mirror.clone());
-            return Ok(entry.clone());
+            cache.insert(mango_account, mirror.clone());
         }
         Ok(mirror)
     }
@@ -3906,6 +3915,103 @@ impl Engine {
                 };
                 self.reject_submit_request(request, code, err.to_string())
             })
+    }
+
+    /// Stage-11 phantom-cancel check. Fresh-reads the mango account and
+    /// verifies the target order (by order_id or client_order_id) is actually
+    /// resting for this market_index. Returns `Some(reject)` if the cancel
+    /// targets an order that doesn't exist — rejecting it at ingress prevents
+    /// a wasted commit + PerpOrderIdNotFound at reveal. Returns `None` if
+    /// the variant isn't a cancel, the order is found, or we couldn't fetch
+    /// the account (fall open: program still revert-guards at reveal).
+    async fn phantom_cancel_check(
+        &self,
+        decoded: &mango_v4::instructions::DecodedQueuePayload,
+        mango_account: Pubkey,
+        market_index: u16,
+        raw_payload: &[u8],
+    ) -> Option<v5_precheck::PrecheckReject> {
+        use mango_v4::instructions::QueuePayloadVariant;
+        use mango_v4::state::MangoAccountValue;
+        // DecodedQueuePayload.body is crate-private, so re-parse the variant
+        // body from raw bytes. Layout: [u8 variant][u16_le flags][body].
+        // PerpCancelOrder               body = u128 order_id        (16 B LE)
+        // PerpCancelOrderByClientOrderId body = u64 client_order_id  (8 B LE)
+        if raw_payload.len() < 3 {
+            return None;
+        }
+        let body = &raw_payload[3..];
+        let (is_client_id, target_str, lookup_order_id, lookup_client_id): (
+            bool,
+            String,
+            Option<u128>,
+            Option<u64>,
+        ) = match decoded.variant {
+            QueuePayloadVariant::PerpCancelOrder => {
+                if body.len() < 16 { return None; }
+                let mut b = [0u8; 16];
+                b.copy_from_slice(&body[..16]);
+                let id = u128::from_le_bytes(b);
+                (false, format!("{}", id), Some(id), None)
+            }
+            QueuePayloadVariant::PerpCancelOrderByClientOrderId => {
+                if body.len() < 8 { return None; }
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&body[..8]);
+                let cid = u64::from_le_bytes(b);
+                (true, format!("{}", cid), None, Some(cid))
+            }
+            _ => return None,
+        };
+        // Fresh read — cached mirror is stale for open-orders churn. Fall
+        // open if the RPC fails; program-side 6044 still catches it.
+        let acct = match self.rpc.get_account(&mango_account).await {
+            Ok(a) => a,
+            Err(err) => {
+                warn!(
+                    target: "v5_precheck",
+                    mango_account = %mango_account,
+                    error = %err,
+                    "phantom_cancel_check: mango fetch failed, falling open"
+                );
+                return None;
+            }
+        };
+        if acct.data.len() < 8 {
+            return None;
+        }
+        let decoded_ma = match MangoAccountValue::from_bytes(&acct.data[8..]) {
+            Ok(v) => v,
+            Err(err) => {
+                warn!(
+                    target: "v5_precheck",
+                    mango_account = %mango_account,
+                    error = %err,
+                    "phantom_cancel_check: decode failed, falling open"
+                );
+                return None;
+            }
+        };
+        let found = if let Some(cid) = lookup_client_id {
+            decoded_ma
+                .perp_find_order_with_client_order_id(market_index, cid)
+                .is_some()
+        } else if let Some(oid) = lookup_order_id {
+            decoded_ma
+                .perp_find_order_with_order_id(market_index, oid)
+                .is_some()
+        } else {
+            true
+        };
+        if found {
+            None
+        } else {
+            Some(v5_precheck::PrecheckReject::PhantomCancelOrder {
+                market_index,
+                is_client_id,
+                target: target_str,
+            })
+        }
     }
 
     async fn derive_submit_remaining_accounts(
@@ -6756,7 +6862,41 @@ impl Engine {
                     !request.user_signature.is_empty(),
                     &self.config.v5_precheck,
                 ) {
-                    Ok(_decoded) => {}
+                    Ok(decoded) => {
+                        // Stage 11: phantom-cancel check. Runs only for the
+                        // two cancel variants, requires a fresh mango-account
+                        // fetch (can't trust the long-lived mirror — open
+                        // orders churn on every place/cancel). Without this
+                        // every phantom cancel consumes a commit slot, then
+                        // reveals fail with PerpOrderIdNotFound (6044) and
+                        // inflate live_count until autodrop catches up.
+                        if let Some(reject) = self
+                            .phantom_cancel_check(
+                                &decoded,
+                                mango_account,
+                                v5_mkt.market_index,
+                                &request.payload,
+                            )
+                            .await
+                        {
+                            let tag = reject.reason_tag();
+                            warn!(
+                                target: "v5_precheck",
+                                reason = tag,
+                                market_index = v5_mkt.market_index,
+                                mango_account = %mango_account,
+                                "ingress reject (phantom cancel): {reject}"
+                            );
+                            self.metrics
+                                .ingress_rejected_total
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            return Err(self.reject_submit_request(
+                                &request,
+                                Code::FailedPrecondition,
+                                format!("v5 precheck [{tag}]: {reject}"),
+                            ));
+                        }
+                    }
                     Err(reject) => {
                         let tag = reject.reason_tag();
                         warn!(
@@ -6835,6 +6975,36 @@ impl Engine {
                 let v5_seq = v5_next_seq_ref
                     .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                 let client_order_id = request.client_order_id;
+
+                // Rekey status_ctx from the CTM seq (stamped at allocation
+                // time before we knew the route) to the v5 seq the client
+                // sees in the response. Every subsequent relay_intent_status
+                // event is now queryable by v5_seq via /trace — without this
+                // rekey, `/trace?market=M&sequence=<v5_seq>` returns
+                // `no_record_found` even though the intent was accepted,
+                // which violates the audit-trail SLA.
+                status_ctx.with_sequence(v5_seq);
+
+                // Emit "accepted" IMMEDIATELY on v5 seq allocation — before
+                // the commit tx is built or sent. This guarantees that every
+                // allocated v5 seq has at least one accepted record in the
+                // event log, independent of whether the commit-send succeeds
+                // below. Without this, if the commit send fails (RPC error,
+                // blockhash expired, seq collision), the intent exits via
+                // the outer catchall emitting only a `rejected` event — and
+                // clients / operators see no proof that their intent was
+                // ever accepted, only that it was rejected. Ordering
+                // matters: accepted → (submitted | rejected), never just
+                // rejected.
+                self.maybe_emit_status_event(status_ctx.event(
+                    1,
+                    "accepted",
+                    None,
+                    None,
+                    None,
+                    None,
+                ))
+                .await;
                 let commit_hash = v5_pipeline::canonical_user_intent_v3(
                     v5_mkt.group,
                     mango_account,
@@ -6900,22 +7070,48 @@ impl Engine {
                 // the write lock below catches the concurrent-submit
                 // variant; this early check just avoids building & sending
                 // a commit tx we'd have to roll back.
-                {
+                // Check for pre-send seq collision. Compute outside the
+                // lock scope so we can await an emit below — the reveal_store
+                // is a parking_lot::Mutex whose guard is !Send and would
+                // make the enclosing future !Send if held across .await.
+                let pre_send_collision = {
                     let store = v5_reveal_store_ref.lock();
-                    if store.contains_key(&v5_seq) {
-                        drop(store);
-                        warn!(
-                            seq = v5_seq,
-                            market_index = v5_mkt.market_index,
-                            "v5 commit reject: seq collision — reveal_store already has an entry at this seq from a prior (un-revealed) commit"
-                        );
-                        self.metrics
-                            .ingress_rejected_total
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        return Err(Status::resource_exhausted(format!(
-                            "v5 sequence {v5_seq} collision — retry"
-                        )));
-                    }
+                    store.contains_key(&v5_seq)
+                };
+                if pre_send_collision {
+                    warn!(
+                        seq = v5_seq,
+                        market_index = v5_mkt.market_index,
+                        "v5 commit reject: seq collision — reveal_store already has an entry at this seq from a prior (un-revealed) commit"
+                    );
+                    self.metrics
+                        .ingress_rejected_total
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // Urgent: seq collision before commit send means the
+                    // local allocator is drift-rewound onto a still-live
+                    // seq. Audit-trail-critical: the accepted event was
+                    // emitted above, so without this explicit rejected
+                    // emission the intent would appear `submitted` never
+                    // arriving — /trace needs the URGENT marker to
+                    // classify this as a commit-path failure, not a
+                    // normal reject at ingress.
+                    self.maybe_emit_status_event(status_ctx.event(
+                        0,
+                        "rejected",
+                        Some(format!(
+                            "URGENT: commit_seq_collision_pre_send: \
+                             v5 seq {v5_seq} market_index={} already in \
+                             reveal_store (allocator drift-rewound)",
+                            v5_mkt.market_index
+                        )),
+                        Some(Code::ResourceExhausted as i32),
+                        None,
+                        None,
+                    ))
+                    .await;
+                    return Err(Status::resource_exhausted(format!(
+                        "v5 sequence {v5_seq} collision — retry"
+                    )));
                 }
                 // Build and send the commit tx WITH preflight enabled BEFORE
                 // touching reveal_store or the WAL. Rationale (devnet
@@ -6970,8 +7166,44 @@ impl Engine {
                         // Nothing was inserted into reveal_store or WAL yet —
                         // no cleanup needed. Seq is released back to the
                         // allocator (caller will re-fetch on next attempt).
+                        //
+                        // URGENT: RPC preflight / send failure on the commit
+                        // tx. Common causes: blockhash expired, RPC
+                        // rate-limit, preflight-level program error
+                        // (ExecutionQueueFull 6076, admission ceiling),
+                        // connection reset mid-send. Must surface visibly —
+                        // the accepted event was already emitted, so a silent
+                        // drop here would show up as `accepted` with no
+                        // `submitted` and no `rejected`, indistinguishable
+                        // from "in flight" under /trace. Emit an explicit
+                        // rejected status with an URGENT marker so operators
+                        // paging on commit-path failures see it immediately.
+                        let err_text = format!("{e}");
+                        warn!(
+                            target: "v5_commit_send",
+                            seq = v5_seq,
+                            market_index = v5_mkt.market_index,
+                            err = %err_text,
+                            "URGENT v5 commit send failed — SLA violation"
+                        );
+                        self.metrics
+                            .ingress_rejected_total
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.maybe_emit_status_event(status_ctx.event(
+                            0,
+                            "rejected",
+                            Some(format!(
+                                "URGENT: commit_send_rpc_failed: \
+                                 v5 seq {v5_seq} market_index={} err={}",
+                                v5_mkt.market_index, err_text
+                            )),
+                            Some(Code::Internal as i32),
+                            None,
+                            None,
+                        ))
+                        .await;
                         return Err(Status::internal(format!(
-                            "v5 commit send failed: {e}"
+                            "v5 commit send failed: {err_text}"
                         )));
                     }
                 };
@@ -6986,38 +7218,84 @@ impl Engine {
                     if let Err(e) = wal.append_insert(&reveal_entry) {
                         warn!(
                             seq = v5_seq,
-                            "v5 reveal WAL append failed after commit tx sent: {e} (autodrop will clear)"
+                            "URGENT v5 reveal WAL append failed after commit tx sent: {e} (autodrop will clear)"
                         );
+                        // Post-commit failure: the commit tx is already on
+                        // chain (sig below), so the seq slot is taken and
+                        // the reveal handler will 6122 until autodrop. This
+                        // is strictly worse than a pre-send failure — the
+                        // user's intent cannot execute but the seq is
+                        // burned. Must be surfaced loudly.
+                        self.metrics
+                            .ingress_rejected_total
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.maybe_emit_status_event(status_ctx.event(
+                            0,
+                            "rejected",
+                            Some(format!(
+                                "URGENT: wal_append_post_commit_failed: \
+                                 v5 seq {v5_seq} commit_sig={sig} err={e} \
+                                 — autodrop required to clear on-chain slot"
+                            )),
+                            Some(Code::Internal as i32),
+                            None,
+                            None,
+                        ))
+                        .await;
                         return Err(Status::internal(format!(
                             "v5 reveal WAL append failed post-commit: {e}"
                         )));
                     }
                 }
-                {
+                // Race guard: if a concurrent submit for the same seq
+                // won the lock first, tombstone the WAL entry we just
+                // appended and fail. The commit tx for this racer is
+                // already in flight — it'll either land (and 6122
+                // until autodrop because reveal_store has the other
+                // payload) or fail. Either way the honest path for the
+                // losing submitter is to retry with a fresh seq. Do the
+                // store.entry check + insert in a single short critical
+                // section so we can await the status emit outside it
+                // (parking_lot guard is !Send).
+                let post_send_collision = {
                     let mut store = v5_reveal_store_ref.lock();
-                    // Race guard: if a concurrent submit for the same seq
-                    // won the lock first, tombstone the WAL entry we just
-                    // appended and fail. The commit tx for this racer is
-                    // already in flight — it'll either land (and 6122
-                    // until autodrop because reveal_store has the other
-                    // payload) or fail. Either way the honest path for the
-                    // losing submitter is to retry with a fresh seq.
                     if store.contains_key(&v5_seq) {
-                        drop(store);
-                        if let Some(wal) = v5_reveal_wal_ref.as_ref() {
-                            let _ = wal.append_remove(v5_seq);
-                        }
-                        warn!(
-                            seq = v5_seq,
-                            market_index = v5_mkt.market_index,
-                            sig = %sig,
-                            "v5 commit reject: seq collision detected under write lock after send — autodrop will reconcile the stuck on-chain commit"
-                        );
-                        return Err(Status::resource_exhausted(format!(
-                            "v5 sequence {v5_seq} collision after send — retry"
-                        )));
+                        true
+                    } else {
+                        store.insert(v5_seq, reveal_entry);
+                        false
                     }
-                    store.insert(v5_seq, reveal_entry);
+                };
+                if post_send_collision {
+                    if let Some(wal) = v5_reveal_wal_ref.as_ref() {
+                        let _ = wal.append_remove(v5_seq);
+                    }
+                    warn!(
+                        seq = v5_seq,
+                        market_index = v5_mkt.market_index,
+                        sig = %sig,
+                        "URGENT v5 commit reject: seq collision detected under write lock after send — autodrop will reconcile the stuck on-chain commit"
+                    );
+                    self.metrics
+                        .ingress_rejected_total
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.maybe_emit_status_event(status_ctx.event(
+                        0,
+                        "rejected",
+                        Some(format!(
+                            "URGENT: commit_seq_collision_post_send: \
+                             v5 seq {v5_seq} market_index={} commit_sig={sig} \
+                             — on-chain commit stuck; autodrop will clear",
+                            v5_mkt.market_index
+                        )),
+                        Some(Code::ResourceExhausted as i32),
+                        None,
+                        None,
+                    ))
+                    .await;
+                    return Err(Status::resource_exhausted(format!(
+                        "v5 sequence {v5_seq} collision after send — retry"
+                    )));
                 }
                 self.metrics
                     .ingress_accepted_total
@@ -7633,9 +7911,14 @@ impl Engine {
         let payload_b64 = base64::engine::general_purpose::STANDARD.encode(&request.payload);
         let ts_ms = unix_timestamp_ms();
 
-        let Some(url) = self.config.event_sink_url.clone() else {
+        // emit_sink_json handles a None URL by skipping just the HTTP POST;
+        // the local relay event log append still happens. Don't early-return
+        // on a missing sink URL — that would hide the accepted event from
+        // /trace even when the local log is configured.
+        let url_opt = self.config.event_sink_url.clone();
+        if url_opt.is_none() && self.relay_event_log.is_none() {
             return;
-        };
+        }
         #[derive(Serialize)]
         struct EventAccountMeta {
             pubkey: String,
@@ -7704,29 +7987,73 @@ impl Engine {
             mango_account: request.mango_account.clone(),
             enqueue_tx_signature: tx_signature.to_string(),
         };
-        self.emit_sink_json(body, url).await;
+        self.emit_sink_json(body, url_opt).await;
     }
 
     async fn maybe_emit_status_event(&self, event: RelayIntentStatusEvent) {
-        let Some(url) = self.config.event_sink_url.clone() else {
+        // Hard-guarantee path: always emit, even when event_sink_url is
+        // not configured. emit_sink_json persists to the local relay log
+        // first, which is what /trace actually reads; the HTTP POST is
+        // optional downstream fan-out. Early-returning here when the URL
+        // is missing would silently drop the accepted record on hosts
+        // that only run the local log (e.g. standalone dev).
+        let url_opt = self.config.event_sink_url.clone();
+        if url_opt.is_none() && self.relay_event_log.is_none() {
             return;
-        };
-        self.emit_sink_json(event, url).await;
+        }
+        self.emit_sink_json(event, url_opt).await;
     }
 
-    async fn emit_sink_json<T>(&self, body: T, url: String)
+    async fn emit_sink_json<T>(&self, body: T, url: Option<String>)
     where
         T: Serialize + Send + Sync + 'static,
     {
-        if let Ok(line) = serde_json::to_string(&body) {
+        // Serialize once: used for (a) structured log, (b) sync file append,
+        // (c) HTTP sink POST body.
+        let serialized = match serde_json::to_string(&body) {
+            Ok(s) => Some(s),
+            Err(err) => {
+                error!("relay event serialize failed: {err:?}");
+                None
+            }
+        };
+        if let Some(line) = serialized.as_deref() {
             info!("{line}");
         }
-        let client = self.http_client.clone();
-        tokio::spawn(async move {
-            if let Err(err) = client.post(url).json(&body).send().await {
-                warn!("event sink request failed: {err:?}");
+
+        // Hard-guarantee path: append to the authoritative relay event log
+        // BEFORE the HTTP POST spawn. An O_APPEND `write_all` on a < 4 KiB
+        // line is atomic under POSIX so we won't interleave with the
+        // harness's concurrent appends on the same file. If this succeeds
+        // the event is durable on disk even if the HTTP sink is down — and
+        // /trace reads this file directly, so the seq is visible regardless
+        // of sink health. Any write failure here is loud (error!) because
+        // it would degrade us back to the old fire-and-forget-only mode.
+        if let (Some(log), Some(line)) = (self.relay_event_log.as_ref(), serialized.as_deref()) {
+            let mut buf = String::with_capacity(line.len() + 1);
+            buf.push_str(line);
+            buf.push('\n');
+            let mut file = log.lock();
+            use std::io::Write as _;
+            if let Err(err) = file.write_all(buf.as_bytes()) {
+                error!(
+                    "URGENT: relay event log append failed — falling back to HTTP-sink only for this event: {err:?}"
+                );
             }
-        });
+        }
+
+        // Fire the HTTP sink POST after the local write. The POST is still
+        // best-effort — it feeds downstream consumers (SSE feeds, harness
+        // state apply) that can't tail the file. The file write above is
+        // what guarantees /trace visibility; this POST is ancillary.
+        if let Some(url) = url {
+            let client = self.http_client.clone();
+            tokio::spawn(async move {
+                if let Err(err) = client.post(url).json(&body).send().await {
+                    warn!("event sink request failed: {err:?}");
+                }
+            });
+        }
     }
 
     /// Periodic loop that consumes events from the perp event queue. Without
@@ -13096,6 +13423,40 @@ async fn async_main() -> Result<()> {
     }
     let v5_markets = Arc::new(v5_markets_map);
 
+    // Open the authoritative relay event log in append mode once, up-front.
+    // Subsequent status-event writes re-use this handle under a mutex —
+    // avoids per-event open()/close() overhead and the associated TOCTOU.
+    // A failure to open here is not fatal: we log loudly and fall back to
+    // the legacy HTTP-only sink. But on healthy hosts this should always
+    // succeed and the hard-guarantee path kicks in.
+    let relay_event_log = config
+        .executor_relay_event_log_path
+        .as_ref()
+        .and_then(|path| {
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                Ok(file) => {
+                    info!(
+                        "relay event log opened for sync append: {}",
+                        path.display()
+                    );
+                    Some(Arc::new(PlMutex::new(file)))
+                }
+                Err(err) => {
+                    error!(
+                        "failed to open relay event log {} for append: {err} — \
+                         falling back to HTTP-sink-only (events may be lost \
+                         on HTTP failure)",
+                        path.display()
+                    );
+                    None
+                }
+            }
+        });
+
     let engine = Arc::new(Engine {
         config: config.clone(),
         rpc: rpc.clone(),
@@ -13124,6 +13485,7 @@ async fn async_main() -> Result<()> {
         mango_account_mirrors: Arc::new(StdMutex::new(HashMap::new())),
         ingress_failure_memo: Arc::new(StdMutex::new(HashMap::new())),
         ingress_rate_slots: Arc::new(StdMutex::new(HashMap::new())),
+        relay_event_log,
     });
 
     // Load the reveal-path ALT (if configured) once at startup. The ALT

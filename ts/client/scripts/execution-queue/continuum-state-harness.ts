@@ -102,6 +102,18 @@ const HARNESS_EVENT_LOG_PATH =
 const HARNESS_TXN_LOG_PATH =
   process.env.CONTINUUM_HARNESS_TXN_LOG_PATH ||
   HARNESS_EVENT_LOG_PATH.replace(/\.jsonl$/i, '.txns.jsonl');
+// Authoritative relay event log written DIRECTLY by the relayer process
+// (synchronous append before its HTTP sink POST). /trace reads this file
+// in addition to HARNESS_EVENT_LOG_PATH so `relay_intent_*` events are
+// visible even when the HTTP sink POST fails (harness down, net reset).
+// When the two paths point to the same file the relayer + harness both
+// append to it; dedup at scan time keeps the response clean. In devnet
+// they ARE the same file — this extra env lets a deployment split them
+// for isolation or debugging.
+const HARNESS_RELAY_EVENT_LOG_PATH =
+  process.env.EXECUTION_QUEUE_CRANK_RELAY_EVENT_LOG_PATH ||
+  process.env.CONTINUUM_RELAY_EVENT_LOG_PATH ||
+  HARNESS_EVENT_LOG_PATH;
 const HARNESS_RELAY_INGEST_TOKEN =
   process.env.CONTINUUM_HARNESS_RELAY_INGEST_TOKEN || '';
 const HARNESS_REPLAY_LOG =
@@ -9972,7 +9984,38 @@ function buildHttpServer(
           });
           return;
         }
+        // Filter events to the currently-active (group, program) tuple.
+        // Before this guard, /trace bled events from closed prior-generation
+        // groups — e.g. a seq=2 lookup post-program-reset returned old-group
+        // rejections as if they belonged to the fresh queue, poisoning
+        // `latest_reject_reason` and `stages_reached`.
+        const currentGroup = onchain?.groupPk?.toBase58() ?? '';
+        const currentProgramId = onchain?.programId?.toBase58() ?? '';
+        const matchesCurrentGeneration = (
+          obj: Record<string, unknown>,
+        ): boolean => {
+          const evtGroup = obj['group'];
+          if (
+            currentGroup &&
+            typeof evtGroup === 'string' &&
+            evtGroup.length > 0 &&
+            evtGroup !== currentGroup
+          ) {
+            return false;
+          }
+          const evtProgram = obj['program_id'];
+          if (
+            currentProgramId &&
+            typeof evtProgram === 'string' &&
+            evtProgram.length > 0 &&
+            evtProgram !== currentProgramId
+          ) {
+            return false;
+          }
+          return true;
+        };
         const matchFilter = (obj: Record<string, unknown>): boolean => {
+          if (!matchesCurrentGeneration(obj)) return false;
           if (sequence != null) {
             const seqField = obj['sequence'];
             if (String(seqField ?? '') !== sequence) return false;
@@ -9992,30 +10035,83 @@ function buildHttpServer(
           }
           return false;
         };
+        // Scan both event logs. The harness log (HARNESS_EVENT_LOG_PATH)
+        // is fed by the HTTP sink handler and by on-chain program log
+        // subscriptions (queue_item_enqueued / queue_item_processed). The
+        // relay event log (HARNESS_RELAY_EVENT_LOG_PATH) is written
+        // DIRECTLY by the relayer process, synchronously, before its
+        // HTTP sink POST — so every `relay_intent_accepted` and
+        // `relay_intent_status` event the relayer emits is visible to
+        // /trace regardless of HTTP sink delivery. When both paths
+        // resolve to the same file we scan it once (path compare).
+        //
+        // Dedup: the relayer path and the HTTP-sink path can both carry
+        // the same event (the relayer writes locally, then POSTs, and
+        // the harness HTTP handler appends the POST body to its log). We
+        // key on (event_type, request_id, status_label, ts_ms) —
+        // request_id is unique per submit, status_label disambiguates
+        // accepted/submitted/rejected within one submit, and ts_ms pins
+        // a specific emission. Different ts_ms means different emissions
+        // of the same status (rare but possible, e.g. retries) and both
+        // should be preserved.
+        const logPaths =
+          path.resolve(HARNESS_RELAY_EVENT_LOG_PATH) ===
+          path.resolve(HARNESS_EVENT_LOG_PATH)
+            ? [HARNESS_EVENT_LOG_PATH]
+            : [HARNESS_EVENT_LOG_PATH, HARNESS_RELAY_EVENT_LOG_PATH];
         const events: Array<Record<string, unknown>> = [];
+        const seenKeys = new Set<string>();
+        const eventKey = (obj: Record<string, unknown>): string => {
+          const et = String(obj['event_type'] ?? '');
+          const reqId = String(obj['request_id'] ?? '');
+          const label = String(obj['status_label'] ?? '');
+          const ts = String(obj['ts_ms'] ?? '');
+          const seq = String(obj['sequence'] ?? '');
+          // request_id alone suffices when present; fall back to
+          // (event_type, sequence, status_label, ts_ms) for legacy
+          // events without a request_id.
+          return reqId
+            ? `${reqId}|${et}|${label}|${ts}`
+            : `${et}|${seq}|${label}|${ts}`;
+        };
         try {
-          const stream = fs.createReadStream(HARNESS_EVENT_LOG_PATH, {
-            encoding: 'utf8',
-            highWaterMark: 1 << 20,
-          });
-          const rl = require('readline').createInterface({
-            input: stream,
-            crlfDelay: Infinity,
-          });
-          for await (const line of rl) {
-            if (!line.trim()) continue;
-            let obj: Record<string, unknown>;
+          for (const logPath of logPaths) {
+            let stream: fs.ReadStream | null = null;
             try {
-              obj = JSON.parse(line);
-            } catch {
+              stream = fs.createReadStream(logPath, {
+                encoding: 'utf8',
+                highWaterMark: 1 << 20,
+              });
+            } catch (openErr) {
+              // A missing relay log is not fatal — the harness log may
+              // still have the HTTP-sink-received copy of the events.
+              if (logPath === HARNESS_EVENT_LOG_PATH) throw openErr;
               continue;
             }
-            if (matchFilter(obj)) {
+            const rl = require('readline').createInterface({
+              input: stream,
+              crlfDelay: Infinity,
+            });
+            for await (const line of rl) {
+              if (!line.trim()) continue;
+              let obj: Record<string, unknown>;
+              try {
+                obj = JSON.parse(line);
+              } catch {
+                continue;
+              }
+              if (!matchFilter(obj)) continue;
+              const key = eventKey(obj);
+              if (seenKeys.has(key)) continue;
+              seenKeys.add(key);
               events.push(obj);
-              if (events.length > limit) events.shift();
+              if (events.length > limit) {
+                const dropped = events.shift();
+                if (dropped) seenKeys.delete(eventKey(dropped));
+              }
             }
+            stream.destroy?.();
           }
-          stream.destroy?.();
         } catch (err) {
           writeJson(res, 500, {
             error: 'event_log_scan_failed',
@@ -10023,6 +10119,14 @@ function buildHttpServer(
           });
           return;
         }
+        // Preserve chronological order after the dedup merge so downstream
+        // stage-tracking (which iterates events in order) gets consistent
+        // timestamps regardless of which file each event was observed in.
+        events.sort((a, b) => {
+          const aTs = Number(a['ts_ms'] ?? 0);
+          const bTs = Number(b['ts_ms'] ?? 0);
+          return aTs - bTs;
+        });
 
         // Stage reached tracking. Each stage is implied by at least one event
         // type — if the set is empty for a stage, the intent never reached
@@ -10046,6 +10150,16 @@ function buildHttpServer(
         let enqueueObservedSignature: string | null = null;
         let executedSignature: string | null = null;
         let latestRejectReason: string | null = null;
+        // URGENT-tagged rejects (prefix `URGENT:` in the reason) surface
+        // commit-path failures — RPC send failures, WAL append failures,
+        // seq collisions — that must not be buried by a later generic
+        // catchall reject emitted by the relayer's outer error handler.
+        // Capturing the URGENT reason + tag separately lets /trace flag the
+        // intent as an SLA violation (accepted seq that never submitted)
+        // and preserves the full failure detail for auditing.
+        let urgentRejectReason: string | null = null;
+        let urgentRejectTag: string | null = null;
+        let urgentRejectTsMs: number | null = null;
         for (const e of events) {
           const et = String(e['event_type'] ?? '');
           const tsMs = Number(e['ts_ms'] ?? 0);
@@ -10062,7 +10176,23 @@ function buildHttpServer(
             if (label === 'rejected') {
               stagesReached.add('rejected');
               noteStageTs('rejected', tsMs);
-              latestRejectReason = String(e['reason'] ?? '');
+              const reasonStr = String(e['reason'] ?? '');
+              latestRejectReason = reasonStr;
+              // URGENT: <tag>: <detail> — commit-path failure emitted by
+              // the relayer before its outer catchall double-emits a plain
+              // reject. Keep the first URGENT we see (the explicit one),
+              // not the later generic one.
+              if (
+                urgentRejectReason === null &&
+                reasonStr.startsWith('URGENT:')
+              ) {
+                urgentRejectReason = reasonStr;
+                urgentRejectTsMs = tsMs > 0 ? tsMs : null;
+                const afterPrefix = reasonStr.slice('URGENT:'.length).trimStart();
+                const tagEnd = afterPrefix.indexOf(':');
+                urgentRejectTag =
+                  tagEnd > 0 ? afterPrefix.slice(0, tagEnd) : afterPrefix;
+              }
             }
             const sig = e['tx_signature'];
             if (typeof sig === 'string' && sig.length > 0) {
@@ -10237,6 +10367,14 @@ function buildHttpServer(
         // don't mis-classify a tx that failed 6076 as "landed_and_head_
         // advanced" just because unrelated successful txs later advanced
         // head past its seq.
+        // An URGENT reject that fires AFTER an accepted event is an SLA
+        // violation: the intent was accepted (seq allocated, committed to
+        // audit trail) but the commit path failed. These must be flagged
+        // distinctly from "rejected at ingress" (where accepted never
+        // happened) so operators can alert on the commit-failure rate
+        // independently of pre-accept ingress rejections.
+        const urgentAfterAccepted =
+          urgentRejectReason !== null && stagesReached.has('accepted');
         let classification: string;
         if (events.length === 0 && !onchainTx) {
           classification = 'no_record_found — check client send path';
@@ -10255,10 +10393,18 @@ function buildHttpServer(
           classification = 'committed_awaiting_reveal';
         } else if (stagesReached.has('submitted')) {
           classification = 'submitted_awaiting_onchain';
+        } else if (urgentAfterAccepted) {
+          // Accepted, then URGENT reject — commit path failed. SLA
+          // violation by construction (see CLAUDE.md "no silent drops").
+          classification = `URGENT_accepted_then_commit_failed [${urgentRejectTag ?? 'unknown'}]`;
         } else if (stagesReached.has('rejected')) {
           classification = 'rejected_at_ingress';
         } else if (stagesReached.has('accepted')) {
-          classification = 'accepted_but_no_submit_status';
+          // Accepted but no submit AND no reject — this is the invisible-
+          // drop state the SLA explicitly forbids. Something between seq
+          // allocation and commit send died without emitting a status.
+          classification =
+            'URGENT_accepted_no_subsequent_status — SLA violation, investigate relayer commit path';
         } else {
           classification = 'unknown';
         }
@@ -10319,6 +10465,23 @@ function buildHttpServer(
           executed: executedSignature ?? null,
         };
 
+        // SLA block: surfaces whether this intent violated the no-silent-
+        // drops rule. `ok: false` means ops should page. `kind` gives the
+        // failure category so monitoring can route the alert correctly.
+        const slaViolation =
+          urgentAfterAccepted ||
+          classification.startsWith('URGENT_accepted_no_subsequent_status');
+        const sla = {
+          ok: !slaViolation,
+          kind: slaViolation
+            ? urgentRejectTag
+              ? `commit_failed:${urgentRejectTag}`
+              : 'accepted_no_subsequent_status'
+            : null,
+          urgent_reject_reason: urgentRejectReason,
+          urgent_reject_ts_ms: urgentRejectTsMs,
+        };
+
         writeJson(res, 200, {
           query: {
             market: market ?? null,
@@ -10329,6 +10492,7 @@ function buildHttpServer(
           classification,
           stages_reached: Array.from(stagesReached).sort(),
           latest_reject_reason: latestRejectReason,
+          sla,
           queue_slot: queueSlot,
           onchain_tx: onchainTx,
           executed_onchain_tx: executedOnchainTx,
@@ -10337,6 +10501,348 @@ function buildHttpServer(
           event_count: events.length,
           events,
         });
+        return;
+      }
+
+      // /trace_full — same as /trace, plus an on-chain log parse for the
+      // queue PDA. Heavier (getSignaturesForAddress + per-tx getTransaction
+      // roundtrips) so it lives on a separate endpoint; operators who want
+      // the fast path keep using /trace. The extra step surfaces on-chain
+      // gap-skip events the relayer-side jsonl doesn't see.
+      if (method === 'GET' && url.pathname === '/trace_full') {
+        const market = url.searchParams.get('market');
+        const sequence = url.searchParams.get('sequence');
+        const clientOrderId = url.searchParams.get('client_order_id');
+        const txSignature = url.searchParams.get('tx_signature');
+        if (!sequence && !clientOrderId && !txSignature) {
+          writeJson(res, 400, {
+            error: 'missing_filter',
+            message:
+              'provide one of: ?market=M&sequence=S | ?client_order_id=C | ?tx_signature=T',
+          });
+          return;
+        }
+        const queuePdaLimit = parseNonNegativeInteger(
+          url.searchParams.get('queue_pda_limit'),
+          40,
+          { min: 1, max: 200 },
+        );
+        // Dispatch through the HTTP layer to /trace so the fast path and
+        // /trace_full stay in lockstep without duplicating ~300 lines of
+        // classification code. If /trace ever grows new stages, /trace_full
+        // inherits them automatically.
+        const bindPort = Number(
+          (process.env.CONTINUUM_HARNESS_BIND_ADDR || '0.0.0.0:9091').split(
+            ':',
+          )[1] || 9091,
+        );
+        const innerQs = new URLSearchParams();
+        if (market) innerQs.set('market', market);
+        if (sequence) innerQs.set('sequence', sequence);
+        if (clientOrderId) innerQs.set('client_order_id', clientOrderId);
+        if (txSignature) innerQs.set('tx_signature', txSignature);
+        let base: Record<string, unknown>;
+        try {
+          const innerRes = await fetch(
+            `http://127.0.0.1:${bindPort}/trace?${innerQs.toString()}`,
+          );
+          base = (await innerRes.json()) as Record<string, unknown>;
+        } catch (err) {
+          writeJson(res, 500, {
+            error: 'inner_trace_failed',
+            message: normalizeError(err).message,
+          });
+          return;
+        }
+
+        // Heavy path: pull recent queue-PDA txs so callers can see every
+        // on-chain status emit (QueueItemProcessed { GapSkipped, Failed, ...})
+        // that the relayer-side jsonl doesn't record. Bounded by
+        // queue_pda_limit (default 40, max 200).
+        //
+        // We categorize each tx (commit / reveal_exec / admin_drop / other)
+        // and extract the Anchor error code/name/message when a tx failed.
+        // This surfaces the *reason* a reveal blew up (e.g. 6101
+        // ExecutionQueuePerpHealthAccountsInvalid) or which admin drop
+        // covered a stuck seq — both of which previously required manual
+        // on-chain log grepping. Matches CLAUDE.md's "no silent drops"
+        // SLA: autodrop and reveal-failed paths MUST surface in /trace.
+        const queuePdaSection: {
+          queue_pda: string | null;
+          signatures_scanned: number;
+          txs: Array<Record<string, unknown>>;
+          reveal_attempts: Array<Record<string, unknown>>;
+          admin_drops: Array<Record<string, unknown>>;
+          likely_head_skipped: boolean;
+          likely_terminalized: boolean;
+          likely_autodropped: boolean;
+          reveal_error_codes: Record<string, number>;
+          scan_error?: string;
+        } = {
+          queue_pda: null,
+          signatures_scanned: 0,
+          txs: [],
+          reveal_attempts: [],
+          admin_drops: [],
+          likely_head_skipped: false,
+          likely_terminalized: false,
+          likely_autodropped: false,
+          reveal_error_codes: {},
+        };
+        if (market && onchain?.groupPk && onchain?.programId) {
+          const mi = Number(market);
+          if (Number.isFinite(mi) && mi >= 0 && mi <= 65535) {
+            const queuePda = deriveV5QueuePda(
+              onchain.programId,
+              onchain.groupPk,
+              mi,
+            );
+            queuePdaSection.queue_pda = queuePda.toBase58();
+            try {
+              const sigInfos = await onchain.connection.getSignaturesForAddress(
+                queuePda,
+                { limit: queuePdaLimit },
+                HARNESS_COMMITMENT === 'finalized'
+                  ? 'finalized'
+                  : 'confirmed',
+              );
+              queuePdaSection.signatures_scanned = sigInfos.length;
+              // Fetch logs in parallel (bounded) so a 40-sig scan is a
+              // single RPC burst instead of 40 sequential roundtrips.
+              const txs = await Promise.all(
+                sigInfos.map((s) =>
+                  onchain.connection
+                    .getTransaction(s.signature, {
+                      maxSupportedTransactionVersion: 0,
+                      commitment:
+                        HARNESS_COMMITMENT === 'finalized'
+                          ? 'finalized'
+                          : 'confirmed',
+                    })
+                    .catch(() => null),
+                ),
+              );
+              // AnchorError log pattern (from anchor-lang::error):
+              //   "Program log: AnchorError thrown in programs/.../X.rs:N.
+              //    Error Code: <Name>. Error Number: <Code>. Error Message:
+              //    <message>."
+              // Capture the last AnchorError in a tx's logs as the
+              // authoritative failure reason (anchor re-throws can nest;
+              // last one is the outermost reported).
+              const anchorErrRe =
+                /AnchorError .* Error Code: (\w+)\. Error Number: (\d+)\. Error Message: ([^]*?)(?=\.\s*(?:Program|$)|$)/;
+              const parseAnchorError = (
+                logs: readonly string[],
+              ): { code: number; name: string; message: string } | null => {
+                for (let j = logs.length - 1; j >= 0; j--) {
+                  const m = logs[j].match(anchorErrRe);
+                  if (m) {
+                    return {
+                      name: m[1],
+                      code: Number(m[2]),
+                      message: m[3].trim(),
+                    };
+                  }
+                }
+                return null;
+              };
+
+              for (let i = 0; i < sigInfos.length; i++) {
+                const s = sigInfos[i];
+                const tx = txs[i];
+                if (!tx) continue;
+                const logs = tx.meta?.logMessages || [];
+
+                // Classify by which V5 instruction was invoked. A single
+                // tx carries exactly one of commit / reveal_exec / drop,
+                // so this labels cleanly.
+                let kind: 'commit' | 'reveal_exec' | 'admin_drop' | 'other' =
+                  'other';
+                let droppedCount: number | null = null;
+                let droppedMarketIdx: number | null = null;
+                for (const l of logs) {
+                  if (l.includes('Instruction: ExecutionQueueV5CommitMarket')) {
+                    kind = 'commit';
+                  } else if (
+                    l.includes('Instruction: ExecutionQueueV5RevealExecuteMarket')
+                  ) {
+                    kind = 'reveal_exec';
+                  } else if (
+                    l.includes('Instruction: ExecutionQueueV5DropHeadMarket')
+                  ) {
+                    kind = 'admin_drop';
+                  }
+                  // Drop summary log: "drop_head_market_v5: market=X dropped=N"
+                  const dm = l.match(/drop_head_market_v5: market=(\d+) dropped=(\d+)/);
+                  if (dm) {
+                    droppedMarketIdx = Number(dm[1]);
+                    droppedCount = Number(dm[2]);
+                  }
+                }
+
+                const anchorErr = parseAnchorError(logs);
+                const txErr = tx.meta?.err ?? null;
+
+                if (kind === 'reveal_exec') {
+                  queuePdaSection.reveal_attempts.push({
+                    signature: s.signature,
+                    slot: tx.slot,
+                    block_time: tx.blockTime ?? null,
+                    success: !txErr,
+                    err_code: anchorErr?.code ?? null,
+                    err_name: anchorErr?.name ?? null,
+                    err_message: anchorErr?.message ?? null,
+                    raw_err: txErr,
+                  });
+                  if (txErr && anchorErr) {
+                    const key = `${anchorErr.code}:${anchorErr.name}`;
+                    queuePdaSection.reveal_error_codes[key] =
+                      (queuePdaSection.reveal_error_codes[key] || 0) + 1;
+                  }
+                } else if (kind === 'admin_drop' && droppedCount !== null) {
+                  queuePdaSection.admin_drops.push({
+                    signature: s.signature,
+                    slot: tx.slot,
+                    block_time: tx.blockTime ?? null,
+                    market_index: droppedMarketIdx,
+                    dropped: droppedCount,
+                  });
+                  // If this admin_drop is on the same market as the query
+                  // and the queried seq is AT OR BELOW the post-drop head
+                  // (which the queue_slot lookup already fetched), mark
+                  // the seq as likely autodropped. We use the existing
+                  // queue_slot.classification == 'head_advanced_past' as
+                  // a coarse match; a finer attribution would need the
+                  // pre-drop head which the program doesn't log directly.
+                  if (
+                    String(droppedMarketIdx) === market &&
+                    sequence &&
+                    (base['queue_slot'] as { classification?: string } | null)
+                      ?.classification === 'head_advanced_past'
+                  ) {
+                    queuePdaSection.likely_autodropped = true;
+                  }
+                }
+
+                // Keep logs that hint at status/skip/failure events. The
+                // program emits `QueueItemProcessed` as an Anchor event
+                // (Program data: <base64>); without a decoder here we
+                // surface the raw data lines so operators can cross-check.
+                const interesting = logs.filter(
+                  (l) =>
+                    l.startsWith('Program data:') ||
+                    l.includes('GapSkipped') ||
+                    l.includes('head advanced') ||
+                    l.includes('head-skip') ||
+                    l.includes('terminal=true') ||
+                    l.includes('terminalized') ||
+                    l.includes('commit_hash mismatch') ||
+                    l.includes('drop_head_market_v5') ||
+                    l.includes('AnchorError'),
+                );
+                if (interesting.length === 0 && kind === 'other') continue;
+                // Heuristic flagging against the queried seq. A deeper
+                // fix decodes the base64 Anchor-event struct; these string
+                // matches are strict enough to avoid the `terminal=false`
+                // false-positive ("terminal" alone is too broad).
+                const seqRe = sequence
+                  ? new RegExp(`\\b(seq|sequence)=${sequence}\\b`)
+                  : null;
+                if (
+                  interesting.some(
+                    (l) =>
+                      l.includes('GapSkipped') &&
+                      (!seqRe || seqRe.test(l)),
+                  )
+                ) {
+                  queuePdaSection.likely_head_skipped = true;
+                }
+                if (
+                  interesting.some(
+                    (l) =>
+                      (l.includes('terminal=true') ||
+                        l.includes('terminalized')) &&
+                      (!seqRe || seqRe.test(l)),
+                  )
+                ) {
+                  queuePdaSection.likely_terminalized = true;
+                }
+                queuePdaSection.txs.push({
+                  signature: s.signature,
+                  slot: tx.slot,
+                  block_time: tx.blockTime ?? null,
+                  kind,
+                  err: tx.meta?.err ?? null,
+                  anchor_error: anchorErr,
+                  logs: interesting.slice(0, 30),
+                });
+              }
+            } catch (err) {
+              queuePdaSection.scan_error = normalizeError(err).message;
+            }
+          }
+        }
+
+        // Promote head_skipped / autodropped to the stages + classification
+        // based on what the on-chain scan turned up. The base /trace doesn't
+        // see these because the relayer-side jsonl only carries the commit
+        // path; program-emitted status events and admin-drop txs live
+        // purely on-chain.
+        const stages = Array.isArray(base['stages_reached'])
+          ? new Set<string>(base['stages_reached'] as string[])
+          : new Set<string>();
+        if (queuePdaSection.likely_head_skipped) {
+          stages.add('head_skipped');
+          if (base['classification'] === 'head_advanced_past_seq_but_no_landed_tx_for_it') {
+            base['classification'] = 'head_skipped_by_program';
+          }
+        }
+        if (queuePdaSection.likely_terminalized) {
+          stages.add('terminalized');
+        }
+        if (queuePdaSection.likely_autodropped) {
+          stages.add('autodropped');
+          // Base /trace mis-classifies autodropped seqs as
+          // `executed_and_head_advanced` because the commit tx succeeded
+          // and head advanced — but the intent NEVER executed; an admin
+          // drop skipped it. Rewrite to make this visible as an SLA
+          // issue with the reveal error code that caused the drop.
+          if (
+            base['classification'] === 'executed_and_head_advanced' ||
+            base['classification'] === 'head_advanced_past_seq_but_no_landed_tx_for_it'
+          ) {
+            const topErr = Object.entries(
+              queuePdaSection.reveal_error_codes,
+            ).sort((a, b) => b[1] - a[1])[0];
+            base['classification'] = topErr
+              ? `autodropped_after_reveal_fail [${topErr[0]}]`
+              : 'autodropped';
+          }
+        }
+        base['stages_reached'] = Array.from(stages).sort();
+        base['queue_pda_scan'] = queuePdaSection;
+
+        // Summary block for fast operator triage — the most important
+        // info (reveal errors + drop count) surfaced without needing to
+        // read through the per-tx logs array.
+        const topRevealErr = Object.entries(
+          queuePdaSection.reveal_error_codes,
+        ).sort((a, b) => b[1] - a[1])[0];
+        base['debug_summary'] = {
+          reveal_attempts: queuePdaSection.reveal_attempts.length,
+          reveal_failures: queuePdaSection.reveal_attempts.filter(
+            (r) => !(r as { success?: boolean }).success,
+          ).length,
+          top_reveal_error: topRevealErr
+            ? { code_name: topRevealErr[0], occurrences: topRevealErr[1] }
+            : null,
+          admin_drops_on_this_market: queuePdaSection.admin_drops.filter(
+            (d) => String((d as { market_index?: number }).market_index) === market,
+          ).length,
+          likely_autodropped: queuePdaSection.likely_autodropped,
+        };
+
+        writeJson(res, 200, base);
         return;
       }
 
