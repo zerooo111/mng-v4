@@ -7,12 +7,25 @@ import { AnchorProvider, Wallet } from '@coral-xyz/anchor';
 import { MangoClient } from '../../src/client';
 import * as fs from 'fs';
 
-const CLUSTER_URL = 'https://devnet.helius-rpc.com/?api-key=61e8475f-abea-4774-bc59-9b8ba4df20a0';
-const PROGRAM_ID = new PublicKey('Bgjnb7rn2T157TSradRsENVcW86Ss58oMvGGvBgQxTEt');
-const GROUP_PK = new PublicKey('Cj8vUC2nWbREhofnD3iWk4j8CD9Fo6j9c33M5ZFKLVPB');
-const USDC_MINT = new PublicKey('BBf5TvMhDG3rA8WuNV8xFxZoi2qZ9d5QTouDkeR1ha66');
+// Hardcoded defaults are baked to a pre-reset deployment. Overridable via
+// env so the script tracks the current devnet bootstrap without edits.
+const CLUSTER_URL =
+  process.env.CLUSTER_URL_OVERRIDE ||
+  'https://devnet.helius-rpc.com/?api-key=61e8475f-abea-4774-bc59-9b8ba4df20a0';
+const PROGRAM_ID = new PublicKey(
+  process.env.CTM_RELAYER_PROGRAM_ID || 'Bgjnb7rn2T157TSradRsENVcW86Ss58oMvGGvBgQxTEt',
+);
+const GROUP_PK = new PublicKey(
+  process.env.V4_GROUP ||
+    process.env.CONTINUUM_HARNESS_GROUP_PK ||
+    'Cj8vUC2nWbREhofnD3iWk4j8CD9Fo6j9c33M5ZFKLVPB',
+);
+const USDC_MINT = new PublicKey(
+  process.env.CONTINUUM_HARNESS_USDC_MINT || 'BBf5TvMhDG3rA8WuNV8xFxZoi2qZ9d5QTouDkeR1ha66',
+);
 const KEYPAIR_PATH = process.env.TAKER_KEYPAIR_PATH || '/home/hetalkenaudekar/mng-v4/keypairs/taker-fresh.json';
 const DEPOSIT_AMOUNT = Number(process.env.DEPOSIT_AMOUNT || '5000');
+const ACCOUNT_NUM_OVERRIDE = Number(process.env.ACCOUNT_NUM ?? '0');
 
 async function main() {
   const keypair = Keypair.fromSecretKey(
@@ -26,7 +39,7 @@ async function main() {
   const group = await client.getGroup(GROUP_PK);
 
   // Derive mango account PDA: seeds = ["MangoAccount", group, owner, account_num_le_u32]
-  const ACCOUNT_NUM = 0;
+  const ACCOUNT_NUM = ACCOUNT_NUM_OVERRIDE;
   const accountNumBuf = Buffer.alloc(4);
   accountNumBuf.writeUInt32LE(ACCOUNT_NUM, 0);
   const [mangoAccountPk] = PublicKey.findProgramAddressSync(

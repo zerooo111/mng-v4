@@ -9828,18 +9828,41 @@ function buildHttpServer(
         // Stage reached tracking. Each stage is implied by at least one event
         // type — if the set is empty for a stage, the intent never reached
         // that stage (either legitimately not-yet-there, or silently dropped).
+        //
+        // We also track the earliest ts_ms observed for each stage so we can
+        // compute per-stage latencies relative to the `accepted` baseline. The
+        // latencies surface end-to-end dex performance (ingress → commit →
+        // reveal/execute) and make regressions auditable per-seq.
         const stagesReached = new Set<string>();
+        const stageTimestampsMs: Record<string, number> = {};
+        const noteStageTs = (stage: string, tsMs: number): void => {
+          if (!Number.isFinite(tsMs) || tsMs <= 0) return;
+          const prev = stageTimestampsMs[stage];
+          if (prev === undefined || tsMs < prev) {
+            stageTimestampsMs[stage] = tsMs;
+          }
+        };
         let signatureFromEvents: string | null = null;
         let enqueueSignature: string | null = null;
+        let enqueueObservedSignature: string | null = null;
+        let executedSignature: string | null = null;
         let latestRejectReason: string | null = null;
         for (const e of events) {
           const et = String(e['event_type'] ?? '');
+          const tsMs = Number(e['ts_ms'] ?? 0);
           if (et === 'relay_intent_status') {
             const label = String(e['status_label'] ?? '');
-            if (label === 'accepted') stagesReached.add('accepted');
-            if (label === 'submitted') stagesReached.add('submitted');
+            if (label === 'accepted') {
+              stagesReached.add('accepted');
+              noteStageTs('accepted', tsMs);
+            }
+            if (label === 'submitted') {
+              stagesReached.add('submitted');
+              noteStageTs('submitted', tsMs);
+            }
             if (label === 'rejected') {
               stagesReached.add('rejected');
+              noteStageTs('rejected', tsMs);
               latestRejectReason = String(e['reason'] ?? '');
             }
             const sig = e['tx_signature'];
@@ -9848,14 +9871,42 @@ function buildHttpServer(
             }
           } else if (et === 'relay_intent_accepted') {
             stagesReached.add('accepted');
+            // Prefer the harness-ingress timestamp if present (more precise
+            // than the emission ts_ms). Falls back to ts_ms otherwise.
+            const ingressTs = Number(e['harness_accept_received_ts_ms'] ?? 0);
+            noteStageTs('accepted', ingressTs > 0 ? ingressTs : tsMs);
+            const preconfTs = Number(e['harness_preconfirm_emit_ts_ms'] ?? 0);
+            if (preconfTs > 0) {
+              noteStageTs('preconfirm_emitted', preconfTs);
+            }
             const sig = e['enqueue_tx_signature'];
             if (typeof sig === 'string' && sig.length > 0) {
               enqueueSignature = sig;
             }
           } else if (et === 'queue_item_enqueued') {
             stagesReached.add('enqueued');
+            noteStageTs('enqueued', tsMs);
+            const sig = e['tx_signature'];
+            if (typeof sig === 'string' && sig.length > 0) {
+              enqueueObservedSignature = sig;
+            }
           } else if (et === 'queue_item_processed') {
             stagesReached.add('executed');
+            noteStageTs('executed', tsMs);
+            // The reveal/dispatch tx that actually executed the intent on
+            // chain. Distinct from the commit tx — operators can paste this
+            // directly into an explorer to confirm book state, logs, fills.
+            // Synthetic `onchain_queue_sweep:*` sentinels are emitted when
+            // the lane guard notices head advanced past a seq without a log
+            // event; those are not real signatures, so skip them.
+            const sig = e['tx_signature'];
+            if (
+              typeof sig === 'string' &&
+              sig.length > 0 &&
+              !sig.startsWith('onchain_queue_sweep:')
+            ) {
+              executedSignature = sig;
+            }
           }
         }
 
@@ -9901,13 +9952,14 @@ function buildHttpServer(
           }
         }
 
-        // If we have a tx signature (from events or direct query), fetch its
-        // on-chain outcome for visibility.
-        const sigToCheck = txSignature || signatureFromEvents || enqueueSignature;
-        let onchainTx: Record<string, unknown> | null = null;
-        if (sigToCheck && onchain?.connection) {
+        // Fetch a tx + summarise relevant logs for the trace response.
+        // Used for both the commit tx and the reveal/executed tx.
+        const fetchTxSummary = async (
+          sig: string,
+        ): Promise<Record<string, unknown> | null> => {
+          if (!onchain?.connection) return null;
           try {
-            const tx = await onchain.connection.getTransaction(sigToCheck, {
+            const tx = await onchain.connection.getTransaction(sig, {
               maxSupportedTransactionVersion: 0,
               commitment:
                 HARNESS_COMMITMENT === 'confirmed' ||
@@ -9915,37 +9967,65 @@ function buildHttpServer(
                   ? HARNESS_COMMITMENT
                   : 'confirmed',
             });
-            if (tx) {
-              stagesReached.add('committed');
-              const err = tx.meta?.err;
-              onchainTx = {
-                signature: sigToCheck,
-                slot: tx.slot,
-                block_time: tx.blockTime ?? null,
-                err: err ?? null,
-                log_summary: (tx.meta?.logMessages || [])
-                  .filter(
-                    (l) =>
-                      l.startsWith('Program log: Instruction:') ||
-                      l.includes('dispatch failed') ||
-                      l.includes('commit_hash mismatch') ||
-                      l.includes('head advanced') ||
-                      l.includes('AnchorError'),
-                  )
-                  .slice(0, 20),
-              };
-              if (!err) stagesReached.add('executed');
-            } else {
-              onchainTx = {
-                signature: sigToCheck,
-                status: 'not_found_on_chain',
-              };
+            if (!tx) {
+              return { signature: sig, status: 'not_found_on_chain' };
             }
-          } catch (rpcErr) {
-            onchainTx = {
-              signature: sigToCheck,
-              fetch_error: normalizeError(rpcErr).message,
+            return {
+              signature: sig,
+              slot: tx.slot,
+              block_time: tx.blockTime ?? null,
+              err: tx.meta?.err ?? null,
+              log_summary: (tx.meta?.logMessages || [])
+                .filter(
+                  (l) =>
+                    l.startsWith('Program log: Instruction:') ||
+                    l.includes('dispatch failed') ||
+                    l.includes('dispatch_ok') ||
+                    l.includes('commit_hash mismatch') ||
+                    l.includes('head advanced') ||
+                    l.includes('AnchorError'),
+                )
+                .slice(0, 20),
             };
+          } catch (rpcErr) {
+            return { signature: sig, fetch_error: normalizeError(rpcErr).message };
+          }
+        };
+
+        // Commit tx — the client-side enqueue/commit. Sig priority: the
+        // explicit ?tx_signature filter first (lets operators trace by sig
+        // directly), then commit-status events, then the enqueue sig from
+        // the accept event.
+        const sigToCheck = txSignature || signatureFromEvents || enqueueSignature;
+        let onchainTx: Record<string, unknown> | null = null;
+        if (sigToCheck) {
+          onchainTx = await fetchTxSummary(sigToCheck);
+          if (onchainTx && 'slot' in onchainTx) {
+            stagesReached.add('committed');
+            const blockTime = (onchainTx as { block_time: number | null })
+              .block_time;
+            if (typeof blockTime === 'number' && blockTime > 0) {
+              noteStageTs('committed_onchain', blockTime * 1000);
+            }
+            if (!(onchainTx as { err: unknown }).err) {
+              stagesReached.add('executed');
+            }
+          }
+        }
+
+        // Reveal tx — the dispatch that processed the intent on chain.
+        // Distinct from the commit tx; this is the one whose logs show
+        // `dispatch_ok` and the book state update. Only fetch if the sig
+        // differs from what we already looked up.
+        let executedOnchainTx: Record<string, unknown> | null = null;
+        if (executedSignature && executedSignature !== sigToCheck) {
+          executedOnchainTx = await fetchTxSummary(executedSignature);
+          if (executedOnchainTx && 'block_time' in executedOnchainTx) {
+            const blockTime = (executedOnchainTx as { block_time: number | null })
+              .block_time;
+            if (typeof blockTime === 'number' && blockTime > 0) {
+              noteStageTs('executed_onchain', blockTime * 1000);
+            }
           }
         }
 
@@ -9984,6 +10064,62 @@ function buildHttpServer(
           classification = 'unknown';
         }
 
+        // Per-stage latency relative to `accepted` baseline. Exposes the
+        // end-to-end ingress→commit→reveal pipeline as numbers operators /
+        // users can see, and lets regressions be caught per-seq. If
+        // `accepted` was never reached we emit timestamps only (no deltas).
+        const baselineMs = stageTimestampsMs['accepted'];
+        const latenciesMs: Record<string, number> = {};
+        let totalMs: number | null = null;
+        if (baselineMs !== undefined) {
+          let lastStageMs = baselineMs;
+          for (const [stage, ts] of Object.entries(stageTimestampsMs)) {
+            if (stage === 'accepted') continue;
+            const delta = ts - baselineMs;
+            latenciesMs[`accepted_to_${stage}_ms`] = delta;
+            if (ts > lastStageMs) lastStageMs = ts;
+          }
+          totalMs = lastStageMs - baselineMs;
+          // Inter-stage deltas (each stage relative to the previous one) —
+          // these are the per-hop costs that matter most for auditing.
+          const orderedStages = [
+            'accepted',
+            'submitted',
+            'enqueued',
+            'committed_onchain',
+            'executed',
+            'executed_onchain',
+          ];
+          let prevStage: string | null = null;
+          for (const stage of orderedStages) {
+            if (stageTimestampsMs[stage] === undefined) continue;
+            if (prevStage !== null) {
+              latenciesMs[`${prevStage}_to_${stage}_ms`] =
+                stageTimestampsMs[stage] - stageTimestampsMs[prevStage];
+            }
+            prevStage = stage;
+          }
+        }
+        const stageSummary = {
+          baseline_stage: baselineMs !== undefined ? 'accepted' : null,
+          baseline_ts_ms: baselineMs ?? null,
+          total_observed_ms: totalMs,
+          stage_timestamps_ms: stageTimestampsMs,
+          latencies_ms: latenciesMs,
+        };
+
+        // Per-stage signatures so operators can paste any of them into an
+        // explorer. `commit` is the client's enqueue/commit tx; `executed`
+        // is the reveal/dispatch tx that actually processed the intent on
+        // chain (the one whose logs show `dispatch_ok` / book updates).
+        const commitSig =
+          signatureFromEvents || enqueueSignature || enqueueObservedSignature;
+        const signatures: Record<string, string | null> = {
+          commit: commitSig ?? null,
+          enqueue_observed: enqueueObservedSignature ?? null,
+          executed: executedSignature ?? null,
+        };
+
         writeJson(res, 200, {
           query: {
             market: market ?? null,
@@ -9996,6 +10132,9 @@ function buildHttpServer(
           latest_reject_reason: latestRejectReason,
           queue_slot: queueSlot,
           onchain_tx: onchainTx,
+          executed_onchain_tx: executedOnchainTx,
+          signatures,
+          performance: stageSummary,
           event_count: events.length,
           events,
         });
