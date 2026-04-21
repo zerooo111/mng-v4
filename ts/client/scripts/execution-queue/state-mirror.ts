@@ -103,6 +103,12 @@ interface PerpMarketSyncLike {
   readonly quote_lot_size?: string;
   readonly long_funding?: string;
   readonly short_funding?: string;
+  // Computed metrics attached by the harness `enrichedPerp` block in
+  // continuum-state-harness.ts. All optional so the mirror stays compatible
+  // with harness builds that haven't shipped the enrichment yet.
+  readonly mark_price?: number | string | null;
+  readonly funding_rate_daily?: number | string | null;
+  readonly funding_rate_hourly?: number | string | null;
   readonly maker_fee?: string;
   readonly taker_fee?: string;
   readonly settle_token_index?: number | string;
@@ -340,12 +346,19 @@ class IORedisMirror implements Mirror {
           'taker_fee',
           'settle_token_index',
           'market',
+          'mark_price',
+          'funding_rate_daily',
+          'funding_rate_hourly',
         ] as const) {
           addField(id, k, pm[k]);
         }
       }
 
       // 2. Static identity from markets[id].metadata (if present).
+      // NOTE: base_lot_size and quote_lot_size are deliberately NOT copied
+      // here — they are already written from perp_markets above. Writing
+      // them from both sources would silently overwrite one with the other
+      // on drift; perp_markets is the canonical source.
       if (snap.markets) {
         for (const [key, m] of Object.entries(snap.markets)) {
           const md = m.metadata;
@@ -364,8 +377,6 @@ class IORedisMirror implements Mirror {
             'event_queue',
             'base_decimals',
             'quote_decimals',
-            'base_lot_size',
-            'quote_lot_size',
             'open_interest',
           ] as const) {
             addField(id, k, md[k]);

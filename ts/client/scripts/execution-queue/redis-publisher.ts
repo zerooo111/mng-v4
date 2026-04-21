@@ -30,6 +30,10 @@ const PUBLISH_ENABLED =
 const EVENTS_STREAM_MAXLEN = 50_000;
 // Trades stream is smaller — 1000 is the minimum window the frontend shows.
 const TRADES_STREAM_MAXLEN = 1_000;
+// Per-wallet tail. Smaller than the market-wide stream — wallets rarely look
+// deeper than a few hundred prior trades, and one stream per owner adds up
+// in aggregate. 500 × Redis-stream-entry (~200B) ~ 100KB per active trader.
+const WALLET_TRADES_MAXLEN = 500;
 
 // Hard cap: if any single XADD takes longer than this, we give up on it. The
 // harness hot path never blocks on Redis; the pipeline call is `.exec()` but
@@ -162,6 +166,10 @@ class IORedisPublisher implements Publisher {
         if (v === undefined || v === null) return;
         fields.push(k, String(v));
       };
+      // Always carry `market` on the per-wallet tail so readers can dedupe
+      // across markets without a second lookup. Cheap on the market-wide
+      // stream too — keeps field layout consistent.
+      push('market', market);
       push('maker', t.maker);
       push('taker', t.taker);
       push('price', t.price);
@@ -169,11 +177,54 @@ class IORedisPublisher implements Publisher {
       push('side', t.side);
       push('ts_ms', t.ts_ms ?? event.ts_ms);
       push('sequence', t.sequence ?? event.sequence);
+      // Legacy-shape fields required by the TimescaleDB ingester and the
+      // existing /wallet/:pubkey/trades payload. The harness enrichment
+      // attaches both sets so consumers can keep their current field names.
+      push('price_lots', (t as Record<string, unknown>).price_lots);
+      push('base_lots', (t as Record<string, unknown>).base_lots);
+      push('quote_lots', (t as Record<string, unknown>).quote_lots);
+      push('taker_side', (t as Record<string, unknown>).taker_side);
+      push('maker_owner', (t as Record<string, unknown>).maker_owner);
+      push('taker_owner', (t as Record<string, unknown>).taker_owner);
+      push('maker_order_id', (t as Record<string, unknown>).maker_order_id);
+      push('taker_sequence', (t as Record<string, unknown>).taker_sequence);
+      push('trade_id', (t as Record<string, unknown>).trade_id);
       if (fields.length === 0) continue;
+      // Fan-out: one XADD to the market-wide stream, plus one XADD per
+      // participating wallet so /v2/trades/wallet/:owner is a single XREVRANGE.
       this.client
         .xadd(streamKey, 'MAXLEN', '~', TRADES_STREAM_MAXLEN, '*', ...fields)
         .then(() => this.metrics.writesTotal?.inc({ stream: streamKey }))
         .catch(() => this.metrics.writeErrorsTotal?.inc({ kind: 'xadd' }));
+
+      // Fan-out keys: accept either shorthand (maker/taker) or legacy-alias
+      // (maker_owner/taker_owner) field names. If a future producer emits
+      // only one shape, we still index every participant into the per-wallet
+      // stream — staying consistent with the market-wide stream.
+      const participants = new Set<string>();
+      const asPubkey = (...candidates: unknown[]): string | null => {
+        for (const c of candidates) {
+          if (typeof c === 'string' && c.length > 0) return c;
+        }
+        return null;
+      };
+      const makerKey = asPubkey(
+        t.maker,
+        (t as Record<string, unknown>).maker_owner,
+      );
+      const takerKey = asPubkey(
+        t.taker,
+        (t as Record<string, unknown>).taker_owner,
+      );
+      if (makerKey) participants.add(makerKey);
+      if (takerKey && takerKey !== makerKey) participants.add(takerKey);
+      for (const owner of participants) {
+        const walletKey = `v1:wallet_trades:${owner}`;
+        this.client
+          .xadd(walletKey, 'MAXLEN', '~', WALLET_TRADES_MAXLEN, '*', ...fields)
+          .then(() => this.metrics.writesTotal?.inc({ stream: walletKey }))
+          .catch(() => this.metrics.writeErrorsTotal?.inc({ kind: 'xadd_wallet' }));
+      }
     }
   }
 }
@@ -186,6 +237,18 @@ interface TradeLike {
   side?: unknown;
   ts_ms?: unknown;
   sequence?: unknown;
+  // Legacy-shape aliases attached by the harness enrichment for consumers
+  // that predate the publisher fan-out (TimescaleDB ingester, wallet-trades
+  // endpoint). Any subset being present is fine — readers ignore absent keys.
+  price_lots?: unknown;
+  base_lots?: unknown;
+  quote_lots?: unknown;
+  taker_side?: unknown;
+  maker_owner?: unknown;
+  taker_owner?: unknown;
+  maker_order_id?: unknown;
+  taker_sequence?: unknown;
+  trade_id?: unknown;
 }
 
 function extractMarket(event: HarnessEventLike): number | null {
