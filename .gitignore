@@ -9,7 +9,9 @@ programs/margin-trade/src/lib-expanded.rs
 programs/mango-v4/src/lib-expanded.rs
 
 dist
+# JS dependencies / failed merge leftovers
 node_modules
+node_modules.corrupt-merge.*
 yarn-error.log
 .yarn
 
