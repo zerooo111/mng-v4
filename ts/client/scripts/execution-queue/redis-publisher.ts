@@ -177,6 +177,18 @@ class IORedisPublisher implements Publisher {
       push('side', t.side);
       push('ts_ms', t.ts_ms ?? event.ts_ms);
       push('sequence', t.sequence ?? event.sequence);
+      // Legacy-shape fields required by the TimescaleDB ingester and the
+      // existing /wallet/:pubkey/trades payload. The harness enrichment
+      // attaches both sets so consumers can keep their current field names.
+      push('price_lots', (t as Record<string, unknown>).price_lots);
+      push('base_lots', (t as Record<string, unknown>).base_lots);
+      push('quote_lots', (t as Record<string, unknown>).quote_lots);
+      push('taker_side', (t as Record<string, unknown>).taker_side);
+      push('maker_owner', (t as Record<string, unknown>).maker_owner);
+      push('taker_owner', (t as Record<string, unknown>).taker_owner);
+      push('maker_order_id', (t as Record<string, unknown>).maker_order_id);
+      push('taker_sequence', (t as Record<string, unknown>).taker_sequence);
+      push('trade_id', (t as Record<string, unknown>).trade_id);
       if (fields.length === 0) continue;
       // Fan-out: one XADD to the market-wide stream, plus one XADD per
       // participating wallet so /v2/trades/wallet/:owner is a single XREVRANGE.
@@ -207,6 +219,18 @@ interface TradeLike {
   side?: unknown;
   ts_ms?: unknown;
   sequence?: unknown;
+  // Legacy-shape aliases attached by the harness enrichment for consumers
+  // that predate the publisher fan-out (TimescaleDB ingester, wallet-trades
+  // endpoint). Any subset being present is fine — readers ignore absent keys.
+  price_lots?: unknown;
+  base_lots?: unknown;
+  quote_lots?: unknown;
+  taker_side?: unknown;
+  maker_owner?: unknown;
+  taker_owner?: unknown;
+  maker_order_id?: unknown;
+  taker_sequence?: unknown;
+  trade_id?: unknown;
 }
 
 function extractMarket(event: HarnessEventLike): number | null {

@@ -3873,11 +3873,24 @@ function enrichProcessedWithFills(event: HarnessEvent): HarnessEvent {
       trades: matches.map((t: Record<string, unknown>) => ({
         maker: t['maker_owner'],
         taker: t['taker_owner'],
+        // Shorthand field names for the Redis publisher + downstream consumers,
+        // plus the legacy *_lots / *_owner names the TimescaleDB ingester and
+        // the /wallet/:pubkey/trades payload already expect. Duplicating is
+        // cheap and saves a translation layer in every consumer.
         price: t['price_lots'],
         size: t['base_lots'],
         side: t['taker_side'],
         ts_ms: t['ts_ms'],
         sequence: t['taker_sequence'],
+        price_lots: t['price_lots'],
+        base_lots: t['base_lots'],
+        quote_lots: t['quote_lots'],
+        taker_side: t['taker_side'],
+        maker_owner: t['maker_owner'],
+        taker_owner: t['taker_owner'],
+        maker_order_id: t['maker_order_id'],
+        taker_sequence: t['taker_sequence'],
+        trade_id: t['trade_id'],
       })),
     } as HarnessEvent;
   } catch {
