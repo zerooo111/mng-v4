@@ -42,6 +42,23 @@ type E2EConfig = {
   };
 };
 
+type BenchmarkMode = 'legacy-config' | 'v5-env';
+
+type BenchmarkTarget = {
+  mode: BenchmarkMode;
+  cluster: Cluster;
+  clusterUrl: string;
+  programId: PublicKey;
+  groupPk: PublicKey;
+  executionQueuePk: PublicKey;
+  marketIndex: PerpMarketIndex;
+  owner: Keypair;
+  ownerProvided: boolean;
+  mangoAccountPk: PublicKey | null;
+  accountNum: number | null;
+  configPath: string | null;
+};
+
 type SubmitIntentResponse = {
   sequence: string | number;
   tx_signature: string;
@@ -84,6 +101,9 @@ const ORDER_QTY_UI = Number(process.env.BENCH_QUERY_QTY_UI || '1');
 const MAX_QUOTE_UI = Number(process.env.BENCH_QUERY_MAX_QUOTE_UI || '1000');
 const ORDER_LIMIT = Number(process.env.BENCH_QUERY_LIMIT || '20');
 const CANCEL_LIMIT = Number(process.env.BENCH_QUERY_CANCEL_LIMIT || '20');
+const BENCH_MODE = (process.env.BENCH_CONFIG_MODE || process.env.BENCH_MODE || '')
+  .trim()
+  .toLowerCase();
 
 function percentile(sorted: number[], p: number): number {
   if (!sorted.length) {
@@ -133,6 +153,143 @@ function readKeypair(rawPathOrJson: string): Keypair {
     ? fs.readFileSync(maybeFile, 'utf-8')
     : rawPathOrJson;
   return Keypair.fromSecretKey(Uint8Array.from(JSON.parse(raw)));
+}
+
+function envValue(...names: string[]): string | undefined {
+  for (const name of names) {
+    const value = process.env[name]?.trim();
+    if (value) {
+      return value;
+    }
+  }
+  return undefined;
+}
+
+function parseOptionalU32(value?: string): number | null {
+  if (!value) {
+    return null;
+  }
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0 || parsed > 0xffffffff) {
+    throw new Error(`invalid u32 value: ${value}`);
+  }
+  return parsed;
+}
+
+function u16le(value: number): Buffer {
+  const out = Buffer.alloc(2);
+  out.writeUInt16LE(value, 0);
+  return out;
+}
+
+function deriveExecutionQueueV5(params: {
+  groupPk: PublicKey;
+  marketIndex: number;
+  programId: PublicKey;
+}): PublicKey {
+  const [pk] = PublicKey.findProgramAddressSync(
+    [
+      Buffer.from('execution-queue-v5'),
+      params.groupPk.toBuffer(),
+      u16le(params.marketIndex),
+    ],
+    params.programId,
+  );
+  return pk;
+}
+
+function detectBenchmarkMode(): BenchmarkMode {
+  if (BENCH_MODE === 'legacy' || BENCH_MODE === 'legacy-config') {
+    return 'legacy-config';
+  }
+  if (BENCH_MODE === 'v5' || BENCH_MODE === 'v5-env' || BENCH_MODE === 'env') {
+    return 'v5-env';
+  }
+  if (envValue('BENCH_GROUP_PK', 'V4_GROUP')) {
+    return 'v5-env';
+  }
+  return 'legacy-config';
+}
+
+function resolveLegacyTarget(): BenchmarkTarget {
+  const configPath = path.resolve(CONFIG_PATH);
+  const config = JSON.parse(fs.readFileSync(configPath, 'utf-8')) as E2EConfig;
+  return {
+    mode: 'legacy-config',
+    cluster: config.cluster,
+    clusterUrl: process.env.CLUSTER_URL_OVERRIDE || config.clusterUrl,
+    programId: new PublicKey(config.programId),
+    groupPk: new PublicKey(config.group),
+    executionQueuePk: new PublicKey(config.executionQueue),
+    marketIndex: config.perpMarketIndex as PerpMarketIndex,
+    owner: readKeypair(config.maker.keypairPath),
+    ownerProvided: true,
+    mangoAccountPk: new PublicKey(config.maker.mangoAccount),
+    accountNum: null,
+    configPath,
+  };
+}
+
+function resolveEnvTarget(): BenchmarkTarget {
+  const clusterUrl = envValue('CLUSTER_URL_OVERRIDE', 'MB_CLUSTER_URL');
+  if (!clusterUrl) {
+    throw new Error('CLUSTER_URL_OVERRIDE is required for BENCH_CONFIG_MODE=v5-env');
+  }
+
+  const programIdRaw = envValue('BENCH_PROGRAM_ID', 'CTM_RELAYER_PROGRAM_ID');
+  const groupRaw = envValue('BENCH_GROUP_PK', 'V4_GROUP');
+  const marketRaw = envValue('BENCH_MARKET_INDEX', 'V4_MARKET_INDEX');
+  if (!programIdRaw) {
+    throw new Error('BENCH_PROGRAM_ID or CTM_RELAYER_PROGRAM_ID is required for v5-env mode');
+  }
+  if (!groupRaw) {
+    throw new Error('BENCH_GROUP_PK or V4_GROUP is required for v5-env mode');
+  }
+  if (!marketRaw) {
+    throw new Error('BENCH_MARKET_INDEX or V4_MARKET_INDEX is required for v5-env mode');
+  }
+
+  const programId = new PublicKey(programIdRaw);
+  const groupPk = new PublicKey(groupRaw);
+  const marketIndex = Number(marketRaw);
+  if (!Number.isInteger(marketIndex) || marketIndex < 0 || marketIndex > 0xffff) {
+    throw new Error(`invalid BENCH_MARKET_INDEX/V4_MARKET_INDEX: ${marketRaw}`);
+  }
+
+  const ownerRaw = envValue('BENCH_OWNER_KEYPAIR');
+  const owner = ownerRaw ? readKeypair(ownerRaw) : Keypair.generate();
+  const executionQueueRaw = envValue('BENCH_EXECUTION_QUEUE_PK');
+  const executionQueuePk = executionQueueRaw
+    ? new PublicKey(executionQueueRaw)
+    : deriveExecutionQueueV5({
+        groupPk,
+        marketIndex,
+        programId,
+      });
+
+  const mangoAccountRaw = envValue('BENCH_MANGO_ACCOUNT_PK');
+  const accountNum = parseOptionalU32(envValue('BENCH_ACCOUNT_NUM'));
+
+  return {
+    mode: 'v5-env',
+    cluster: ((process.env.CLUSTER_OVERRIDE as Cluster) || 'devnet') as Cluster,
+    clusterUrl,
+    programId,
+    groupPk,
+    executionQueuePk,
+    marketIndex: marketIndex as PerpMarketIndex,
+    owner,
+    ownerProvided: !!ownerRaw,
+    mangoAccountPk: mangoAccountRaw ? new PublicKey(mangoAccountRaw) : null,
+    accountNum,
+    configPath: null,
+  };
+}
+
+function resolveBenchmarkTarget(): BenchmarkTarget {
+  return detectBenchmarkMode() === 'v5-env'
+    ? resolveEnvTarget()
+    : resolveLegacyTarget();
 }
 
 async function waitForHealth(client: ContinuumHarnessClient): Promise<void> {
@@ -399,53 +556,69 @@ async function clearExistingOrders(params: {
   }
 }
 
+async function resolveMangoAccountPk(params: {
+  harnessClient: ContinuumHarnessClient;
+  target: BenchmarkTarget;
+}): Promise<PublicKey> {
+  if (params.target.mangoAccountPk) {
+    return params.target.mangoAccountPk;
+  }
+  const response = await params.harnessClient.airdropDepositUsdc({
+    owner: params.target.owner.publicKey.toBase58(),
+    ...(params.target.accountNum !== null
+      ? { account_num: params.target.accountNum }
+      : {}),
+  });
+  return new PublicKey(response.mango_account);
+}
+
 async function main(): Promise<void> {
-  const config = JSON.parse(fs.readFileSync(path.resolve(CONFIG_PATH), 'utf-8')) as E2EConfig;
-  const connection = new Connection(
-    process.env.CLUSTER_URL_OVERRIDE || config.clusterUrl,
-    AnchorProvider.defaultOptions(),
-  );
-  const programId = new PublicKey(config.programId);
-  const groupPk = new PublicKey(config.group);
-  const executionQueuePk = new PublicKey(config.executionQueue);
-  const marketIndex = config.perpMarketIndex as PerpMarketIndex;
-
-  const owner = readKeypair(config.maker.keypairPath);
-  const provider = new AnchorProvider(
-    connection,
-    new Wallet(owner),
-    AnchorProvider.defaultOptions(),
-  );
-  const mangoClient = await MangoClient.connect(provider, config.cluster, programId, {
-    idsSource: 'get-program-accounts',
-  });
-  const group = await mangoClient.getGroup(groupPk);
-  const mangoAccount = await mangoClient.getMangoAccount(new PublicKey(config.maker.mangoAccount));
-  const perpMarket = group.getPerpMarketByMarketIndex(marketIndex);
-  const remainingAccounts = await executionQueueCanonicalPerpRemainingAccounts({
-    client: mangoClient,
-    group,
-    mangoAccount,
-    marketIndex,
-    userOwner: owner.publicKey,
-  });
-
+  const target = resolveBenchmarkTarget();
   const harnessClient = new ContinuumHarnessClient(HARNESS_URL);
   await waitForHealth(harnessClient);
   const relayerClient = createRelayerClient(RELAYER_ADDR);
   await waitForRelayerReady(relayerClient as grpc.Client);
 
+  const mangoAccountPk = await resolveMangoAccountPk({
+    harnessClient,
+    target,
+  });
+
+  const connection = new Connection(
+    target.clusterUrl,
+    AnchorProvider.defaultOptions(),
+  );
+  const owner = target.owner;
+  const provider = new AnchorProvider(
+    connection,
+    new Wallet(owner),
+    AnchorProvider.defaultOptions(),
+  );
+  const mangoClient = await MangoClient.connect(provider, target.cluster, target.programId, {
+    idsSource: 'get-program-accounts',
+  });
+  const group = await mangoClient.getGroup(target.groupPk);
+  const mangoAccount = await mangoClient.getMangoAccount(mangoAccountPk);
+  const perpMarket = group.getPerpMarketByMarketIndex(target.marketIndex);
+  const remainingAccounts = await executionQueueCanonicalPerpRemainingAccounts({
+    client: mangoClient,
+    group,
+    mangoAccount,
+    marketIndex: target.marketIndex,
+    userOwner: owner.publicKey,
+  });
+
   await harnessClient.getOrders({
-    market: marketIndex,
+    market: target.marketIndex,
     owner: owner.publicKey,
     view: 'optimistic',
   });
   await clearExistingOrders({
     harnessClient,
     relayerClient,
-    group: groupPk,
-    executionQueue: executionQueuePk,
-    market: marketIndex,
+    group: target.groupPk,
+    executionQueue: target.executionQueuePk,
+    market: target.marketIndex,
     remainingAccounts,
     owner,
     mangoAccount: mangoAccount.publicKey,
@@ -473,7 +646,7 @@ async function main(): Promise<void> {
     const visibleCancelRef = { cancelled: false };
     const visiblePromise = waitForOrderVisible({
       harnessClient,
-      market: marketIndex,
+      market: target.marketIndex,
       owner: owner.publicKey,
       clientOrderId: clientOrderId.toString(),
       startedAt: submitStartedAt,
@@ -488,9 +661,9 @@ async function main(): Promise<void> {
     try {
       ackResponse = await submitIntentViaRelayer({
         relayerClient,
-        group: groupPk,
-        executionQueue: executionQueuePk,
-        market: marketIndex,
+        group: target.groupPk,
+        executionQueue: target.executionQueuePk,
+        market: target.marketIndex,
         payload,
         remainingAccounts,
         userOwner: owner.publicKey,
@@ -510,7 +683,7 @@ async function main(): Promise<void> {
     const clearedCancelRef = { cancelled: false };
     const clearedPromise = waitForOrderCleared({
       harnessClient,
-      market: marketIndex,
+      market: target.marketIndex,
       owner: owner.publicKey,
       clientOrderId: clientOrderId.toString(),
       startedAt: clearedStartedAt,
@@ -523,9 +696,9 @@ async function main(): Promise<void> {
     try {
       await submitIntentViaRelayer({
         relayerClient,
-        group: groupPk,
-        executionQueue: executionQueuePk,
-        market: marketIndex,
+        group: target.groupPk,
+        executionQueue: target.executionQueuePk,
+        market: target.marketIndex,
         payload: cancelPayload,
         remainingAccounts,
         userOwner: owner.publicKey,
@@ -561,17 +734,24 @@ async function main(): Promise<void> {
 
   const output = {
     config: {
+      mode: target.mode,
       harness_url: HARNESS_URL,
       relayer_addr: RELAYER_ADDR,
-      config_path: path.resolve(CONFIG_PATH),
+      cluster_url: target.clusterUrl,
+      cluster: target.cluster,
+      program_id: target.programId.toBase58(),
+      group: target.groupPk.toBase58(),
+      execution_queue: target.executionQueuePk.toBase58(),
+      config_path: target.configPath,
       iterations: ITERATIONS,
       warmup_iterations: WARMUP_ITERATIONS,
       timeout_ms: TIMEOUT_MS,
       poll_interval_ms: POLL_INTERVAL_MS,
-      market: marketIndex,
+      market: target.marketIndex,
       owner: owner.publicKey.toBase58(),
+      owner_provided: target.ownerProvided,
       mango_account: mangoAccount.publicKey.toBase58(),
-      endpoint: `/state/orders/${marketIndex}?owner=${owner.publicKey.toBase58()}&view=optimistic`,
+      endpoint: `/state/orders/${target.marketIndex}?owner=${owner.publicKey.toBase58()}&view=optimistic`,
       price_ui: ORDER_PRICE_UI,
       qty_ui: ORDER_QTY_UI,
     },
