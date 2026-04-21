@@ -92,6 +92,16 @@ interface UserLike {
   readonly owner: string;
   readonly per_market?: PerMarketStateLike[];
   readonly margin_summary?: unknown;
+  // Per-asset token balances as computed by the harness's optimistic
+  // collateral pass. When present, mirrored into v1:balance:<owner> alongside
+  // margin_summary so the frontend's vault / wallet-balance panels can read
+  // them without a separate /state/balances HTTP hop. Optional so the mirror
+  // stays compatible with harness builds that don't compute this field yet.
+  readonly optimistic_collateral?: unknown;
+  // Aggregate reserves (total_quote_reserved_lots, etc.) — used by v1's
+  // /state/balances composer to report per-mint reserved amounts. Mirrored
+  // verbatim so the gateway can expose the same derivation.
+  readonly totals?: unknown;
 }
 
 interface PerpMarketSyncLike {
@@ -294,16 +304,37 @@ class IORedisMirror implements Mirror {
           });
         }
 
-        if (user.margin_summary !== undefined) {
+        if (
+          user.margin_summary !== undefined ||
+          user.optimistic_collateral !== undefined ||
+          user.totals !== undefined
+        ) {
           const balKey = `v1:balance:${tag}:${owner}`;
-          let summaryJson: string;
-          try {
-            summaryJson = JSON.stringify(user.margin_summary);
-          } catch {
-            summaryJson = '{}';
+          const hash: Record<string, string> = { ts_ms: tsMs };
+          const stringifyOrEmpty = (v: unknown): string => {
+            try {
+              return JSON.stringify(v);
+            } catch {
+              return '{}';
+            }
+          };
+          if (user.margin_summary !== undefined) {
+            hash.summary = stringifyOrEmpty(user.margin_summary);
+          }
+          if (user.optimistic_collateral !== undefined) {
+            // Per-asset token balances from the harness's optimistic-collateral
+            // computation. Writing as a JSON blob under one field rather than
+            // exploding into a sub-hash keeps the HSET atomic with the summary
+            // + totals write, and the data is small enough (<1KB per user)
+            // that parsing on read is cheap. Frontend vault panel + wallet
+            // balance lookup read this instead of calling /state/balances.
+            hash.tokens = stringifyOrEmpty(user.optimistic_collateral);
+          }
+          if (user.totals !== undefined) {
+            hash.totals = stringifyOrEmpty(user.totals);
           }
           pipeline.del(balKey);
-          pipeline.hset(balKey, { summary: summaryJson, ts_ms: tsMs });
+          pipeline.hset(balKey, hash);
         }
       }
     }
