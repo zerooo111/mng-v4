@@ -216,13 +216,15 @@ Request body:
 ```json
 {
   "owner": "FByAc4zWBnKKKnvdXSscFsztYBLgbUtmbVobnMVYxzkC",
-  "mango_account": "optional-mango-account-pubkey"
+  "mango_account": "optional-mango-account-pubkey",
+  "account_num": 0
 }
 ```
 
 Notes:
 - `ui_amount` is fixed by harness config (`CONTINUUM_HARNESS_AIRDROP_DEPOSIT_UI_AMOUNT`, default `1000`).
 - If `mango_account` is omitted, the first Mango account for `owner` in the configured group is used.
+- If `account_num` is provided and no Mango account exists yet for `owner`, the harness may auto-create that account number before depositing.
 
 Response `200`:
 
@@ -236,7 +238,9 @@ Response `200`:
   "ui_amount": 1000,
   "raw_amount": "1000000000",
   "unsafe_deposit_tx_signature": "5Qf...abc",
-  "execution_path": "unsafe_deposit"
+  "execution_path": "unsafe_deposit",
+  "auto_created_mango_account": false,
+  "unsafe_account_create_tx_signature": null
 }
 ```
 
@@ -247,6 +251,37 @@ Errors:
 `execution_path` values:
 - `unsafe_deposit`: new on-chain unsafe instruction path was used.
 - `token_deposit_into_existing_fallback`: node is running an older program binary; harness fell back to mint+deposit-into-existing path.
+
+### `GET /state/deposit-context/:owner`
+
+Returns the quote-bank and Mango-account context a frontend or SDK needs to build a real deposit flow against the configured group.
+
+Example response:
+
+```json
+{
+  "owner": "FByAc4zWBnKKKnvdXSscFsztYBLgbUtmbVobnMVYxzkC",
+  "group": "9VYm4QaBhEPEiFfyGxXEDpN7ZTh2muajTDebKrDL4f5k",
+  "program_id": "4Mango111111111111111111111111111111111111",
+  "quote_mint": "DnTjy48VD6KN2mkXoaHjmgtMxjT1Ub9dc64vxPfiHomA",
+  "quote_decimals": 6,
+  "quote_bank": "4qBank1111111111111111111111111111111111111",
+  "quote_vault": "9vVault111111111111111111111111111111111111",
+  "quote_oracle": "7sOracle11111111111111111111111111111111111",
+  "mango_account": "gddrsZnnddtquJHquhCmqq3bekkW3MN5SBCSJSij79j",
+  "mango_account_exists": true,
+  "account_num": 0,
+  "health_remaining_accounts": [
+    "4qBank1111111111111111111111111111111111111",
+    "7sOracle11111111111111111111111111111111111"
+  ],
+  "default_ui_amount": 1000
+}
+```
+
+Query params:
+- `mango_account`: optional explicit Mango account to validate and use
+- `account_num`: optional Mango account number to derive when the owner does not yet have an account
 
 ## 2) Relay Ingestion
 
@@ -546,6 +581,35 @@ Response `200`:
   "users": {
     "<owner>": { "...": "..." }
   }
+}
+```
+
+## `GET /monitoring`
+
+Returns per-market monitoring aggregates collected by the harness. This includes runtime statistics that are useful for dashboards and fee-state reads, such as `fees_accrued_native`, `fees_settled_native`, open interest, rolling volume, and funding history.
+
+Query params:
+- `full_history=true` to return the full funding-rate history instead of the recent window
+
+Response `200` (shape):
+
+```json
+{
+  "generated_ts_ms": 1772349020285,
+  "collection_interval_ms": 30000,
+  "stats_file": "/tmp/continuum-market-stats.json",
+  "last_collection_ms": 1772349019000,
+  "markets": [
+    {
+      "market": "2",
+      "market_name": "SOL-PERP",
+      "fees_accrued_native": "123456",
+      "fees_settled_native": "120000",
+      "open_interest_base_lots": "900",
+      "open_interest_base_ui": 9.0,
+      "funding_rate_history": []
+    }
+  ]
 }
 ```
 

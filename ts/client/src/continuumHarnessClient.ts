@@ -281,6 +281,8 @@ export type HarnessAirdropResponse = {
 export type HarnessAirdropDepositRequest = {
   owner: string;
   mango_account?: string;
+  account_num?: number;
+  ui_amount?: number;
 };
 
 export type HarnessAirdropDepositResponse = {
@@ -293,6 +295,68 @@ export type HarnessAirdropDepositResponse = {
   raw_amount: string;
   unsafe_deposit_tx_signature: string;
   execution_path: 'unsafe_deposit' | 'token_deposit_into_existing_fallback';
+  auto_created_mango_account: boolean;
+  unsafe_account_create_tx_signature: string | null;
+};
+
+export type HarnessDepositContextResponse = {
+  owner: string;
+  group: string;
+  program_id: string;
+  quote_mint: string;
+  quote_decimals: number;
+  quote_bank: string;
+  quote_vault: string;
+  quote_oracle: string;
+  mango_account: string;
+  mango_account_exists: boolean;
+  account_num: number;
+  health_remaining_accounts: string[];
+  default_ui_amount: number;
+};
+
+export type HarnessFundingRateEntry = {
+  ts_ms: number;
+  hourly_pct: number | null;
+  daily_pct: number | null;
+  long_funding: string;
+  short_funding: string;
+  oracle_price_ui: number | null;
+};
+
+export type HarnessMonitoringMarketItem = {
+  market: string;
+  market_name: string;
+  last_collected_ms: number | null;
+  volume_24h_base_lots: string;
+  volume_24h_quote_lots: string;
+  volume_24h_base_ui: number | null;
+  volume_24h_quote_ui: number | null;
+  trade_count_24h: number | null;
+  change_24h_pct: number | null;
+  last_price_ui: number | null;
+  cumulative_volume_base_lots: string;
+  cumulative_volume_quote_lots: string;
+  cumulative_volume_base_ui: number | null;
+  cumulative_volume_quote_ui: number | null;
+  open_interest_base_lots: string | null;
+  open_interest_base_ui: number | null;
+  fees_accrued_native: string | null;
+  fees_settled_native: string | null;
+  active_unique_users: number;
+  all_time_unique_users: number;
+  current_funding_hourly_pct: number | null;
+  current_funding_daily_pct: number | null;
+  current_oracle_price_ui: number | null;
+  funding_rate_history: HarnessFundingRateEntry[];
+};
+
+export type HarnessMonitoringResponse = {
+  generated_ts_ms: number;
+  collection_interval_ms: number;
+  stats_file: string;
+  last_collection_ms: number | null;
+  markets: HarnessMonitoringMarketItem[];
 };
 
 function normalizeBaseUrl(baseUrl: string): string {
@@ -621,6 +685,35 @@ export class ContinuumHarnessClient {
       'POST',
       '/airdrop-deposit',
       params,
+    );
+  }
+
+  async getDepositContext(
+    owner: PublicKey | string,
+    params?: {
+      mangoAccount?: PublicKey | string;
+      accountNum?: number;
+    },
+  ): Promise<HarnessDepositContextResponse> {
+    const ownerPk = toBase58(owner)!;
+    return await this.request<HarnessDepositContextResponse>(
+      'GET',
+      withQuery(`/state/deposit-context/${encodeURIComponent(ownerPk)}`, {
+        mango_account: toBase58(params?.mangoAccount),
+        account_num:
+          params?.accountNum !== undefined ? String(params.accountNum) : undefined,
+      }),
+    );
+  }
+
+  async getMonitoring(params?: {
+    fullHistory?: boolean;
+  }): Promise<HarnessMonitoringResponse> {
+    return await this.request<HarnessMonitoringResponse>(
+      'GET',
+      withQuery('/monitoring', {
+        full_history: params?.fullHistory ? 'true' : undefined,
+      }),
     );
   }
 

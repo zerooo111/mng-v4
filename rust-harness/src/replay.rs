@@ -706,16 +706,26 @@ impl ContinuumStateEngine {
             }
         }
 
+        // On the first incremental apply after bootstrap, build the live
+        // projection without this key present so the incoming intent is
+        // only applied once below. For replacement keys, also exclude the
+        // previous value from that first build so the new payload becomes
+        // the single source of truth in the live projection.
+        if self.live_optimistic_projection.is_none() {
+            let removed_existing = self.intents_by_key.remove(&key);
+            if let Err(err) = self.ensure_live_optimistic_projection() {
+                if let Some(existing_intent) = removed_existing {
+                    self.intents_by_key.insert(key.clone(), existing_intent);
+                }
+                return Err(err);
+            }
+        }
+
         // Insert into the canonical intent map. Keeping intents_by_key in
         // sync is required so the lazy fallback rebuild path still works
         // and so divergence detection / retention can see the new intent.
         self.intents_by_key.insert(key.clone(), canonical.clone());
         self.enforce_retention_limits();
-
-        // Make sure the live projection exists. First-call cost is one
-        // baseline build + replay of stored intents (skipping the one we
-        // just added; it's applied next). Subsequent calls are O(1).
-        self.ensure_live_optimistic_projection()?;
 
         // Apply the new intent to the live projection in place. The
         // borrow-checker dance: temporarily take the projection out of the
@@ -3732,6 +3742,80 @@ mod tests {
         Pubkey::new_unique().to_string()
     }
 
+    fn pending_limit_order_event(
+        group: &str,
+        execution_queue: &str,
+        owner: &str,
+        mango_account: &str,
+        market: &str,
+        sequence: u64,
+        client_order_id: u64,
+    ) -> RelayIntentAcceptedEvent {
+        RelayIntentAcceptedEvent {
+            event_type: "relay_intent_accepted".to_string(),
+            ts_ms: sequence,
+            group: group.to_string(),
+            execution_queue: execution_queue.to_string(),
+            market: market.to_string(),
+            intent_version: None,
+            target_kind: None,
+            target_index: None,
+            accounts_hash: None,
+            remaining_accounts_source: None,
+            sequence: sequence.to_string(),
+            kind: 0,
+            payload_b64: place_order_payload(
+                Side::Bid,
+                101,
+                1,
+                101,
+                client_order_id,
+                PlaceOrderType::Limit,
+                SelfTradeBehavior::DecrementTake,
+                false,
+                0,
+                10,
+            ),
+            remaining_accounts: Vec::new(),
+            min_execute_slot: "1".to_string(),
+            expires_at_slot: "0".to_string(),
+            user_owner: owner.to_string(),
+            mango_account: mango_account.to_string(),
+            enqueue_tx_signature: format!("bench-place-{sequence}"),
+        }
+    }
+
+    fn pending_cancel_all_event(
+        group: &str,
+        execution_queue: &str,
+        owner: &str,
+        mango_account: &str,
+        market: &str,
+        sequence: u64,
+    ) -> RelayIntentAcceptedEvent {
+        RelayIntentAcceptedEvent {
+            event_type: "relay_intent_accepted".to_string(),
+            ts_ms: sequence,
+            group: group.to_string(),
+            execution_queue: execution_queue.to_string(),
+            market: market.to_string(),
+            intent_version: None,
+            target_kind: None,
+            target_index: None,
+            accounts_hash: None,
+            remaining_accounts_source: None,
+            sequence: sequence.to_string(),
+            kind: 0,
+            payload_b64: cancel_all_payload(10),
+            remaining_accounts: Vec::new(),
+            min_execute_slot: "1".to_string(),
+            expires_at_slot: "0".to_string(),
+            user_owner: owner.to_string(),
+            mango_account: mango_account.to_string(),
+            enqueue_tx_signature: format!("bench-cancel-{sequence}"),
+        }
+    }
+
     fn run_with_large_stack(test: impl FnOnce() + Send + 'static) {
         std::thread::Builder::new()
             .name("rust-harness-replay-test".to_string())
@@ -4835,6 +4919,45 @@ mod tests {
     }
 
     #[test]
+    fn first_local_apply_builds_projection_without_double_applying_new_intent() {
+        run_with_large_stack(|| {
+            let mut engine = ContinuumStateEngine::new();
+            let group = key();
+            let execution_queue = key();
+            let owner = key();
+            let mango_account = key();
+            let market = "21".to_string();
+
+            bootstrap_market(&mut engine, &market, 100);
+
+            black_box(
+                engine
+                    .apply_relay_intent_local(pending_limit_order_event(
+                        &group,
+                        &execution_queue,
+                        &owner,
+                        &mango_account,
+                        &market,
+                        1,
+                        9_999,
+                    ))
+                    .unwrap(),
+            );
+
+            let optimistic = engine
+                .get_market_state(&market, QueueView::Optimistic)
+                .unwrap();
+            assert_eq!(optimistic.open_orders.len(), 1);
+            assert_eq!(optimistic.open_orders[0].client_order_id, "9999");
+            assert!(engine
+                .get_market_state(&market, QueueView::Confirmed)
+                .unwrap()
+                .open_orders
+                .is_empty());
+        });
+    }
+
+    #[test]
     fn optimistic_pending_ctm_waits_on_head_gap() {
         run_with_large_stack(|| {
             let mut engine = ContinuumStateEngine::new();
@@ -5759,6 +5882,122 @@ mod tests {
                     incremental_json_summary.mean_ns
                 ),
             );
+        });
+    }
+
+    #[test]
+    #[ignore = "microbenchmark"]
+    fn benchmark_optimistic_update_latency() {
+        run_with_large_stack(|| {
+            let cold_iterations = 128u64;
+            let warmup_iterations = 128u64;
+            let measured_iterations = 2_048u64;
+
+            let group = key();
+            let execution_queue = key();
+            let owner = key();
+            let mango_account = key();
+            let market = "42".to_string();
+
+            let mut cold_apply_samples = Vec::with_capacity(cold_iterations as usize);
+            let mut cold_apply_read_samples = Vec::with_capacity(cold_iterations as usize);
+            for iter in 0..cold_iterations {
+                let mut engine = ContinuumStateEngine::new();
+                bootstrap_market(&mut engine, &market, 100);
+                let event = pending_limit_order_event(
+                    &group,
+                    &execution_queue,
+                    &owner,
+                    &mango_account,
+                    &market,
+                    1,
+                    10_000 + iter,
+                );
+                let started = Instant::now();
+                black_box(engine.apply_relay_intent_local(event).unwrap());
+                cold_apply_samples.push(started.elapsed().as_nanos());
+
+                let market_state = black_box(
+                    engine
+                        .get_market_state(&market, QueueView::Optimistic)
+                        .unwrap(),
+                );
+                assert_eq!(market_state.open_orders.len(), 1);
+                cold_apply_read_samples.push(started.elapsed().as_nanos());
+            }
+
+            let mut warm_engine = ContinuumStateEngine::new();
+            bootstrap_market(&mut warm_engine, &market, 100);
+            black_box(
+                warm_engine
+                    .get_market_state(&market, QueueView::Optimistic)
+                    .unwrap(),
+            );
+
+            let mut warm_apply_samples = Vec::with_capacity(measured_iterations as usize);
+            let mut warm_apply_read_samples = Vec::with_capacity(measured_iterations as usize);
+            let mut next_sequence = 1u64;
+            for iter in 0..(warmup_iterations + measured_iterations) {
+                let client_order_id = 50_000 + iter;
+                let place_event = pending_limit_order_event(
+                    &group,
+                    &execution_queue,
+                    &owner,
+                    &mango_account,
+                    &market,
+                    next_sequence,
+                    client_order_id,
+                );
+                let started = Instant::now();
+                black_box(warm_engine.apply_relay_intent_local(place_event).unwrap());
+                let apply_ns = started.elapsed().as_nanos();
+                let market_state = black_box(
+                    warm_engine
+                        .get_market_state(&market, QueueView::Optimistic)
+                        .unwrap(),
+                );
+                assert_eq!(market_state.open_orders.len(), 1);
+                assert_eq!(
+                    market_state.open_orders[0].client_order_id,
+                    client_order_id.to_string()
+                );
+                let apply_and_read_ns = started.elapsed().as_nanos();
+
+                let cancel_event = pending_cancel_all_event(
+                    &group,
+                    &execution_queue,
+                    &owner,
+                    &mango_account,
+                    &market,
+                    next_sequence + 1,
+                );
+                black_box(warm_engine.apply_relay_intent_local(cancel_event).unwrap());
+                let cleared_state = black_box(
+                    warm_engine
+                        .get_market_state(&market, QueueView::Optimistic)
+                        .unwrap(),
+                );
+                assert!(cleared_state.open_orders.is_empty());
+
+                if iter >= warmup_iterations {
+                    warm_apply_samples.push(apply_ns);
+                    warm_apply_read_samples.push(apply_and_read_ns);
+                }
+                next_sequence = next_sequence.saturating_add(2);
+            }
+
+            let cold_apply_summary = summarize_bench(&cold_apply_samples);
+            let cold_apply_read_summary = summarize_bench(&cold_apply_read_samples);
+            let warm_apply_summary = summarize_bench(&warm_apply_samples);
+            let warm_apply_read_summary = summarize_bench(&warm_apply_read_samples);
+
+            println!(
+                "optimistic_update benchmark config: cold_iterations={cold_iterations} warmup_iterations={warmup_iterations} measured_iterations={measured_iterations}"
+            );
+            print_bench_summary("cold_first_apply_only", cold_apply_summary);
+            print_bench_summary("cold_first_apply_plus_market_read", cold_apply_read_summary);
+            print_bench_summary("warm_apply_only", warm_apply_summary);
+            print_bench_summary("warm_apply_plus_market_read", warm_apply_read_summary);
         });
     }
 
