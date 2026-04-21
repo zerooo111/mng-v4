@@ -951,6 +951,10 @@ const marketRuntimeMetricsCache = new Map<
   string,
   { fetchedAtMs: number; data: MarketRuntimeMetrics | null }
 >();
+// [redis-phase5] Module-level mirror of onchain.cachedMarketMetadata so the
+// state-mirror snapshot provider can attach rich identity fields without a
+// dependency on a specific OnchainContext reference or on any HTTP call.
+let harnessMarketMetadataSnapshot: Record<string, HarnessMarketMetadata> = {};
 // ── Market stats state ───────────────────────────────────────────────────────
 let marketStatsStore: MarketStatsStore = {
   version: 1,
@@ -2437,6 +2441,9 @@ async function getMarketMetadataMap(
     }
 
     onchain.cachedMarketMetadata = metadata;
+    // [redis-phase5] keep module-level mirror in sync so the state-mirror
+    // snapshot provider reads the freshest metadata without an onchain ref.
+    harnessMarketMetadataSnapshot = metadata;
     onchain.cachedMarketMetadataFetchedAtMs = Date.now();
     return metadata;
   });
@@ -2476,6 +2483,214 @@ function emptyQueueState(market: string): QueueState {
     last_processed_sequence: '0',
     lag_slots: '0',
     unmatched_processed_count: 0,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// v5 per-market queue helpers
+//
+// The harness was originally written against the v2/v3 "single shared queue"
+// topology and only tracks one PDA via CONTINUUM_HARNESS_EXECUTION_QUEUE_PK.
+// After the v5 migration, queues are per-market PDAs derived with
+//   seeds = ["execution-queue-v5", group, market_index u16 LE]
+// The helpers below let the harness do a fresh RPC read of the per-market
+// queue account on request, bypassing the legacy single-queue replay model
+// so /state/queue/{m} and /state/book/{m} can serve post-upgrade truth.
+//
+// Byte layout of ExecutionQueueV5 (see programs/mango-v4/src/state/execution_queue_v5.rs):
+//   [0..8)           anchor discriminator
+//   [8..152)         ExecutionQueueV5Header  (group, authority_state, bump, pauses, layout_version, max_retries, _padding, total_count, reserved[64])
+//   [152..216)       SubQueueHeaderV5[0]     (N_MAX_MARKETS=1)
+//     +0  market_index: u16
+//     +2  active: u8
+//     +3  paused_ingress: u8
+//     +4  paused_execute: u8
+//     +5  shard_id: u8
+//     +8  live_count: u32
+//     +12 gap_wait_slots: u16
+//     +14 soft_limit: u16
+//     +16 next_sequence_to_execute: u64
+//     +24 max_seen_sequence: u64
+//   [216..)          items array (per-market ring)
+// ---------------------------------------------------------------------------
+const V5_QUEUE_SEED = Buffer.from('execution-queue-v5');
+
+function deriveV5QueuePda(
+  programId: PublicKey,
+  group: PublicKey,
+  marketIndex: number,
+): PublicKey {
+  const leBytes = Buffer.alloc(2);
+  leBytes.writeUInt16LE(marketIndex, 0);
+  const [pda] = PublicKey.findProgramAddressSync(
+    [V5_QUEUE_SEED, group.toBuffer(), leBytes],
+    programId,
+  );
+  return pda;
+}
+
+interface V5QueueLiveState {
+  pda: string;
+  layout_version: number;
+  paused_ingress: boolean;
+  paused_execute: boolean;
+  total_count: string;
+  sub_queue: {
+    market_index: number;
+    active: boolean;
+    live_count: number;
+    gap_wait_slots: number;
+    soft_limit: number;
+    next_sequence_to_execute: string;
+    max_seen_sequence: string;
+    paused_ingress: boolean;
+    paused_execute: boolean;
+    head_ring_offset: number;
+  } | null;
+  observed_slot: number;
+  generated_ts_ms: number;
+}
+
+async function fetchV5QueueLiveState(
+  connection: Connection,
+  programId: PublicKey,
+  group: PublicKey,
+  marketIndex: number,
+  commitment: Commitment,
+): Promise<V5QueueLiveState | null> {
+  const pda = deriveV5QueuePda(programId, group, marketIndex);
+  const resp = await connection.getAccountInfoAndContext(pda, commitment);
+  if (!resp.value?.data) return null;
+  const data = Buffer.from(resp.value.data);
+  if (data.length < 216) return null;
+  // Header fields we surface.
+  const layoutVersion = data.readUInt8(8 + 32 + 32 + 1 + 1 + 1); // layout_version
+  const headerPausedIngress = data.readUInt8(8 + 32 + 32 + 1) === 1;
+  const headerPausedExecute = data.readUInt8(8 + 32 + 32 + 1 + 1) === 1;
+  const totalCount = data.readBigUInt64LE(8 + 32 + 32 + 1 + 1 + 1 + 1 + 1 + 3); // after 3-byte padding
+  // SubQueueHeader[0] at offset 152.
+  const sqBase = 152;
+  const marketIdx = data.readUInt16LE(sqBase + 0);
+  const active = data.readUInt8(sqBase + 2) === 1;
+  const pausedIng = data.readUInt8(sqBase + 3) === 1;
+  const pausedExe = data.readUInt8(sqBase + 4) === 1;
+  const liveCount = data.readUInt32LE(sqBase + 8);
+  const gapWaitSlots = data.readUInt16LE(sqBase + 12);
+  const softLimit = data.readUInt16LE(sqBase + 14);
+  const nextSeqToExec = data.readBigUInt64LE(sqBase + 16);
+  const maxSeenSeq = data.readBigUInt64LE(sqBase + 24);
+  const V5_PER_MARKET_CAPACITY = 1024n;
+  const headRingOffset = Number(nextSeqToExec % V5_PER_MARKET_CAPACITY);
+  return {
+    pda: pda.toBase58(),
+    layout_version: layoutVersion,
+    paused_ingress: headerPausedIngress,
+    paused_execute: headerPausedExecute,
+    total_count: totalCount.toString(),
+    sub_queue: active
+      ? {
+          market_index: marketIdx,
+          active,
+          live_count: liveCount,
+          gap_wait_slots: gapWaitSlots,
+          soft_limit: softLimit,
+          next_sequence_to_execute: nextSeqToExec.toString(),
+          max_seen_sequence: maxSeenSeq.toString(),
+          paused_ingress: pausedIng,
+          paused_execute: pausedExe,
+          head_ring_offset: headRingOffset,
+        }
+      : null,
+    observed_slot: resp.context.slot,
+    generated_ts_ms: Date.now(),
+  };
+}
+
+interface FreshBookLevel {
+  price_lots: string;
+  price_ui: string;
+  base_lots: string;
+  orders: number;
+}
+
+interface FreshBookSnapshot {
+  market_index: number;
+  observed_slot: number;
+  generated_ts_ms: number;
+  oracle_price_ui: string | null;
+  bids: FreshBookLevel[];
+  asks: FreshBookLevel[];
+  best_bid: FreshBookLevel | null;
+  best_ask: FreshBookLevel | null;
+  mid_ui: string | null;
+  spread_ui: string | null;
+}
+
+async function fetchFreshBook(
+  onchain: OnchainContext,
+  marketIndex: number,
+  depth: number,
+): Promise<FreshBookSnapshot | null> {
+  const group = await getFreshGroup(onchain);
+  if (!group) return null;
+  const perpMarket = group.perpMarketsMapByMarketIndex.get(
+    marketIndex as unknown as import('../../src/accounts/perp').PerpMarketIndex,
+  );
+  if (!perpMarket) return null;
+  const [bidsBook, asksBook] = await Promise.all([
+    perpMarket.loadBids(onchain.mangoClient, true),
+    perpMarket.loadAsks(onchain.mangoClient, true),
+  ]);
+  const foldLevels = (book: typeof bidsBook): FreshBookLevel[] => {
+    const levels = new Map<string, { baseLots: bigint; orders: number }>();
+    for (const o of book.itemsValid()) {
+      const priceKey = o.priceLots.toString();
+      const cur = levels.get(priceKey) || { baseLots: 0n, orders: 0 };
+      cur.baseLots += BigInt(o.sizeLots.toString());
+      cur.orders += 1;
+      levels.set(priceKey, cur);
+    }
+    const arr: FreshBookLevel[] = [];
+    for (const [priceKey, v] of levels.entries()) {
+      const priceUi = perpMarket.priceLotsToUi(new BN(priceKey));
+      arr.push({
+        price_lots: priceKey,
+        price_ui: priceUi.toString(),
+        base_lots: v.baseLots.toString(),
+        orders: v.orders,
+      });
+    }
+    return arr;
+  };
+  const bidsRaw = foldLevels(bidsBook).sort(
+    (a, b) => Number(BigInt(b.price_lots) - BigInt(a.price_lots)),
+  );
+  const asksRaw = foldLevels(asksBook).sort(
+    (a, b) => Number(BigInt(a.price_lots) - BigInt(b.price_lots)),
+  );
+  const bids = bidsRaw.slice(0, depth);
+  const asks = asksRaw.slice(0, depth);
+  const bestBid = bids[0] || null;
+  const bestAsk = asks[0] || null;
+  const midUi =
+    bestBid && bestAsk
+      ? ((parseFloat(bestBid.price_ui) + parseFloat(bestAsk.price_ui)) / 2).toString()
+      : null;
+  const spreadUi =
+    bestBid && bestAsk
+      ? (parseFloat(bestAsk.price_ui) - parseFloat(bestBid.price_ui)).toString()
+      : null;
+  return {
+    market_index: marketIndex,
+    observed_slot: 0, // loadBids/Asks don't return a context; slot left 0 — clients can still ts-check.
+    generated_ts_ms: Date.now(),
+    oracle_price_ui: perpMarket.uiPrice?.toString?.() ?? null,
+    bids,
+    asks,
+    best_bid: bestBid,
+    best_ask: bestAsk,
+    mid_ui: midUi,
+    spread_ui: spreadUi,
   };
 }
 
@@ -3596,11 +3811,100 @@ function writeSseEvent(
 const redisPublisher: Publisher = createPublisher(publisherMetricsHooks); // [redis-phase6]
 // [redis-phase1b] Closure captures the module-level `engine` lazily, so this is safe
 // even though `engine` is assigned asynchronously during boot.
-const stateMirror: Mirror = createMirror((view) => engine?.getSnapshot(view));
+const stateMirror: Mirror = createMirror((view) => {
+  const snap = engine?.getSnapshot(view);
+  if (!snap) return snap;
+  // [redis-phase5] enrich EngineSnapshot with rich identity + computed
+  // metrics so v1:meta:market:<id> is a complete replacement for
+  // /state/markets. Both reads are from module-level caches; zero I/O.
+  const enrichedMarkets: typeof snap.markets = {};
+  for (const [id, m] of Object.entries(snap.markets)) {
+    enrichedMarkets[id] = {
+      ...m,
+      metadata: harnessMarketMetadataSnapshot[id] ?? null,
+    } as (typeof snap.markets)[string];
+  }
+  const perp = (snap as { perp_markets?: Record<string, Record<string, unknown>> }).perp_markets ?? {};
+  const enrichedPerp: Record<string, Record<string, unknown>> = {};
+  for (const [id, pm] of Object.entries(perp)) {
+    const marketKey = String((pm as { market_index?: unknown }).market_index ?? id);
+    const metrics = marketRuntimeMetricsCache.get(marketKey)?.data ?? null;
+    enrichedPerp[id] = {
+      ...pm,
+      mark_price: metrics?.mark_price_ui ?? null,
+      funding_rate_daily: metrics?.funding_rate_daily_pct ?? null,
+      funding_rate_hourly: metrics?.funding_rate_hourly_pct ?? null,
+      open_interest: metrics?.open_interest_base_lots ?? null,
+    };
+  }
+  return {
+    ...snap,
+    markets: enrichedMarkets,
+    perp_markets: enrichedPerp,
+  } as unknown as ReturnType<NonNullable<typeof engine>['getSnapshot']>;
+});
+
+// [redis-phase5] For queue_item_processed events, attach the fills the
+// engine produced for this taker_sequence so the publisher's extractTrades()
+// walker sees them and XADDs into v1:trades:<market>. Non-throwing; on any
+// lookup failure we fall back to the original event shape.
+function enrichProcessedWithFills(event: HarnessEvent): HarnessEvent {
+  try {
+    if (!engine || event.event_type !== 'queue_item_processed') return event;
+    const ev = event as unknown as Record<string, unknown>;
+    const market =
+      (ev['market'] as string | number | undefined) ??
+      (ev['market_index'] as string | number | undefined) ??
+      null;
+    const sequence = ev['sequence'] as string | number | undefined;
+    if (market === null || market === undefined || sequence === undefined) return event;
+    const filtered = engine.getTradesFiltered({
+      view: 'confirmed',
+      market: String(market),
+      limit: 200,
+    });
+    const wanted = String(sequence);
+    const matches = filtered.filter(
+      (t: { taker_sequence?: string | number }) => String(t.taker_sequence) === wanted,
+    );
+    if (matches.length === 0) return event;
+    return {
+      ...event,
+      trades: matches.map((t: Record<string, unknown>) => ({
+        maker: t['maker_owner'],
+        taker: t['taker_owner'],
+        // Shorthand field names for the Redis publisher + downstream consumers,
+        // plus the legacy *_lots / *_owner names the TimescaleDB ingester and
+        // the /wallet/:pubkey/trades payload already expect. Duplicating is
+        // cheap and saves a translation layer in every consumer.
+        price: t['price_lots'],
+        size: t['base_lots'],
+        side: t['taker_side'],
+        ts_ms: t['ts_ms'],
+        sequence: t['taker_sequence'],
+        price_lots: t['price_lots'],
+        base_lots: t['base_lots'],
+        quote_lots: t['quote_lots'],
+        taker_side: t['taker_side'],
+        maker_owner: t['maker_owner'],
+        taker_owner: t['taker_owner'],
+        maker_order_id: t['maker_order_id'],
+        taker_sequence: t['taker_sequence'],
+        trade_id: t['trade_id'],
+      })),
+    } as HarnessEvent;
+  } catch {
+    return event;
+  }
+}
 
 function broadcastEvent(event: HarnessEvent): void {
-  // [redis-phase1a] fire-and-forget mirror; never blocks, never throws
-  redisPublisher.publishEvent(event as unknown as HarnessEventLike);
+  // [redis-phase1a + phase5] fire-and-forget mirror; enrich processed events
+  // with fill details so /v2/trades, /v2/trades/wallet and /v2/stream/trades
+  // see them. Never blocks, never throws.
+  redisPublisher.publishEvent(
+    enrichProcessedWithFills(event) as unknown as HarnessEventLike,
+  );
   // [redis-phase1b] debounced snapshot mirror; never blocks, never throws
   stateMirror.onEvent();
   measureSync(
@@ -9277,12 +9581,129 @@ function buildHttpServer(
         );
         const view = parseView(url);
         const snapshot = getSnapshotForView(view, onchainSync);
+        // v5 per-market PDA: opt-in live read via ?source=onchain_v5.
+        // Default keeps the legacy replay-engine shape so existing callers
+        // don't regress. `onchain_v5` bypasses the replay model and reads
+        // the per-market queue PDA directly — the correct truth after the
+        // per-market-queue migration.
+        const source = (url.searchParams.get('source') || 'engine').toLowerCase();
+        if (source === 'onchain_v5') {
+          const marketIndex = Number(market);
+          if (
+            !Number.isFinite(marketIndex) ||
+            marketIndex < 0 ||
+            marketIndex > 65535
+          ) {
+            writeJson(res, 400, {
+              error: 'invalid_market_index',
+              message: `market index must be 0..65535, got '${market}'`,
+            });
+            return;
+          }
+          if (!onchain || !onchain.groupPk || !onchain.programId) {
+            writeJson(res, 503, {
+              error: 'onchain_unavailable',
+              message: 'onchain context not initialised',
+            });
+            return;
+          }
+          try {
+            const live = await fetchV5QueueLiveState(
+              onchain.connection,
+              onchain.programId,
+              onchain.groupPk,
+              marketIndex,
+              HARNESS_COMMITMENT,
+            );
+            if (!live) {
+              writeJson(res, 404, {
+                source: 'onchain_v5',
+                market,
+                message: 'per-market v5 queue PDA not found on-chain',
+                pda: deriveV5QueuePda(
+                  onchain.programId,
+                  onchain.groupPk,
+                  marketIndex,
+                ).toBase58(),
+              });
+              return;
+            }
+            writeJson(res, 200, {
+              source: 'onchain_v5',
+              market,
+              data: live,
+            });
+            return;
+          } catch (err) {
+            writeJson(res, 502, {
+              source: 'onchain_v5',
+              market,
+              error: 'rpc_read_failed',
+              message: normalizeError(err).message,
+            });
+            return;
+          }
+        }
         writeJson(res, 200, {
           view,
           market,
           data: snapshot.queue[market] || emptyQueueState(market),
         });
         return;
+      }
+
+      // Fresh per-market orderbook — always live-reads from on-chain,
+      // bypassing the replay engine. Use when the reconciled snapshot is
+      // too stale (e.g. between HARNESS_RECONCILE_INTERVAL_MS ticks).
+      // Query params: depth=N (default 20, max 500).
+      if (method === 'GET' && url.pathname.startsWith('/state/book/')) {
+        const market = decodeURIComponent(
+          url.pathname.slice('/state/book/'.length),
+        );
+        const marketIndex = Number(market);
+        if (
+          !Number.isFinite(marketIndex) ||
+          marketIndex < 0 ||
+          marketIndex > 65535
+        ) {
+          writeJson(res, 400, {
+            error: 'invalid_market_index',
+            message: `market index must be 0..65535, got '${market}'`,
+          });
+          return;
+        }
+        if (!onchain) {
+          writeJson(res, 503, {
+            error: 'onchain_unavailable',
+            message: 'onchain context not initialised',
+          });
+          return;
+        }
+        const depth = parseNonNegativeInteger(
+          url.searchParams.get('depth'),
+          20,
+          { min: 1, max: 500 },
+        );
+        try {
+          const book = await fetchFreshBook(onchain, marketIndex, depth);
+          if (!book) {
+            writeJson(res, 404, {
+              market,
+              message:
+                'market not found in mango group (check V5_M<idx>_PERP_MARKET config)',
+            });
+            return;
+          }
+          writeJson(res, 200, { market, data: book });
+          return;
+        } catch (err) {
+          writeJson(res, 502, {
+            market,
+            error: 'rpc_read_failed',
+            message: normalizeError(err).message,
+          });
+          return;
+        }
       }
 
       if (method === 'GET' && url.pathname === '/state/full') {
