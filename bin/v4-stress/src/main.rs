@@ -47,7 +47,7 @@ use std::{
 
 mod real_e2e;
 
-const PROGRAM_ID_STR: &str = "9rpAcg1jNmUydb4QoeCeJBGf8JfRuxLciRbS7AHGnXEq";
+const PROGRAM_ID_STR: &str = "9MkHgbHZ24xQ9YUdqUfpsakH2MBUsP8tZWtNJ4pEL8qZ";
 
 #[derive(Parser, Debug)]
 struct Args {

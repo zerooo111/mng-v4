@@ -93,6 +93,8 @@ const PYTH_SPONSORED = {
   SOL: new PublicKey('7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE'),
   BTC: new PublicKey('4cSM2e6rvbGQUFiJbqytoVMi5GgghSMr8LwVrT9VPSPo'),
   ETH: new PublicKey('42amVS4KgzR9rA28tkVYqVXjq9Qa8dcZQMbH5EYFX6XC'),
+  ZEC: new PublicKey('HzdKMXqocYWqy7mh8AKDoZFJinjeGMfBKmGAxGbasc28'),
+  FARTCOIN: new PublicKey('2t8eUbYKjidMs3uSeYM9jXM9uudYZwGkSeTB4TKjmvnC'),
 };
 
 const PYTH_ORACLE_CONFIG = {
@@ -139,6 +141,27 @@ const MARKETS: MarketDef[] = [
     initialPrice: 67_000,
     baseDecimals: 6,
     baseLotSize: 100,
+    quoteLotSize: 1,
+  },
+  {
+    // ZEC ~$50 → 5 sig figs = $0.001 tick. Same shape as SOL.
+    name: 'ZEC-PERP',
+    marketIndex: Number(process.env.V5_MARKET_INDEX_ZEC ?? '3') as PerpMarketIndex,
+    oraclePk: PYTH_SPONSORED.ZEC,
+    initialPrice: 50,
+    baseDecimals: 5,
+    baseLotSize: 100,
+    quoteLotSize: 1,
+  },
+  {
+    // FARTCOIN ~$1 → 5 sig figs = $0.0001. baseLotSize=10000 with
+    // baseDecimals=6 gives min size 0.01 FARTCOIN (~$0.01) and tick $0.0001.
+    name: 'FARTCOIN-PERP',
+    marketIndex: Number(process.env.V5_MARKET_INDEX_FARTCOIN ?? '4') as PerpMarketIndex,
+    oraclePk: PYTH_SPONSORED.FARTCOIN,
+    initialPrice: 1,
+    baseDecimals: 6,
+    baseLotSize: 10000,
     quoteLotSize: 1,
   },
 ];
@@ -497,11 +520,15 @@ async function main(): Promise<void> {
     if (existingBank) {
       usdcMint = existingBank.mint;
       log({ msg: 'group_exists_with_usdc', usdc_mint: usdcMint.toBase58() });
+    } else if (process.env.USDC_MINT_OVERRIDE) {
+      // Resuming a partial prior run: caller passed the mint the previous
+      // run created (log line `group_created` / `group_existed_new_usdc_mint`
+      // records it). Reusing avoids orphan mints and a second bank creation
+      // that'd collide with the first once it lands.
+      usdcMint = new PublicKey(process.env.USDC_MINT_OVERRIDE);
+      log({ msg: 'group_existed_usdc_mint_from_env', usdc_mint: usdcMint.toBase58() });
     } else {
-      // Group exists but no USDC bank yet. Reuse any hint the group carries
-      // (the bootstrap mint address is not persisted on the group itself, so
-      // fall through to minting a fresh one; a redeploy in this state is
-      // unusual and likely means a partial prior run).
+      // Group exists but no USDC bank yet and no override — mint fresh.
       usdcMint = await createMint(
         connection,
         admin,
@@ -547,6 +574,14 @@ async function main(): Promise<void> {
   }
 
   // 3. v5 queue: create → resize → init.
+  //    Skipped when V5_SKIP_SHARED_QUEUE=true — the program now requires
+  //    per-market PDA seeds (["execution-queue-v5", group, market_index]),
+  //    so the shared-seed derivation here is rejected by program checks.
+  //    Use v5-bootstrap-per-market.ts to create per-market queues after
+  //    this script finishes group + bank + perp markets.
+  if (process.env.V5_SKIP_SHARED_QUEUE === 'true') {
+    log({ msg: 'queue_step_skipped_per_market_mode' });
+  } else {
   let queueInfo = await connection.getAccountInfo(queuePk, 'confirmed');
   if (!queueInfo) {
     log({ msg: 'queue_create' });
@@ -600,6 +635,7 @@ async function main(): Promise<void> {
       throw new Error('queue layout_version != 5 after init');
     }
   }
+  } // end V5_SKIP_SHARED_QUEUE else
 
   // 4. Perp markets.
   for (const mkt of MARKETS) {
@@ -657,7 +693,12 @@ async function main(): Promise<void> {
   }
 
   // 5. v5 sub-queues — one per market_index.
-  queueInfo = await connection.getAccountInfo(queuePk, 'confirmed');
+  //    Skipped in per-market mode; v5-bootstrap-per-market.ts both creates
+  //    the queue PDA AND configures its sub-queue in a single pass.
+  if (process.env.V5_SKIP_SHARED_QUEUE === 'true') {
+    log({ msg: 'sub_queue_step_skipped_per_market_mode' });
+  } else {
+  let queueInfo = await connection.getAccountInfo(queuePk, 'confirmed');
   for (const mkt of MARKETS) {
     if (isSubQueueConfigured(queueInfo!.data, mkt.marketIndex)) {
       log({
@@ -694,6 +735,7 @@ async function main(): Promise<void> {
       );
     }
   }
+  } // end V5_SKIP_SHARED_QUEUE else (step 5)
 
   // Summary.
   const finalGroup = await adminClient.getGroup(groupPk);

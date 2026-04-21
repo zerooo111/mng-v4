@@ -75,7 +75,7 @@ build source, not the symlink.
 
 ## Program id (`declare_id!`) must match deployed
 
-`programs/mango-v4/src/lib.rs:49` must contain `declare_id!("9rpAcg1jNmUydb4QoeCeJBGf8JfRuxLciRbS7AHGnXEq");`
+`programs/mango-v4/src/lib.rs:49` must contain `declare_id!("9MkHgbHZ24xQ9YUdqUfpsakH2MBUsP8tZWtNJ4pEL8qZ");`
 — the **deployed devnet program id**. If it diverges (historically a revert
 to `Hjz5uX54…` has crept in), every zerocopy `load::<Bank>()` /
 `load::<PerpMarket>()` returns `AccountOwnedByWrongProgram` and the relayer's

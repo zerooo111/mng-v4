@@ -322,7 +322,7 @@ tail -c 20M .devnet/logs/ctm-relayer.log \
 ## ⚠️ WARN — Oracle staleness config (DEVNET HACK, MUST FIX BEFORE MAINNET)
 
 **Context (2026-04-20, investigating empty orderbook with all reveals returning `status=Revealed`):**
-SOL/ETH/BTC perp markets on the devnet group (`BrbJtc8ja8CH75CxbtRMzYqchtEq4XvsQZ6nKvCkQfGG`, program `9rpAcg1jNmUydb4QoeCeJBGf8JfRuxLciRbS7AHGnXEq`) are configured with `oracle_config.max_staleness_slots = 600` (~4 min) to tolerate the devnet sponsored Pyth PriceUpdateV2 feed's real update cadence (observed publish_time lags of 120–180 s are normal there, occasionally up to 240 s).
+SOL/ETH/BTC perp markets on the devnet group (`BrbJtc8ja8CH75CxbtRMzYqchtEq4XvsQZ6nKvCkQfGG`, program `9MkHgbHZ24xQ9YUdqUfpsakH2MBUsP8tZWtNJ4pEL8qZ`) are configured with `oracle_config.max_staleness_slots = 600` (~4 min) to tolerate the devnet sponsored Pyth PriceUpdateV2 feed's real update cadence (observed publish_time lags of 120–180 s are normal there, occasionally up to 240 s).
 
 **Why this is dangerous:**
 - At 400 ms/slot, 600 slots = 240 s of tolerable staleness. On mainnet Pyth feeds update sub-second; 600 slots is an eternity of price drift a liquidator or attacker can exploit.
