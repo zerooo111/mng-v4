@@ -35,6 +35,16 @@ const MIRROR_DEBOUNCE_MS = 100;
 // books bloating Redis.
 const MIRROR_MAX_ORDERS_PER_MARKET = 500;
 
+// Tick-notification streams. Consumers (continuum-proxy-rust, others) that
+// want push semantics instead of polling the book/meta HASHes can
+// `XREAD BLOCK 0` one of these streams and — on any new entry — fetch the
+// current hash state. Entries are small (just ts_ms + tag) so the stream
+// cost is negligible; MAXLEN keeps memory bounded. This decouples cadence
+// from consumer poll intervals and was the reason for the v2 proxy's
+// observed ~15× fewer meta updates vs v1 (polling at 2000ms vs harness
+// push at ~17ms).
+const TICK_STREAM_MAXLEN = 100;
+
 // ── Types (structural subset of EngineSnapshot) ─────────────────────
 
 type ViewTag = 'opt' | 'conf';
@@ -237,6 +247,7 @@ class IORedisMirror implements Mirror {
     // cleared — their keys fall out when the mirror is rebuilt on next
     // startup. (Sparse per-owner keys are cheap.)
     const ordersByOwner = new Map<string, Map<string, string>>(); // owner → (order_id → market_id)
+    const bookTickedMarkets: string[] = [];
     if (snap.markets) {
       for (const [marketKey, market] of Object.entries(snap.markets)) {
         const bidsKey = `v1:book:${tag}:${marketKey}:bids`;
@@ -244,6 +255,7 @@ class IORedisMirror implements Mirror {
         const ordersKey = `v1:book:${tag}:${marketKey}:orders`;
 
         pipeline.del(bidsKey, asksKey, ordersKey);
+        bookTickedMarkets.push(marketKey);
 
         const orders = market.open_orders ?? [];
         const trimmed = orders.slice(0, MIRROR_MAX_ORDERS_PER_MARKET);
@@ -286,6 +298,26 @@ class IORedisMirror implements Mirror {
         obj[oid] = mkt;
       }
       if (Object.keys(obj).length > 0) pipeline.hset(key, obj);
+    }
+
+    // Book-tick notification streams. One XADD per market per tick so
+    // `XREAD BLOCK 0 STREAMS v1:ticks:book:<market> $` wakes the consumer
+    // exactly when the underlying ZSET/HSET has been updated.
+    for (const marketKey of bookTickedMarkets) {
+      const tickKey = `v1:ticks:book:${tag}:${marketKey}`;
+      pipeline.xadd(
+        tickKey,
+        'MAXLEN',
+        '~',
+        TICK_STREAM_MAXLEN,
+        '*',
+        'ts_ms',
+        tsMs,
+        'tag',
+        tag,
+        'market',
+        marketKey,
+      );
     }
 
     // ── User positions + balance summary ──
@@ -422,6 +454,21 @@ class IORedisMirror implements Mirror {
           const key = `v1:meta:market:${id}`;
           pipeline.del(key);
           pipeline.hset(key, collect[id]);
+
+          // Meta-tick notification. Symmetrical with the book-tick stream
+          // above: consumers XREAD BLOCK 0 this and refetch the hash.
+          const tickKey = `v1:ticks:meta:${id}`;
+          pipeline.xadd(
+            tickKey,
+            'MAXLEN',
+            '~',
+            TICK_STREAM_MAXLEN,
+            '*',
+            'ts_ms',
+            tsMs,
+            'market',
+            id,
+          );
         }
       }
     }
